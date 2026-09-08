@@ -26,3 +26,67 @@ fn file_backend_creates_one_file_per_table() {
     let count = std::fs::read_dir(&tables_dir).unwrap().count();
     assert_eq!(count, 3, "windows-style case-insensitive names must not collide");
 }
+
+#[test]
+fn reopen_restores_schema_and_data() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = Database::open(dir.path()).unwrap();
+        db.execute_sql("create table student (id int, name char(10), score float);")
+            .unwrap();
+        db.execute_sql("insert into student values (1, 'alice', 95.5), (2, 'bob', 80);")
+            .unwrap();
+    }
+
+    let mut db = Database::open(dir.path()).unwrap();
+    let rs = db.execute_sql("select * from student;").unwrap();
+    match &rs[0] {
+        chibidb::ResultSet::Rows { columns, rows } => {
+            assert_eq!(columns.as_slice(), ["id", "name", "score"]);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][1].to_string(), "alice");
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    db.execute_sql("insert into student values (3, 'carol', 90);").unwrap();
+    db.execute_sql("update student set score = 99 where id = 3;").unwrap();
+    let rs = db.execute_sql("select id, score from student where id = 3;").unwrap();
+    match &rs[0] {
+        chibidb::ResultSet::Rows { rows, .. } => assert_eq!(
+            rows.as_slice(),
+            [[chibidb::value::Value::Int(3), chibidb::value::Value::Float(99.0)]]
+        ),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_counter_continues_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = Database::open(dir.path()).unwrap();
+        db.execute_sql("create table a (id int);").unwrap();
+        db.execute_sql("create table b (id int);").unwrap();
+    }
+    let mut db = Database::open(dir.path()).unwrap();
+    db.execute_sql("create table c (id int);").unwrap();
+    db.execute_sql("insert into c values (42);").unwrap();
+
+    let count = std::fs::read_dir(dir.path().join("tables")).unwrap().count();
+    assert_eq!(count, 3);
+    for t in ["a", "b", "c"] {
+        assert!(db.execute_sql(&format!("select * from {t};")).is_ok(), "table {t}");
+    }
+}
+
+#[test]
+fn reopen_rejects_corrupt_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = Database::open(dir.path()).unwrap();
+        db.execute_sql("create table t (id int);").unwrap();
+    }
+    std::fs::write(dir.path().join("catalog.bin"), b"garbage!!!").unwrap();
+    assert!(Database::open(dir.path()).is_err());
+}

@@ -7,6 +7,8 @@ use crate::{Error, Result};
 
 pub mod meta;
 
+use meta::TableMeta;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDesc {
     pub name: String,
@@ -27,7 +29,7 @@ impl Schema {
 #[derive(Debug)]
 pub(crate) enum RowStore {
     Mem(Vec<Vec<Value>>),
-    Heap { file: FileId },
+    Heap { file: FileId, file_no: u32 },
 }
 
 #[derive(Debug)]
@@ -60,5 +62,24 @@ impl Catalog {
         self.tables
             .get_mut(name)
             .ok_or_else(|| Error::Runtime(format!("no such table: {name}")))
+    }
+
+    pub(crate) fn table_metas(&self) -> Vec<TableMeta> {
+        self.tables
+            .iter()
+            .map(|(name, t)| {
+                let columns = t
+                    .schema
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.dtype))
+                    .collect();
+                let file_no = match &t.store {
+                    RowStore::Heap { file_no, .. } => *file_no,
+                    RowStore::Mem(_) => 0,
+                };
+                TableMeta { name: name.clone(), columns, file_no }
+            })
+            .collect()
     }
 }

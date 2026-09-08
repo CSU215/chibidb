@@ -128,6 +128,7 @@ fn execute_create_table(db: &mut Database, c: &CreateTableStmt) -> Result<Result
     };
     let store = db.new_table_store(&c.name)?;
     db.catalog_mut().create_table(&c.name, schema, store)?;
+    db.save_catalog()?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 

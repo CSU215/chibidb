@@ -15,7 +15,8 @@ pub use result::ResultSet;
 
 use std::path::{Path, PathBuf};
 
-use crate::catalog::{Catalog, RowStore};
+use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
+use crate::catalog::{Catalog, ColumnDesc, RowStore, Schema};
 use crate::storage::codec::{decode_row, encode_row};
 use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, Rid};
 use crate::value::Value;
@@ -44,13 +45,51 @@ impl Database {
         std::fs::create_dir_all(&tables_dir).map_err(|e| {
             Error::Runtime(format!("cannot create dir {}: {e}", tables_dir.display()))
         })?;
-        let pool = BufferPool::new(DiskManager::new(), BUFFER_POOL_FRAMES);
+        let mut pool = BufferPool::new(DiskManager::new(), BUFFER_POOL_FRAMES);
+        let mut catalog = Catalog::default();
+        let mut next_table_file = 0;
+
+        let catalog_path = path.join("catalog.bin");
+        if catalog_path.exists() {
+            let bytes = std::fs::read(&catalog_path)
+                .map_err(|e| Error::Runtime(format!("cannot read catalog: {e}")))?;
+            let snap = decode_catalog(&bytes)?;
+            for meta in &snap.tables {
+                let fpath = tables_dir.join(format!("{:06}.dbf", meta.file_no));
+                let file = pool.open_file(&fpath)?;
+                HeapFile::open(&mut pool, file)?;
+                let schema = Schema {
+                    columns: meta
+                        .columns
+                        .iter()
+                        .map(|(name, dtype)| ColumnDesc {
+                            name: name.clone(),
+                            dtype: *dtype,
+                        })
+                        .collect(),
+                };
+                catalog.create_table(
+                    &meta.name,
+                    schema,
+                    RowStore::Heap { file, file_no: meta.file_no },
+                )?;
+            }
+            next_table_file = snap.next_table_file;
+        }
+
         Ok(Self {
-            catalog: Catalog::default(),
+            catalog,
             pool: Some(pool),
             data_dir: Some(path.to_path_buf()),
-            next_table_file: 0,
+            next_table_file,
         })
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        if let Some(pool) = &mut self.pool {
+            pool.flush_all()?;
+        }
+        self.save_catalog()
     }
 
     pub fn execute_sql(&mut self, sql: &str) -> Result<Vec<ResultSet>> {
@@ -74,11 +113,25 @@ impl Database {
         let (Some(pool), Some(dir)) = (&mut self.pool, &self.data_dir) else {
             return Ok(RowStore::Mem(vec![]));
         };
-        let path = dir.join("tables").join(format!("{:06}.dbf", self.next_table_file));
+        let file_no = self.next_table_file;
         self.next_table_file += 1;
+        let path = dir.join("tables").join(format!("{file_no:06}.dbf"));
         let file = pool.create_file(&path)?;
         HeapFile::init(pool, file)?;
-        Ok(RowStore::Heap { file })
+        Ok(RowStore::Heap { file, file_no })
+    }
+
+    pub(crate) fn save_catalog(&self) -> Result<()> {
+        let Some(dir) = &self.data_dir else {
+            return Ok(());
+        };
+        let snap = CatalogSnapshot {
+            next_table_file: self.next_table_file,
+            tables: self.catalog.table_metas(),
+        };
+        let bytes = encode_catalog(&snap);
+        std::fs::write(dir.join("catalog.bin"), bytes)
+            .map_err(|e| Error::Runtime(format!("cannot write catalog: {e}")))
     }
 
     pub(crate) fn store_scan(&mut self, name: &str) -> Result<Vec<(Rid, Vec<Value>)>> {
@@ -176,7 +229,7 @@ impl Database {
 
     fn heap_file(&self, name: &str) -> Result<Option<FileId>> {
         match &self.catalog.table(name)?.store {
-            RowStore::Heap { file } => Ok(Some(*file)),
+            RowStore::Heap { file, .. } => Ok(Some(*file)),
             RowStore::Mem(_) => Ok(None),
         }
     }
