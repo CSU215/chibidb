@@ -99,3 +99,22 @@ fn comparison_is_looser_than_additive() {
 fn comparisons_are_not_chainable() {
     err("select 1 < 2 < 3;");
 }
+
+#[test]
+fn parses_and_or_not() {
+    assert_eq!(single_exprs("select 1 = 1 and 2 = 2;"), ["(and (= 1 1) (= 2 2))"]);
+    assert_eq!(single_exprs("select 1 or 0;"), ["(or 1 0)"]);
+    assert_eq!(single_exprs("select not 1;"), ["(not 1)"]);
+    assert_eq!(single_exprs("select not not 1;"), ["(not (not 1))"]);
+    assert_eq!(single_exprs("select 1 AND 2;"), ["(and 1 2)"]);
+}
+
+#[test]
+fn logical_precedence() {
+    // and binds tighter than or
+    assert_eq!(single_exprs("select 1 or 0 and 0;"), ["(or 1 (and 0 0))"]);
+    // not binds looser than comparison
+    assert_eq!(single_exprs("select not 1 = 1;"), ["(not (= 1 1))"]);
+    // left associativity
+    assert_eq!(single_exprs("select 1 and 0 and 1;"), ["(and (and 1 0) 1)"]);
+}

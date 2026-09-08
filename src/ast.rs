@@ -12,11 +12,14 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UnOp {
     Neg,
+    Not,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +58,8 @@ impl fmt::Display for BinOp {
             BinOp::Le => "<=",
             BinOp::Gt => ">",
             BinOp::Ge => ">=",
+            BinOp::And => "and",
+            BinOp::Or => "or",
         };
         f.write_str(s)
     }
@@ -64,6 +69,7 @@ impl fmt::Display for UnOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             UnOp::Neg => "-",
+            UnOp::Not => "not",
         };
         f.write_str(s)
     }

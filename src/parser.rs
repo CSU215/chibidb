@@ -93,6 +93,32 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<Expr> {
+        let mut lhs = self.parse_and()?;
+        while self.eat_keyword("or") {
+            let rhs = self.parse_and()?;
+            lhs = Expr::Binary(BinOp::Or, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr> {
+        let mut lhs = self.parse_not()?;
+        while self.eat_keyword("and") {
+            let rhs = self.parse_not()?;
+            lhs = Expr::Binary(BinOp::And, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_not(&mut self) -> Result<Expr> {
+        if self.eat_keyword("not") {
+            let e = self.parse_not()?;
+            return Ok(Expr::Unary(UnOp::Not, Box::new(e)));
+        }
         self.parse_comparison()
     }
 
