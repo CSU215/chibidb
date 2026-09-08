@@ -1,0 +1,27 @@
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Int(n) => write!(f, "{n}"),
+            Value::Float(x) => {
+                let s = x.to_string();
+                if s.contains('.') {
+                    f.write_str(&s)
+                } else {
+                    write!(f, "{x:.1}")
+                }
+            }
+            Value::Str(s) => f.write_str(s),
+        }
+    }
+}

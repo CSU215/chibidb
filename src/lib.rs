@@ -1,8 +1,10 @@
 pub mod ast;
 mod error;
+pub mod exec;
 pub mod lexer;
 pub mod parser;
 mod repl;
+pub mod value;
 
 pub use error::{Error, Result};
 pub use repl::run_repl;

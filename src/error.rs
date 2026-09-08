@@ -2,6 +2,8 @@
 pub enum Error {
     #[error("syntax error: {0}")]
     Syntax(String),
+    #[error("{0}")]
+    Runtime(String),
     #[error("unsupported sql")]
     Unsupported,
 }
