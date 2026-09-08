@@ -21,11 +21,22 @@ async fn run_with(input: &[u8]) -> String {
 }
 
 #[tokio::test]
-async fn prompts_reports_unsupported_and_exits() {
-    let output = run_with(b"select 1;\nexit\n").await;
+async fn prompts_renders_results_and_exits() {
+    let output = run_with(b"select 1+2;\nexit\n").await;
 
     assert!(output.starts_with("db> "), "got: {output:?}");
-    assert!(output.contains("error: unsupported"), "got: {output:?}");
+    assert!(output.contains("(+ 1 2)"), "got: {output:?}");
+    assert!(output.contains("-------"), "got: {output:?}");
+    assert!(output.contains("3"), "got: {output:?}");
+    assert!(!output.contains("error"), "got: {output:?}");
+    assert_eq!(output.matches("db> ").count(), 2, "got: {output:?}");
+}
+
+#[tokio::test]
+async fn reports_errors_without_crashing() {
+    let output = run_with(b"select 1/0;\nexit\n").await;
+
+    assert!(output.contains("error: division by zero"), "got: {output:?}");
     assert_eq!(output.matches("db> ").count(), 2, "got: {output:?}");
 }
 

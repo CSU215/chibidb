@@ -1,6 +1,29 @@
-use crate::ast::{BinOp, Expr, UnOp};
+use crate::ast::{BinOp, Expr, SelectItem, Stmt, UnOp};
+use crate::result::ResultSet;
 use crate::value::Value;
 use crate::{Error, Result};
+
+pub fn execute(stmt: &Stmt) -> Result<ResultSet> {
+    match stmt {
+        Stmt::Select(s) if s.from.is_none() => {
+            let mut columns = Vec::new();
+            let mut row = Vec::new();
+            for item in &s.items {
+                match item {
+                    SelectItem::Expr(e) => {
+                        columns.push(e.to_string());
+                        row.push(eval_const(e)?);
+                    }
+                    SelectItem::Star => {
+                        return Err(Error::Runtime("select * requires from".into()))
+                    }
+                }
+            }
+            Ok(ResultSet::Rows { columns, rows: vec![row] })
+        }
+        _ => Err(Error::Runtime("not implemented yet".into())),
+    }
+}
 
 pub fn eval_const(expr: &Expr) -> Result<Value> {
     match expr {
