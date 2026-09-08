@@ -22,9 +22,9 @@ fn encodes_and_decodes_rows() {
 #[test]
 fn encoding_is_stable() {
     let bytes = encode_row(&[Value::Int(1)]);
-    assert_eq!(bytes, vec![0x01, 1, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(bytes, vec![1, 0, 0x01, 1, 0, 0, 0, 0, 0, 0, 0]);
     let bytes = encode_row(&[Value::Str("ab".into())]);
-    assert_eq!(bytes, vec![0x03, 2, 0, b'a', b'b']);
+    assert_eq!(bytes, vec![1, 0, 0x03, 2, 0, b'a', b'b']);
 }
 
 #[test]

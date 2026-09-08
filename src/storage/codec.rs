@@ -8,6 +8,7 @@ const TAG_BOOL: u8 = 0x04;
 
 pub fn encode_row(row: &[Value]) -> Vec<u8> {
     let mut buf = Vec::new();
+    buf.extend_from_slice(&(row.len() as u16).to_le_bytes());
     for v in row {
         match v {
             Value::Int(n) => {
@@ -33,9 +34,11 @@ pub fn encode_row(row: &[Value]) -> Vec<u8> {
 }
 
 pub fn decode_row(data: &[u8]) -> Result<(Vec<Value>, usize)> {
-    let mut row = Vec::new();
     let mut pos = 0;
-    while pos < data.len() {
+    let hb = take(data, &mut pos, 2)?;
+    let count = u16::from_le_bytes(hb.try_into().unwrap()) as usize;
+    let mut row = Vec::with_capacity(count);
+    for _ in 0..count {
         let tag = data[pos];
         pos += 1;
         let v = match tag {
