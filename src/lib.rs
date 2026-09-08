@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod catalog;
+pub mod datetime;
 mod error;
 pub mod exec;
 pub mod lexer;

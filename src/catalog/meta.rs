@@ -6,6 +6,7 @@ const MAGIC: [u8; 8] = *b"CHIDCAT1";
 const DTYPE_INT: u8 = 0x00;
 const DTYPE_FLOAT: u8 = 0x01;
 const DTYPE_CHAR: u8 = 0x02;
+const DTYPE_DATE: u8 = 0x03;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableMeta {
@@ -37,6 +38,7 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
                     buf.push(DTYPE_CHAR);
                     put_u32(&mut buf, *n);
                 }
+                DataType::Date => buf.push(DTYPE_DATE),
             }
         }
         put_u32(&mut buf, t.file_no);
@@ -63,6 +65,7 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
                 DTYPE_INT => DataType::Int,
                 DTYPE_FLOAT => DataType::Float,
                 DTYPE_CHAR => DataType::Char(take_u32(data, &mut pos)?),
+                DTYPE_DATE => DataType::Date,
                 _ => return Err(Error::Runtime(format!("unknown dtype tag 0x{tag:02x}"))),
             };
             columns.push((cname, dtype));

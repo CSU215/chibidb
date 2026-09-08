@@ -300,8 +300,7 @@ fn update_errors() {
 }
 
 #[test]
-fn null_storage_and_filtering() {
-    with_dbs(|db| {
+fn null_storage_and_filtering() {    with_dbs(|db| {
         db.execute_sql("create table t (id int, name char(10));").unwrap();
         db.execute_sql("insert into t values (1, null), (2, 'x');").unwrap();
 
@@ -327,5 +326,34 @@ fn null_storage_and_filtering() {
         let (_, r) = rows(&rs);
         assert_eq!(r.len(), 2);
         assert_eq!(r[0][0], Value::Str("y".into()));
+    });
+}
+
+#[test]
+fn date_type() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int, birthday date);").unwrap();
+        db.execute_sql("insert into t values (1, '2000-02-29'), (2, '1999-06-15');")
+            .unwrap();
+
+        let err = db.execute_sql("insert into t values (3, '2023-02-29');").unwrap_err();
+        assert!(err.to_string().contains("invalid date"), "{err}");
+
+        let rs = db.execute_sql("select birthday from t where id = 2;").unwrap();
+        let (_, r) = rows(&rs);
+        assert_eq!(r, [[Value::Date(10757)]], "1999-06-15");
+        assert_eq!(r[0][0].to_string(), "1999-06-15");
+
+        let rs =
+            db.execute_sql("select id from t where birthday = '2000-02-29';").unwrap();
+        let (_, r) = rows(&rs);
+        assert_eq!(r, [[Value::Int(1)]]);
+
+        let rs = db.execute_sql("select id from t where birthday > '2000-01-01';").unwrap();
+        let (_, r) = rows(&rs);
+        assert_eq!(r, [[Value::Int(1)]]);
+
+        let err = db.execute_sql("insert into t values (4, 'not a date');").unwrap_err();
+        assert!(err.to_string().contains("invalid date"), "{err}");
     });
 }

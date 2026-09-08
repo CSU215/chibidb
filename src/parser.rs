@@ -274,6 +274,9 @@ impl Parser {
             self.expect_punct(Punct::RParen)?;
             return Ok(DataType::Char(n as u32));
         }
+        if self.eat_keyword("date") {
+            return Ok(DataType::Date);
+        }
         Err(self.unexpected("data type"))
     }
 

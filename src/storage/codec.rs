@@ -6,6 +6,7 @@ const TAG_INT: u8 = 0x01;
 const TAG_FLOAT: u8 = 0x02;
 const TAG_STR: u8 = 0x03;
 const TAG_BOOL: u8 = 0x04;
+const TAG_DATE: u8 = 0x05;
 
 pub fn encode_row(row: &[Value]) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -29,6 +30,10 @@ pub fn encode_row(row: &[Value]) -> Vec<u8> {
             Value::Bool(b) => {
                 buf.push(TAG_BOOL);
                 buf.push(*b as u8);
+            }
+            Value::Date(d) => {
+                buf.push(TAG_DATE);
+                buf.extend_from_slice(&d.to_le_bytes());
             }
         }
     }
@@ -64,6 +69,10 @@ pub fn decode_row(data: &[u8]) -> Result<(Vec<Value>, usize)> {
             TAG_BOOL => {
                 let b = take(data, &mut pos, 1)?;
                 Value::Bool(b[0] != 0)
+            }
+            TAG_DATE => {
+                let b = take(data, &mut pos, 4)?;
+                Value::Date(i32::from_le_bytes(b.try_into().unwrap()))
             }
             _ => return Err(Error::Runtime(format!("unknown value tag 0x{tag:02x}"))),
         };

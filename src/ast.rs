@@ -85,6 +85,7 @@ pub enum DataType {
     Int,
     Float,
     Char(u32),
+    Date,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -18,6 +18,7 @@ fn encodes_and_decodes_rows() {
     roundtrip(&[Value::Str("数据".into()), Value::Int(42), Value::Float(1.5)]);
     roundtrip(&[Value::Bool(true), Value::Bool(false)]);
     roundtrip(&[Value::Null, Value::Int(1)]);
+    roundtrip(&[Value::Date(0), Value::Date(19723), Value::Date(-1)]);
 }
 
 #[test]

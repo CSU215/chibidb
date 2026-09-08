@@ -111,6 +111,10 @@ fn coerce(v: Value, dtype: DataType, col: &str) -> Result<Value> {
                 )))
             }
         }
+        (v @ Value::Date(_), DataType::Date) => Ok(v),
+        (Value::Str(s), DataType::Date) => crate::datetime::parse_date(&s)
+            .map(Value::Date)
+            .map_err(|e| Error::Runtime(format!("cannot insert into column {col}: {e}"))),
         (v, _) => Err(Error::Runtime(format!(
             "cannot insert {v} into column {col}"
         ))),
@@ -320,6 +324,13 @@ fn compare(op: BinOp, l: Value, r: Value) -> Result<Value> {
         (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
         (Value::Str(a), Value::Str(b)) => Some(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+        (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
+        (Value::Date(a), Value::Str(b)) | (Value::Str(b), Value::Date(a)) => {
+            match crate::datetime::parse_date(b) {
+                Ok(d) => Some(a.cmp(&d)),
+                Err(e) => return Err(e),
+            }
+        }
         _ => return Err(type_mismatch()),
     };
     let res = match ord {
