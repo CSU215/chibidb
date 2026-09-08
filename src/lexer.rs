@@ -6,6 +6,16 @@ pub enum Punct {
     RParen,
     Comma,
     Semicolon,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Eq,
+    NotEq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,10 +75,44 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 i += 1;
                 out.push(Token { kind: TokenKind::Str(s), pos: start });
             }
-            b'(' => push_punct(&mut out, &mut i, Punct::LParen),
-            b')' => push_punct(&mut out, &mut i, Punct::RParen),
-            b',' => push_punct(&mut out, &mut i, Punct::Comma),
-            b';' => push_punct(&mut out, &mut i, Punct::Semicolon),
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                out.push(Token { kind: TokenKind::Ident(src[start..i].to_string()), pos: start });
+            }
+            b'(' => push_punct(&mut out, &mut i, Punct::LParen, 1),
+            b')' => push_punct(&mut out, &mut i, Punct::RParen, 1),
+            b',' => push_punct(&mut out, &mut i, Punct::Comma, 1),
+            b';' => push_punct(&mut out, &mut i, Punct::Semicolon, 1),
+            b'+' => push_punct(&mut out, &mut i, Punct::Plus, 1),
+            b'-' => push_punct(&mut out, &mut i, Punct::Minus, 1),
+            b'*' => push_punct(&mut out, &mut i, Punct::Star, 1),
+            b'/' => push_punct(&mut out, &mut i, Punct::Slash, 1),
+            b'=' => push_punct(&mut out, &mut i, Punct::Eq, 1),
+            b'<' => {
+                let (p, len) = match bytes.get(i + 1) {
+                    Some(b'=') => (Punct::Le, 2),
+                    Some(b'>') => (Punct::NotEq, 2),
+                    _ => (Punct::Lt, 1),
+                };
+                push_punct(&mut out, &mut i, p, len);
+            }
+            b'>' => {
+                let (p, len) =
+                    if bytes.get(i + 1) == Some(&b'=') { (Punct::Ge, 2) } else { (Punct::Gt, 1) };
+                push_punct(&mut out, &mut i, p, len);
+            }
+            b'!' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    push_punct(&mut out, &mut i, Punct::NotEq, 2);
+                } else {
+                    return Err(Error::Syntax(format!(
+                        "unexpected character '!' at byte {i}"
+                    )));
+                }
+            }
             _ => {
                 let ch = src.get(i..).and_then(|s| s.chars().next());
                 return Err(Error::Syntax(format!(
@@ -80,7 +124,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
     Ok(out)
 }
 
-fn push_punct(out: &mut Vec<Token>, i: &mut usize, p: Punct) {
+fn push_punct(out: &mut Vec<Token>, i: &mut usize, p: Punct, len: usize) {
     out.push(Token { kind: TokenKind::Punct(p), pos: *i });
-    *i += 1;
+    *i += len;
 }

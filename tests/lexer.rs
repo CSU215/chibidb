@@ -68,6 +68,73 @@ fn errors_on_unterminated_string() {
 }
 
 #[test]
+fn tokenizes_identifiers() {
+    let toks = lex("select from_1 _abc123").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![
+            TokenKind::Ident("select".into()),
+            TokenKind::Ident("from_1".into()),
+            TokenKind::Ident("_abc123".into()),
+        ]
+    );
+}
+
+#[test]
+fn identifiers_do_not_swallow_digits_from_numbers() {
+    let toks = lex("t1 1").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![TokenKind::Ident("t1".into()), TokenKind::Int(1)]
+    );
+}
+
+#[test]
+fn tokenizes_arithmetic_operators() {
+    let toks = lex("+ - * /").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![
+            TokenKind::Punct(Punct::Plus),
+            TokenKind::Punct(Punct::Minus),
+            TokenKind::Punct(Punct::Star),
+            TokenKind::Punct(Punct::Slash),
+        ]
+    );
+}
+
+#[test]
+fn tokenizes_comparison_operators() {
+    let toks = lex("= <> != < <= > >=").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![
+            TokenKind::Punct(Punct::Eq),
+            TokenKind::Punct(Punct::NotEq),
+            TokenKind::Punct(Punct::NotEq),
+            TokenKind::Punct(Punct::Lt),
+            TokenKind::Punct(Punct::Le),
+            TokenKind::Punct(Punct::Gt),
+            TokenKind::Punct(Punct::Ge),
+        ]
+    );
+}
+
+#[test]
+fn lt_and_gt_need_whitespace() {
+    let toks = lex("< >").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![TokenKind::Punct(Punct::Lt), TokenKind::Punct(Punct::Gt)]
+    );
+}
+
+#[test]
+fn errors_on_lone_exclamation() {
+    assert!(lex("!").is_err());
+}
+
+#[test]
 fn errors_on_integer_overflow() {
     assert!(lex("99999999999999999999999").is_err());
 }
