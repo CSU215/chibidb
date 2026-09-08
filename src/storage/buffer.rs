@@ -41,6 +41,16 @@ impl BufferPool {
         out
     }
 
+    pub fn read_page<T>(
+        &mut self,
+        file: FileId,
+        no: PageNo,
+        f: impl FnOnce(&[u8; PAGE_SIZE]) -> Result<T>,
+    ) -> Result<T> {
+        let idx = self.frame_for(file, no)?;
+        f(&self.frames[idx].data)
+    }
+
     fn frame_for(&mut self, file: FileId, no: PageNo) -> Result<usize> {
         let key = (file, no);
         if let Some(&idx) = self.page_table.get(&key) {

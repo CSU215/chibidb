@@ -47,7 +47,7 @@ pub fn page_insert(page: &mut [u8; PAGE_SIZE], record: &[u8]) -> Result<u16> {
     let reuse = (0..n).find(|&i| get_slot(page, i).0 == 0);
     let dir_end = HEADER_SIZE + (n + if reuse.is_none() { 1 } else { 0 }) * SLOT_SIZE;
     if dir_end + record.len() > upper {
-        return Err(Error::Runtime("page full".into()));
+        return Err(Error::PageFull);
     }
     let off = upper - record.len();
     page[off..upper].copy_from_slice(record);

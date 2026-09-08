@@ -4,6 +4,8 @@ pub enum Error {
     Syntax(String),
     #[error("{0}")]
     Runtime(String),
+    #[error("page full")]
+    PageFull,
     #[error("unsupported sql")]
     Unsupported,
 }
