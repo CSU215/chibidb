@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, CreateTableStmt, Expr, SelectItem, SelectStmt, Stmt, UnOp};
+use crate::ast::{BinOp, CreateTableStmt, DataType, Expr, InsertStmt, SelectItem, SelectStmt, Stmt, UnOp};
 use crate::catalog::Schema;
 use crate::result::ResultSet;
 use crate::value::Value;
@@ -7,8 +7,50 @@ use crate::{Database, Error, Result};
 pub fn execute(db: &mut Database, stmt: &Stmt) -> Result<ResultSet> {
     match stmt {
         Stmt::CreateTable(c) => execute_create_table(db, c),
+        Stmt::Insert(i) => execute_insert(db, i),
         Stmt::Select(s) => execute_select(db, s),
-        _ => Err(Error::Runtime("not implemented yet".into())),
+    }
+}
+
+fn execute_insert(db: &mut Database, i: &InsertStmt) -> Result<ResultSet> {
+    let schema = db.catalog().table(&i.table)?.schema.clone();
+    for values in &i.rows {
+        if values.len() != schema.columns.len() {
+            return Err(Error::Runtime(format!(
+                "expected {} values, got {}",
+                schema.columns.len(),
+                values.len()
+            )));
+        }
+    }
+    for values in &i.rows {
+        let mut row = Vec::with_capacity(values.len());
+        for (expr, col) in values.iter().zip(&schema.columns) {
+            let v = eval_const(expr)?;
+            row.push(coerce(v, col.dtype, &col.name)?);
+        }
+        db.catalog_mut().insert_row(&i.table, row)?;
+    }
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn coerce(v: Value, dtype: DataType, col: &str) -> Result<Value> {
+    match (v, dtype) {
+        (v @ Value::Int(_), DataType::Int) => Ok(v),
+        (Value::Int(n), DataType::Float) => Ok(Value::Float(n as f64)),
+        (v @ Value::Float(_), DataType::Float) => Ok(v),
+        (Value::Str(s), DataType::Char(n)) => {
+            if s.chars().count() <= n as usize {
+                Ok(Value::Str(s))
+            } else {
+                Err(Error::Runtime(format!(
+                    "cannot insert '{s}' into column {col}"
+                )))
+            }
+        }
+        (v, _) => Err(Error::Runtime(format!(
+            "cannot insert {v} into column {col}"
+        ))),
     }
 }
 
