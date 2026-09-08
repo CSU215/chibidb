@@ -35,6 +35,16 @@ impl Table {
     pub fn push_row(&mut self, row: Vec<Value>) {
         self.rows.push(row);
     }
+
+    pub(crate) fn delete_rows_at(&mut self, indices: &[usize]) {
+        let drop: std::collections::HashSet<usize> = indices.iter().copied().collect();
+        self.rows = std::mem::take(&mut self.rows)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !drop.contains(i))
+            .map(|(_, row)| row)
+            .collect();
+    }
 }
 
 #[derive(Debug, Default)]

@@ -197,3 +197,30 @@ fn select_from_errors() {
     let err = db.execute_sql("select * from student where 1;").unwrap_err();
     assert!(err.to_string().contains("boolean"), "{err}");
 }
+
+#[test]
+fn deletes_matching_rows() {
+    let mut db = seeded();
+    db.execute_sql("delete from student where id = 2;").unwrap();
+    let rs = db.execute_sql("select id from student;").unwrap();
+    let (_, rows) = rows(&rs);
+    assert_eq!(rows, [[Value::Int(1)], [Value::Int(3)]]);
+}
+
+#[test]
+fn deletes_all_rows_without_where() {
+    let mut db = seeded();
+    db.execute_sql("delete from student;").unwrap();
+    let rs = db.execute_sql("select id from student;").unwrap();
+    let (_, rows) = rows(&rs);
+    assert_eq!(rows.len(), 0);
+}
+
+#[test]
+fn delete_errors() {
+    let mut db = seeded();
+    let err = db.execute_sql("delete from missing;").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
+    let err = db.execute_sql("delete from student where name;").unwrap_err();
+    assert!(err.to_string().contains("boolean"), "{err}");
+}

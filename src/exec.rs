@@ -1,4 +1,7 @@
-use crate::ast::{BinOp, CreateTableStmt, DataType, Expr, InsertStmt, SelectItem, SelectStmt, Stmt, UnOp};
+use crate::ast::{
+    BinOp, CreateTableStmt, DataType, DeleteStmt, Expr, InsertStmt, SelectItem, SelectStmt,
+    Stmt, UnOp,
+};
 use crate::catalog::Schema;
 use crate::result::ResultSet;
 use crate::value::Value;
@@ -9,7 +12,34 @@ pub fn execute(db: &mut Database, stmt: &Stmt) -> Result<ResultSet> {
         Stmt::CreateTable(c) => execute_create_table(db, c),
         Stmt::Insert(i) => execute_insert(db, i),
         Stmt::Select(s) => execute_select(db, s),
-        Stmt::Delete(_) | Stmt::Update(_) => Err(Error::Runtime("not implemented yet".into())),
+        Stmt::Delete(d) => execute_delete(db, d),
+        Stmt::Update(_) => Err(Error::Runtime("not implemented yet".into())),
+    }
+}
+
+fn execute_delete(db: &mut Database, d: &DeleteStmt) -> Result<ResultSet> {
+    let schema = db.catalog().table(&d.table)?.schema.clone();
+    let table = db.catalog_mut().table_mut(&d.table)?;
+    let mut to_delete = Vec::new();
+    for (i, row) in table.rows().iter().enumerate() {
+        let matched = match &d.selection {
+            Some(sel) => eval_predicate(sel, &schema, row)?,
+            None => true,
+        };
+        if matched {
+            to_delete.push(i);
+        }
+    }
+    table.delete_rows_at(&to_delete);
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn eval_predicate(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<bool> {
+    match eval(expr, Some((schema, row)))? {
+        Value::Bool(b) => Ok(b),
+        _ => Err(Error::Runtime(
+            "where clause must evaluate to boolean".into(),
+        )),
     }
 }
 
@@ -108,14 +138,8 @@ fn execute_select(db: &Database, s: &SelectStmt) -> Result<ResultSet> {
     let mut out_rows = Vec::new();
     for row in table.rows() {
         if let Some(sel) = &s.selection {
-            match eval(sel, Some((schema, row)))? {
-                Value::Bool(true) => {}
-                Value::Bool(false) => continue,
-                _ => {
-                    return Err(Error::Runtime(
-                        "where clause must evaluate to boolean".into(),
-                    ))
-                }
+            if !eval_predicate(sel, schema, row)? {
+                continue;
             }
         }
         let mut out_row = Vec::with_capacity(exprs.len());
