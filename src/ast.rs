@@ -101,8 +101,22 @@ pub struct InsertStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TableRef {
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectItem {
+    Star,
+    Expr(Expr),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
-    pub exprs: Vec<Expr>,
+    pub items: Vec<SelectItem>,
+    pub from: Option<TableRef>,
+    pub selection: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1,4 +1,7 @@
-use crate::ast::{BinOp, ColumnDef, CreateTableStmt, DataType, Expr, InsertStmt, SelectStmt, Stmt, UnOp};
+use crate::ast::{
+    BinOp, ColumnDef, CreateTableStmt, DataType, Expr, InsertStmt, SelectItem, SelectStmt,
+    Stmt, TableRef, UnOp,
+};
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
 
@@ -83,11 +86,7 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Stmt> {
         if self.eat_keyword("select") {
-            let mut exprs = vec![self.parse_expr()?];
-            while self.eat_punct(Punct::Comma) {
-                exprs.push(self.parse_expr()?);
-            }
-            return Ok(Stmt::Select(SelectStmt { exprs }));
+            return self.parse_select();
         }
         if self.eat_keyword("create") {
             if !self.eat_keyword("table") {
@@ -102,6 +101,54 @@ impl Parser {
             return self.parse_insert();
         }
         Err(self.unexpected("statement"))
+    }
+
+    const RESERVED: &[&str] = &["where"];
+
+    fn at_reserved(&self) -> bool {
+        matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Ident(s)) if Self::RESERVED.contains(&s.to_ascii_lowercase().as_str()))
+    }
+
+    fn parse_ident(&mut self, want: &str) -> Result<String> {
+        match self.bump() {
+            Some(Token { kind: TokenKind::Ident(s), .. }) => Ok(s.clone()),
+            _ => Err(self.unexpected(want)),
+        }
+    }
+
+    fn parse_select(&mut self) -> Result<Stmt> {
+        let mut items = Vec::new();
+        loop {
+            if self.eat_punct(Punct::Star) {
+                items.push(SelectItem::Star);
+            } else {
+                items.push(SelectItem::Expr(self.parse_expr()?));
+            }
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        let from = if self.eat_keyword("from") {
+            let name = self.parse_ident("table name")?;
+            let alias = if self.eat_keyword("as") {
+                Some(self.parse_ident("alias")?)
+            } else if self.at_reserved() {
+                None
+            } else if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Ident(_))) {
+                Some(self.parse_ident("alias")?)
+            } else {
+                None
+            };
+            Some(TableRef { name, alias })
+        } else {
+            None
+        };
+        let selection = if self.eat_keyword("where") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Stmt::Select(SelectStmt { items, from, selection }))
     }
 
     fn parse_insert(&mut self) -> Result<Stmt> {

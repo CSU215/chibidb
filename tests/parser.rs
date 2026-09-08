@@ -1,11 +1,18 @@
-use chibidb::ast::{DataType, Stmt};
+use chibidb::ast::{DataType, SelectItem, Stmt};
 use chibidb::parser::parse;
 
 fn single_exprs(sql: &str) -> Vec<String> {
     let stmts = parse(sql).unwrap();
     assert_eq!(stmts.len(), 1, "sql: {sql}");
     match stmts.into_iter().next().unwrap() {
-        Stmt::Select(s) => s.exprs.iter().map(|e| e.to_string()).collect(),
+        Stmt::Select(s) => s
+            .items
+            .iter()
+            .map(|it| match it {
+                SelectItem::Star => "*".to_string(),
+                SelectItem::Expr(e) => e.to_string(),
+            })
+            .collect(),
         other => panic!("expected select, got {other:?}"),
     }
 }
@@ -214,4 +221,66 @@ fn insert_syntax_errors() {
     err("insert into t values (1,);");
     err("insert into t values (1); extra");
     err("insert into t values (1, 2))");
+}
+
+fn select(sql: &str) -> chibidb::ast::SelectStmt {
+    let stmts = parse(sql).unwrap();
+    assert_eq!(stmts.len(), 1, "sql: {sql}");
+    match stmts.into_iter().next().unwrap() {
+        Stmt::Select(s) => s,
+        other => panic!("expected select, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_select_from_where() {
+    let s = select("select id, name from student where id = 1;");
+    assert_eq!(s.items.len(), 2);
+    assert!(matches!(&s.items[0], SelectItem::Expr(e) if e.to_string() == "id"));
+    assert!(matches!(&s.items[1], SelectItem::Expr(e) if e.to_string() == "name"));
+    let from = s.from.as_ref().unwrap();
+    assert_eq!(from.name, "student");
+    assert_eq!(from.alias, None);
+    assert_eq!(s.selection.as_ref().unwrap().to_string(), "(= id 1)");
+}
+
+#[test]
+fn parses_star() {
+    let s = select("select * from t;");
+    assert_eq!(s.items, [SelectItem::Star]);
+    assert_eq!(s.from.as_ref().unwrap().name, "t");
+    let s = select("select *, id from t;");
+    assert_eq!(s.items.len(), 2);
+}
+
+#[test]
+fn parses_table_alias() {
+    let s = select("select 1 from t as a;");
+    assert_eq!(s.from.as_ref().unwrap().alias.as_deref(), Some("a"));
+    let s = select("select 1 from t a;");
+    assert_eq!(s.from.as_ref().unwrap().alias.as_deref(), Some("a"));
+}
+
+#[test]
+fn select_without_from_has_no_selection() {
+    let s = select("select 1;");
+    assert_eq!(s.from, None);
+    assert_eq!(s.selection, None);
+    let s = select("select 1 from t where 1 and 2;");
+    assert_eq!(s.selection.as_ref().unwrap().to_string(), "(and 1 2)");
+}
+
+#[test]
+fn keywords_in_select_are_case_insensitive() {
+    let s = select("SELECT * FROM t WHERE 1;");
+    assert_eq!(s.from.as_ref().unwrap().name, "t");
+    assert!(s.selection.is_some());
+}
+
+#[test]
+fn select_from_syntax_errors() {
+    err("select * from;");
+    err("select 1 from;");
+    err("select * from t where;");
+    err("select * from t where 1 =;");
 }
