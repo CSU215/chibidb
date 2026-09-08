@@ -31,6 +31,7 @@ pub enum Expr {
     Column(String),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
+    IsNull(Box<Expr>, bool),
 }
 
 impl fmt::Display for Expr {
@@ -43,6 +44,8 @@ impl fmt::Display for Expr {
             Expr::Column(c) => write!(f, "{c}"),
             Expr::Unary(op, e) => write!(f, "({op} {e})"),
             Expr::Binary(op, l, r) => write!(f, "({op} {l} {r})"),
+            Expr::IsNull(e, false) => write!(f, "(is-null {e})"),
+            Expr::IsNull(e, true) => write!(f, "(is-not-null {e})"),
         }
     }
 }

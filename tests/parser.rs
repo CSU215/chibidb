@@ -341,3 +341,13 @@ fn delete_update_syntax_errors() {
     err("update t set a =;");
     err("update t set a = 1,;");
 }
+
+#[test]
+fn parses_is_null() {
+    assert_eq!(single_exprs("select a is null;"), ["(is-null a)"]);
+    assert_eq!(single_exprs("select a is not null;"), ["(is-not-null a)"]);
+    assert_eq!(single_exprs("select 1+1 is null;"), ["(is-null (+ 1 1))"]);
+    err("select a is;");
+    err("select a is not;");
+    err("select a is maybe;");
+}

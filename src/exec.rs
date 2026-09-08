@@ -67,6 +67,7 @@ fn execute_delete(db: &mut Database, d: &DeleteStmt) -> Result<ResultSet> {
 fn eval_predicate(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<bool> {
     match eval(expr, Some((schema, row)))? {
         Value::Bool(b) => Ok(b),
+        Value::Null => Ok(false),
         _ => Err(Error::Runtime(
             "where clause must evaluate to boolean".into(),
         )),
@@ -97,6 +98,7 @@ fn execute_insert(db: &mut Database, i: &InsertStmt) -> Result<ResultSet> {
 
 fn coerce(v: Value, dtype: DataType, col: &str) -> Result<Value> {
     match (v, dtype) {
+        (Value::Null, _) => Ok(Value::Null),
         (v @ Value::Int(_), DataType::Int) => Ok(v),
         (Value::Int(n), DataType::Float) => Ok(Value::Float(n as f64)),
         (v @ Value::Float(_), DataType::Float) => Ok(v),
@@ -225,6 +227,11 @@ pub(crate) fn eval(expr: &Expr, ctx: Option<(&Schema, &[Value])>) -> Result<Valu
             let lv = eval(l, ctx)?;
             let rv = eval(r, ctx)?;
             eval_binary(*op, lv, rv)
+        }
+        Expr::IsNull(e, negated) => {
+            let v = eval(e, ctx)?;
+            let is_null = matches!(v, Value::Null);
+            Ok(Value::Bool(if *negated { !is_null } else { is_null }))
         }
     }
 }

@@ -110,3 +110,11 @@ fn null_type_errors_still_error() {
     err("select null and 'a';");
     err("select null + 'a';");
 }
+
+#[test]
+fn is_null_evaluation() {
+    assert_eq!(val("select null is null;"), Value::Bool(true));
+    assert_eq!(val("select null is not null;"), Value::Bool(false));
+    assert_eq!(val("select 1 is null;"), Value::Bool(false));
+    assert_eq!(val("select 'a' is not null;"), Value::Bool(true));
+}

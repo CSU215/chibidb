@@ -298,3 +298,34 @@ fn update_errors() {
         assert!(err.to_string().contains("boolean"), "{err}");
     });
 }
+
+#[test]
+fn null_storage_and_filtering() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int, name char(10));").unwrap();
+        db.execute_sql("insert into t values (1, null), (2, 'x');").unwrap();
+
+        let rs = db.execute_sql("select name from t where id = 1;").unwrap();
+        let (_, r) = rows(&rs);
+        assert_eq!(r, [[Value::Null]]);
+
+        let rs = db.execute_sql("select id from t where name is null;").unwrap();
+        let (_, r) = rows(&rs);
+        assert_eq!(r, [[Value::Int(1)]]);
+
+        let rs = db.execute_sql("select id from t where name is not null;").unwrap();
+        let (_, r) = rows(&rs);
+        assert_eq!(r, [[Value::Int(2)]]);
+
+        // NULL never satisfies = per SQL semantics
+        let rs = db.execute_sql("select id from t where name = name;").unwrap();
+        let (_, r) = rows(&rs);
+        assert_eq!(r, [[Value::Int(2)]]);
+
+        db.execute_sql("update t set name = 'y' where name is null;").unwrap();
+        let rs = db.execute_sql("select name from t;").unwrap();
+        let (_, r) = rows(&rs);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0][0], Value::Str("y".into()));
+    });
+}

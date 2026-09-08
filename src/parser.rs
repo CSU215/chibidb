@@ -214,6 +214,10 @@ impl Parser {
 
     fn parse_value(&mut self) -> Result<Expr> {
         let neg = self.eat_punct(Punct::Minus);
+        if !neg && self.at_keyword("null") {
+            self.pos += 1;
+            return Ok(Expr::Null);
+        }
         let v = match self.bump() {
             Some(Token { kind: TokenKind::Int(n), .. }) => Expr::Int(if neg { -*n } else { *n }),
             Some(Token { kind: TokenKind::Float(x), .. }) => {
@@ -305,6 +309,13 @@ impl Parser {
 
     fn parse_comparison(&mut self) -> Result<Expr> {
         let lhs = self.parse_additive()?;
+        if self.eat_keyword("is") {
+            let negated = self.eat_keyword("not");
+            if !self.eat_keyword("null") {
+                return Err(self.unexpected("null"));
+            }
+            return Ok(Expr::IsNull(Box::new(lhs), negated));
+        }
         let op = if self.at_punct(Punct::Eq) {
             BinOp::Eq
         } else if self.at_punct(Punct::NotEq) {
