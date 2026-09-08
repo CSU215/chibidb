@@ -25,7 +25,6 @@ impl Schema {
 #[derive(Debug)]
 pub(crate) enum RowStore {
     Mem(Vec<Vec<Value>>),
-    #[allow(dead_code)]
     Heap { file: FileId },
 }
 

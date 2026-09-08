@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 
 use crate::storage::disk::DiskManager;
 use crate::storage::page::{zeroed_page, FileId, PageData, PageNo, PAGE_SIZE};
@@ -95,6 +96,14 @@ impl BufferPool {
         let empty = zeroed_page();
         self.disk.write_page(file, no, &empty)?;
         Ok(no)
+    }
+
+    pub fn create_file(&mut self, path: &Path) -> Result<FileId> {
+        self.disk.create_file(path)
+    }
+
+    pub fn open_file(&mut self, path: &Path) -> Result<FileId> {
+        self.disk.open_file(path)
     }
 
     pub fn page_count(&mut self, file: FileId) -> Result<PageNo> {

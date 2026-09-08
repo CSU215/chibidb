@@ -2,7 +2,7 @@ use crate::ast::{
     BinOp, CreateTableStmt, DataType, DeleteStmt, Expr, InsertStmt, SelectItem, SelectStmt,
     Stmt, UnOp, UpdateStmt,
 };
-use crate::catalog::{RowStore, Schema};
+use crate::catalog::Schema;
 use crate::result::ResultSet;
 use crate::value::Value;
 use crate::{Database, Error, Result};
@@ -126,7 +126,8 @@ fn execute_create_table(db: &mut Database, c: &CreateTableStmt) -> Result<Result
             })
             .collect(),
     };
-    db.catalog_mut().create_table(&c.name, schema, RowStore::Mem(vec![]))?;
+    let store = db.new_table_store(&c.name)?;
+    db.catalog_mut().create_table(&c.name, schema, store)?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
