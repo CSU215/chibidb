@@ -1,4 +1,5 @@
 pub mod buffer;
+pub mod codec;
 pub mod disk;
 pub mod heap;
 pub mod page;
