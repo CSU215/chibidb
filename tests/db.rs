@@ -53,7 +53,33 @@ fn runtime_errors_propagate() {
 #[test]
 fn unimplemented_statements_error() {
     let mut db = Database::open_in_memory();
-    assert!(db.execute_sql("create table t (id int);").is_err());
     assert!(db.execute_sql("insert into t values (1);").is_err());
     assert!(db.execute_sql("select 1 from t;").is_err());
+}
+
+#[test]
+fn creates_table() {
+    let mut db = Database::open_in_memory();
+    let rs = db
+        .execute_sql("create table t (id int, name char(10), score float);")
+        .unwrap();
+    assert_eq!(rs, [ResultSet::Message("SUCCESS".into())]);
+}
+
+#[test]
+fn duplicate_table_errors() {
+    let mut db = Database::open_in_memory();
+    db.execute_sql("create table t (id int);").unwrap();
+    let err = db.execute_sql("create table t (id int);").unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+}
+
+#[test]
+fn table_names_are_case_sensitive() {
+    let mut db = Database::open_in_memory();
+    db.execute_sql("create table t (id int);").unwrap();
+    let err = db.execute_sql("create table T (id int);");
+    assert!(err.is_ok(), "distinct names should both work");
+    let err = db.execute_sql("create table t (x int);").unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
 }

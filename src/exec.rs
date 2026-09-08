@@ -1,28 +1,51 @@
-use crate::ast::{BinOp, Expr, SelectItem, Stmt, UnOp};
+use crate::ast::{BinOp, CreateTableStmt, Expr, SelectItem, SelectStmt, Stmt, UnOp};
+use crate::catalog::Schema;
 use crate::result::ResultSet;
 use crate::value::Value;
-use crate::{Error, Result};
+use crate::{Database, Error, Result};
 
-pub fn execute(stmt: &Stmt) -> Result<ResultSet> {
+pub fn execute(db: &mut Database, stmt: &Stmt) -> Result<ResultSet> {
     match stmt {
-        Stmt::Select(s) if s.from.is_none() => {
-            let mut columns = Vec::new();
-            let mut row = Vec::new();
-            for item in &s.items {
-                match item {
-                    SelectItem::Expr(e) => {
-                        columns.push(e.to_string());
-                        row.push(eval_const(e)?);
-                    }
-                    SelectItem::Star => {
-                        return Err(Error::Runtime("select * requires from".into()))
-                    }
-                }
-            }
-            Ok(ResultSet::Rows { columns, rows: vec![row] })
-        }
+        Stmt::CreateTable(c) => execute_create_table(db, c),
+        Stmt::Select(s) => execute_select(db, s),
         _ => Err(Error::Runtime("not implemented yet".into())),
     }
+}
+
+fn execute_create_table(db: &mut Database, c: &CreateTableStmt) -> Result<ResultSet> {
+    let schema = Schema {
+        columns: c
+            .columns
+            .iter()
+            .map(|cd| crate::catalog::ColumnDesc {
+                name: cd.name.clone(),
+                dtype: cd.dtype,
+            })
+            .collect(),
+    };
+    db.catalog_mut().create_table(&c.name, schema)?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_select(db: &Database, s: &SelectStmt) -> Result<ResultSet> {
+    let Some(from) = &s.from else {
+        let mut columns = Vec::new();
+        let mut row = Vec::new();
+        for item in &s.items {
+            match item {
+                SelectItem::Expr(e) => {
+                    columns.push(e.to_string());
+                    row.push(eval_const(e)?);
+                }
+                SelectItem::Star => {
+                    return Err(Error::Runtime("select * requires from".into()))
+                }
+            }
+        }
+        return Ok(ResultSet::Rows { columns, rows: vec![row] });
+    };
+    db.catalog().table(&from.name)?;
+    Err(Error::Runtime("not implemented yet".into()))
 }
 
 pub fn eval_const(expr: &Expr) -> Result<Value> {
