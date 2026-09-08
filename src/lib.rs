@@ -1,4 +1,5 @@
 mod error;
+pub mod lexer;
 mod repl;
 
 pub use error::{Error, Result};
