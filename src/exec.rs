@@ -9,6 +9,7 @@ pub fn execute(db: &mut Database, stmt: &Stmt) -> Result<ResultSet> {
         Stmt::CreateTable(c) => execute_create_table(db, c),
         Stmt::Insert(i) => execute_insert(db, i),
         Stmt::Select(s) => execute_select(db, s),
+        Stmt::Delete(_) | Stmt::Update(_) => Err(Error::Runtime("not implemented yet".into())),
     }
 }
 

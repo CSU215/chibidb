@@ -284,3 +284,60 @@ fn select_from_syntax_errors() {
     err("select * from t where;");
     err("select * from t where 1 =;");
 }
+
+#[test]
+fn parses_delete() {
+    let stmts = parse("delete from t;").unwrap();
+    match &stmts[0] {
+        Stmt::Delete(d) => {
+            assert_eq!(d.table, "t");
+            assert_eq!(d.selection, None);
+        }
+        other => panic!("expected delete, got {other:?}"),
+    }
+    let stmts = parse("delete from t where id = 1 or name = 'x';").unwrap();
+    match &stmts[0] {
+        Stmt::Delete(d) => {
+            assert_eq!(d.table, "t");
+            assert_eq!(d.selection.as_ref().unwrap().to_string(), "(or (= id 1) (= name 'x'))");
+        }
+        other => panic!("expected delete, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_update() {
+    let stmts = parse("update t set score = 100;").unwrap();
+    match &stmts[0] {
+        Stmt::Update(u) => {
+            assert_eq!(u.table, "t");
+            assert_eq!(u.assignments.len(), 1);
+            assert_eq!(u.assignments[0].0, "score");
+            assert_eq!(u.assignments[0].1.to_string(), "100");
+            assert_eq!(u.selection, None);
+        }
+        other => panic!("expected update, got {other:?}"),
+    }
+    let stmts = parse("update t set a = a + 1, b = 'x' where id = 3;").unwrap();
+    match &stmts[0] {
+        Stmt::Update(u) => {
+            assert_eq!(u.assignments.len(), 2);
+            assert_eq!(u.assignments[0].1.to_string(), "(+ a 1)");
+            assert_eq!(u.assignments[1].1.to_string(), "'x'");
+            assert_eq!(u.selection.as_ref().unwrap().to_string(), "(= id 3)");
+        }
+        other => panic!("expected update, got {other:?}"),
+    }
+}
+
+#[test]
+fn delete_update_syntax_errors() {
+    err("delete t;");
+    err("delete from;");
+    err("delete from t where;");
+    err("update t;");
+    err("update t set;");
+    err("update t set a;");
+    err("update t set a =;");
+    err("update t set a = 1,;");
+}

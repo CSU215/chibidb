@@ -101,6 +101,19 @@ pub struct InsertStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStmt {
+    pub table: String,
+    pub selection: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStmt {
+    pub table: String,
+    pub assignments: Vec<(String, Expr)>,
+    pub selection: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
@@ -122,6 +135,8 @@ pub struct SelectStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     CreateTable(CreateTableStmt),
+    Delete(DeleteStmt),
     Insert(InsertStmt),
     Select(SelectStmt),
+    Update(UpdateStmt),
 }

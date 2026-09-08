@@ -1,6 +1,6 @@
 use crate::ast::{
-    BinOp, ColumnDef, CreateTableStmt, DataType, Expr, InsertStmt, SelectItem, SelectStmt,
-    Stmt, TableRef, UnOp,
+    BinOp, ColumnDef, CreateTableStmt, DataType, DeleteStmt, Expr, InsertStmt, SelectItem,
+    SelectStmt, Stmt, TableRef, UnOp, UpdateStmt,
 };
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
@@ -100,7 +100,41 @@ impl Parser {
             }
             return self.parse_insert();
         }
+        if self.eat_keyword("delete") {
+            if !self.eat_keyword("from") {
+                return Err(self.unexpected("from"));
+            }
+            let table = self.parse_ident("table name")?;
+            let selection = self.parse_where()?;
+            return Ok(Stmt::Delete(DeleteStmt { table, selection }));
+        }
+        if self.eat_keyword("update") {
+            let table = self.parse_ident("table name")?;
+            if !self.eat_keyword("set") {
+                return Err(self.unexpected("set"));
+            }
+            let mut assignments = Vec::new();
+            loop {
+                let col = self.parse_ident("column name")?;
+                self.expect_punct(Punct::Eq)?;
+                let expr = self.parse_expr()?;
+                assignments.push((col, expr));
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
+            }
+            let selection = self.parse_where()?;
+            return Ok(Stmt::Update(UpdateStmt { table, assignments, selection }));
+        }
         Err(self.unexpected("statement"))
+    }
+
+    fn parse_where(&mut self) -> Result<Option<Expr>> {
+        if self.eat_keyword("where") {
+            Ok(Some(self.parse_expr()?))
+        } else {
+            Ok(None)
+        }
     }
 
     const RESERVED: &[&str] = &["where"];
