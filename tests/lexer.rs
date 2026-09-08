@@ -135,6 +135,37 @@ fn errors_on_lone_exclamation() {
 }
 
 #[test]
+fn skips_line_comments() {
+    let toks = lex("1 -- trailing comment\n2 -- to eof").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![TokenKind::Int(1), TokenKind::Int(2)]
+    );
+}
+
+#[test]
+fn comment_to_eof_without_newline() {
+    let toks = lex("1 -- unterminated").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![TokenKind::Int(1)]
+    );
+}
+
+#[test]
+fn single_minus_is_still_minus() {
+    let toks = lex("1-2").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![
+            TokenKind::Int(1),
+            TokenKind::Punct(Punct::Minus),
+            TokenKind::Int(2)
+        ]
+    );
+}
+
+#[test]
 fn errors_on_integer_overflow() {
     assert!(lex("99999999999999999999999").is_err());
 }

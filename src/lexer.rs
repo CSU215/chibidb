@@ -87,7 +87,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             b',' => push_punct(&mut out, &mut i, Punct::Comma, 1),
             b';' => push_punct(&mut out, &mut i, Punct::Semicolon, 1),
             b'+' => push_punct(&mut out, &mut i, Punct::Plus, 1),
-            b'-' => push_punct(&mut out, &mut i, Punct::Minus, 1),
+            b'-' => {
+                if bytes.get(i + 1) == Some(&b'-') {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                } else {
+                    push_punct(&mut out, &mut i, Punct::Minus, 1);
+                }
+            }
             b'*' => push_punct(&mut out, &mut i, Punct::Star, 1),
             b'/' => push_punct(&mut out, &mut i, Punct::Slash, 1),
             b'=' => push_punct(&mut out, &mut i, Punct::Eq, 1),
