@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, Expr, SelectStmt, Stmt, UnOp};
+use crate::ast::{BinOp, ColumnDef, CreateTableStmt, DataType, Expr, SelectStmt, Stmt, UnOp};
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
 
@@ -89,7 +89,61 @@ impl Parser {
             }
             return Ok(Stmt::Select(SelectStmt { exprs }));
         }
+        if self.eat_keyword("create") {
+            if !self.eat_keyword("table") {
+                return Err(self.unexpected("table"));
+            }
+            return self.parse_create_table();
+        }
         Err(self.unexpected("statement"))
+    }
+
+    fn parse_create_table(&mut self) -> Result<Stmt> {
+        let name = match self.bump() {
+            Some(Token { kind: TokenKind::Ident(s), .. }) => s.clone(),
+            _ => return Err(self.unexpected("table name")),
+        };
+        self.expect_punct(Punct::LParen)?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.parse_column_def()?);
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RParen)?;
+        Ok(Stmt::CreateTable(CreateTableStmt { name, columns }))
+    }
+
+    fn parse_column_def(&mut self) -> Result<ColumnDef> {
+        let name = match self.bump() {
+            Some(Token { kind: TokenKind::Ident(s), .. }) => s.clone(),
+            _ => return Err(self.unexpected("column name")),
+        };
+        let dtype = self.parse_data_type()?;
+        Ok(ColumnDef { name, dtype })
+    }
+
+    fn parse_data_type(&mut self) -> Result<DataType> {
+        if self.eat_keyword("int") {
+            return Ok(DataType::Int);
+        }
+        if self.eat_keyword("float") {
+            return Ok(DataType::Float);
+        }
+        if self.eat_keyword("char") {
+            self.expect_punct(Punct::LParen)?;
+            let n = match self.bump() {
+                Some(Token { kind: TokenKind::Int(n), .. }) => *n,
+                _ => return Err(self.unexpected("char length")),
+            };
+            if n <= 0 {
+                return Err(Error::Syntax("char length must be positive".into()));
+            }
+            self.expect_punct(Punct::RParen)?;
+            return Ok(DataType::Char(n as u32));
+        }
+        Err(self.unexpected("data type"))
     }
 
     fn parse_expr(&mut self) -> Result<Expr> {

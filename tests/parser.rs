@@ -1,10 +1,12 @@
+use chibidb::ast::{DataType, Stmt};
 use chibidb::parser::parse;
 
 fn single_exprs(sql: &str) -> Vec<String> {
     let stmts = parse(sql).unwrap();
     assert_eq!(stmts.len(), 1, "sql: {sql}");
     match stmts.into_iter().next().unwrap() {
-        chibidb::ast::Stmt::Select(s) => s.exprs.iter().map(|e| e.to_string()).collect(),
+        Stmt::Select(s) => s.exprs.iter().map(|e| e.to_string()).collect(),
+        other => panic!("expected select, got {other:?}"),
     }
 }
 
@@ -117,4 +119,47 @@ fn logical_precedence() {
     assert_eq!(single_exprs("select not 1 = 1;"), ["(not (= 1 1))"]);
     // left associativity
     assert_eq!(single_exprs("select 1 and 0 and 1;"), ["(and (and 1 0) 1)"]);
+}
+
+fn create_table(sql: &str) -> chibidb::ast::CreateTableStmt {
+    let stmts = parse(sql).unwrap();
+    assert_eq!(stmts.len(), 1, "sql: {sql}");
+    match stmts.into_iter().next().unwrap() {
+        Stmt::CreateTable(c) => c,
+        _ => panic!("expected create table for: {sql}"),
+    }
+}
+
+#[test]
+fn parses_create_table() {
+    let c = create_table("create table student (id int, name char(10), score float);");
+    assert_eq!(c.name, "student");
+    assert_eq!(c.columns.len(), 3);
+    assert_eq!(c.columns[0].name, "id");
+    assert_eq!(c.columns[0].dtype, DataType::Int);
+    assert_eq!(c.columns[1].name, "name");
+    assert_eq!(c.columns[1].dtype, DataType::Char(10));
+    assert_eq!(c.columns[2].name, "score");
+    assert_eq!(c.columns[2].dtype, DataType::Float);
+}
+
+#[test]
+fn create_table_is_case_insensitive() {
+    let c = create_table("CREATE TABLE T (ID INT);");
+    assert_eq!(c.name, "T");
+    assert_eq!(c.columns[0].dtype, DataType::Int);
+}
+
+#[test]
+fn create_table_syntax_errors() {
+    err("create t (id int);");
+    err("create table (id int);");
+    err("create table t ();");
+    err("create table t (id int,);");
+    err("create table t (id int");
+    err("create table t (id);");
+    err("create table t (s char);");
+    err("create table t (s char(0));");
+    err("create table t (a bool);");
+    err("create table t (id int,);");
 }

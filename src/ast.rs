@@ -75,6 +75,25 @@ impl fmt::Display for UnOp {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DataType {
+    Int,
+    Float,
+    Char(u32),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnDef {
+    pub name: String,
+    pub dtype: DataType,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTableStmt {
+    pub name: String,
+    pub columns: Vec<ColumnDef>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub exprs: Vec<Expr>,
@@ -82,5 +101,6 @@ pub struct SelectStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
+    CreateTable(CreateTableStmt),
     Select(SelectStmt),
 }
