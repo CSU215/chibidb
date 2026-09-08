@@ -95,6 +95,12 @@ pub struct CreateTableStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct InsertStmt {
+    pub table: String,
+    pub rows: Vec<Vec<Expr>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub exprs: Vec<Expr>,
 }
@@ -102,5 +108,6 @@ pub struct SelectStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     CreateTable(CreateTableStmt),
+    Insert(InsertStmt),
     Select(SelectStmt),
 }

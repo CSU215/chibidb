@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, ColumnDef, CreateTableStmt, DataType, Expr, SelectStmt, Stmt, UnOp};
+use crate::ast::{BinOp, ColumnDef, CreateTableStmt, DataType, Expr, InsertStmt, SelectStmt, Stmt, UnOp};
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
 
@@ -95,7 +95,53 @@ impl Parser {
             }
             return self.parse_create_table();
         }
+        if self.eat_keyword("insert") {
+            if !self.eat_keyword("into") {
+                return Err(self.unexpected("into"));
+            }
+            return self.parse_insert();
+        }
         Err(self.unexpected("statement"))
+    }
+
+    fn parse_insert(&mut self) -> Result<Stmt> {
+        let table = match self.bump() {
+            Some(Token { kind: TokenKind::Ident(s), .. }) => s.clone(),
+            _ => return Err(self.unexpected("table name")),
+        };
+        if !self.eat_keyword("values") {
+            return Err(self.unexpected("values"));
+        }
+        let mut rows = Vec::new();
+        loop {
+            self.expect_punct(Punct::LParen)?;
+            let mut row = Vec::new();
+            loop {
+                row.push(self.parse_value()?);
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
+            }
+            self.expect_punct(Punct::RParen)?;
+            rows.push(row);
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        Ok(Stmt::Insert(InsertStmt { table, rows }))
+    }
+
+    fn parse_value(&mut self) -> Result<Expr> {
+        let neg = self.eat_punct(Punct::Minus);
+        let v = match self.bump() {
+            Some(Token { kind: TokenKind::Int(n), .. }) => Expr::Int(if neg { -*n } else { *n }),
+            Some(Token { kind: TokenKind::Float(x), .. }) => {
+                Expr::Float(if neg { -*x } else { *x })
+            }
+            Some(Token { kind: TokenKind::Str(s), .. }) if !neg => Expr::Str(s.clone()),
+            _ => return Err(self.unexpected("value")),
+        };
+        Ok(v)
     }
 
     fn parse_create_table(&mut self) -> Result<Stmt> {

@@ -163,3 +163,55 @@ fn create_table_syntax_errors() {
     err("create table t (a bool);");
     err("create table t (id int,);");
 }
+
+fn insert(sql: &str) -> chibidb::ast::InsertStmt {
+    let stmts = parse(sql).unwrap();
+    assert_eq!(stmts.len(), 1, "sql: {sql}");
+    match stmts.into_iter().next().unwrap() {
+        Stmt::Insert(i) => i,
+        other => panic!("expected insert, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_insert() {
+    let i = insert("insert into student values (1, 'alice', 95.5);");
+    assert_eq!(i.table, "student");
+    assert_eq!(i.rows.len(), 1);
+    let row: Vec<String> = i.rows[0].iter().map(|e| e.to_string()).collect();
+    assert_eq!(row, ["1", "'alice'", "95.5"]);
+}
+
+#[test]
+fn parses_multi_row_insert() {
+    let i = insert("insert into t values (1), (2, 3.5);");
+    assert_eq!(i.table, "t");
+    assert_eq!(i.rows.len(), 2);
+    assert_eq!(i.rows[0][0].to_string(), "1");
+    assert_eq!(i.rows[1][0].to_string(), "2");
+    assert_eq!(i.rows[1][1].to_string(), "3.5");
+}
+
+#[test]
+fn parses_negative_literals() {
+    let i = insert("insert into t values (-1, -2.5);");
+    assert_eq!(i.rows[0][0].to_string(), "-1");
+    assert_eq!(i.rows[0][1].to_string(), "-2.5");
+}
+
+#[test]
+fn insert_is_case_insensitive() {
+    let i = insert("INSERT INTO T VALUES (1);");
+    assert_eq!(i.table, "T");
+}
+
+#[test]
+fn insert_syntax_errors() {
+    err("insert t values (1);");
+    err("insert into values (1);");
+    err("insert into t (1);");
+    err("insert into t values ();");
+    err("insert into t values (1,);");
+    err("insert into t values (1); extra");
+    err("insert into t values (1, 2))");
+}
