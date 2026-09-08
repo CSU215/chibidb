@@ -2,7 +2,7 @@ use crate::ast::{
     BinOp, CreateTableStmt, DataType, DeleteStmt, Expr, InsertStmt, SelectItem, SelectStmt,
     Stmt, UnOp, UpdateStmt,
 };
-use crate::catalog::Schema;
+use crate::catalog::{RowStore, Schema};
 use crate::result::ResultSet;
 use crate::value::Value;
 use crate::{Database, Error, Result};
@@ -26,45 +26,41 @@ fn execute_update(db: &mut Database, u: &UpdateStmt) -> Result<ResultSet> {
             .ok_or_else(|| Error::Runtime(format!("no such column: {col}")))?;
         assigns.push((idx, col.clone(), schema.columns[idx].dtype, expr));
     }
-    let table = db.catalog_mut().table_mut(&u.table)?;
-    let mut applied: Vec<(usize, Vec<(usize, Value)>)> = Vec::new();
-    for (i, row) in table.rows().iter().enumerate() {
+    let scan = db.store_scan(&u.table)?;
+    let mut updates = Vec::new();
+    for (rid, row) in scan {
         let matched = match &u.selection {
-            Some(sel) => eval_predicate(sel, &schema, row)?,
+            Some(sel) => eval_predicate(sel, &schema, &row)?,
             None => true,
         };
         if !matched {
             continue;
         }
-        let mut cells = Vec::new();
+        let mut new_row = row.clone();
         for (idx, col, dtype, expr) in &assigns {
-            let v = eval(expr, Some((&schema, row)))?;
-            cells.push((*idx, coerce(v, *dtype, col)?));
+            let v = eval(expr, Some((&schema, &row)))?;
+            new_row[*idx] = coerce(v, *dtype, col)?;
         }
-        applied.push((i, cells));
+        updates.push((rid, new_row));
     }
-    for (i, cells) in applied {
-        for (idx, v) in cells {
-            table.rows_mut()[i][idx] = v;
-        }
-    }
+    db.store_replace_all(&u.table, updates)?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
 fn execute_delete(db: &mut Database, d: &DeleteStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&d.table)?.schema.clone();
-    let table = db.catalog_mut().table_mut(&d.table)?;
+    let scan = db.store_scan(&d.table)?;
     let mut to_delete = Vec::new();
-    for (i, row) in table.rows().iter().enumerate() {
+    for (rid, row) in scan {
         let matched = match &d.selection {
-            Some(sel) => eval_predicate(sel, &schema, row)?,
+            Some(sel) => eval_predicate(sel, &schema, &row)?,
             None => true,
         };
         if matched {
-            to_delete.push(i);
+            to_delete.push(rid);
         }
     }
-    table.delete_rows_at(&to_delete);
+    db.store_delete_all(&d.table, &to_delete)?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
@@ -94,7 +90,7 @@ fn execute_insert(db: &mut Database, i: &InsertStmt) -> Result<ResultSet> {
             let v = eval_const(expr)?;
             row.push(coerce(v, col.dtype, &col.name)?);
         }
-        db.catalog_mut().insert_row(&i.table, row)?;
+        db.store_insert(&i.table, row)?;
     }
     Ok(ResultSet::Message("SUCCESS".into()))
 }
@@ -130,11 +126,11 @@ fn execute_create_table(db: &mut Database, c: &CreateTableStmt) -> Result<Result
             })
             .collect(),
     };
-    db.catalog_mut().create_table(&c.name, schema)?;
+    db.catalog_mut().create_table(&c.name, schema, RowStore::Mem(vec![]))?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
-fn execute_select(db: &Database, s: &SelectStmt) -> Result<ResultSet> {
+fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
     let Some(from) = &s.from else {
         let mut columns = Vec::new();
         let mut row = Vec::new();
@@ -151,8 +147,7 @@ fn execute_select(db: &Database, s: &SelectStmt) -> Result<ResultSet> {
         }
         return Ok(ResultSet::Rows { columns, rows: vec![row] });
     };
-    let table = db.catalog().table(&from.name)?;
-    let schema = &table.schema;
+    let schema = db.catalog().table(&from.name)?.schema.clone();
     let mut headers = Vec::new();
     let mut exprs = Vec::new();
     for item in &s.items {
@@ -169,16 +164,17 @@ fn execute_select(db: &Database, s: &SelectStmt) -> Result<ResultSet> {
             }
         }
     }
+    let scan = db.store_scan(&from.name)?;
     let mut out_rows = Vec::new();
-    for row in table.rows() {
+    for (_, row) in scan {
         if let Some(sel) = &s.selection {
-            if !eval_predicate(sel, schema, row)? {
+            if !eval_predicate(sel, &schema, &row)? {
                 continue;
             }
         }
         let mut out_row = Vec::with_capacity(exprs.len());
         for e in &exprs {
-            out_row.push(eval(e, Some((schema, row)))?);
+            out_row.push(eval(e, Some((&schema, &row)))?);
         }
         out_rows.push(out_row);
     }

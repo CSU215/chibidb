@@ -8,4 +8,4 @@ pub mod slotted;
 pub use buffer::BufferPool;
 pub use disk::DiskManager;
 pub use heap::{HeapFile, Rid};
-pub use page::{PageNo, PageData, PAGE_SIZE};
+pub use page::{FileId, PageNo, PageData, PAGE_SIZE};

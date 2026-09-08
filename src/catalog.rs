@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::ast::DataType;
+use crate::storage::FileId;
 use crate::value::Value;
 use crate::{Error, Result};
 
@@ -21,34 +22,17 @@ impl Schema {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct Table {
-    pub schema: Schema,
-    rows: Vec<Vec<Value>>,
+#[derive(Debug)]
+pub(crate) enum RowStore {
+    Mem(Vec<Vec<Value>>),
+    #[allow(dead_code)]
+    Heap { file: FileId },
 }
 
-impl Table {
-    pub fn rows(&self) -> &[Vec<Value>] {
-        &self.rows
-    }
-
-    pub fn push_row(&mut self, row: Vec<Value>) {
-        self.rows.push(row);
-    }
-
-    pub(crate) fn delete_rows_at(&mut self, indices: &[usize]) {
-        let drop: std::collections::HashSet<usize> = indices.iter().copied().collect();
-        self.rows = std::mem::take(&mut self.rows)
-            .into_iter()
-            .enumerate()
-            .filter(|(i, _)| !drop.contains(i))
-            .map(|(_, row)| row)
-            .collect();
-    }
-
-    pub(crate) fn rows_mut(&mut self) -> &mut Vec<Vec<Value>> {
-        &mut self.rows
-    }
+#[derive(Debug)]
+pub struct Table {
+    pub schema: Schema,
+    pub(crate) store: RowStore,
 }
 
 #[derive(Debug, Default)]
@@ -57,12 +41,11 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    pub fn create_table(&mut self, name: &str, schema: Schema) -> Result<()> {
+    pub(crate) fn create_table(&mut self, name: &str, schema: Schema, store: RowStore) -> Result<()> {
         if self.tables.contains_key(name) {
             return Err(Error::Runtime(format!("table already exists: {name}")));
         }
-        self.tables
-            .insert(name.to_string(), Table { schema, rows: Vec::new() });
+        self.tables.insert(name.to_string(), Table { schema, store });
         Ok(())
     }
 
@@ -76,10 +59,5 @@ impl Catalog {
         self.tables
             .get_mut(name)
             .ok_or_else(|| Error::Runtime(format!("no such table: {name}")))
-    }
-
-    pub fn insert_row(&mut self, name: &str, row: Vec<Value>) -> Result<()> {
-        self.table_mut(name)?.push_row(row);
-        Ok(())
     }
 }
