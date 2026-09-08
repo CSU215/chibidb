@@ -79,4 +79,34 @@ fn value_display() {
     assert_eq!(Value::Float(2.0).to_string(), "2.0");
     assert_eq!(Value::Str("ab".into()).to_string(), "ab");
     assert_eq!(Value::Bool(true).to_string(), "true");
+    assert_eq!(Value::Null.to_string(), "NULL");
+}
+
+#[test]
+fn null_propagates_through_arithmetic_and_comparison() {
+    assert_eq!(val("select null;"), Value::Null);
+    assert_eq!(val("select null + 1;"), Value::Null);
+    assert_eq!(val("select 1 * null;"), Value::Null);
+    assert_eq!(val("select -null;"), Value::Null);
+    assert_eq!(val("select null = null;"), Value::Null);
+    assert_eq!(val("select null < 1;"), Value::Null);
+    assert_eq!(val("select null = 'a';"), Value::Null);
+    assert_eq!(val("select 'a' <> null;"), Value::Null);
+}
+
+#[test]
+fn three_valued_logic() {
+    assert_eq!(val("select not null;"), Value::Null);
+    assert_eq!(val("select null and 1 = 1;"), Value::Null);
+    assert_eq!(val("select null and 1 = 2;"), Value::Bool(false));
+    assert_eq!(val("select null or 1 = 1;"), Value::Bool(true));
+    assert_eq!(val("select null or 1 = 2;"), Value::Null);
+    assert_eq!(val("select null and null;"), Value::Null);
+    assert_eq!(val("select null or null;"), Value::Null);
+}
+
+#[test]
+fn null_type_errors_still_error() {
+    err("select null and 'a';");
+    err("select null + 'a';");
 }

@@ -375,6 +375,9 @@ impl Parser {
             Some(Token { kind: TokenKind::Int(n), .. }) => Ok(Expr::Int(*n)),
             Some(Token { kind: TokenKind::Float(x), .. }) => Ok(Expr::Float(*x)),
             Some(Token { kind: TokenKind::Str(s), .. }) => Ok(Expr::Str(s.clone())),
+            Some(Token { kind: TokenKind::Ident(s), .. }) if s.eq_ignore_ascii_case("null") => {
+                Ok(Expr::Null)
+            }
             Some(Token { kind: TokenKind::Ident(s), .. }) => Ok(Expr::Column(s.clone())),
             Some(Token { kind: TokenKind::Punct(Punct::LParen), .. }) => {
                 let e = self.parse_expr()?;

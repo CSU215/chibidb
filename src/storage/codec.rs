@@ -1,6 +1,7 @@
 use crate::value::Value;
 use crate::{Error, Result};
 
+const TAG_NULL: u8 = 0x00;
 const TAG_INT: u8 = 0x01;
 const TAG_FLOAT: u8 = 0x02;
 const TAG_STR: u8 = 0x03;
@@ -11,6 +12,7 @@ pub fn encode_row(row: &[Value]) -> Vec<u8> {
     buf.extend_from_slice(&(row.len() as u16).to_le_bytes());
     for v in row {
         match v {
+            Value::Null => buf.push(TAG_NULL),
             Value::Int(n) => {
                 buf.push(TAG_INT);
                 buf.extend_from_slice(&n.to_le_bytes());
@@ -42,6 +44,7 @@ pub fn decode_row(data: &[u8]) -> Result<(Vec<Value>, usize)> {
         let tag = data[pos];
         pos += 1;
         let v = match tag {
+            TAG_NULL => Value::Null,
             TAG_INT => {
                 let b = take(data, &mut pos, 8)?;
                 Value::Int(i64::from_le_bytes(b.try_into().unwrap()))

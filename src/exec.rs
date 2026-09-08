@@ -192,6 +192,7 @@ pub(crate) fn eval(expr: &Expr, ctx: Option<(&Schema, &[Value])>) -> Result<Valu
         Expr::Int(n) => Ok(Value::Int(*n)),
         Expr::Float(x) => Ok(Value::Float(*x)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
+        Expr::Null => Ok(Value::Null),
         Expr::Column(c) => {
             let Some((schema, row)) = ctx else {
                 return Err(Error::Runtime(format!("no such column: {c}")));
@@ -205,6 +206,7 @@ pub(crate) fn eval(expr: &Expr, ctx: Option<(&Schema, &[Value])>) -> Result<Valu
             let v = eval(e, ctx)?;
             match op {
                 UnOp::Neg => match v {
+                    Value::Null => Ok(Value::Null),
                     Value::Int(n) => n
                         .checked_neg()
                         .map(Value::Int)
@@ -213,6 +215,7 @@ pub(crate) fn eval(expr: &Expr, ctx: Option<(&Schema, &[Value])>) -> Result<Valu
                     _ => Err(type_mismatch()),
                 },
                 UnOp::Not => match v {
+                    Value::Null => Ok(Value::Null),
                     Value::Bool(b) => Ok(Value::Bool(!b)),
                     _ => Err(type_mismatch()),
                 },
@@ -229,11 +232,21 @@ pub(crate) fn eval(expr: &Expr, ctx: Option<(&Schema, &[Value])>) -> Result<Valu
 fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
     match op {
         BinOp::And => match (l, r) {
-            (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a && b)),
+            (Value::Bool(false), _) | (_, Value::Bool(false)) => Ok(Value::Bool(false)),
+            (Value::Bool(true), Value::Bool(true)) => Ok(Value::Bool(true)),
+            (Value::Bool(true), Value::Null) | (Value::Null, Value::Bool(true)) => {
+                Ok(Value::Null)
+            }
+            (Value::Null, Value::Null) => Ok(Value::Null),
             _ => Err(type_mismatch()),
         },
         BinOp::Or => match (l, r) {
-            (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a || b)),
+            (Value::Bool(true), _) | (_, Value::Bool(true)) => Ok(Value::Bool(true)),
+            (Value::Bool(false), Value::Bool(false)) => Ok(Value::Bool(false)),
+            (Value::Bool(false), Value::Null) | (Value::Null, Value::Bool(false)) => {
+                Ok(Value::Null)
+            }
+            (Value::Null, Value::Null) => Ok(Value::Null),
             _ => Err(type_mismatch()),
         },
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => arith(op, l, r),
@@ -245,6 +258,9 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
 
 fn arith(op: BinOp, l: Value, r: Value) -> Result<Value> {
     match (l, r) {
+        (Value::Null, Value::Null) => Ok(Value::Null),
+        (Value::Null, Value::Int(_) | Value::Float(_))
+        | (Value::Int(_) | Value::Float(_), Value::Null) => Ok(Value::Null),
         (Value::Int(a), Value::Int(b)) => int_arith(op, a, b),
         (Value::Float(a), Value::Float(b)) => float_arith(op, a, b),
         (Value::Int(a), Value::Float(b)) => float_arith(op, a as f64, b),
@@ -287,6 +303,9 @@ fn float_arith(op: BinOp, a: f64, b: f64) -> Result<Value> {
 
 fn compare(op: BinOp, l: Value, r: Value) -> Result<Value> {
     use std::cmp::Ordering::{Equal, Greater, Less};
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Ok(Value::Null);
+    }
     let ord: Option<std::cmp::Ordering> = match (&l, &r) {
         (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
         (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
