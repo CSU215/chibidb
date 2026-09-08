@@ -157,6 +157,12 @@ fn parses_date_columns() {
 }
 
 #[test]
+fn parses_text_columns() {
+    let c = create_table("create table t (body text);");
+    assert_eq!(c.columns[0].dtype, DataType::Text);
+}
+
+#[test]
 fn create_table_is_case_insensitive() {
     let c = create_table("CREATE TABLE T (ID INT);");
     assert_eq!(c.name, "T");

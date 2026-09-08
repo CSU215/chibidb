@@ -330,6 +330,36 @@ fn null_storage_and_filtering() {    with_dbs(|db| {
 }
 
 #[test]
+fn text_type() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int, body text);").unwrap();
+        let long = "x".repeat(5000);
+        db.execute_sql(&format!(
+            "insert into t values (1, '{long}'), (2, 'short');"
+        ))
+        .unwrap();
+
+        let rs = db.execute_sql("select body from t where id = 1;").unwrap();
+        let (_, r) = rows(&rs);
+        assert_eq!(r[0][0], Value::Str(long.clone()));
+
+        // text longer than a page cannot be stored
+        let huge = "y".repeat(20000);
+        let err = db.execute_sql(&format!("insert into t values (3, '{huge}');")).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+
+        // numbers do not fit into text columns
+        let err = db.execute_sql("insert into t values (4, 123);").unwrap_err();
+        assert!(err.to_string().contains("cannot insert"), "{err}");
+
+        db.execute_sql("update t set body = null where id = 2;").unwrap();
+        let rs = db.execute_sql("select body from t where id = 2;").unwrap();
+        let (_, r) = rows(&rs);
+        assert_eq!(r, [[Value::Null]]);
+    });
+}
+
+#[test]
 fn date_type() {
     with_dbs(|db| {
         db.execute_sql("create table t (id int, birthday date);").unwrap();

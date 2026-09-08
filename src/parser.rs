@@ -277,6 +277,9 @@ impl Parser {
         if self.eat_keyword("date") {
             return Ok(DataType::Date);
         }
+        if self.eat_keyword("text") {
+            return Ok(DataType::Text);
+        }
         Err(self.unexpected("data type"))
     }
 

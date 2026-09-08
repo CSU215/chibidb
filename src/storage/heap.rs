@@ -66,7 +66,17 @@ impl HeapFile {
             }
         }
         let no = bp.alloc_page(self.file)?;
-        let slot = bp.with_page(self.file, no, |page| page_insert(page, record))?;
+        let slot = bp.with_page(self.file, no, |page| page_insert(page, record))
+            .map_err(|e| {
+                if matches!(e, Error::PageFull) {
+                    Error::Runtime(format!(
+                        "record too large ({record_len} bytes does not fit in a page)",
+                        record_len = record.len()
+                    ))
+                } else {
+                    e
+                }
+            })?;
         Ok(Rid::new(no, slot))
     }
 

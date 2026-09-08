@@ -91,6 +91,13 @@ fn execute_insert(db: &mut Database, i: &InsertStmt) -> Result<ResultSet> {
             let v = eval_const(expr)?;
             row.push(coerce(v, col.dtype, &col.name)?);
         }
+        let encoded = crate::storage::codec::encode_row(&row);
+        if encoded.len() + 8 > crate::storage::PAGE_SIZE {
+            return Err(Error::Runtime(format!(
+                "record too large ({} bytes does not fit in a page)",
+                encoded.len()
+            )));
+        }
         db.store_insert(&i.table, row)?;
     }
     Ok(ResultSet::Message("SUCCESS".into()))
@@ -112,6 +119,7 @@ fn coerce(v: Value, dtype: DataType, col: &str) -> Result<Value> {
             }
         }
         (v @ Value::Date(_), DataType::Date) => Ok(v),
+        (v @ Value::Str(_), DataType::Text) => Ok(v),
         (Value::Str(s), DataType::Date) => crate::datetime::parse_date(&s)
             .map(Value::Date)
             .map_err(|e| Error::Runtime(format!("cannot insert into column {col}: {e}"))),

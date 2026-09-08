@@ -7,6 +7,7 @@ const DTYPE_INT: u8 = 0x00;
 const DTYPE_FLOAT: u8 = 0x01;
 const DTYPE_CHAR: u8 = 0x02;
 const DTYPE_DATE: u8 = 0x03;
+const DTYPE_TEXT: u8 = 0x04;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableMeta {
@@ -39,6 +40,7 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
                     put_u32(&mut buf, *n);
                 }
                 DataType::Date => buf.push(DTYPE_DATE),
+                DataType::Text => buf.push(DTYPE_TEXT),
             }
         }
         put_u32(&mut buf, t.file_no);
@@ -66,6 +68,7 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
                 DTYPE_FLOAT => DataType::Float,
                 DTYPE_CHAR => DataType::Char(take_u32(data, &mut pos)?),
                 DTYPE_DATE => DataType::Date,
+                DTYPE_TEXT => DataType::Text,
                 _ => return Err(Error::Runtime(format!("unknown dtype tag 0x{tag:02x}"))),
             };
             columns.push((cname, dtype));
