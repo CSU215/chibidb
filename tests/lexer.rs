@@ -36,7 +36,35 @@ fn tokenizes_punctuation() {
 #[test]
 fn errors_on_unknown_char() {
     assert!(lex("1 @").is_err());
-    assert!(lex("1.2").is_err(), "dot is not a token yet");
+    assert!(lex("1.").is_err(), "dot needs trailing digits");
+    assert!(lex(".5").is_err(), "dot needs leading digits");
+}
+
+#[test]
+fn tokenizes_floats() {
+    let toks = lex("1.5 0.25").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![TokenKind::Float(1.5), TokenKind::Float(0.25)]
+    );
+    assert_eq!(toks[0].pos, 0);
+    assert_eq!(toks[1].pos, 4);
+}
+
+#[test]
+fn tokenizes_strings() {
+    let toks = lex("'abc' ''").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![TokenKind::Str("abc".into()), TokenKind::Str("".into())]
+    );
+    assert_eq!(toks[0].pos, 0);
+    assert_eq!(toks[1].pos, 6);
+}
+
+#[test]
+fn errors_on_unterminated_string() {
+    assert!(lex("'abc").is_err());
 }
 
 #[test]

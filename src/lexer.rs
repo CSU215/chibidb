@@ -11,6 +11,7 @@ pub enum Punct {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Int(i64),
+    Float(f64),
     Str(String),
     Ident(String),
     Punct(Punct),
@@ -34,10 +35,35 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                let n: i64 = src[start..i]
-                    .parse()
-                    .map_err(|_| Error::Syntax(format!("integer overflow at byte {start}")))?;
-                out.push(Token { kind: TokenKind::Int(n), pos: start });
+                let kind = if i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit()
+                {
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    TokenKind::Float(src[start..i].parse().unwrap())
+                } else {
+                    let n: i64 = src[start..i].parse().map_err(|_| {
+                        Error::Syntax(format!("integer overflow at byte {start}"))
+                    })?;
+                    TokenKind::Int(n)
+                };
+                out.push(Token { kind, pos: start });
+            }
+            b'\'' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return Err(Error::Syntax(format!(
+                        "unterminated string at byte {start}"
+                    )));
+                }
+                let s = src[start + 1..i].to_string();
+                i += 1;
+                out.push(Token { kind: TokenKind::Str(s), pos: start });
             }
             b'(' => push_punct(&mut out, &mut i, Punct::LParen),
             b')' => push_punct(&mut out, &mut i, Punct::RParen),
