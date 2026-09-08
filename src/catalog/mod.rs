@@ -5,6 +5,8 @@ use crate::storage::FileId;
 use crate::value::Value;
 use crate::{Error, Result};
 
+pub mod meta;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDesc {
     pub name: String,
