@@ -86,18 +86,66 @@ fn execute_select(db: &Database, s: &SelectStmt) -> Result<ResultSet> {
         }
         return Ok(ResultSet::Rows { columns, rows: vec![row] });
     };
-    db.catalog().table(&from.name)?;
-    Err(Error::Runtime("not implemented yet".into()))
+    let table = db.catalog().table(&from.name)?;
+    let schema = &table.schema;
+    let mut headers = Vec::new();
+    let mut exprs = Vec::new();
+    for item in &s.items {
+        match item {
+            SelectItem::Star => {
+                for col in &schema.columns {
+                    headers.push(col.name.clone());
+                    exprs.push(Expr::Column(col.name.clone()));
+                }
+            }
+            SelectItem::Expr(e) => {
+                headers.push(e.to_string());
+                exprs.push(e.clone());
+            }
+        }
+    }
+    let mut out_rows = Vec::new();
+    for row in table.rows() {
+        if let Some(sel) = &s.selection {
+            match eval(sel, Some((schema, row)))? {
+                Value::Bool(true) => {}
+                Value::Bool(false) => continue,
+                _ => {
+                    return Err(Error::Runtime(
+                        "where clause must evaluate to boolean".into(),
+                    ))
+                }
+            }
+        }
+        let mut out_row = Vec::with_capacity(exprs.len());
+        for e in &exprs {
+            out_row.push(eval(e, Some((schema, row)))?);
+        }
+        out_rows.push(out_row);
+    }
+    Ok(ResultSet::Rows { columns: headers, rows: out_rows })
 }
 
 pub fn eval_const(expr: &Expr) -> Result<Value> {
+    eval(expr, None)
+}
+
+pub(crate) fn eval(expr: &Expr, ctx: Option<(&Schema, &[Value])>) -> Result<Value> {
     match expr {
         Expr::Int(n) => Ok(Value::Int(*n)),
         Expr::Float(x) => Ok(Value::Float(*x)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
-        Expr::Column(c) => Err(Error::Runtime(format!("no such column: {c}"))),
+        Expr::Column(c) => {
+            let Some((schema, row)) = ctx else {
+                return Err(Error::Runtime(format!("no such column: {c}")));
+            };
+            let idx = schema
+                .index_of(c)
+                .ok_or_else(|| Error::Runtime(format!("no such column: {c}")))?;
+            Ok(row[idx].clone())
+        }
         Expr::Unary(op, e) => {
-            let v = eval_const(e)?;
+            let v = eval(e, ctx)?;
             match op {
                 UnOp::Neg => match v {
                     Value::Int(n) => n
@@ -114,8 +162,8 @@ pub fn eval_const(expr: &Expr) -> Result<Value> {
             }
         }
         Expr::Binary(op, l, r) => {
-            let lv = eval_const(l)?;
-            let rv = eval_const(r)?;
+            let lv = eval(l, ctx)?;
+            let rv = eval(r, ctx)?;
             eval_binary(*op, lv, rv)
         }
     }

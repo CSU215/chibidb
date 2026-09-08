@@ -134,3 +134,66 @@ fn insert_type_rules() {
     let err = db.execute_sql("insert into t values (1, 1, 'abcde');").unwrap_err();
     assert!(err.to_string().contains("cannot insert"), "{err}");
 }
+
+fn seeded() -> Database {
+    let mut db = Database::open_in_memory();
+    setup(&mut db, "create table student (id int, name char(10), score float);");
+    db.execute_sql(
+        "insert into student values (1, 'alice', 95.5), (2, 'bob', 80), (3, 'carol', 90);",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn selects_all_columns() {
+    let mut db = seeded();
+    let rs = db.execute_sql("select * from student;").unwrap();
+    let (columns, rows) = rows(&rs);
+    assert_eq!(columns, ["id", "name", "score"]);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], [Value::Int(1), Value::Str("alice".into()), Value::Float(95.5)]);
+}
+
+#[test]
+fn selects_projected_columns_with_where() {
+    let mut db = seeded();
+    let rs = db
+        .execute_sql("select name, score from student where score >= 90;")
+        .unwrap();
+    let (columns, rows) = rows(&rs);
+    assert_eq!(columns, ["name", "score"]);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], [Value::Str("alice".into()), Value::Float(95.5)]);
+    assert_eq!(rows[1], [Value::Str("carol".into()), Value::Float(90.0)]);
+}
+
+#[test]
+fn selects_expressions_over_columns() {
+    let mut db = seeded();
+    let rs = db.execute_sql("select id * 2 from student where id = 2;").unwrap();
+    let (columns, rows) = rows(&rs);
+    assert_eq!(columns, ["(* id 2)"]);
+    assert_eq!(rows, [[Value::Int(4)]]);
+}
+
+#[test]
+fn selects_empty_table_yields_header_only() {
+    let mut db = Database::open_in_memory();
+    setup(&mut db, "create table t (id int);");
+    let rs = db.execute_sql("select * from t;").unwrap();
+    let (columns, rows) = rows(&rs);
+    assert_eq!(columns, ["id"]);
+    assert_eq!(rows.len(), 0);
+}
+
+#[test]
+fn select_from_errors() {
+    let mut db = seeded();
+    let err = db.execute_sql("select * from missing;").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
+    let err = db.execute_sql("select nope from student;").unwrap_err();
+    assert!(err.to_string().contains("no such column"), "{err}");
+    let err = db.execute_sql("select * from student where 1;").unwrap_err();
+    assert!(err.to_string().contains("boolean"), "{err}");
+}
