@@ -45,6 +45,10 @@ impl Table {
             .map(|(_, row)| row)
             .collect();
     }
+
+    pub(crate) fn rows_mut(&mut self) -> &mut Vec<Vec<Value>> {
+        &mut self.rows
+    }
 }
 
 #[derive(Debug, Default)]

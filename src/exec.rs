@@ -1,6 +1,6 @@
 use crate::ast::{
     BinOp, CreateTableStmt, DataType, DeleteStmt, Expr, InsertStmt, SelectItem, SelectStmt,
-    Stmt, UnOp,
+    Stmt, UnOp, UpdateStmt,
 };
 use crate::catalog::Schema;
 use crate::result::ResultSet;
@@ -13,8 +13,42 @@ pub fn execute(db: &mut Database, stmt: &Stmt) -> Result<ResultSet> {
         Stmt::Insert(i) => execute_insert(db, i),
         Stmt::Select(s) => execute_select(db, s),
         Stmt::Delete(d) => execute_delete(db, d),
-        Stmt::Update(_) => Err(Error::Runtime("not implemented yet".into())),
+        Stmt::Update(u) => execute_update(db, u),
     }
+}
+
+fn execute_update(db: &mut Database, u: &UpdateStmt) -> Result<ResultSet> {
+    let schema = db.catalog().table(&u.table)?.schema.clone();
+    let mut assigns = Vec::new();
+    for (col, expr) in &u.assignments {
+        let idx = schema
+            .index_of(col)
+            .ok_or_else(|| Error::Runtime(format!("no such column: {col}")))?;
+        assigns.push((idx, col.clone(), schema.columns[idx].dtype, expr));
+    }
+    let table = db.catalog_mut().table_mut(&u.table)?;
+    let mut applied: Vec<(usize, Vec<(usize, Value)>)> = Vec::new();
+    for (i, row) in table.rows().iter().enumerate() {
+        let matched = match &u.selection {
+            Some(sel) => eval_predicate(sel, &schema, row)?,
+            None => true,
+        };
+        if !matched {
+            continue;
+        }
+        let mut cells = Vec::new();
+        for (idx, col, dtype, expr) in &assigns {
+            let v = eval(expr, Some((&schema, row)))?;
+            cells.push((*idx, coerce(v, *dtype, col)?));
+        }
+        applied.push((i, cells));
+    }
+    for (i, cells) in applied {
+        for (idx, v) in cells {
+            table.rows_mut()[i][idx] = v;
+        }
+    }
+    Ok(ResultSet::Message("SUCCESS".into()))
 }
 
 fn execute_delete(db: &mut Database, d: &DeleteStmt) -> Result<ResultSet> {

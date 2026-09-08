@@ -224,3 +224,48 @@ fn delete_errors() {
     let err = db.execute_sql("delete from student where name;").unwrap_err();
     assert!(err.to_string().contains("boolean"), "{err}");
 }
+
+#[test]
+fn updates_matching_rows() {
+    let mut db = seeded();
+    db.execute_sql("update student set score = 100 where id = 2;").unwrap();
+    let rs = db.execute_sql("select score from student where id = 2;").unwrap();
+    let (_, rows) = rows(&rs);
+    assert_eq!(rows, [[Value::Float(100.0)]]);
+}
+
+#[test]
+fn updates_with_row_expressions() {
+    let mut db = seeded();
+    db.execute_sql("update student set score = score + 1 where id <= 2;").unwrap();
+    let rs = db.execute_sql("select score from student;").unwrap();
+    let (_, rows) = rows(&rs);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0], Value::Float(96.5));
+    assert_eq!(rows[1][0], Value::Float(81.0));
+    assert_eq!(rows[2][0], Value::Float(90.0), "unmatched row untouched");
+}
+
+#[test]
+fn updates_without_where_touches_all_rows() {
+    let mut db = seeded();
+    db.execute_sql("update student set id = id * 10;").unwrap();
+    let rs = db.execute_sql("select id from student;").unwrap();
+    let (_, rows) = rows(&rs);
+    assert_eq!(rows, [[Value::Int(10)], [Value::Int(20)], [Value::Int(30)]]);
+}
+
+#[test]
+fn update_errors() {
+    let mut db = seeded();
+    let err = db.execute_sql("update missing set id = 1;").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
+    let err = db.execute_sql("update student set nope = 1;").unwrap_err();
+    assert!(err.to_string().contains("no such column"), "{err}");
+    let err = db.execute_sql("update student set name = 1;").unwrap_err();
+    assert!(err.to_string().contains("cannot insert"), "{err}");
+    let err = db.execute_sql("update student set name = 'waytoolongname';").unwrap_err();
+    assert!(err.to_string().contains("cannot insert"), "{err}");
+    let err = db.execute_sql("update student set id = 1 where name;").unwrap_err();
+    assert!(err.to_string().contains("boolean"), "{err}");
+}
