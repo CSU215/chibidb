@@ -79,3 +79,23 @@ fn syntax_errors() {
     err("select )");
     err("select (1");
 }
+
+#[test]
+fn parses_comparisons() {
+    assert_eq!(single_exprs("select 1 = 2;"), ["(= 1 2)"]);
+    assert_eq!(single_exprs("select 1 <> 2;"), ["(<> 1 2)"]);
+    assert_eq!(single_exprs("select 1 != 2;"), ["(<> 1 2)"], "!= normalizes to <>");
+    assert_eq!(single_exprs("select 1 < 2, 2 <= 2, 3 > 2, 3 >= 3;"),
+        ["(< 1 2)", "(<= 2 2)", "(> 3 2)", "(>= 3 3)"]);
+}
+
+#[test]
+fn comparison_is_looser_than_additive() {
+    assert_eq!(single_exprs("select 1+1 = 2;"), ["(= (+ 1 1) 2)"]);
+    assert_eq!(single_exprs("select 1 < 2+3;"), ["(< 1 (+ 2 3))"]);
+}
+
+#[test]
+fn comparisons_are_not_chainable() {
+    err("select 1 < 2 < 3;");
+}

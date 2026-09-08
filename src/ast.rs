@@ -6,6 +6,12 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Eq,
+    NotEq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,6 +49,12 @@ impl fmt::Display for BinOp {
             BinOp::Sub => "-",
             BinOp::Mul => "*",
             BinOp::Div => "/",
+            BinOp::Eq => "=",
+            BinOp::NotEq => "<>",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
         };
         f.write_str(s)
     }

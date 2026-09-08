@@ -93,7 +93,29 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr> {
-        self.parse_additive()
+        self.parse_comparison()
+    }
+
+    fn parse_comparison(&mut self) -> Result<Expr> {
+        let lhs = self.parse_additive()?;
+        let op = if self.at_punct(Punct::Eq) {
+            BinOp::Eq
+        } else if self.at_punct(Punct::NotEq) {
+            BinOp::NotEq
+        } else if self.at_punct(Punct::Lt) {
+            BinOp::Lt
+        } else if self.at_punct(Punct::Le) {
+            BinOp::Le
+        } else if self.at_punct(Punct::Gt) {
+            BinOp::Gt
+        } else if self.at_punct(Punct::Ge) {
+            BinOp::Ge
+        } else {
+            return Ok(lhs);
+        };
+        self.pos += 1;
+        let rhs = self.parse_additive()?;
+        Ok(Expr::Binary(op, Box::new(lhs), Box::new(rhs)))
     }
 
     fn parse_additive(&mut self) -> Result<Expr> {
