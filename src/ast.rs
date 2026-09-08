@@ -1,0 +1,68 @@
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnOp {
+    Neg,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Column(String),
+    Unary(UnOp, Box<Expr>),
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+}
+
+impl fmt::Display for Expr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expr::Int(n) => write!(f, "{n}"),
+            Expr::Float(x) => write!(f, "{x}"),
+            Expr::Str(s) => write!(f, "'{s}'"),
+            Expr::Column(c) => write!(f, "{c}"),
+            Expr::Unary(op, e) => write!(f, "({op} {e})"),
+            Expr::Binary(op, l, r) => write!(f, "({op} {l} {r})"),
+        }
+    }
+}
+
+impl fmt::Display for BinOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+        };
+        f.write_str(s)
+    }
+}
+
+impl fmt::Display for UnOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            UnOp::Neg => "-",
+        };
+        f.write_str(s)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectStmt {
+    pub exprs: Vec<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stmt {
+    Select(SelectStmt),
+}

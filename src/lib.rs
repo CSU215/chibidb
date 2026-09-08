@@ -1,5 +1,7 @@
+pub mod ast;
 mod error;
 pub mod lexer;
+pub mod parser;
 mod repl;
 
 pub use error::{Error, Result};
