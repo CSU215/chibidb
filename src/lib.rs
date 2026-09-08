@@ -6,6 +6,7 @@ pub mod lexer;
 pub mod parser;
 mod repl;
 pub mod result;
+pub mod storage;
 pub mod value;
 
 pub use error::{Error, Result};
