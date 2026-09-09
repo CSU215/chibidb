@@ -163,7 +163,7 @@ impl Parser {
         }
     }
 
-    const RESERVED: &[&str] = &["where"];
+    const RESERVED: &[&str] = &["where", "group", "having", "order", "limit", "on"];
 
     fn agg_func(name: &str) -> Option<AggFunc> {
         if name.eq_ignore_ascii_case("count") {
@@ -224,7 +224,24 @@ impl Parser {
         } else {
             None
         };
-        Ok(Stmt::Select(SelectStmt { items, from, selection }))
+        let group_by = if self.eat_keyword("group") {
+            if !self.eat_keyword("by") {
+                return Err(self.unexpected("by"));
+            }
+            let mut group_by = vec![self.parse_expr()?];
+            while self.eat_punct(Punct::Comma) {
+                group_by.push(self.parse_expr()?);
+            }
+            group_by
+        } else {
+            vec![]
+        };
+        let having = if self.eat_keyword("having") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Stmt::Select(SelectStmt { items, from, selection, group_by, having }))
     }
 
     fn parse_insert(&mut self) -> Result<Stmt> {

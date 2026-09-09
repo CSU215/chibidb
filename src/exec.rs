@@ -362,8 +362,36 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
     let has_aggregate = s
         .items
         .iter()
-        .any(|it| matches!(it, SelectItem::Expr(e) if expr_has_aggregate(e)));
-    if has_aggregate {
+        .any(|it| matches!(it, SelectItem::Expr(e) if expr_has_aggregate(e)))
+        || s.having.as_ref().is_some_and(expr_has_aggregate);
+
+    if !s.group_by.is_empty() || has_aggregate {
+        return execute_grouped_select(&schema, s, filtered, headers, exprs);
+    }
+    let mut out_rows = Vec::new();
+    for row in filtered {
+        let mut out_row = Vec::with_capacity(exprs.len());
+        for e in &exprs {
+            out_row.push(eval(e, Some(&EvalCtx::Row(&schema, &row)))?);
+        }
+        out_rows.push(out_row);
+    }
+    Ok(ResultSet::Rows { columns: headers, rows: out_rows })
+}
+
+fn execute_grouped_select(
+    schema: &Schema,
+    s: &SelectStmt,
+    filtered: Vec<Vec<Value>>,
+    headers: Vec<String>,
+    exprs: Vec<Expr>,
+) -> Result<ResultSet> {
+    for g in &s.group_by {
+        if expr_has_aggregate(g) {
+            return Err(Error::Runtime("aggregate functions are not allowed in group by".into()));
+        }
+    }
+    if s.group_by.is_empty() {
         for it in &s.items {
             if let SelectItem::Expr(e) = it {
                 if expr_has_column(e) {
@@ -373,17 +401,38 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
                 }
             }
         }
-        let mut row = Vec::with_capacity(exprs.len());
-        for e in &exprs {
-            row.push(eval(e, Some(&EvalCtx::Group(&schema, &filtered)))?);
+    }
+    let mut groups: Vec<(Vec<Value>, Vec<Vec<Value>>)> = Vec::new();
+    if s.group_by.is_empty() {
+        groups.push((vec![], filtered));
+    } else {
+        for row in filtered {
+            let mut key = Vec::with_capacity(s.group_by.len());
+            for g in &s.group_by {
+                key.push(eval(g, Some(&EvalCtx::Row(schema, &row)))?);
+            }
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, rows)) => rows.push(row),
+                None => groups.push((key, vec![row])),
+            }
         }
-        return Ok(ResultSet::Rows { columns: headers, rows: vec![row] });
     }
     let mut out_rows = Vec::new();
-    for row in filtered {
+    for (_, group_rows) in groups {
+        if let Some(having) = &s.having {
+            match eval(having, Some(&EvalCtx::Group(schema, &group_rows)))? {
+                Value::Bool(true) => {}
+                Value::Bool(false) | Value::Null => continue,
+                _ => {
+                    return Err(Error::Runtime(
+                        "having clause must evaluate to boolean".into(),
+                    ))
+                }
+            }
+        }
         let mut out_row = Vec::with_capacity(exprs.len());
         for e in &exprs {
-            out_row.push(eval(e, Some(&EvalCtx::Row(&schema, &row)))?);
+            out_row.push(eval(e, Some(&EvalCtx::Group(schema, &group_rows)))?);
         }
         out_rows.push(out_row);
     }

@@ -179,6 +179,8 @@ pub struct SelectStmt {
     pub items: Vec<SelectItem>,
     pub from: Option<TableRef>,
     pub selection: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

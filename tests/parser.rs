@@ -407,6 +407,8 @@ fn parses_explain() {
                     items: vec![chibidb::ast::SelectItem::Expr(chibidb::ast::Expr::Int(1))],
                     from: None,
                     selection: None,
+                    group_by: vec![],
+                    having: None,
                 })
             );
         }
@@ -414,4 +416,26 @@ fn parses_explain() {
     }
     err("explain;");
     err("explain create table t (id int);");
+}
+
+#[test]
+fn parses_group_by_and_having() {
+    let s = select("select dept, count(*) from emp group by dept;");
+    assert_eq!(s.group_by, [chibidb::ast::Expr::Column("dept".into())]);
+    assert_eq!(s.having, None);
+
+    let s = select("select dept, avg(score) from emp where age > 18 group by dept having avg(score) > 60;");
+    assert_eq!(s.group_by, [chibidb::ast::Expr::Column("dept".into())]);
+    assert_eq!(
+        s.having.as_ref().unwrap().to_string(),
+        "(> (avg score) 60)"
+    );
+}
+
+#[test]
+fn group_by_syntax_errors() {
+    err("select 1 from t group;");
+    err("select 1 from t group by;");
+    err("select 1 from t having;");
+    err("select 1 from t group by 1 having;");
 }

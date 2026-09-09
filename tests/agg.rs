@@ -120,5 +120,105 @@ fn aggregate_errors() {
         err(db, "select sum(name) from t;");
         // avg over strings
         err(db, "select avg(name) from t;");
+        // aggregate in group by
+        err(db, "select name, count(*) from t group by count(*);");
+    });
+}
+
+#[test]
+fn group_by_counts_per_group() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (dept char(4), score int);").unwrap();
+        db.execute_sql(
+            "insert into t values ('a', 1), ('b', 2), ('a', 3), ('c', 4), ('b', 5);",
+        )
+        .unwrap();
+
+        let rs = db
+            .execute_sql("select dept, count(*), sum(score) from t group by dept;")
+            .unwrap();
+        match &rs[0] {
+            chibidb::ResultSet::Rows { columns, rows } => {
+                assert_eq!(columns.as_slice(), ["dept", "(count *)", "(sum score)"]);
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0], [Value::Str("a".into()), Value::Int(2), Value::Int(4)]);
+                assert_eq!(rows[1], [Value::Str("b".into()), Value::Int(2), Value::Int(7)]);
+                assert_eq!(rows[2], [Value::Str("c".into()), Value::Int(1), Value::Int(4)]);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn group_by_with_where_and_having() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (dept char(4), score int);").unwrap();
+        db.execute_sql(
+            "insert into t values ('a', 1), ('b', 2), ('a', 3), ('c', 4), ('b', 5), ('a', 10);",
+        )
+        .unwrap();
+
+        let rs = db
+            .execute_sql(
+                "select dept, count(*) from t where score < 10 group by dept having count(*) > 1;",
+            )
+            .unwrap();
+        match &rs[0] {
+            chibidb::ResultSet::Rows { rows, .. } => {
+                // group a: rows (1,3) → count 2 ✓; b: (2,5) → 2 ✓; c: (4) → 1 ✗
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][0], Value::Str("a".into()));
+                assert_eq!(rows[0][1], Value::Int(2));
+                assert_eq!(rows[1][0], Value::Str("b".into()));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn group_by_multiple_columns_and_empty_groups() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (a int, b int, v int);").unwrap();
+        db.execute_sql("insert into t values (1, 1, 10), (1, 2, 20), (1, 1, 30);").unwrap();
+
+        let rs = db
+            .execute_sql("select a, b, count(*) from t group by a, b;")
+            .unwrap();
+        match &rs[0] {
+            chibidb::ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0], [Value::Int(1), Value::Int(1), Value::Int(2)]);
+                assert_eq!(rows[1], [Value::Int(1), Value::Int(2), Value::Int(1)]);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // where filters everything → no groups → no rows
+        let rs = db
+            .execute_sql("select a, count(*) from t where a > 99 group by a;")
+            .unwrap();
+        match &rs[0] {
+            chibidb::ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn having_without_aggregate_still_works() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (dept char(4), score int);").unwrap();
+        db.execute_sql("insert into t values ('a', 1), ('b', 2), ('a', 3);").unwrap();
+        let rs = db
+            .execute_sql("select dept, count(*) from t group by dept having dept = 'b';")
+            .unwrap();
+        match &rs[0] {
+            chibidb::ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.as_slice(), [[Value::Str("b".into()), Value::Int(1)]]);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
     });
 }
