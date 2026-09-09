@@ -5,7 +5,7 @@ use crate::{Error, Result};
 
 const MAGIC: [u8; 4] = *b"CHID";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Rid {
     pub page_no: PageNo,
     pub slot: u16,
