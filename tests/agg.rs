@@ -166,7 +166,7 @@ fn group_by_with_where_and_having() {
             .unwrap();
         match &rs[0] {
             chibidb::ResultSet::Rows { rows, .. } => {
-                // group a: rows (1,3) → count 2 ✓; b: (2,5) → 2 ✓; c: (4) → 1 ✗
+                // group a: rows (1,3) -> count 2; b: (2,5) -> 2; c: (4) -> 1
                 assert_eq!(rows.len(), 2);
                 assert_eq!(rows[0][0], Value::Str("a".into()));
                 assert_eq!(rows[0][1], Value::Int(2));
@@ -195,12 +195,91 @@ fn group_by_multiple_columns_and_empty_groups() {
             other => panic!("expected rows, got {other:?}"),
         }
 
-        // where filters everything → no groups → no rows
+        // where filters everything -> no groups -> no rows
         let rs = db
             .execute_sql("select a, count(*) from t where a > 99 group by a;")
             .unwrap();
         match &rs[0] {
             chibidb::ResultSet::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn order_by_sorts_rows() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int, score float);").unwrap();
+        db.execute_sql(
+            "insert into t values (3, 30.0), (1, 20.0), (2, 10.0), (4, 20.0);",
+        )
+        .unwrap();
+
+        let col = |sql: &str, db: &mut Database| -> Vec<Value> {
+            let rs = db.execute_sql(sql).unwrap();
+            match &rs[0] {
+                chibidb::ResultSet::Rows { rows, .. } => rows.iter().map(|r| r[0].clone()).collect(),
+                other => panic!("expected rows for {sql}, got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            col("select id from t order by score;", db),
+            [Value::Int(2), Value::Int(1), Value::Int(4), Value::Int(3)],
+            "stable sort keeps insertion order for ties"
+        );
+        assert_eq!(
+            col("select id from t order by score desc;", db),
+            [Value::Int(3), Value::Int(1), Value::Int(4), Value::Int(2)]
+        );
+        assert_eq!(
+            col("select id from t order by score asc, id desc;", db),
+            [Value::Int(2), Value::Int(4), Value::Int(1), Value::Int(3)]
+        );
+        assert_eq!(
+            col("select id from t order by score * -1;", db),
+            [Value::Int(3), Value::Int(1), Value::Int(4), Value::Int(2)]
+        );
+    });
+}
+
+#[test]
+fn order_by_nulls_sort_first_on_asc() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int);").unwrap();
+        db.execute_sql("insert into t values (2), (null), (1);").unwrap();
+        let rs = db.execute_sql("select id from t order by id;").unwrap();
+        match &rs[0] {
+            chibidb::ResultSet::Rows { rows, .. } => {
+                assert_eq!(
+                    rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+                    [Value::Null, Value::Int(1), Value::Int(2)]
+                );
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn order_by_aggregate_output() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (dept char(4), score int);").unwrap();
+        db.execute_sql("insert into t values ('a', 1), ('b', 2), ('a', 3), ('c', 4);")
+            .unwrap();
+        let rs = db
+            .execute_sql(
+                "select dept, count(*) from t group by dept order by count(*) desc, dept;",
+            )
+            .unwrap();
+        match &rs[0] {
+            chibidb::ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0][0], Value::Str("a".into()));
+                assert_eq!(rows[0][1], Value::Int(2));
+                assert_eq!(rows[1][0], Value::Str("b".into()));
+                assert_eq!(rows[2][0], Value::Str("c".into()));
+            }
             other => panic!("expected rows, got {other:?}"),
         }
     });

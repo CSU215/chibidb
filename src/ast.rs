@@ -181,6 +181,7 @@ pub struct SelectStmt {
     pub selection: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
+    pub order_by: Vec<(Expr, bool)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

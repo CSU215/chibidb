@@ -409,6 +409,7 @@ fn parses_explain() {
                     selection: None,
                     group_by: vec![],
                     having: None,
+                    order_by: vec![],
                 })
             );
         }
@@ -438,4 +439,19 @@ fn group_by_syntax_errors() {
     err("select 1 from t group by;");
     err("select 1 from t having;");
     err("select 1 from t group by 1 having;");
+}
+
+#[test]
+fn parses_order_by() {
+    let s = select("select id from t order by id;");
+    assert_eq!(s.order_by, [(chibidb::ast::Expr::Column("id".into()), false)]);
+
+    let s = select("select id from t order by score desc, name asc, id;");
+    assert_eq!(s.order_by.len(), 3);
+    assert_eq!(s.order_by[0].1, true);
+    assert_eq!(s.order_by[1].1, false);
+    assert_eq!(s.order_by[2].1, false, "default is asc");
+
+    err("select 1 from t order;");
+    err("select 1 from t order by;");
 }

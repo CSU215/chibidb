@@ -368,6 +368,9 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
     if !s.group_by.is_empty() || has_aggregate {
         return execute_grouped_select(&schema, s, filtered, headers, exprs);
     }
+    if !s.order_by.is_empty() {
+        sort_rows(&schema, &mut filtered, &s.order_by)?;
+    }
     let mut out_rows = Vec::new();
     for row in filtered {
         let mut out_row = Vec::with_capacity(exprs.len());
@@ -417,7 +420,7 @@ fn execute_grouped_select(
             }
         }
     }
-    let mut out_rows = Vec::new();
+    let mut surviving: Vec<Vec<Vec<Value>>> = Vec::new();
     for (_, group_rows) in groups {
         if let Some(having) = &s.having {
             match eval(having, Some(&EvalCtx::Group(schema, &group_rows)))? {
@@ -430,6 +433,13 @@ fn execute_grouped_select(
                 }
             }
         }
+        surviving.push(group_rows);
+    }
+    if !s.order_by.is_empty() {
+        sort_groups(schema, &mut surviving, &s.order_by)?;
+    }
+    let mut out_rows = Vec::new();
+    for group_rows in surviving {
         let mut out_row = Vec::with_capacity(exprs.len());
         for e in &exprs {
             out_row.push(eval(e, Some(&EvalCtx::Group(schema, &group_rows)))?);
@@ -437,6 +447,59 @@ fn execute_grouped_select(
         out_rows.push(out_row);
     }
     Ok(ResultSet::Rows { columns: headers, rows: out_rows })
+}
+
+fn eval_sort_keys(
+    ctx: EvalCtx,
+    order_by: &[(Expr, bool)],
+) -> Result<Vec<Value>> {
+    order_by
+        .iter()
+        .map(|(e, _)| eval(e, Some(&ctx)))
+        .collect()
+}
+
+fn cmp_sort_keys(a: &[Value], b: &[Value], order_by: &[(Expr, bool)]) -> std::cmp::Ordering {
+    for ((_, desc), (va, vb)) in order_by.iter().zip(a.iter().zip(b.iter())) {
+        // nulls sort as smallest: first on asc, last on desc
+        let ord = match (va, vb) {
+            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+            (Value::Null, _) => std::cmp::Ordering::Less,
+            (_, Value::Null) => std::cmp::Ordering::Greater,
+            _ => cmp_values(va, vb).ok().flatten().unwrap_or(std::cmp::Ordering::Equal),
+        };
+        let ord = if *desc { ord.reverse() } else { ord };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn sort_rows(schema: &Schema, rows: &mut Vec<Vec<Value>>, order_by: &[(Expr, bool)]) -> Result<()> {
+    let mut pairs: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        let keys = eval_sort_keys(EvalCtx::Row(schema, &row), order_by)?;
+        pairs.push((row, keys));
+    }
+    pairs.sort_by(|(_, ka), (_, kb)| cmp_sort_keys(ka, kb, order_by));
+    rows.extend(pairs.into_iter().map(|(r, _)| r));
+    Ok(())
+}
+
+fn sort_groups(
+    schema: &Schema,
+    groups: &mut Vec<Vec<Vec<Value>>>,
+    order_by: &[(Expr, bool)],
+) -> Result<()> {
+    let mut pairs: Vec<(Vec<Vec<Value>>, Vec<Value>)> = Vec::with_capacity(groups.len());
+    for group in groups.drain(..) {
+        let keys = eval_sort_keys(EvalCtx::Group(schema, &group), order_by)?;
+        pairs.push((group, keys));
+    }
+    pairs.sort_by(|(_, ka), (_, kb)| cmp_sort_keys(ka, kb, order_by));
+    groups.extend(pairs.into_iter().map(|(g, _)| g));
+    Ok(())
 }
 
 fn scan_rids(

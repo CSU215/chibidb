@@ -241,7 +241,26 @@ impl Parser {
         } else {
             None
         };
-        Ok(Stmt::Select(SelectStmt { items, from, selection, group_by, having }))
+        let mut order_by = Vec::new();
+        if self.eat_keyword("order") {
+            if !self.eat_keyword("by") {
+                return Err(self.unexpected("by"));
+            }
+            loop {
+                let expr = self.parse_expr()?;
+                let desc = if self.eat_keyword("desc") {
+                    true
+                } else {
+                    self.eat_keyword("asc");
+                    false
+                };
+                order_by.push((expr, desc));
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
+            }
+        }
+        Ok(Stmt::Select(SelectStmt { items, from, selection, group_by, having, order_by }))
     }
 
     fn parse_insert(&mut self) -> Result<Stmt> {
