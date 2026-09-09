@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use crate::ast::DataType;
 use crate::storage::FileId;
-use crate::value::Value;
 use crate::{Error, Result};
 
 pub mod meta;
@@ -27,15 +26,15 @@ impl Schema {
 }
 
 #[derive(Debug)]
-pub(crate) enum RowStore {
-    Mem(Vec<Vec<Value>>),
-    Heap { file: FileId, file_no: u32 },
+pub(crate) struct HeapStore {
+    pub file: FileId,
+    pub file_no: u32,
 }
 
 #[derive(Debug)]
 pub struct Table {
     pub schema: Schema,
-    pub(crate) store: RowStore,
+    pub(crate) heap: HeapStore,
 }
 
 #[derive(Debug, Default)]
@@ -44,11 +43,16 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    pub(crate) fn create_table(&mut self, name: &str, schema: Schema, store: RowStore) -> Result<()> {
+    pub(crate) fn create_table(
+        &mut self,
+        name: &str,
+        schema: Schema,
+        heap: HeapStore,
+    ) -> Result<()> {
         if self.tables.contains_key(name) {
             return Err(Error::Runtime(format!("table already exists: {name}")));
         }
-        self.tables.insert(name.to_string(), Table { schema, store });
+        self.tables.insert(name.to_string(), Table { schema, heap });
         Ok(())
     }
 
@@ -74,11 +78,7 @@ impl Catalog {
                     .iter()
                     .map(|c| (c.name.clone(), c.dtype))
                     .collect();
-                let file_no = match &t.store {
-                    RowStore::Heap { file_no, .. } => *file_no,
-                    RowStore::Mem(_) => 0,
-                };
-                TableMeta { name: name.clone(), columns, file_no }
+                TableMeta { name: name.clone(), columns, file_no: t.heap.file_no }
             })
             .collect()
     }

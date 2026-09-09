@@ -397,7 +397,7 @@ impl BTree {
             if !self.delete_rec(bp, child, key, rid)? {
                 return Ok(false);
             }
-            self.fix_child(bp, page_no, child, key)?;
+            self.fix_child(bp, page_no, child)?;
             bp.read_page(self.file, page_no, |page| {
                 Ok(internal_bytes_used(page) < MIN_OCCUPANCY)
             })
@@ -407,27 +407,16 @@ impl BTree {
     }
 
     /// Child of `parent` underflowed after a delete: borrow from siblings or merge.
-    fn fix_child(
-        &self,
-        bp: &mut BufferPool,
-        parent: PageNo,
-        child: PageNo,
-        key: &[u8],
-    ) -> Result<()> {
+    fn fix_child(&self, bp: &mut BufferPool, parent: PageNo, child: PageNo) -> Result<()> {
         let (child_ty, idx, keys, children) = self.locate_child(bp, parent, child)?;
         let sep_left = if idx >= 1 { Some(keys[idx - 1].clone()) } else { None };
         let sep_right = if idx < keys.len() { Some(keys[idx].clone()) } else { None };
-        let left = if idx >= 1 { Some(children[idx - 1]) } else { None };
-        let right = if idx + 1 < children.len() { Some(children[idx + 1]) } else { None };
 
         if child_ty == LEAF {
-            self.fix_leaf_child(bp, parent, child, idx, keys, children, sep_left, sep_right)
+            self.fix_leaf_child(bp, parent, child, idx, &children, sep_left, sep_right)
         } else {
-            self.fix_internal_child(bp, parent, child, idx, keys, children, sep_left, sep_right)
+            self.fix_internal_child(bp, parent, child, idx, children, sep_left, sep_right)
         }
-        .map(|_| {
-            let _ = key;
-        })
     }
 
     #[allow(clippy::type_complexity)]
@@ -460,10 +449,9 @@ impl BTree {
         parent: PageNo,
         child: PageNo,
         idx: usize,
-        keys: Vec<Vec<u8>>,
-        children: Vec<PageNo>,
-        sep_left: Option<Vec<u8>>,
-        sep_right: Option<Vec<u8>>,
+        children: &[PageNo],
+        _sep_left: Option<Vec<u8>>,
+        _sep_right: Option<Vec<u8>>,
     ) -> Result<()> {
         let left = if idx >= 1 { Some(children[idx - 1]) } else { None };
         let right = if idx + 1 < children.len() { Some(children[idx + 1]) } else { None };
@@ -542,7 +530,6 @@ impl BTree {
         parent: PageNo,
         child: PageNo,
         idx: usize,
-        keys: Vec<Vec<u8>>,
         children: Vec<PageNo>,
         sep_left: Option<Vec<u8>>,
         sep_right: Option<Vec<u8>>,

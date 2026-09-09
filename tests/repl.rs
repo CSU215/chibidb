@@ -5,7 +5,7 @@ async fn run_with(input: &[u8]) -> String {
     let (mut cmd_tx, repl_input) = duplex(64);
     let repl_input = BufReader::new(repl_input);
     let (mut repl_output, mut out_rx) = duplex(64);
-    let mut db = Database::open_in_memory();
+    let mut db = Database::open_in_memory().unwrap();
 
     cmd_tx.write_all(input).await.unwrap();
     cmd_tx.shutdown().await.unwrap();

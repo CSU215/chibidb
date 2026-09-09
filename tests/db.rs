@@ -10,7 +10,7 @@ fn rows(rs: &[ResultSet]) -> (&[String], &[Vec<Value>]) {
 
 /// Runs `f` against every backend: in-memory and file-backed.
 fn with_dbs(f: impl Fn(&mut Database)) {
-    let mut mem = Database::open_in_memory();
+    let mut mem = Database::open_in_memory().unwrap();
     f(&mut mem);
 
     let dir = tempfile::tempdir().unwrap();
@@ -29,7 +29,7 @@ fn seed(db: &mut Database) {
 
 #[test]
 fn executes_constant_select() {
-    let mut db = Database::open_in_memory();
+    let mut db = Database::open_in_memory().unwrap();
     let rs = db.execute_sql("select 1+2, 'ab';").unwrap();
     assert_eq!(rs.len(), 1);
     let (columns, rows) = rows(&rs);
@@ -40,7 +40,7 @@ fn executes_constant_select() {
 
 #[test]
 fn executes_each_statement() {
-    let mut db = Database::open_in_memory();
+    let mut db = Database::open_in_memory().unwrap();
     let rs = db.execute_sql("select 1; select 2;").unwrap();
     assert_eq!(rs.len(), 2);
     let (_, r1) = rows(&rs[0..1]);
@@ -51,20 +51,20 @@ fn executes_each_statement() {
 
 #[test]
 fn empty_sql_yields_no_results() {
-    let mut db = Database::open_in_memory();
+    let mut db = Database::open_in_memory().unwrap();
     assert_eq!(db.execute_sql("").unwrap().len(), 0);
     assert_eq!(db.execute_sql(";;").unwrap().len(), 0);
 }
 
 #[test]
 fn star_requires_from() {
-    let mut db = Database::open_in_memory();
+    let mut db = Database::open_in_memory().unwrap();
     assert!(db.execute_sql("select *;").is_err());
 }
 
 #[test]
 fn runtime_errors_propagate() {
-    let mut db = Database::open_in_memory();
+    let mut db = Database::open_in_memory().unwrap();
     let err = db.execute_sql("select 1/0;").unwrap_err();
     assert!(err.to_string().contains("division by zero"), "{err}");
 }
