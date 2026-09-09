@@ -1,6 +1,6 @@
 use crate::ast::{
-    BinOp, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt, ExplainStmt,
-    Expr, InsertStmt, SelectItem, SelectStmt, Stmt, UnOp, UpdateStmt,
+    AggFunc, BinOp, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt,
+    ExplainStmt, Expr, InsertStmt, Limit, SelectItem, SelectStmt, Stmt, UnOp, UpdateStmt,
 };
 use crate::catalog::Schema;
 use crate::index::{encode_key, BTree, Bound};
@@ -379,7 +379,31 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
         }
         out_rows.push(out_row);
     }
+    apply_limit(&mut out_rows, &s.limit)?;
     Ok(ResultSet::Rows { columns: headers, rows: out_rows })
+}
+
+fn apply_limit(out_rows: &mut Vec<Vec<Value>>, limit: &Option<Limit>) -> Result<()> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let count = match eval_const(&limit.count)? {
+        Value::Int(n) if n >= 0 => n as usize,
+        _ => return Err(Error::Runtime("limit count must be a non-negative integer".into())),
+    };
+    let offset = match &limit.offset {
+        Some(e) => match eval_const(e)? {
+            Value::Int(n) if n >= 0 => n as usize,
+            _ => {
+                return Err(Error::Runtime(
+                    "limit offset must be a non-negative integer".into(),
+                ))
+            }
+        },
+        None => 0,
+    };
+    *out_rows = out_rows.iter().skip(offset).take(count).cloned().collect();
+    Ok(())
 }
 
 fn execute_grouped_select(
@@ -446,6 +470,7 @@ fn execute_grouped_select(
         }
         out_rows.push(out_row);
     }
+    apply_limit(&mut out_rows, &s.limit)?;
     Ok(ResultSet::Rows { columns: headers, rows: out_rows })
 }
 

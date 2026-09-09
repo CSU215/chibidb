@@ -1,7 +1,7 @@
 use crate::ast::{
     AggFunc, BinOp, ColumnDef, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt,
-    DropIndexStmt, ExplainStmt, Expr, InsertStmt, SelectItem, SelectStmt, Stmt, TableRef, UnOp,
-    UpdateStmt,
+    DropIndexStmt, ExplainStmt, Expr, InsertStmt, Limit, SelectItem, SelectStmt, Stmt, TableRef,
+    UnOp, UpdateStmt,
 };
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
@@ -260,7 +260,35 @@ impl Parser {
                 }
             }
         }
-        Ok(Stmt::Select(SelectStmt { items, from, selection, group_by, having, order_by }))
+        let limit = if self.eat_keyword("limit") {
+            let count = self.parse_expr()?;
+            if !matches!(count, Expr::Int(_)) {
+                return Err(Error::Syntax("limit count must be a non-negative integer".into()));
+            }
+            let offset = if self.eat_keyword("offset") {
+                let off = self.parse_expr()?;
+                if !matches!(off, Expr::Int(_)) {
+                    return Err(Error::Syntax(
+                        "limit offset must be a non-negative integer".into(),
+                    ));
+                }
+                Some(off)
+            } else {
+                None
+            };
+            Some(Limit { count, offset })
+        } else {
+            None
+        };
+        Ok(Stmt::Select(SelectStmt {
+            items,
+            from,
+            selection,
+            group_by,
+            having,
+            order_by,
+            limit,
+        }))
     }
 
     fn parse_insert(&mut self) -> Result<Stmt> {

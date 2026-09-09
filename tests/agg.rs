@@ -286,6 +286,47 @@ fn order_by_aggregate_output() {
 }
 
 #[test]
+fn limit_and_offset() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int);").unwrap();
+        for i in 0..5 {
+            db.execute_sql(&format!("insert into t values ({i});")).unwrap();
+        }
+        let ids = |sql: &str, db: &mut Database| -> Vec<i64> {
+            let rs = db.execute_sql(sql).unwrap();
+            match &rs[0] {
+                chibidb::ResultSet::Rows { rows, .. } => rows
+                    .iter()
+                    .map(|r| match &r[0] {
+                        Value::Int(n) => *n,
+                        other => panic!("unexpected {other:?}"),
+                    })
+                    .collect(),
+                other => panic!("expected rows for {sql}, got {other:?}"),
+            }
+        };
+
+        assert_eq!(ids("select id from t limit 2;", db), [0, 1]);
+        assert_eq!(ids("select id from t limit 2 offset 1;", db), [1, 2]);
+        assert_eq!(ids("select id from t limit 0;", db), []);
+        assert_eq!(ids("select id from t limit 100;", db), [0, 1, 2, 3, 4]);
+        assert_eq!(ids("select id from t limit 100 offset 3;", db), [3, 4]);
+        assert_eq!(
+            ids("select id from t order by id desc limit 2;", db),
+            [4, 3],
+            "limit applies after order by"
+        );
+        assert_eq!(
+            ids("select id, count(*) from t group by id order by id desc limit 2;", db),
+            [4, 3],
+            "limit applies to grouped output"
+        );
+        err(db, "select id from t limit -1;");
+        err(db, "select id from t limit 'a';");
+    });
+}
+
+#[test]
 fn having_without_aggregate_still_works() {
     with_dbs(|db| {
         db.execute_sql("create table t (dept char(4), score int);").unwrap();

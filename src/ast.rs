@@ -175,6 +175,12 @@ pub enum SelectItem {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Limit {
+    pub count: Expr,
+    pub offset: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub items: Vec<SelectItem>,
     pub from: Option<TableRef>,
@@ -182,6 +188,7 @@ pub struct SelectStmt {
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
     pub order_by: Vec<(Expr, bool)>,
+    pub limit: Option<Limit>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

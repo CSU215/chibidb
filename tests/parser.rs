@@ -410,6 +410,7 @@ fn parses_explain() {
                     group_by: vec![],
                     having: None,
                     order_by: vec![],
+                    limit: None,
                 })
             );
         }
@@ -454,4 +455,18 @@ fn parses_order_by() {
 
     err("select 1 from t order;");
     err("select 1 from t order by;");
+}
+
+#[test]
+fn parses_limit() {
+    let s = select("select id from t limit 5;");
+    assert_eq!(s.limit.as_ref().unwrap().count.to_string(), "5");
+    assert_eq!(s.limit.as_ref().unwrap().offset, None);
+
+    let s = select("select id from t limit 5 offset 2;");
+    assert_eq!(s.limit.as_ref().unwrap().offset.as_ref().unwrap().to_string(), "2");
+
+    err("select 1 from t limit;");
+    err("select 1 from t limit 5 offset;");
+    err("select 1 from t limit 'a';");
 }
