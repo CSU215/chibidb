@@ -1,9 +1,8 @@
 use chibidb::index::node::{
     internal_child_for, internal_init, internal_insert_entry, internal_num,
-    leaf_entries, leaf_init, leaf_insert_at, leaf_lower_bound, leaf_remove_at, LEAF,
+    leaf_entries, leaf_init, leaf_insert_at, leaf_lower_bound, leaf_remove_at,
 };
-use chibidb::storage::{PageNo, PAGE_SIZE};
-use chibidb::storage::Rid;
+use chibidb::storage::{Rid, PAGE_SIZE};
 
 fn leaf_page() -> Box<[u8; PAGE_SIZE]> {
     let mut page = Box::new([0u8; PAGE_SIZE]);

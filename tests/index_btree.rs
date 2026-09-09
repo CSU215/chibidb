@@ -59,3 +59,39 @@ fn survives_reopen() {
     assert_eq!(tree.search(&mut bp, b"k1").unwrap(), [Rid::new(7, 3)]);
     assert_eq!(tree.search(&mut bp, b"k2").unwrap(), [Rid::new(7, 4)]);
 }
+
+#[test]
+fn splits_grow_height_and_stay_searchable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut bp, f) = setup(&dir, "d.idxf");
+    let tree = BTree::init(&mut bp, f).unwrap();
+
+    let n = 500;
+    for i in 0..n {
+        let key = format!("key{i:06}");
+        tree.insert(&mut bp, key.as_bytes(), Rid::new(1, i as u16)).unwrap();
+    }
+    assert!(tree.height(&mut bp).unwrap() >= 2, "tree must grow beyond a single leaf");
+    for i in 0..n {
+        let key = format!("key{i:06}");
+        assert_eq!(tree.search(&mut bp, key.as_bytes()).unwrap(), [Rid::new(1, i as u16)], "{key}");
+    }
+    assert_eq!(tree.search(&mut bp, b"key000500").unwrap(), []);
+}
+
+#[test]
+fn duplicates_survive_split_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut bp, f) = setup(&dir, "e.idxf");
+    let tree = BTree::init(&mut bp, f).unwrap();
+
+    for i in 0..300 {
+        tree.insert(&mut bp, b"dup", Rid::new(9, i as u16)).unwrap();
+    }
+    let got = tree.search(&mut bp, b"dup").unwrap();
+    assert_eq!(got.len(), 300);
+    for (i, rid) in got.iter().enumerate() {
+        assert_eq!(rid.slot, i as u16);
+    }
+}
+

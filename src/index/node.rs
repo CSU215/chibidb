@@ -88,6 +88,18 @@ pub fn leaf_lower_bound(page: &[u8], key: &[u8]) -> usize {
     n
 }
 
+/// First entry index whose key > `key` (insertion point after equal keys).
+pub fn leaf_upper_bound(page: &[u8], key: &[u8]) -> usize {
+    let n = leaf_num(page);
+    for i in 0..n {
+        let (k, _) = leaf_entry_at(page, i);
+        if k.as_slice() > key {
+            return i;
+        }
+    }
+    n
+}
+
 pub fn leaf_entries<'a>(page: &'a [u8]) -> impl Iterator<Item = (Vec<u8>, Rid)> + 'a {
     let n = leaf_num(page) as u16;
     (0..n).map(move |i| leaf_entry_at(page, i as usize))
