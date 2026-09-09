@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod datetime;
 mod error;
 pub mod exec;
+pub mod index;
 pub mod lexer;
 pub mod parser;
 mod repl;
