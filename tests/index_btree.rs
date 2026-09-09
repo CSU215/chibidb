@@ -1,4 +1,4 @@
-use chibidb::index::BTree;
+use chibidb::index::{BTree, Bound};
 use chibidb::storage::{BufferPool, DiskManager, Rid};
 
 fn setup(dir: &tempfile::TempDir, name: &str) -> (BufferPool, u32) {
@@ -93,5 +93,81 @@ fn duplicates_survive_split_boundary() {
     for (i, rid) in got.iter().enumerate() {
         assert_eq!(rid.slot, i as u16);
     }
+}
+
+fn seeded_tree(dir: &tempfile::TempDir, name: &str, n: u32) -> (BufferPool, u32, BTree) {
+    let (mut bp, f) = setup(dir, name);
+    let tree = BTree::init(&mut bp, f).unwrap();
+    for i in 0..n {
+        let key = format!("key{i:06}");
+        tree.insert(&mut bp, key.as_bytes(), Rid::new(1, i as u16)).unwrap();
+    }
+    (bp, f, tree)
+}
+
+fn keys_of(res: &[(Vec<u8>, Rid)]) -> Vec<String> {
+    res.iter().map(|(k, _)| String::from_utf8(k.clone()).unwrap()).collect()
+}
+
+#[test]
+fn scans_closed_range_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut bp, _f, tree) = seeded_tree(&dir, "f.idxf", 500);
+
+    let got = tree
+        .scan_range(
+            &mut bp,
+            Bound::Included(b"key000100"),
+            Bound::Included(b"key000199"),
+        )
+        .unwrap();
+    let keys = keys_of(&got);
+    assert_eq!(keys.len(), 100);
+    assert_eq!(keys[0], "key000100");
+    assert_eq!(keys[99], "key000199");
+    for w in keys.windows(2) {
+        assert!(w[0] < w[1], "{} < {}", w[0], w[1]);
+    }
+    assert_eq!(got[0].1, Rid::new(1, 100));
+}
+
+#[test]
+fn scans_open_and_unbounded_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut bp, _f, tree) = seeded_tree(&dir, "g.idxf", 500);
+
+    let got = tree
+        .scan_range(&mut bp, Bound::Included(b"key000100"), Bound::Excluded(b"key000200"))
+        .unwrap();
+    let keys = keys_of(&got);
+    assert_eq!(keys.len(), 100);
+    assert_eq!(keys[0], "key000100");
+    assert_eq!(keys[99], "key000199");
+
+    let got = tree
+        .scan_range(&mut bp, Bound::Excluded(b"key000100"), Bound::Included(b"key000105"))
+        .unwrap();
+    let keys = keys_of(&got);
+    assert_eq!(keys, ["key000101", "key000102", "key000103", "key000104", "key000105"]);
+
+    let got = tree.scan_range(&mut bp, Bound::Unbounded, Bound::Unbounded).unwrap();
+    let keys = keys_of(&got);
+    assert_eq!(keys.len(), 500);
+    assert_eq!(keys[0], "key000000");
+    assert_eq!(keys[499], "key000499");
+}
+
+#[test]
+fn scan_of_empty_and_missing_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut bp, _f, tree) = seeded_tree(&dir, "h.idxf", 100);
+    let got = tree
+        .scan_range(&mut bp, Bound::Included(b"zzz"), Bound::Unbounded)
+        .unwrap();
+    assert_eq!(got.len(), 0);
+    let got = tree
+        .scan_range(&mut bp, Bound::Unbounded, Bound::Included(b"aaa"))
+        .unwrap();
+    assert_eq!(got.len(), 0);
 }
 

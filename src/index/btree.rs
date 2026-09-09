@@ -10,6 +10,13 @@ use crate::{Error, Result};
 
 const MAGIC: [u8; 8] = *b"CHIDBTX1";
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Bound<'a> {
+    Included(&'a [u8]),
+    Excluded(&'a [u8]),
+    Unbounded,
+}
+
 pub struct BTree {
     file: FileId,
 }
@@ -246,6 +253,86 @@ impl BTree {
                 Ok(Some((promoted, new_no)))
             }
             Err(e) => Err(e),
+        }
+    }
+
+    pub fn scan_range(
+        &self,
+        bp: &mut BufferPool,
+        start: Bound,
+        end: Bound,
+    ) -> Result<Vec<(Vec<u8>, Rid)>> {
+        let root = self.root(bp)?;
+        if root == 0 {
+            return Ok(vec![]);
+        }
+        let (mut page_no, mut pos) = match start {
+            Bound::Unbounded => {
+                let first = self.header_u32(bp, 12)?;
+                if first == 0 {
+                    return Ok(vec![]);
+                }
+                (first, 0)
+            }
+            Bound::Included(key) | Bound::Excluded(key) => {
+                let leaf = self.descend(bp, root, key)?;
+                // walk back to the first leaf holding this key (duplicate run)
+                let mut leaf = leaf;
+                loop {
+                    let back = bp.read_page(self.file, leaf, |page| {
+                        let prev = leaf_prev(page);
+                        if prev == 0 || leaf_num(page) == 0 {
+                            return Ok(None);
+                        }
+                        let (first_key, _) = leaf_entry(page, 0);
+                        if first_key.as_slice() == key {
+                            Ok(Some(prev))
+                        } else {
+                            Ok(None)
+                        }
+                    })?;
+                    match back {
+                        Some(prev) => leaf = prev,
+                        None => break,
+                    }
+                }
+                (leaf, bp.read_page(self.file, leaf, |page| Ok(leaf_lower_bound(page, key)))?)
+            }
+        };
+
+        let mut out = Vec::new();
+        loop {
+            let next = bp.read_page(self.file, page_no, |page| {
+                while pos < leaf_num(page) {
+                    let (k, rid) = leaf_entry(page, pos);
+                    pos += 1;
+                    let after_start = match start {
+                        Bound::Unbounded => true,
+                        Bound::Included(s) => k.as_slice() >= s,
+                        Bound::Excluded(s) => k.as_slice() > s,
+                    };
+                    if !after_start {
+                        continue;
+                    }
+                    let past_end = match end {
+                        Bound::Unbounded => false,
+                        Bound::Included(e) => k.as_slice() > e,
+                        Bound::Excluded(e) => k.as_slice() >= e,
+                    };
+                    if past_end {
+                        return Ok(None);
+                    }
+                    out.push((k, rid));
+                }
+                Ok(Some(leaf_next(page)))
+            })?;
+            match next {
+                Some(next) if next != 0 => {
+                    page_no = next;
+                    pos = 0;
+                }
+                _ => return Ok(out),
+            }
         }
     }
 
