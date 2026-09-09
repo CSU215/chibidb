@@ -2,7 +2,8 @@ use crate::ast::{
     BinOp, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt, Expr,
     InsertStmt, SelectItem, SelectStmt, Stmt, UnOp, UpdateStmt,
 };
-use crate::catalog::Schema;
+use crate::catalog::{HeapStore, IndexStore, Schema};
+use crate::index::{encode_key, BTree};
 use crate::result::ResultSet;
 use crate::value::Value;
 use crate::{Database, Error, Result};
@@ -10,14 +11,41 @@ use crate::{Database, Error, Result};
 pub fn execute(db: &mut Database, stmt: &Stmt) -> Result<ResultSet> {
     match stmt {
         Stmt::CreateTable(c) => execute_create_table(db, c),
+        Stmt::CreateIndex(c) => execute_create_index(db, c),
+        Stmt::DropIndex(d) => execute_drop_index(db, d),
         Stmt::Insert(i) => execute_insert(db, i),
         Stmt::Select(s) => execute_select(db, s),
         Stmt::Delete(d) => execute_delete(db, d),
         Stmt::Update(u) => execute_update(db, u),
-        Stmt::CreateIndex(_) | Stmt::DropIndex(_) => {
-            Err(Error::Runtime("not implemented yet".into()))
-        }
     }
+}
+
+fn execute_create_index(db: &mut Database, c: &CreateIndexStmt) -> Result<ResultSet> {
+    let schema = db.catalog().table(&c.table)?.schema.clone();
+    let col_idx = schema
+        .index_of(&c.column)
+        .ok_or_else(|| Error::Runtime(format!("no such column: {}", c.column)))?;
+    let store = db.new_index_heap(&c.name)?;
+    let scan = db.store_scan(&c.table)?;
+    let btree = BTree::at(store.file);
+    for (rid, row) in scan {
+        let key = encode_key(&row[col_idx])?;
+        btree.insert(&mut db.pool, &key, rid)?;
+    }
+    db.catalog_mut().create_index(
+        &c.name,
+        c.table.clone(),
+        c.column.clone(),
+        store,
+    )?;
+    db.save_catalog()?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_drop_index(db: &mut Database, d: &DropIndexStmt) -> Result<ResultSet> {
+    db.catalog_mut().drop_index(&d.name)?;
+    db.save_catalog()?;
+    Ok(ResultSet::Message("SUCCESS".into()))
 }
 
 fn execute_update(db: &mut Database, u: &UpdateStmt) -> Result<ResultSet> {
@@ -44,26 +72,26 @@ fn execute_update(db: &mut Database, u: &UpdateStmt) -> Result<ResultSet> {
             let v = eval(expr, Some((&schema, &row)))?;
             new_row[*idx] = coerce(v, *dtype, col)?;
         }
-        updates.push((rid, new_row));
+        updates.push((rid, row, new_row));
     }
-    db.store_replace_all(&u.table, updates)?;
+    db.store_replace_all(&u.table, &updates)?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
 fn execute_delete(db: &mut Database, d: &DeleteStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&d.table)?.schema.clone();
     let scan = db.store_scan(&d.table)?;
-    let mut to_delete = Vec::new();
+    let mut victims = Vec::new();
     for (rid, row) in scan {
         let matched = match &d.selection {
             Some(sel) => eval_predicate(sel, &schema, &row)?,
             None => true,
         };
         if matched {
-            to_delete.push(rid);
+            victims.push((rid, row));
         }
     }
-    db.store_delete_all(&d.table, &to_delete)?;
+    db.store_delete_all(&d.table, &victims)?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 

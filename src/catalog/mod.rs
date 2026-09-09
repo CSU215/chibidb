@@ -6,7 +6,7 @@ use crate::{Error, Result};
 
 pub mod meta;
 
-use meta::TableMeta;
+use meta::{IndexMeta, TableMeta};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDesc {
@@ -32,6 +32,20 @@ pub(crate) struct HeapStore {
 }
 
 #[derive(Debug)]
+pub(crate) struct IndexStore {
+    pub file: FileId,
+    pub file_no: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct IndexEntry {
+    pub name: String,
+    pub table: String,
+    pub column: String,
+    pub store: IndexStore,
+}
+
+#[derive(Debug)]
 pub struct Table {
     pub schema: Schema,
     pub(crate) heap: HeapStore,
@@ -40,6 +54,7 @@ pub struct Table {
 #[derive(Debug, Default)]
 pub struct Catalog {
     tables: BTreeMap<String, Table>,
+    indexes: BTreeMap<String, IndexEntry>,
 }
 
 impl Catalog {
@@ -81,5 +96,45 @@ impl Catalog {
                 TableMeta { name: name.clone(), columns, file_no: t.heap.file_no }
             })
             .collect()
+    }
+
+    pub(crate) fn create_index(
+        &mut self,
+        name: &str,
+        table: String,
+        column: String,
+        store: IndexStore,
+    ) -> Result<()> {
+        if self.indexes.contains_key(name) {
+            return Err(Error::Runtime(format!("index already exists: {name}")));
+        }
+        self.indexes.insert(
+            name.to_string(),
+            IndexEntry { name: name.to_string(), table, column, store },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn drop_index(&mut self, name: &str) -> Result<()> {
+        self.indexes
+            .remove(name)
+            .ok_or_else(|| Error::Runtime(format!("no such index: {name}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn index_metas(&self) -> Vec<IndexMeta> {
+        self.indexes
+            .values()
+            .map(|ix| IndexMeta {
+                name: ix.name.clone(),
+                table: ix.table.clone(),
+                column: ix.column.clone(),
+                file_no: ix.store.file_no,
+            })
+            .collect()
+    }
+
+    pub(crate) fn indexes_for(&self, table: &str) -> Vec<&IndexEntry> {
+        self.indexes.values().filter(|ix| ix.table == table).collect()
     }
 }

@@ -27,6 +27,11 @@ pub struct BTree {
 }
 
 impl BTree {
+    /// Unvalidated handle for an already-initialized index file.
+    pub fn at(file: FileId) -> Self {
+        Self { file }
+    }
+
     pub fn init(bp: &mut BufferPool, file: FileId) -> Result<Self> {
         if bp.page_count(file)? != 0 {
             return Err(Error::Runtime("cannot init index file: file not empty".into()));
