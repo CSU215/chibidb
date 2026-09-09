@@ -1,6 +1,6 @@
 use crate::ast::{
     BinOp, ColumnDef, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt,
-    Expr, InsertStmt, SelectItem, SelectStmt, Stmt, TableRef, UnOp, UpdateStmt,
+    ExplainStmt, Expr, InsertStmt, SelectItem, SelectStmt, Stmt, TableRef, UnOp, UpdateStmt,
 };
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
@@ -85,6 +85,13 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Stmt> {
+        if self.eat_keyword("explain") {
+            if !self.at_keyword("select") {
+                return Err(self.unexpected("select after explain"));
+            }
+            let inner = self.parse_statement()?;
+            return Ok(Stmt::Explain(ExplainStmt { stmt: Box::new(inner) }));
+        }
         if self.eat_keyword("select") {
             return self.parse_select();
         }

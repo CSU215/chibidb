@@ -133,6 +133,11 @@ pub struct DropIndexStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ExplainStmt {
+    pub stmt: Box<Stmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
@@ -157,6 +162,7 @@ pub enum Stmt {
     CreateTable(CreateTableStmt),
     Delete(DeleteStmt),
     DropIndex(DropIndexStmt),
+    Explain(ExplainStmt),
     Insert(InsertStmt),
     Select(SelectStmt),
     Update(UpdateStmt),

@@ -1,10 +1,11 @@
 use crate::ast::{
-    BinOp, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt, Expr,
-    InsertStmt, SelectItem, SelectStmt, Stmt, UnOp, UpdateStmt,
+    BinOp, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt, ExplainStmt,
+    Expr, InsertStmt, SelectItem, SelectStmt, Stmt, UnOp, UpdateStmt,
 };
-use crate::catalog::{HeapStore, IndexStore, Schema};
-use crate::index::{encode_key, BTree};
+use crate::catalog::Schema;
+use crate::index::{encode_key, BTree, Bound};
 use crate::result::ResultSet;
+use crate::storage::Rid;
 use crate::value::Value;
 use crate::{Database, Error, Result};
 
@@ -17,7 +18,119 @@ pub fn execute(db: &mut Database, stmt: &Stmt) -> Result<ResultSet> {
         Stmt::Select(s) => execute_select(db, s),
         Stmt::Delete(d) => execute_delete(db, d),
         Stmt::Update(u) => execute_update(db, u),
+        Stmt::Explain(e) => execute_explain(db, e),
     }
+}
+
+fn execute_explain(db: &mut Database, e: &ExplainStmt) -> Result<ResultSet> {
+    match &*e.stmt {
+        Stmt::Select(s) => Ok(ResultSet::Message(plan_select(db, s)?)),
+        _ => Err(Error::Runtime("explain supports select only".into())),
+    }
+}
+
+fn plan_select(db: &mut Database, s: &SelectStmt) -> Result<String> {
+    let Some(from) = &s.from else {
+        return Ok("ConstantSelect -> Project".into());
+    };
+    match find_sargable(db, &from.name, s.selection.as_ref())? {
+        Some(sarg) => Ok(format!(
+            "IndexScan(index={}, table={}, where {} {}) -> Filter -> Project",
+            sarg.index, from.name, sarg.column, sarg.op
+        )),
+        None => Ok(format!("FullScan(table={}) -> Filter -> Project", from.name)),
+    }
+}
+
+struct Sargable {
+    index: String,
+    column: String,
+    dtype: DataType,
+    op: BinOp,
+    lit: Expr,
+}
+
+fn split_conjuncts(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::Binary(BinOp::And, l, r) => {
+            let mut out = split_conjuncts(l);
+            out.extend(split_conjuncts(r));
+            out
+        }
+        other => vec![other],
+    }
+}
+
+fn expr_has_column(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_) => true,
+        Expr::Unary(_, e) => expr_has_column(e),
+        Expr::Binary(_, l, r) => expr_has_column(l) || expr_has_column(r),
+        Expr::IsNull(e, _) => expr_has_column(e),
+        _ => false,
+    }
+}
+
+fn flip_cmp(op: BinOp) -> Option<BinOp> {
+    match op {
+        BinOp::Eq => Some(BinOp::Eq),
+        BinOp::Lt => Some(BinOp::Gt),
+        BinOp::Le => Some(BinOp::Ge),
+        BinOp::Gt => Some(BinOp::Lt),
+        BinOp::Ge => Some(BinOp::Le),
+        _ => None,
+    }
+}
+
+/// Rule-based access path choice: an equality or range predicate over an
+/// indexed column (even buried in an AND chain) uses the index.
+fn find_sargable(
+    db: &mut Database,
+    table: &str,
+    selection: Option<&Expr>,
+) -> Result<Option<Sargable>> {
+    let Some(sel) = selection else {
+        return Ok(None);
+    };
+    let schema = &db.catalog().table(table)?.schema;
+    for conj in split_conjuncts(sel) {
+        let (col_expr, op, lit) = match conj {
+            Expr::Binary(op @ (BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge), l, r) => {
+                if matches!(**l, Expr::Column(_)) && !expr_has_column(r) {
+                    ((**l).clone(), *op, (**r).clone())
+                } else if matches!(**r, Expr::Column(_)) && !expr_has_column(l) {
+                    match flip_cmp(*op) {
+                        Some(flip) => ((**r).clone(), flip, (**l).clone()),
+                        None => continue,
+                    }
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        let Expr::Column(cname) = col_expr else {
+            continue;
+        };
+        let Some(col_idx) = schema.index_of(&cname) else {
+            continue;
+        };
+        let ix = db
+            .catalog()
+            .indexes_for(table)
+            .into_iter()
+            .find(|ix| ix.column == cname);
+        if let Some(ix) = ix {
+            return Ok(Some(Sargable {
+                index: ix.name.clone(),
+                column: cname,
+                dtype: schema.columns[col_idx].dtype,
+                op,
+                lit,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 fn execute_create_index(db: &mut Database, c: &CreateIndexStmt) -> Result<ResultSet> {
@@ -194,6 +307,7 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
         }
         return Ok(ResultSet::Rows { columns, rows: vec![row] });
     };
+    let sarg = find_sargable(db, &from.name, s.selection.as_ref())?;
     let schema = db.catalog().table(&from.name)?.schema.clone();
     let mut headers = Vec::new();
     let mut exprs = Vec::new();
@@ -211,7 +325,31 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
             }
         }
     }
-    let scan = db.store_scan(&from.name)?;
+    let scan = match sarg {
+        Some(sarg) => {
+            let lit_val = eval_const(&sarg.lit)?;
+            let coerced = coerce(lit_val, sarg.dtype, &sarg.column)?;
+            let key = encode_key(&coerced)?;
+            let ix_file = db
+                .catalog()
+                .indexes_for(&from.name)
+                .into_iter()
+                .find(|ix| ix.name == sarg.index)
+                .map(|ix| ix.store.file)
+                .expect("sargable index exists");
+            let btree = BTree::at(ix_file);
+            let rids: Vec<Rid> = match sarg.op {
+                BinOp::Eq => btree.search(&mut db.pool, &key)?,
+                BinOp::Lt => scan_rids(&btree, &mut db.pool, Bound::Unbounded, Bound::Excluded(&key))?,
+                BinOp::Le => scan_rids(&btree, &mut db.pool, Bound::Unbounded, Bound::Included(&key))?,
+                BinOp::Gt => scan_rids(&btree, &mut db.pool, Bound::Excluded(&key), Bound::Unbounded)?,
+                BinOp::Ge => scan_rids(&btree, &mut db.pool, Bound::Included(&key), Bound::Unbounded)?,
+                _ => unreachable!("sargable ops are restricted"),
+            };
+            db.store_get_rows(&from.name, &rids)?
+        }
+        None => db.store_scan(&from.name)?,
+    };
     let mut out_rows = Vec::new();
     for (_, row) in scan {
         if let Some(sel) = &s.selection {
@@ -226,6 +364,19 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
         out_rows.push(out_row);
     }
     Ok(ResultSet::Rows { columns: headers, rows: out_rows })
+}
+
+fn scan_rids(
+    btree: &BTree,
+    pool: &mut crate::storage::BufferPool,
+    start: Bound,
+    end: Bound,
+) -> Result<Vec<Rid>> {
+    Ok(btree
+        .scan_range(pool, start, end)?
+        .into_iter()
+        .map(|(_, rid)| rid)
+        .collect())
 }
 
 pub fn eval_const(expr: &Expr) -> Result<Value> {

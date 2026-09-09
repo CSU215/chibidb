@@ -395,3 +395,23 @@ fn index_ddl_syntax_errors() {
     err("create index i on t;");
     err("drop index;");
 }
+
+#[test]
+fn parses_explain() {
+    let stmts = parse("explain select 1;").unwrap();
+    match &stmts[0] {
+        Stmt::Explain(inner) => {
+            assert_eq!(
+                *inner.stmt,
+                Stmt::Select(chibidb::ast::SelectStmt {
+                    items: vec![chibidb::ast::SelectItem::Expr(chibidb::ast::Expr::Int(1))],
+                    from: None,
+                    selection: None,
+                })
+            );
+        }
+        other => panic!("expected explain, got {other:?}"),
+    }
+    err("explain;");
+    err("explain create table t (id int);");
+}

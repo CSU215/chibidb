@@ -203,6 +203,22 @@ impl Database {
         Ok(rid)
     }
 
+    pub(crate) fn store_get_rows(
+        &mut self,
+        name: &str,
+        rids: &[Rid],
+    ) -> Result<Vec<(Rid, Vec<Value>)>> {
+        let file = self.catalog.table(name)?.heap.file;
+        let heap = HeapFile::at(file);
+        let mut out = Vec::new();
+        for rid in rids {
+            let rec = heap.get(&mut self.pool, *rid)?;
+            let (row, _) = decode_row(&rec)?;
+            out.push((*rid, row));
+        }
+        Ok(out)
+    }
+
     pub(crate) fn store_delete_all(
         &mut self,
         name: &str,
@@ -231,16 +247,13 @@ impl Database {
         for (rid, old_row, new_row) in updates {
             heap.delete(&mut self.pool, *rid)?;
             let data = encode_row(new_row);
-            heap.insert(&mut self.pool, &data)?;
+            let new_rid = heap.insert(&mut self.pool, &data)?;
             for (ci, ix_file) in &ops {
                 let old_key = encode_key(&old_row[*ci])?;
                 let new_key = encode_key(&new_row[*ci])?;
-                if old_key == new_key {
-                    continue;
-                }
                 let btree = BTree::at(*ix_file);
                 btree.delete(&mut self.pool, &old_key, *rid)?;
-                btree.insert(&mut self.pool, &new_key, *rid)?;
+                btree.insert(&mut self.pool, &new_key, new_rid)?;
             }
         }
         Ok(())
