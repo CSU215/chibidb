@@ -1,6 +1,6 @@
 use crate::ast::{
-    BinOp, CreateTableStmt, DataType, DeleteStmt, Expr, InsertStmt, SelectItem, SelectStmt,
-    Stmt, UnOp, UpdateStmt,
+    BinOp, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt, Expr,
+    InsertStmt, SelectItem, SelectStmt, Stmt, UnOp, UpdateStmt,
 };
 use crate::catalog::Schema;
 use crate::result::ResultSet;
@@ -14,6 +14,9 @@ pub fn execute(db: &mut Database, stmt: &Stmt) -> Result<ResultSet> {
         Stmt::Select(s) => execute_select(db, s),
         Stmt::Delete(d) => execute_delete(db, d),
         Stmt::Update(u) => execute_update(db, u),
+        Stmt::CreateIndex(_) | Stmt::DropIndex(_) => {
+            Err(Error::Runtime("not implemented yet".into()))
+        }
     }
 }
 

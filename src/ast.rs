@@ -121,6 +121,18 @@ pub struct UpdateStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndexStmt {
+    pub name: String,
+    pub table: String,
+    pub column: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndexStmt {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
@@ -141,8 +153,10 @@ pub struct SelectStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
+    CreateIndex(CreateIndexStmt),
     CreateTable(CreateTableStmt),
     Delete(DeleteStmt),
+    DropIndex(DropIndexStmt),
     Insert(InsertStmt),
     Select(SelectStmt),
     Update(UpdateStmt),

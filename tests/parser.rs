@@ -363,3 +363,35 @@ fn parses_is_null() {
     err("select a is not;");
     err("select a is maybe;");
 }
+
+#[test]
+fn parses_create_index() {
+    let stmts = parse("create index idx_name on student (id);").unwrap();
+    match &stmts[0] {
+        Stmt::CreateIndex(c) => {
+            assert_eq!(c.name, "idx_name");
+            assert_eq!(c.table, "student");
+            assert_eq!(c.column, "id");
+        }
+        other => panic!("expected create index, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_drop_index() {
+    let stmts = parse("drop index idx_name;").unwrap();
+    match &stmts[0] {
+        Stmt::DropIndex(d) => assert_eq!(d.name, "idx_name"),
+        other => panic!("expected drop index, got {other:?}"),
+    }
+}
+
+#[test]
+fn index_ddl_syntax_errors() {
+    err("create index on t (c);");
+    err("create index i t (c);");
+    err("create index i on (c);");
+    err("create index i on t ();");
+    err("create index i on t;");
+    err("drop index;");
+}

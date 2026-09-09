@@ -1,6 +1,6 @@
 use crate::ast::{
-    BinOp, ColumnDef, CreateTableStmt, DataType, DeleteStmt, Expr, InsertStmt, SelectItem,
-    SelectStmt, Stmt, TableRef, UnOp, UpdateStmt,
+    BinOp, ColumnDef, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt,
+    Expr, InsertStmt, SelectItem, SelectStmt, Stmt, TableRef, UnOp, UpdateStmt,
 };
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
@@ -89,10 +89,28 @@ impl Parser {
             return self.parse_select();
         }
         if self.eat_keyword("create") {
+            if self.eat_keyword("index") {
+                let name = self.parse_ident("index name")?;
+                if !self.eat_keyword("on") {
+                    return Err(self.unexpected("on"));
+                }
+                let table = self.parse_ident("table name")?;
+                self.expect_punct(Punct::LParen)?;
+                let column = self.parse_ident("column name")?;
+                self.expect_punct(Punct::RParen)?;
+                return Ok(Stmt::CreateIndex(CreateIndexStmt { name, table, column }));
+            }
             if !self.eat_keyword("table") {
                 return Err(self.unexpected("table"));
             }
             return self.parse_create_table();
+        }
+        if self.eat_keyword("drop") {
+            if !self.eat_keyword("index") {
+                return Err(self.unexpected("index"));
+            }
+            let name = self.parse_ident("index name")?;
+            return Ok(Stmt::DropIndex(DropIndexStmt { name }));
         }
         if self.eat_keyword("insert") {
             if !self.eat_keyword("into") {
