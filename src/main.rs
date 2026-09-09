@@ -27,7 +27,7 @@ async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.len() {
         // REPL, in-memory
-        1 => repl(Database::open_in_memory()).await,
+        1 => repl(Database::open_in_memory().expect("cannot open database")).await,
         // REPL, file-backed
         2 if args[1] != "serve" && args[1] != "client" => repl(open(&args[1])).await,
         // server
