@@ -639,9 +639,8 @@ fn cmp_values(l: &Value, r: &Value) -> Result<Option<std::cmp::Ordering>> {
         (Value::Str(a), Value::Str(b)) => Some(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
         (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
-        (Value::Date(a), Value::Str(b)) | (Value::Str(b), Value::Date(a)) => {
-            Some(crate::datetime::parse_date(b)?.cmp(a))
-        }
+        (Value::Date(a), Value::Str(b)) => Some(a.cmp(&crate::datetime::parse_date(b)?)),
+        (Value::Str(a), Value::Date(b)) => Some(crate::datetime::parse_date(a)?.cmp(b)),
         _ => return Err(type_mismatch()),
     };
     Ok(ord)
@@ -649,6 +648,9 @@ fn cmp_values(l: &Value, r: &Value) -> Result<Option<std::cmp::Ordering>> {
 
 fn compare(op: BinOp, l: Value, r: Value) -> Result<Value> {
     use std::cmp::Ordering::{Equal, Greater, Less};
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Ok(Value::Null);
+    }
     let res = match cmp_values(&l, &r)? {
         None => matches!(op, BinOp::NotEq),
         Some(Less) => matches!(op, BinOp::Lt | BinOp::Le | BinOp::NotEq),
