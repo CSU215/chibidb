@@ -68,6 +68,7 @@ impl Database {
                         .columns
                         .iter()
                         .map(|(name, dtype)| ColumnDesc {
+                            owner: None,
                             name: name.clone(),
                             dtype: *dtype,
                         })

@@ -16,6 +16,7 @@ pub enum Punct {
     Le,
     Gt,
     Ge,
+    Dot,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +100,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             b'*' => push_punct(&mut out, &mut i, Punct::Star, 1),
             b'/' => push_punct(&mut out, &mut i, Punct::Slash, 1),
             b'=' => push_punct(&mut out, &mut i, Punct::Eq, 1),
+            b'.' => push_punct(&mut out, &mut i, Punct::Dot, 1),
             b'<' => {
                 let (p, len) = match bytes.get(i + 1) {
                     Some(b'=') => (Punct::Le, 2),

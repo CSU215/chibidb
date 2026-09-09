@@ -163,7 +163,8 @@ impl Parser {
         }
     }
 
-    const RESERVED: &[&str] = &["where", "group", "having", "order", "limit", "on"];
+    const RESERVED: &[&str] =
+        &["where", "group", "having", "order", "limit", "on", "join", "inner", "left", "right"];
 
     fn agg_func(name: &str) -> Option<AggFunc> {
         if name.eq_ignore_ascii_case("count") {
@@ -198,27 +199,41 @@ impl Parser {
             if self.eat_punct(Punct::Star) {
                 items.push(SelectItem::Star);
             } else {
-                items.push(SelectItem::Expr(self.parse_expr()?));
+                let expr = self.parse_expr()?;
+                if self.eat_keyword("as") {
+                    let alias = self.parse_ident("alias")?;
+                    items.push(SelectItem::Aliased(expr, alias));
+                } else {
+                    items.push(SelectItem::Expr(expr));
+                }
             }
             if !self.eat_punct(Punct::Comma) {
                 break;
             }
         }
-        let from = if self.eat_keyword("from") {
-            let name = self.parse_ident("table name")?;
-            let alias = if self.eat_keyword("as") {
-                Some(self.parse_ident("alias")?)
-            } else if self.at_reserved() {
-                None
-            } else if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Ident(_))) {
-                Some(self.parse_ident("alias")?)
-            } else {
-                None
-            };
-            Some(TableRef { name, alias })
-        } else {
-            None
-        };
+        let mut from = Vec::new();
+        let mut on = Vec::new();
+        if self.eat_keyword("from") {
+            from.push(self.parse_table_ref()?);
+            loop {
+                if self.eat_punct(Punct::Comma) {
+                    from.push(self.parse_table_ref()?);
+                    continue;
+                }
+                if self.eat_keyword("inner") && !self.at_keyword("join") {
+                    return Err(self.unexpected("join"));
+                }
+                if self.eat_keyword("join") {
+                    from.push(self.parse_table_ref()?);
+                    if !self.eat_keyword("on") {
+                        return Err(self.unexpected("on"));
+                    }
+                    on.push(self.parse_expr()?);
+                    continue;
+                }
+                break;
+            }
+        }
         let selection = if self.eat_keyword("where") {
             Some(self.parse_expr()?)
         } else {
@@ -283,12 +298,27 @@ impl Parser {
         Ok(Stmt::Select(SelectStmt {
             items,
             from,
+            on,
             selection,
             group_by,
             having,
             order_by,
             limit,
         }))
+    }
+
+    fn parse_table_ref(&mut self) -> Result<TableRef> {
+        let name = self.parse_ident("table name")?;
+        let alias = if self.eat_keyword("as") {
+            Some(self.parse_ident("alias")?)
+        } else if self.at_reserved() {
+            None
+        } else if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Ident(_))) {
+            Some(self.parse_ident("alias")?)
+        } else {
+            None
+        };
+        Ok(TableRef { name, alias })
     }
 
     fn parse_insert(&mut self) -> Result<Stmt> {
@@ -517,6 +547,22 @@ impl Parser {
                 self.expect_punct(Punct::RParen)?;
                 return Ok(Expr::Aggregate(func, arg));
             }
+        }
+        // qualified column: ident '.' ident
+        if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Ident(_)))
+            && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::Punct(Punct::Dot)))
+            && matches!(self.tokens.get(self.pos + 2).map(|t| &t.kind), Some(TokenKind::Ident(_)))
+        {
+            let table = match self.bump() {
+                Some(Token { kind: TokenKind::Ident(s), .. }) => s.clone(),
+                _ => unreachable!(),
+            };
+            self.pos += 1; // '.'
+            let name = match self.bump() {
+                Some(Token { kind: TokenKind::Ident(s), .. }) => s.clone(),
+                _ => unreachable!(),
+            };
+            return Ok(Expr::QualifiedColumn(table, name));
         }
         match self.bump() {
             Some(Token { kind: TokenKind::Int(n), .. }) => Ok(Expr::Int(*n)),

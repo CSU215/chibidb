@@ -55,6 +55,7 @@ pub enum Expr {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     IsNull(Box<Expr>, bool),
     Aggregate(AggFunc, Option<Box<Expr>>),
+    QualifiedColumn(String, String),
 }
 
 impl fmt::Display for Expr {
@@ -71,6 +72,7 @@ impl fmt::Display for Expr {
             Expr::IsNull(e, true) => write!(f, "(is-not-null {e})"),
             Expr::Aggregate(func, None) => write!(f, "({func} *)"),
             Expr::Aggregate(func, Some(e)) => write!(f, "({func} {e})"),
+            Expr::QualifiedColumn(t, c) => write!(f, "{t}.{c}"),
         }
     }
 }
@@ -172,6 +174,7 @@ pub struct TableRef {
 pub enum SelectItem {
     Star,
     Expr(Expr),
+    Aliased(Expr, String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -183,7 +186,8 @@ pub struct Limit {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub items: Vec<SelectItem>,
-    pub from: Option<TableRef>,
+    pub from: Vec<TableRef>,
+    pub on: Vec<Expr>,
     pub selection: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,

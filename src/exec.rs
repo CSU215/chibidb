@@ -30,15 +30,21 @@ fn execute_explain(db: &mut Database, e: &ExplainStmt) -> Result<ResultSet> {
 }
 
 fn plan_select(db: &mut Database, s: &SelectStmt) -> Result<String> {
-    let Some(from) = &s.from else {
+    if s.from.is_empty() {
         return Ok("ConstantSelect -> Project".into());
-    };
-    match find_sargable(db, &from.name, s.selection.as_ref())? {
+    }
+    if s.from.len() > 1 {
+        return Ok(format!(
+            "NestedLoopJoin(tables={}) -> Filter -> Project",
+            s.from.len()
+        ));
+    }
+    match find_sargable(db, &s.from[0].name, s.selection.as_ref())? {
         Some(sarg) => Ok(format!(
             "IndexScan(index={}, table={}, where {} {}) -> Filter -> Project",
-            sarg.index, from.name, sarg.column, sarg.op
+            sarg.index, s.from[0].name, sarg.column, sarg.op
         )),
-        None => Ok(format!("FullScan(table={}) -> Filter -> Project", from.name)),
+        None => Ok(format!("FullScan(table={}) -> Filter -> Project", s.from[0].name)),
     }
 }
 
@@ -61,9 +67,9 @@ fn split_conjuncts(expr: &Expr) -> Vec<&Expr> {
     }
 }
 
-fn expr_has_column(expr: &Expr) -> bool {
+pub(crate) fn expr_has_column(expr: &Expr) -> bool {
     match expr {
-        Expr::Column(_) => true,
+        Expr::Column(_) | Expr::QualifiedColumn(..) => true,
         Expr::Unary(_, e) => expr_has_column(e),
         Expr::Binary(_, l, r) => expr_has_column(l) || expr_has_column(r),
         Expr::IsNull(e, _) => expr_has_column(e),
@@ -279,6 +285,7 @@ fn execute_create_table(db: &mut Database, c: &CreateTableStmt) -> Result<Result
             .columns
             .iter()
             .map(|cd| crate::catalog::ColumnDesc {
+                owner: None,
                 name: cd.name.clone(),
                 dtype: cd.dtype,
             })
@@ -291,7 +298,7 @@ fn execute_create_table(db: &mut Database, c: &CreateTableStmt) -> Result<Result
 }
 
 fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
-    let Some(from) = &s.from else {
+    if s.from.is_empty() {
         let mut columns = Vec::new();
         let mut row = Vec::new();
         for item in &s.items {
@@ -300,15 +307,53 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
                     columns.push(e.to_string());
                     row.push(eval_const(e)?);
                 }
+                SelectItem::Aliased(e, alias) => {
+                    columns.push(alias.clone());
+                    row.push(eval_const(e)?);
+                }
                 SelectItem::Star => {
                     return Err(Error::Runtime("select * requires from".into()))
                 }
             }
         }
         return Ok(ResultSet::Rows { columns, rows: vec![row] });
-    };
-    let sarg = find_sargable(db, &from.name, s.selection.as_ref())?;
-    let schema = db.catalog().table(&from.name)?.schema.clone();
+    }
+    // nested-loop inner join over all FROM tables (comma list and JOIN..ON alike)
+    let mut schema = Schema::default();
+    let mut rows: Vec<Vec<Value>> = vec![vec![]];
+    for (i, tref) in s.from.iter().enumerate() {
+        let table = db.catalog().table(&tref.name)?;
+        let owner = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+        for col in &table.schema.columns {
+            schema.columns.push(crate::catalog::ColumnDesc {
+                owner: Some(owner.clone()),
+                name: col.name.clone(),
+                dtype: col.dtype,
+            });
+        }
+        let side_rows: Vec<(Rid, Vec<Value>)> = db.store_scan(&tref.name)?;
+        let mut combined = Vec::with_capacity(rows.len() * side_rows.len().max(1));
+        for left in rows {
+            for (_, right) in &side_rows {
+                let mut row = left.clone();
+                row.extend(right.iter().cloned());
+                combined.push(row);
+            }
+        }
+        rows = combined;
+        if i >= 1 {
+            // on[i-1] joins the newly added table with everything before it
+            if let Some(cond) = s.on.get(i - 1) {
+                let mut kept = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if eval_predicate(cond, &schema, &row)? {
+                        kept.push(row);
+                    }
+                }
+                rows = kept;
+            }
+        }
+    }
     let mut headers = Vec::new();
     let mut exprs = Vec::new();
     for item in &s.items {
@@ -316,23 +361,33 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
             SelectItem::Star => {
                 for col in &schema.columns {
                     headers.push(col.name.clone());
-                    exprs.push(Expr::Column(col.name.clone()));
+                    // qualified reference avoids ambiguity when column names repeat
+                    match &col.owner {
+                        Some(owner) => exprs.push(Expr::QualifiedColumn(owner.clone(), col.name.clone())),
+                        None => exprs.push(Expr::Column(col.name.clone())),
+                    }
                 }
             }
             SelectItem::Expr(e) => {
                 headers.push(e.to_string());
                 exprs.push(e.clone());
             }
+            SelectItem::Aliased(e, alias) => {
+                headers.push(alias.clone());
+                exprs.push(e.clone());
+            }
         }
     }
-    let scan = match sarg {
-        Some(sarg) => {
+    // index scan only helps single-table scans
+    let mut source_rows: Vec<Vec<Value>> = rows;
+    if s.from.len() == 1 {
+        if let Some(sarg) = find_sargable(db, &s.from[0].name, s.selection.as_ref())? {
             let lit_val = eval_const(&sarg.lit)?;
             let coerced = coerce(lit_val, sarg.dtype, &sarg.column)?;
             let key = encode_key(&coerced)?;
             let ix_file = db
                 .catalog()
-                .indexes_for(&from.name)
+                .indexes_for(&s.from[0].name)
                 .into_iter()
                 .find(|ix| ix.name == sarg.index)
                 .map(|ix| ix.store.file)
@@ -346,12 +401,14 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
                 BinOp::Ge => scan_rids(&btree, &mut db.pool, Bound::Included(&key), Bound::Unbounded)?,
                 _ => unreachable!("sargable ops are restricted"),
             };
-            db.store_get_rows(&from.name, &rids)?
+            source_rows = db.store_get_rows(&s.from[0].name, &rids)?
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect();
         }
-        None => db.store_scan(&from.name)?,
-    };
+    }
     let mut filtered: Vec<Vec<Value>> = Vec::new();
-    for (_, row) in scan {
+    for row in source_rows {
         if let Some(sel) = &s.selection {
             if !eval_predicate(sel, &schema, &row)? {
                 continue;
@@ -362,14 +419,14 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
     let has_aggregate = s
         .items
         .iter()
-        .any(|it| matches!(it, SelectItem::Expr(e) if expr_has_aggregate(e)))
+        .any(|it| matches!(it, SelectItem::Expr(e) | SelectItem::Aliased(e, _) if expr_has_aggregate(e)))
         || s.having.as_ref().is_some_and(expr_has_aggregate);
 
     if !s.group_by.is_empty() || has_aggregate {
         return execute_grouped_select(&schema, s, filtered, headers, exprs);
     }
     if !s.order_by.is_empty() {
-        sort_rows(&schema, &mut filtered, &s.order_by)?;
+        sort_rows(&schema, &mut filtered, &s.order_by, &s.items)?;
     }
     let mut out_rows = Vec::new();
     for row in filtered {
@@ -420,7 +477,7 @@ fn execute_grouped_select(
     }
     if s.group_by.is_empty() {
         for it in &s.items {
-            if let SelectItem::Expr(e) = it {
+            if let SelectItem::Expr(e) | SelectItem::Aliased(e, _) = it {
                 if expr_has_column(e) {
                     return Err(Error::Runtime(
                         "column must appear in group by or aggregate".into(),
@@ -460,7 +517,7 @@ fn execute_grouped_select(
         surviving.push(group_rows);
     }
     if !s.order_by.is_empty() {
-        sort_groups(schema, &mut surviving, &s.order_by)?;
+        sort_groups(schema, &mut surviving, &s.order_by, &s.items)?;
     }
     let mut out_rows = Vec::new();
     for group_rows in surviving {
@@ -474,13 +531,36 @@ fn execute_grouped_select(
     Ok(ResultSet::Rows { columns: headers, rows: out_rows })
 }
 
+fn select_aliases(items: &[SelectItem]) -> Vec<(String, Expr)> {
+    items
+        .iter()
+        .filter_map(|it| match it {
+            SelectItem::Aliased(e, alias) => Some((alias.clone(), e.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// ORDER BY may reference output aliases (e.g. `count(*) as total`).
+fn resolve_order_expr<'a>(expr: &'a Expr, aliases: &'a [(String, Expr)]) -> &'a Expr {
+    match expr {
+        Expr::Column(c) => aliases
+            .iter()
+            .find(|(a, _)| a == c)
+            .map(|(_, e)| e)
+            .unwrap_or(expr),
+        _ => expr,
+    }
+}
+
 fn eval_sort_keys(
     ctx: EvalCtx,
     order_by: &[(Expr, bool)],
+    aliases: &[(String, Expr)],
 ) -> Result<Vec<Value>> {
     order_by
         .iter()
-        .map(|(e, _)| eval(e, Some(&ctx)))
+        .map(|(e, _)| eval(resolve_order_expr(e, aliases), Some(&ctx)))
         .collect()
 }
 
@@ -501,10 +581,16 @@ fn cmp_sort_keys(a: &[Value], b: &[Value], order_by: &[(Expr, bool)]) -> std::cm
     std::cmp::Ordering::Equal
 }
 
-fn sort_rows(schema: &Schema, rows: &mut Vec<Vec<Value>>, order_by: &[(Expr, bool)]) -> Result<()> {
+fn sort_rows(
+    schema: &Schema,
+    rows: &mut Vec<Vec<Value>>,
+    order_by: &[(Expr, bool)],
+    items: &[SelectItem],
+) -> Result<()> {
+    let aliases = select_aliases(items);
     let mut pairs: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
     for row in rows.drain(..) {
-        let keys = eval_sort_keys(EvalCtx::Row(schema, &row), order_by)?;
+        let keys = eval_sort_keys(EvalCtx::Row(schema, &row), order_by, &aliases)?;
         pairs.push((row, keys));
     }
     pairs.sort_by(|(_, ka), (_, kb)| cmp_sort_keys(ka, kb, order_by));
@@ -516,10 +602,12 @@ fn sort_groups(
     schema: &Schema,
     groups: &mut Vec<Vec<Vec<Value>>>,
     order_by: &[(Expr, bool)],
+    items: &[SelectItem],
 ) -> Result<()> {
+    let aliases = select_aliases(items);
     let mut pairs: Vec<(Vec<Vec<Value>>, Vec<Value>)> = Vec::with_capacity(groups.len());
     for group in groups.drain(..) {
-        let keys = eval_sort_keys(EvalCtx::Group(schema, &group), order_by)?;
+        let keys = eval_sort_keys(EvalCtx::Group(schema, &group), order_by, &aliases)?;
         pairs.push((group, keys));
     }
     pairs.sort_by(|(_, ka), (_, kb)| cmp_sort_keys(ka, kb, order_by));
@@ -640,16 +728,26 @@ pub(crate) fn eval(expr: &Expr, ctx: Option<&EvalCtx>) -> Result<Value> {
         Expr::Null => Ok(Value::Null),
         Expr::Column(c) => match ctx {
             None => Err(Error::Runtime(format!("no such column: {c}"))),
-            Some(&EvalCtx::Row(schema, row)) => {
-                let idx = schema
-                    .index_of(c)
-                    .ok_or_else(|| Error::Runtime(format!("no such column: {c}")))?;
+            Some(EvalCtx::Row(schema, row)) => {
+                let idx = schema.resolve(None, c)?;
                 Ok(row[idx].clone())
             }
-            Some(&EvalCtx::Group(schema, rows)) => {
-                let idx = schema
-                    .index_of(c)
-                    .ok_or_else(|| Error::Runtime(format!("no such column: {c}")))?;
+            Some(EvalCtx::Group(schema, rows)) => {
+                let idx = schema.resolve(None, c)?;
+                Ok(rows
+                    .first()
+                    .map(|row| row[idx].clone())
+                    .unwrap_or(Value::Null))
+            }
+        },
+        Expr::QualifiedColumn(t, c) => match ctx {
+            None => Err(Error::Runtime(format!("no such column: {t}.{c}"))),
+            Some(EvalCtx::Row(schema, row)) => {
+                let idx = schema.resolve(Some(t), c)?;
+                Ok(row[idx].clone())
+            }
+            Some(EvalCtx::Group(schema, rows)) => {
+                let idx = schema.resolve(Some(t), c)?;
                 Ok(rows
                     .first()
                     .map(|row| row[idx].clone())

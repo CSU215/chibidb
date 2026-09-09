@@ -10,6 +10,8 @@ use meta::{IndexMeta, TableMeta};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDesc {
+    /// Owning table name or alias; set only in query-time join schemas.
+    pub owner: Option<String>,
     pub name: String,
     pub dtype: DataType,
 }
@@ -22,6 +24,30 @@ pub struct Schema {
 impl Schema {
     pub fn index_of(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name == name)
+    }
+
+    pub fn resolve(&self, qual: Option<&str>, name: &str) -> Result<usize> {
+        match qual {
+            Some(q) => self
+                .columns
+                .iter()
+                .position(|c| c.owner.as_deref() == Some(q) && c.name == name)
+                .ok_or_else(|| Error::Runtime(format!("no such column: {q}.{name}"))),
+            None => {
+                let matches: Vec<usize> = self
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.name == name)
+                    .map(|(i, _)| i)
+                    .collect();
+                match matches.len() {
+                    0 => Err(Error::Runtime(format!("no such column: {name}"))),
+                    1 => Ok(matches[0]),
+                    _ => Err(Error::Runtime(format!("ambiguous column: {name}"))),
+                }
+            }
+        }
     }
 }
 

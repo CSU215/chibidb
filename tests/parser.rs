@@ -11,6 +11,7 @@ fn single_exprs(sql: &str) -> Vec<String> {
             .map(|it| match it {
                 SelectItem::Star => "*".to_string(),
                 SelectItem::Expr(e) => e.to_string(),
+                SelectItem::Aliased(e, _) => e.to_string(),
             })
             .collect(),
         other => panic!("expected select, got {other:?}"),
@@ -250,7 +251,7 @@ fn parses_select_from_where() {
     assert_eq!(s.items.len(), 2);
     assert!(matches!(&s.items[0], SelectItem::Expr(e) if e.to_string() == "id"));
     assert!(matches!(&s.items[1], SelectItem::Expr(e) if e.to_string() == "name"));
-    let from = s.from.as_ref().unwrap();
+    let from = &s.from[0];
     assert_eq!(from.name, "student");
     assert_eq!(from.alias, None);
     assert_eq!(s.selection.as_ref().unwrap().to_string(), "(= id 1)");
@@ -260,7 +261,7 @@ fn parses_select_from_where() {
 fn parses_star() {
     let s = select("select * from t;");
     assert_eq!(s.items, [SelectItem::Star]);
-    assert_eq!(s.from.as_ref().unwrap().name, "t");
+    assert_eq!(s.from[0].name, "t");
     let s = select("select *, id from t;");
     assert_eq!(s.items.len(), 2);
 }
@@ -268,15 +269,15 @@ fn parses_star() {
 #[test]
 fn parses_table_alias() {
     let s = select("select 1 from t as a;");
-    assert_eq!(s.from.as_ref().unwrap().alias.as_deref(), Some("a"));
+    assert_eq!(s.from[0].alias.as_deref(), Some("a"));
     let s = select("select 1 from t a;");
-    assert_eq!(s.from.as_ref().unwrap().alias.as_deref(), Some("a"));
+    assert_eq!(s.from[0].alias.as_deref(), Some("a"));
 }
 
 #[test]
 fn select_without_from_has_no_selection() {
     let s = select("select 1;");
-    assert_eq!(s.from, None);
+    assert!(s.from.is_empty());
     assert_eq!(s.selection, None);
     let s = select("select 1 from t where 1 and 2;");
     assert_eq!(s.selection.as_ref().unwrap().to_string(), "(and 1 2)");
@@ -285,7 +286,7 @@ fn select_without_from_has_no_selection() {
 #[test]
 fn keywords_in_select_are_case_insensitive() {
     let s = select("SELECT * FROM t WHERE 1;");
-    assert_eq!(s.from.as_ref().unwrap().name, "t");
+    assert_eq!(s.from[0].name, "t");
     assert!(s.selection.is_some());
 }
 
@@ -405,7 +406,8 @@ fn parses_explain() {
                 *inner.stmt,
                 Stmt::Select(chibidb::ast::SelectStmt {
                     items: vec![chibidb::ast::SelectItem::Expr(chibidb::ast::Expr::Int(1))],
-                    from: None,
+                    from: vec![],
+                    on: vec![],
                     selection: None,
                     group_by: vec![],
                     having: None,

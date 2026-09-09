@@ -36,8 +36,19 @@ fn tokenizes_punctuation() {
 #[test]
 fn errors_on_unknown_char() {
     assert!(lex("1 @").is_err());
-    assert!(lex("1.").is_err(), "dot needs trailing digits");
-    assert!(lex(".5").is_err(), "dot needs leading digits");
+}
+
+#[test]
+fn lexes_dot_as_punct() {
+    let toks = lex("a.b").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![
+            TokenKind::Ident("a".into()),
+            TokenKind::Punct(Punct::Dot),
+            TokenKind::Ident("b".into())
+        ]
+    );
 }
 
 #[test]
