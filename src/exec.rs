@@ -182,7 +182,7 @@ fn execute_update(db: &mut Database, u: &UpdateStmt) -> Result<ResultSet> {
         }
         let mut new_row = row.clone();
         for (idx, col, dtype, expr) in &assigns {
-            let v = eval(expr, Some((&schema, &row)))?;
+            let v = eval(expr, Some(&EvalCtx::Row(&schema, &row)))?;
             new_row[*idx] = coerce(v, *dtype, col)?;
         }
         updates.push((rid, row, new_row));
@@ -209,7 +209,7 @@ fn execute_delete(db: &mut Database, d: &DeleteStmt) -> Result<ResultSet> {
 }
 
 fn eval_predicate(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<bool> {
-    match eval(expr, Some((schema, row)))? {
+    match eval(expr, Some(&EvalCtx::Row(schema, row)))? {
         Value::Bool(b) => Ok(b),
         Value::Null => Ok(false),
         _ => Err(Error::Runtime(
@@ -350,16 +350,40 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
         }
         None => db.store_scan(&from.name)?,
     };
-    let mut out_rows = Vec::new();
+    let mut filtered: Vec<Vec<Value>> = Vec::new();
     for (_, row) in scan {
         if let Some(sel) = &s.selection {
             if !eval_predicate(sel, &schema, &row)? {
                 continue;
             }
         }
+        filtered.push(row);
+    }
+    let has_aggregate = s
+        .items
+        .iter()
+        .any(|it| matches!(it, SelectItem::Expr(e) if expr_has_aggregate(e)));
+    if has_aggregate {
+        for it in &s.items {
+            if let SelectItem::Expr(e) = it {
+                if expr_has_column(e) {
+                    return Err(Error::Runtime(
+                        "column must appear in group by or aggregate".into(),
+                    ));
+                }
+            }
+        }
+        let mut row = Vec::with_capacity(exprs.len());
+        for e in &exprs {
+            row.push(eval(e, Some(&EvalCtx::Group(&schema, &filtered)))?);
+        }
+        return Ok(ResultSet::Rows { columns: headers, rows: vec![row] });
+    }
+    let mut out_rows = Vec::new();
+    for row in filtered {
         let mut out_row = Vec::with_capacity(exprs.len());
         for e in &exprs {
-            out_row.push(eval(e, Some((&schema, &row)))?);
+            out_row.push(eval(e, Some(&EvalCtx::Row(&schema, &row)))?);
         }
         out_rows.push(out_row);
     }
@@ -383,21 +407,122 @@ pub fn eval_const(expr: &Expr) -> Result<Value> {
     eval(expr, None)
 }
 
-pub(crate) fn eval(expr: &Expr, ctx: Option<(&Schema, &[Value])>) -> Result<Value> {
+pub(crate) fn expr_has_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Aggregate(..) => true,
+        Expr::Unary(_, e) => expr_has_aggregate(e),
+        Expr::Binary(_, l, r) => expr_has_aggregate(l) || expr_has_aggregate(r),
+        Expr::IsNull(e, _) => expr_has_aggregate(e),
+        _ => false,
+    }
+}
+
+fn eval_aggregate(
+    func: crate::ast::AggFunc,
+    arg: Option<&Expr>,
+    schema: &Schema,
+    rows: &[Vec<Value>],
+) -> Result<Value> {
+    use crate::ast::AggFunc;
+    let vals: Vec<Value> = match arg {
+        None => vec![],
+        Some(e) => {
+            let mut vals = Vec::with_capacity(rows.len());
+            for row in rows {
+                match eval(e, Some(&EvalCtx::Row(schema, row)))? {
+                    Value::Null => {}
+                    v => vals.push(v),
+                }
+            }
+            vals
+        }
+    };
+    match func {
+        AggFunc::Count => Ok(Value::Int(match arg {
+            None => rows.len() as i64,
+            Some(_) => vals.len() as i64,
+        })),
+        AggFunc::Sum => {
+            let mut acc: Option<Value> = None;
+            for v in vals {
+                acc = Some(match acc {
+                    None => v,
+                    Some(a) => eval_binary(BinOp::Add, a, v)?,
+                });
+            }
+            Ok(acc.unwrap_or(Value::Null))
+        }
+        AggFunc::Avg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut total = 0.0f64;
+            for v in &vals {
+                match v {
+                    Value::Int(n) => total += *n as f64,
+                    Value::Float(x) => total += *x,
+                    _ => return Err(type_mismatch()),
+                }
+            }
+            Ok(Value::Float(total / vals.len() as f64))
+        }
+        AggFunc::Min | AggFunc::Max => {
+            let mut best: Option<&Value> = None;
+            for v in &vals {
+                best = Some(match best {
+                    None => v,
+                    Some(b) => {
+                        let ord = cmp_values(b, v)?.ok_or_else(type_mismatch)?;
+                        let take = match func {
+                            AggFunc::Min => ord == std::cmp::Ordering::Greater,
+                            _ => ord == std::cmp::Ordering::Less,
+                        };
+                        if take {
+                            v
+                        } else {
+                            b
+                        }
+                    }
+                });
+            }
+            Ok(best.cloned().unwrap_or(Value::Null))
+        }
+    }
+}
+
+pub(crate) enum EvalCtx<'a> {
+    Row(&'a Schema, &'a [Value]),
+    Group(&'a Schema, &'a [Vec<Value>]),
+}
+
+pub(crate) fn eval(expr: &Expr, ctx: Option<&EvalCtx>) -> Result<Value> {
     match expr {
         Expr::Int(n) => Ok(Value::Int(*n)),
         Expr::Float(x) => Ok(Value::Float(*x)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
         Expr::Null => Ok(Value::Null),
-        Expr::Column(c) => {
-            let Some((schema, row)) = ctx else {
-                return Err(Error::Runtime(format!("no such column: {c}")));
-            };
-            let idx = schema
-                .index_of(c)
-                .ok_or_else(|| Error::Runtime(format!("no such column: {c}")))?;
-            Ok(row[idx].clone())
-        }
+        Expr::Column(c) => match ctx {
+            None => Err(Error::Runtime(format!("no such column: {c}"))),
+            Some(&EvalCtx::Row(schema, row)) => {
+                let idx = schema
+                    .index_of(c)
+                    .ok_or_else(|| Error::Runtime(format!("no such column: {c}")))?;
+                Ok(row[idx].clone())
+            }
+            Some(&EvalCtx::Group(schema, rows)) => {
+                let idx = schema
+                    .index_of(c)
+                    .ok_or_else(|| Error::Runtime(format!("no such column: {c}")))?;
+                Ok(rows
+                    .first()
+                    .map(|row| row[idx].clone())
+                    .unwrap_or(Value::Null))
+            }
+        },
+        Expr::Aggregate(func, arg) => match ctx {
+            Some(&EvalCtx::Group(schema, rows)) => eval_aggregate(*func, arg.as_deref(), schema, rows),
+            _ => Err(Error::Runtime("aggregate not allowed here".into())),
+        },
         Expr::Unary(op, e) => {
             let v = eval(e, ctx)?;
             match op {
@@ -502,12 +627,11 @@ fn float_arith(op: BinOp, a: f64, b: f64) -> Result<Value> {
     Ok(Value::Float(v))
 }
 
-fn compare(op: BinOp, l: Value, r: Value) -> Result<Value> {
-    use std::cmp::Ordering::{Equal, Greater, Less};
+fn cmp_values(l: &Value, r: &Value) -> Result<Option<std::cmp::Ordering>> {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
-        return Ok(Value::Null);
+        return Ok(None);
     }
-    let ord: Option<std::cmp::Ordering> = match (&l, &r) {
+    let ord = match (l, r) {
         (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
         (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
         (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
@@ -516,14 +640,16 @@ fn compare(op: BinOp, l: Value, r: Value) -> Result<Value> {
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
         (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
         (Value::Date(a), Value::Str(b)) | (Value::Str(b), Value::Date(a)) => {
-            match crate::datetime::parse_date(b) {
-                Ok(d) => Some(a.cmp(&d)),
-                Err(e) => return Err(e),
-            }
+            Some(crate::datetime::parse_date(b)?.cmp(a))
         }
         _ => return Err(type_mismatch()),
     };
-    let res = match ord {
+    Ok(ord)
+}
+
+fn compare(op: BinOp, l: Value, r: Value) -> Result<Value> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let res = match cmp_values(&l, &r)? {
         None => matches!(op, BinOp::NotEq),
         Some(Less) => matches!(op, BinOp::Lt | BinOp::Le | BinOp::NotEq),
         Some(Equal) => matches!(op, BinOp::Le | BinOp::Ge | BinOp::Eq),

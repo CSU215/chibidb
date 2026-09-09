@@ -22,6 +22,28 @@ pub enum UnOp {
     Not,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl fmt::Display for AggFunc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            AggFunc::Count => "count",
+            AggFunc::Sum => "sum",
+            AggFunc::Avg => "avg",
+            AggFunc::Min => "min",
+            AggFunc::Max => "max",
+        };
+        f.write_str(s)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Int(i64),
@@ -32,6 +54,7 @@ pub enum Expr {
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     IsNull(Box<Expr>, bool),
+    Aggregate(AggFunc, Option<Box<Expr>>),
 }
 
 impl fmt::Display for Expr {
@@ -46,6 +69,8 @@ impl fmt::Display for Expr {
             Expr::Binary(op, l, r) => write!(f, "({op} {l} {r})"),
             Expr::IsNull(e, false) => write!(f, "(is-null {e})"),
             Expr::IsNull(e, true) => write!(f, "(is-not-null {e})"),
+            Expr::Aggregate(func, None) => write!(f, "({func} *)"),
+            Expr::Aggregate(func, Some(e)) => write!(f, "({func} {e})"),
         }
     }
 }

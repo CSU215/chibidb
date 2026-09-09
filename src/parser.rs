@@ -1,6 +1,7 @@
 use crate::ast::{
-    BinOp, ColumnDef, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt,
-    ExplainStmt, Expr, InsertStmt, SelectItem, SelectStmt, Stmt, TableRef, UnOp, UpdateStmt,
+    AggFunc, BinOp, ColumnDef, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt,
+    DropIndexStmt, ExplainStmt, Expr, InsertStmt, SelectItem, SelectStmt, Stmt, TableRef, UnOp,
+    UpdateStmt,
 };
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
@@ -163,6 +164,22 @@ impl Parser {
     }
 
     const RESERVED: &[&str] = &["where"];
+
+    fn agg_func(name: &str) -> Option<AggFunc> {
+        if name.eq_ignore_ascii_case("count") {
+            Some(AggFunc::Count)
+        } else if name.eq_ignore_ascii_case("sum") {
+            Some(AggFunc::Sum)
+        } else if name.eq_ignore_ascii_case("avg") {
+            Some(AggFunc::Avg)
+        } else if name.eq_ignore_ascii_case("min") {
+            Some(AggFunc::Min)
+        } else if name.eq_ignore_ascii_case("max") {
+            Some(AggFunc::Max)
+        } else {
+            None
+        }
+    }
 
     fn at_reserved(&self) -> bool {
         matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Ident(s)) if Self::RESERVED.contains(&s.to_ascii_lowercase().as_str()))
@@ -412,7 +429,31 @@ impl Parser {
         self.parse_primary()
     }
 
+    fn peek_agg_fn(&self) -> Option<AggFunc> {
+        match self.peek().map(|t| &t.kind) {
+            Some(TokenKind::Ident(s)) => Self::agg_func(s),
+            _ => None,
+        }
+    }
+
     fn parse_primary(&mut self) -> Result<Expr> {
+        if let Some(func) = self.peek_agg_fn() {
+            if matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                        Some(TokenKind::Punct(Punct::LParen)))
+            {
+                self.pos += 2; // consume name and '('
+                let arg = if self.eat_punct(Punct::Star) {
+                    if func != AggFunc::Count {
+                        return Err(Error::Syntax("* is only valid in count(*)".into()));
+                    }
+                    None
+                } else {
+                    Some(Box::new(self.parse_expr()?))
+                };
+                self.expect_punct(Punct::RParen)?;
+                return Ok(Expr::Aggregate(func, arg));
+            }
+        }
         match self.bump() {
             Some(Token { kind: TokenKind::Int(n), .. }) => Ok(Expr::Int(*n)),
             Some(Token { kind: TokenKind::Float(x), .. }) => Ok(Expr::Float(*x)),
