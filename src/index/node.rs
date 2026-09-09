@@ -141,6 +141,10 @@ pub fn leaf_remove_at(page: &mut [u8; PAGE_SIZE], idx: usize) -> Result<()> {
     Ok(())
 }
 
+pub fn leaf_bytes_used(page: &[u8]) -> usize {
+    leaf_entry_offset(page, leaf_num(page))
+}
+
 // internal header: type@0, num@1..3, first_child@3..7, entries@7
 const INTERNAL_ENTRIES: usize = 7;
 
@@ -232,4 +236,8 @@ pub fn internal_remove_at(page: &mut [u8; PAGE_SIZE], idx: usize) -> Result<()> 
     page.copy_within(at + size..end, at);
     u16_set(page, 1, n - 1);
     Ok(())
+}
+
+pub fn internal_bytes_used(page: &[u8]) -> usize {
+    internal_entry_offset(page, internal_num(page))
 }

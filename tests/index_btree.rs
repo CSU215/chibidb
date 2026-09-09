@@ -171,3 +171,83 @@ fn scan_of_empty_and_missing_ranges() {
     assert_eq!(got.len(), 0);
 }
 
+#[test]
+fn delete_removes_exact_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut bp, _f, tree) = seeded_tree(&dir, "i.idxf", 500);
+
+    tree.delete(&mut bp, b"key000250", Rid::new(1, 250)).unwrap();
+    assert_eq!(tree.search(&mut bp, b"key000250").unwrap(), []);
+    assert_eq!(tree.search(&mut bp, b"key000249").unwrap(), [Rid::new(1, 249)]);
+    assert_eq!(tree.search(&mut bp, b"key000251").unwrap(), [Rid::new(1, 251)]);
+
+    // deleting a non-existent entry errors
+    assert!(tree.delete(&mut bp, b"key000250", Rid::new(1, 250)).is_err());
+    assert!(tree.delete(&mut bp, b"missing", Rid::new(1, 1)).is_err());
+}
+
+#[test]
+fn delete_duplicates_one_by_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut bp, f) = setup(&dir, "j.idxf");
+    let tree = BTree::init(&mut bp, f).unwrap();
+    for i in 0..5u16 {
+        tree.insert(&mut bp, b"dup", Rid::new(3, i)).unwrap();
+    }
+    tree.delete(&mut bp, b"dup", Rid::new(3, 2)).unwrap();
+    let mut got = tree.search(&mut bp, b"dup").unwrap();
+    got.sort();
+    assert_eq!(got, [Rid::new(3, 0), Rid::new(3, 1), Rid::new(3, 3), Rid::new(3, 4)]);
+}
+
+#[test]
+fn deletes_cause_merge_and_height_shrink() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut bp, _f, tree) = seeded_tree(&dir, "k.idxf", 500);
+    assert!(tree.height(&mut bp).unwrap() >= 2);
+
+    // delete all but 20 keys
+    for i in 20..500 {
+        tree.delete(&mut bp, format!("key{i:06}").as_bytes(), Rid::new(1, i as u16))
+            .unwrap();
+    }
+    assert_eq!(tree.height(&mut bp).unwrap(), 1, "tree must shrink back to one leaf");
+
+    // remaining keys intact and ordered
+    let got = tree.scan_range(&mut bp, Bound::Unbounded, Bound::Unbounded).unwrap();
+    let keys = keys_of(&got);
+    assert_eq!(keys.len(), 20);
+    assert_eq!(keys[0], "key000000");
+    assert_eq!(keys[19], "key000019");
+
+    // delete the rest: tree becomes empty
+    for i in 0..20 {
+        tree.delete(&mut bp, format!("key{i:06}").as_bytes(), Rid::new(1, i as u16))
+            .unwrap();
+    }
+    assert_eq!(tree.height(&mut bp).unwrap(), 0);
+    assert_eq!(tree.search(&mut bp, b"key000000").unwrap(), []);
+}
+
+#[test]
+fn delete_then_reinsert_stays_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut bp, _f, tree) = seeded_tree(&dir, "l.idxf", 300);
+
+    for i in 0..250 {
+        tree.delete(&mut bp, format!("key{i:06}").as_bytes(), Rid::new(1, i as u16))
+            .unwrap();
+    }
+    for i in 0..250 {
+        let key = format!("key{i:06}");
+        tree.insert(&mut bp, key.as_bytes(), Rid::new(2, i as u16)).unwrap();
+    }
+    let got = tree.scan_range(&mut bp, Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert_eq!(got.len(), 300);
+    let keys = keys_of(&got);
+    for w in keys.windows(2) {
+        assert!(w[0] < w[1]);
+    }
+    assert_eq!(tree.search(&mut bp, b"key000100").unwrap(), [Rid::new(2, 100)]);
+}
+
