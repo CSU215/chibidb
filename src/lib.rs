@@ -10,6 +10,7 @@ mod repl;
 pub mod result;
 pub mod storage;
 pub mod value;
+pub mod wire;
 
 pub use error::{Error, Result};
 pub use repl::run_repl;
