@@ -1,6 +1,6 @@
 use crate::ast::{
-    AggFunc, BinOp, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt,
-    ExplainStmt, Expr, InsertStmt, Limit, SelectItem, SelectStmt, Stmt, UnOp, UpdateStmt,
+    BinOp, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt, ExplainStmt,
+    Expr, InsertStmt, Limit, SelectItem, SelectStmt, Stmt, UnOp, UpdateStmt,
 };
 use crate::catalog::Schema;
 use crate::index::{encode_key, BTree, Bound};

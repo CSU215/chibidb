@@ -1,13 +1,16 @@
 pub mod ast;
 pub mod catalog;
+pub mod client;
 pub mod datetime;
 mod error;
 pub mod exec;
 pub mod index;
 pub mod lexer;
 pub mod parser;
+pub mod render;
 mod repl;
 pub mod result;
+pub mod server;
 pub mod storage;
 pub mod value;
 pub mod wire;
