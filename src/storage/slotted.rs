@@ -112,6 +112,22 @@ fn compact(page: &mut [u8; PAGE_SIZE]) {
     set_free_upper(page, upper);
 }
 
+pub fn page_write(page: &mut [u8; PAGE_SIZE], slot: u16, data: &[u8]) -> Result<()> {
+    let n = num_slots(page);
+    if slot as usize >= n {
+        return Err(Error::Runtime(format!("no record at slot {slot}")));
+    }
+    let (off, len) = get_slot(page, slot as usize);
+    if off == 0 && len == 0 {
+        return Err(Error::Runtime(format!("no record at slot {slot}")));
+    }
+    if data.len() != len {
+        return Err(Error::Runtime("record length mismatch on rewrite".into()));
+    }
+    page[off..off + len].copy_from_slice(data);
+    Ok(())
+}
+
 pub fn page_iter<'a>(page: &'a [u8; PAGE_SIZE]) -> impl Iterator<Item = (u16, &'a [u8])> + 'a {
     let n = num_slots(page) as u16;
     (0..n).filter_map(move |s| page_get(page, s).ok().flatten().map(|r| (s, r)))

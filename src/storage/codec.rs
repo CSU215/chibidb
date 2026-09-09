@@ -8,6 +8,25 @@ const TAG_STR: u8 = 0x03;
 const TAG_BOOL: u8 = 0x04;
 const TAG_DATE: u8 = 0x05;
 
+/// Versioned record: two hidden u32 transaction fields precede the row.
+pub fn encode_record(creator: u32, deleter: u32, row: &[Value]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&creator.to_le_bytes());
+    buf.extend_from_slice(&deleter.to_le_bytes());
+    buf.extend(encode_row(row));
+    buf
+}
+
+pub fn decode_record(data: &[u8]) -> Result<(u32, u32, Vec<Value>)> {
+    if data.len() < 8 {
+        return Err(Error::Runtime("truncated versioned record".into()));
+    }
+    let creator = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let deleter = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let (row, _) = decode_row(&data[8..])?;
+    Ok((creator, deleter, row))
+}
+
 pub fn encode_row(row: &[Value]) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&(row.len() as u16).to_le_bytes());

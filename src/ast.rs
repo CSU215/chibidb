@@ -164,6 +164,13 @@ pub struct ExplainStmt {
     pub stmt: Box<Stmt>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TrxCtl {
+    Begin,
+    Commit,
+    Rollback,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
     pub name: String,
@@ -205,4 +212,5 @@ pub enum Stmt {
     Insert(InsertStmt),
     Select(SelectStmt),
     Update(UpdateStmt),
+    Trx(TrxCtl),
 }

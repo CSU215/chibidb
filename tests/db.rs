@@ -262,7 +262,7 @@ fn updates_with_row_expressions() {
     with_dbs(|db| {
         seed(db);
         db.execute_sql("update student set score = score + 1 where id <= 2;").unwrap();
-        let rs = db.execute_sql("select score from student;").unwrap();
+        let rs = db.execute_sql("select score from student order by id;").unwrap();
         let (_, rows) = rows(&rs);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0], Value::Float(96.5));
@@ -322,7 +322,7 @@ fn null_storage_and_filtering() {    with_dbs(|db| {
         assert_eq!(r, [[Value::Int(2)]]);
 
         db.execute_sql("update t set name = 'y' where name is null;").unwrap();
-        let rs = db.execute_sql("select name from t;").unwrap();
+        let rs = db.execute_sql("select name from t order by id;").unwrap();
         let (_, r) = rows(&rs);
         assert_eq!(r.len(), 2);
         assert_eq!(r[0][0], Value::Str("y".into()));

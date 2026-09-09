@@ -1,7 +1,7 @@
-use crate::ast::DataType;
+﻿use crate::ast::DataType;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"CHIDCAT2";
+const MAGIC: [u8; 8] = *b"CHIDCAT3";
 
 const DTYPE_INT: u8 = 0x00;
 const DTYPE_FLOAT: u8 = 0x01;
@@ -28,6 +28,8 @@ pub struct IndexMeta {
 pub struct CatalogSnapshot {
     pub next_table_file: u32,
     pub next_index_file: u32,
+    pub next_trx_id: u32,
+    pub committed_trxs: Vec<u32>,
     pub tables: Vec<TableMeta>,
     pub indexes: Vec<IndexMeta>,
 }
@@ -37,6 +39,11 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
     buf.extend_from_slice(&MAGIC);
     put_u32(&mut buf, snap.next_table_file);
     put_u32(&mut buf, snap.next_index_file);
+    put_u32(&mut buf, snap.next_trx_id);
+    put_u32(&mut buf, snap.committed_trxs.len() as u32);
+    for id in &snap.committed_trxs {
+        put_u32(&mut buf, *id);
+    }
     put_u32(&mut buf, snap.tables.len() as u32);
     for t in &snap.tables {
         put_str(&mut buf, &t.name);
@@ -73,6 +80,12 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
     let mut pos = MAGIC.len();
     let next_table_file = take_u32(data, &mut pos)?;
     let next_index_file = take_u32(data, &mut pos)?;
+    let next_trx_id = take_u32(data, &mut pos)?;
+    let n_committed = take_u32(data, &mut pos)? as usize;
+    let mut committed_trxs = Vec::with_capacity(n_committed);
+    for _ in 0..n_committed {
+        committed_trxs.push(take_u32(data, &mut pos)?);
+    }
     let n_tables = take_u32(data, &mut pos)?;
     let mut tables = Vec::new();
     for _ in 0..n_tables {
@@ -107,7 +120,7 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
     if pos != data.len() {
         return Err(Error::Runtime("trailing bytes in catalog file".into()));
     }
-    Ok(CatalogSnapshot { next_table_file, next_index_file, tables, indexes })
+    Ok(CatalogSnapshot { next_table_file, next_index_file, next_trx_id, committed_trxs, tables, indexes })
 }
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {

@@ -12,6 +12,7 @@ mod repl;
 pub mod result;
 pub mod server;
 pub mod storage;
+pub mod trx;
 pub mod value;
 pub mod wire;
 
@@ -19,14 +20,18 @@ pub use error::{Error, Result};
 pub use repl::run_repl;
 pub use result::ResultSet;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
 use crate::index::{encode_key, BTree};
-use crate::storage::codec::{decode_row, encode_row};
+use crate::storage::codec::encode_record;
 use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, Rid};
+use crate::trx::{TrxState, Undo};
 use crate::value::Value;
+
+pub use crate::trx::Session;
 
 pub const BUFFER_POOL_FRAMES: usize = 64;
 
@@ -36,6 +41,8 @@ pub struct Database {
     data_dir: PathBuf,
     next_table_file: u32,
     next_index_file: u32,
+    next_trx_id: u32,
+    committed_trxs: HashSet<u32>,
     _temp: Option<tempfile::TempDir>,
 }
 
@@ -57,6 +64,8 @@ impl Database {
         let mut catalog = Catalog::default();
         let mut next_table_file = 0;
         let mut next_index_file = 0;
+        let mut next_trx_id = 1;
+        let mut committed_trxs: HashSet<u32> = HashSet::new();
 
         let catalog_path = path.join("catalog.bin");
         if catalog_path.exists() {
@@ -104,6 +113,8 @@ impl Database {
             }
             next_table_file = snap.next_table_file;
             next_index_file = snap.next_index_file;
+            next_trx_id = snap.next_trx_id;
+            committed_trxs = snap.committed_trxs.into_iter().collect();
         }
 
         Ok(Self {
@@ -112,6 +123,8 @@ impl Database {
             data_dir: path.to_path_buf(),
             next_table_file,
             next_index_file,
+            next_trx_id,
+            committed_trxs,
             _temp: None,
         })
     }
@@ -122,12 +135,116 @@ impl Database {
     }
 
     pub fn execute_sql(&mut self, sql: &str) -> Result<Vec<ResultSet>> {
+        let mut session = Session::new();
+        self.execute_sql_with(&mut session, sql)
+    }
+
+    /// Executes statements within the session's transaction context.
+    pub fn execute_sql_with(
+        &mut self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<Vec<ResultSet>> {
         let stmts = parser::parse(sql)?;
-        let mut out = Vec::with_capacity(stmts.len());
+        let mut out = Vec::new();
         for stmt in &stmts {
-            out.push(exec::execute(self, stmt)?);
+            match stmt {
+                crate::ast::Stmt::Trx(crate::ast::TrxCtl::Begin) => {
+                    if session.trx.is_some() {
+                        return Err(Error::Runtime("transaction already begun".into()));
+                    }
+                    let id = self.next_trx_id;
+                    self.next_trx_id += 1;
+                    session.begin(id, &self.committed_trxs, true);
+                }
+                crate::ast::Stmt::Trx(crate::ast::TrxCtl::Commit) => {
+                    if session.trx.is_none() {
+                        return Err(Error::Runtime("no active transaction".into()));
+                    }
+                    if let Some(trx) = session.trx.take() {
+                        self.committed_trxs.insert(trx.id);
+                        // commit durability: the committed set (and thus
+                        // visibility of the transaction's rows) is persisted
+                        self.save_catalog()?;
+                    }
+                }
+                crate::ast::Stmt::Trx(crate::ast::TrxCtl::Rollback) => {
+                    if session.trx.is_none() {
+                        return Err(Error::Runtime("no active transaction".into()));
+                    }
+                    if let Some(mut trx) = session.trx.take() {
+                        self.rollback_trx(&mut trx)?;
+                    }
+                }
+                other => {
+                    let autocommit = session.trx.is_none();
+                    if autocommit {
+                        let id = self.next_trx_id;
+                        self.next_trx_id += 1;
+                        session.begin(id, &self.committed_trxs, false);
+                    }
+                    match exec::execute(self, session.trx(), other) {
+                        Ok(rs) => {
+                            if autocommit {
+                                if let Some(trx) = session.trx.take() {
+                                    self.committed_trxs.insert(trx.id);
+                                }
+                            }
+                            out.push(rs);
+                        }
+                        Err(e) => {
+                            // undo partial statement work; an explicit
+                            // transaction stays open for retry or rollback
+                            if let Some(mut trx) = session.trx.take() {
+                                self.rollback_trx(&mut trx)?;
+                                if !autocommit {
+                                    session.trx = Some(trx);
+                                }
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+            }
         }
         Ok(out)
+    }
+
+    /// Rolls back any open transaction when a session goes away.
+    pub fn rollback_session(&mut self, session: &mut Session) -> Result<()> {
+        if let Some(mut trx) = session.trx.take() {
+            self.rollback_trx(&mut trx)?;
+        }
+        Ok(())
+    }
+
+    fn rollback_trx(&mut self, trx: &mut TrxState) -> Result<()> {
+        while let Some(undo) = trx.undo.pop() {
+            match undo {
+                Undo::Insert { table, rid, row } => {
+                    let file = self.catalog.table(&table)?.heap.file;
+                    HeapFile::at(file).delete(&mut self.pool, rid)?;
+                    for (ci, ix_file) in self.index_ops(&table)? {
+                        let key = encode_key(&row[ci])?;
+                        BTree::at(ix_file).delete(&mut self.pool, &key, rid)?;
+                    }
+                }
+                Undo::DeleteMark { table, rid } => {
+                    let file = self.catalog.table(&table)?.heap.file;
+                    HeapFile::at(file).delete_mark(&mut self.pool, rid, 0)?;
+                }
+                Undo::Update { table, old_rid, new_rid, new_row } => {
+                    let file = self.catalog.table(&table)?.heap.file;
+                    HeapFile::at(file).delete(&mut self.pool, new_rid)?;
+                    for (ci, ix_file) in self.index_ops(&table)? {
+                        let key = encode_key(&new_row[ci])?;
+                        BTree::at(ix_file).delete(&mut self.pool, &key, new_rid)?;
+                    }
+                    HeapFile::at(file).delete_mark(&mut self.pool, old_rid, 0)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn catalog(&self) -> &Catalog {
@@ -160,6 +277,8 @@ impl Database {
         let snap = CatalogSnapshot {
             next_table_file: self.next_table_file,
             next_index_file: self.next_index_file,
+            next_trx_id: self.next_trx_id,
+            committed_trxs: self.committed_trxs.iter().copied().collect(),
             tables: self.catalog.table_metas(),
             indexes: self.catalog.index_metas(),
         };
@@ -184,22 +303,42 @@ impl Database {
             .collect())
     }
 
-    pub(crate) fn store_scan(&mut self, name: &str) -> Result<Vec<(Rid, Vec<Value>)>> {
+    /// Raw versioned records; callers decode and apply visibility.
+    pub(crate) fn store_scan_raw(&mut self, name: &str) -> Result<Vec<(Rid, Vec<u8>)>> {
         let file = self.catalog.table(name)?.heap.file;
         let heap = HeapFile::at(file);
         let mut out = Vec::new();
         heap.for_each(&mut self.pool, |rid, rec| {
-            let (row, _) = decode_row(rec)?;
-            out.push((rid, row));
+            out.push((rid, rec.to_vec()));
             Ok(())
         })?;
         Ok(out)
     }
 
-    pub(crate) fn store_insert(&mut self, name: &str, row: Vec<Value>) -> Result<Rid> {
+    pub(crate) fn store_get_records(
+        &mut self,
+        name: &str,
+        rids: &[Rid],
+    ) -> Result<Vec<(Rid, Vec<u8>)>> {
         let file = self.catalog.table(name)?.heap.file;
         let heap = HeapFile::at(file);
-        let data = encode_row(&row);
+        let mut out = Vec::new();
+        for rid in rids {
+            let rec = heap.get(&mut self.pool, *rid)?;
+            out.push((*rid, rec));
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn store_insert(
+        &mut self,
+        name: &str,
+        row: Vec<Value>,
+        creator: u32,
+    ) -> Result<Rid> {
+        let file = self.catalog.table(name)?.heap.file;
+        let heap = HeapFile::at(file);
+        let data = encode_record(creator, 0, &row);
         let rid = heap.insert(&mut self.pool, &data)?;
         for (ci, ix_file) in self.index_ops(name)? {
             let key = encode_key(&row[ci])?;
@@ -208,60 +347,46 @@ impl Database {
         Ok(rid)
     }
 
-    pub(crate) fn store_get_rows(
+    /// MVCC delete: mark records with the deleter's trx id (index untouched,
+    /// stale entries are filtered by visibility on read).
+    pub(crate) fn store_delete_mark(
         &mut self,
         name: &str,
         rids: &[Rid],
-    ) -> Result<Vec<(Rid, Vec<Value>)>> {
-        let file = self.catalog.table(name)?.heap.file;
-        let heap = HeapFile::at(file);
-        let mut out = Vec::new();
-        for rid in rids {
-            let rec = heap.get(&mut self.pool, *rid)?;
-            let (row, _) = decode_row(&rec)?;
-            out.push((*rid, row));
-        }
-        Ok(out)
-    }
-
-    pub(crate) fn store_delete_all(
-        &mut self,
-        name: &str,
-        victims: &[(Rid, Vec<Value>)],
+        deleter: u32,
     ) -> Result<()> {
         let file = self.catalog.table(name)?.heap.file;
         let heap = HeapFile::at(file);
-        for (rid, row) in victims {
-            heap.delete(&mut self.pool, *rid)?;
-            for (ci, ix_file) in self.index_ops(name)? {
-                let key = encode_key(&row[ci])?;
-                BTree::at(ix_file).delete(&mut self.pool, &key, *rid)?;
-            }
+        for rid in rids {
+            heap.delete_mark(&mut self.pool, *rid, deleter)?;
         }
         Ok(())
     }
 
-    pub(crate) fn store_replace_all(
+    /// MVCC update: delete-mark the old version, insert a new one. Index
+    /// entries for the new version are added; old entries stay so older
+    /// snapshots can still find them (filtered by visibility on read).
+    pub(crate) fn store_update_versions(
         &mut self,
         name: &str,
-        updates: &[(Rid, Vec<Value>, Vec<Value>)],
-    ) -> Result<()> {
+        updates: &[(Rid, Vec<Value>)],
+        trx_id: u32,
+    ) -> Result<Vec<Rid>> {
         let file = self.catalog.table(name)?.heap.file;
         let heap = HeapFile::at(file);
         let ops = self.index_ops(name)?;
-        for (rid, old_row, new_row) in updates {
-            heap.delete(&mut self.pool, *rid)?;
-            let data = encode_row(new_row);
+        let mut new_rids = Vec::with_capacity(updates.len());
+        for (rid, new_row) in updates {
+            heap.delete_mark(&mut self.pool, *rid, trx_id)?;
+            let data = encode_record(trx_id, 0, new_row);
             let new_rid = heap.insert(&mut self.pool, &data)?;
             for (ci, ix_file) in &ops {
-                let old_key = encode_key(&old_row[*ci])?;
-                let new_key = encode_key(&new_row[*ci])?;
-                let btree = BTree::at(*ix_file);
-                btree.delete(&mut self.pool, &old_key, *rid)?;
-                btree.insert(&mut self.pool, &new_key, new_rid)?;
+                let key = encode_key(&new_row[*ci])?;
+                BTree::at(*ix_file).insert(&mut self.pool, &key, new_rid)?;
             }
+            new_rids.push(new_rid);
         }
-        Ok(())
+        Ok(new_rids)
     }
 }
 

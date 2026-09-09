@@ -1,9 +1,9 @@
 use crate::storage::buffer::BufferPool;
 use crate::storage::page::{FileId, PageNo};
-use crate::storage::slotted::{page_delete, page_get, page_insert, page_iter};
+use crate::storage::slotted::{page_delete, page_get, page_insert, page_iter, page_write};
 use crate::{Error, Result};
 
-const MAGIC: [u8; 4] = *b"CHID";
+const MAGIC: [u8; 4] = *b"CHD2"; // v2: records carry mvcc trx fields
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Rid {
@@ -90,6 +90,20 @@ impl HeapFile {
 
     pub fn delete(&self, bp: &mut BufferPool, rid: Rid) -> Result<()> {
         bp.with_page(self.file, rid.page_no, |page| page_delete(page, rid.slot))
+    }
+
+    /// MVCC delete-mark: rewrites the record in place, setting its deleter id.
+    pub fn delete_mark(&self, bp: &mut BufferPool, rid: Rid, deleter: u32) -> Result<()> {
+        bp.with_page(self.file, rid.page_no, |page| {
+            let rec = page_get(page, rid.slot)?
+                .ok_or_else(|| Error::Runtime(format!("no record at {rid:?}")))?;
+            let mut updated = rec.to_vec();
+            if updated.len() < 8 {
+                return Err(Error::Runtime("record lacks mvcc fields".into()));
+            }
+            updated[4..8].copy_from_slice(&deleter.to_le_bytes());
+            page_write(page, rid.slot, &updated)
+        })
     }
 
     pub fn for_each(

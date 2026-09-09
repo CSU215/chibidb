@@ -5,21 +5,46 @@ use crate::ast::{
 use crate::catalog::Schema;
 use crate::index::{encode_key, BTree, Bound};
 use crate::result::ResultSet;
+use crate::storage::codec::decode_record;
 use crate::storage::Rid;
+use crate::trx::{TrxState, Undo};
 use crate::value::Value;
 use crate::{Database, Error, Result};
 
-pub fn execute(db: &mut Database, stmt: &Stmt) -> Result<ResultSet> {
+pub fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Result<ResultSet> {
     match stmt {
+        Stmt::CreateTable(c) if trx.explicit => ddl_in_trx(trx),
         Stmt::CreateTable(c) => execute_create_table(db, c),
-        Stmt::CreateIndex(c) => execute_create_index(db, c),
+        Stmt::CreateIndex(c) if trx.explicit => ddl_in_trx(trx),
+        Stmt::CreateIndex(c) => execute_create_index(db, trx, c),
+        Stmt::DropIndex(d) if trx.explicit => ddl_in_trx(trx),
         Stmt::DropIndex(d) => execute_drop_index(db, d),
-        Stmt::Insert(i) => execute_insert(db, i),
-        Stmt::Select(s) => execute_select(db, s),
-        Stmt::Delete(d) => execute_delete(db, d),
-        Stmt::Update(u) => execute_update(db, u),
+        Stmt::Insert(i) => execute_insert(db, trx, i),
+        Stmt::Select(s) => execute_select(db, trx, s),
+        Stmt::Delete(d) => execute_delete(db, trx, d),
+        Stmt::Update(u) => execute_update(db, trx, u),
         Stmt::Explain(e) => execute_explain(db, e),
+        Stmt::Trx(_) => Err(Error::Runtime("transaction control handled elsewhere".into())),
     }
+}
+
+fn ddl_in_trx(_trx: &TrxState) -> Result<ResultSet> {
+    Err(Error::Runtime("DDL inside a transaction is not supported".into()))
+}
+
+/// Decodes versioned records and keeps only rows visible to `trx`.
+fn decode_visible(
+    records: Vec<(Rid, Vec<u8>)>,
+    trx: &TrxState,
+) -> Result<Vec<Vec<Value>>> {
+    let mut out = Vec::new();
+    for (_, rec) in records {
+        let (creator, deleter, row) = decode_record(&rec)?;
+        if trx.visible(creator, deleter) {
+            out.push(row);
+        }
+    }
+    Ok(out)
 }
 
 fn execute_explain(db: &mut Database, e: &ExplainStmt) -> Result<ResultSet> {
@@ -139,15 +164,19 @@ fn find_sargable(
     Ok(None)
 }
 
-fn execute_create_index(db: &mut Database, c: &CreateIndexStmt) -> Result<ResultSet> {
+fn execute_create_index(db: &mut Database, trx: &mut TrxState, c: &CreateIndexStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&c.table)?.schema.clone();
     let col_idx = schema
         .index_of(&c.column)
         .ok_or_else(|| Error::Runtime(format!("no such column: {}", c.column)))?;
     let store = db.new_index_heap(&c.name)?;
-    let scan = db.store_scan(&c.table)?;
+    let records = db.store_scan_raw(&c.table)?;
     let btree = BTree::at(store.file);
-    for (rid, row) in scan {
+    for (rid, rec) in records {
+        let (creator, deleter, row) = decode_record(&rec)?;
+        if !trx.visible(creator, deleter) {
+            continue;
+        }
         let key = encode_key(&row[col_idx])?;
         btree.insert(&mut db.pool, &key, rid)?;
     }
@@ -167,7 +196,7 @@ fn execute_drop_index(db: &mut Database, d: &DropIndexStmt) -> Result<ResultSet>
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
-fn execute_update(db: &mut Database, u: &UpdateStmt) -> Result<ResultSet> {
+fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&u.table)?.schema.clone();
     let mut assigns = Vec::new();
     for (col, expr) in &u.assignments {
@@ -176,9 +205,13 @@ fn execute_update(db: &mut Database, u: &UpdateStmt) -> Result<ResultSet> {
             .ok_or_else(|| Error::Runtime(format!("no such column: {col}")))?;
         assigns.push((idx, col.clone(), schema.columns[idx].dtype, expr));
     }
-    let scan = db.store_scan(&u.table)?;
+    let records = db.store_scan_raw(&u.table)?;
     let mut updates = Vec::new();
-    for (rid, row) in scan {
+    for (rid, rec) in records {
+        let (creator, deleter, row) = decode_record(&rec)?;
+        if !trx.visible(creator, deleter) {
+            continue;
+        }
         let matched = match &u.selection {
             Some(sel) => eval_predicate(sel, &schema, &row)?,
             None => true,
@@ -191,26 +224,41 @@ fn execute_update(db: &mut Database, u: &UpdateStmt) -> Result<ResultSet> {
             let v = eval(expr, Some(&EvalCtx::Row(&schema, &row)))?;
             new_row[*idx] = coerce(v, *dtype, col)?;
         }
-        updates.push((rid, row, new_row));
+        updates.push((rid, new_row));
     }
-    db.store_replace_all(&u.table, &updates)?;
+    let new_rids = db.store_update_versions(&u.table, &updates, trx.id)?;
+    for ((old_rid, new_row), new_rid) in updates.into_iter().zip(new_rids) {
+        trx.undo.push(Undo::Update {
+            table: u.table.clone(),
+            old_rid,
+            new_rid,
+            new_row,
+        });
+    }
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
-fn execute_delete(db: &mut Database, d: &DeleteStmt) -> Result<ResultSet> {
+fn execute_delete(db: &mut Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&d.table)?.schema.clone();
-    let scan = db.store_scan(&d.table)?;
+    let records = db.store_scan_raw(&d.table)?;
     let mut victims = Vec::new();
-    for (rid, row) in scan {
+    for (rid, rec) in records {
+        let (creator, deleter, row) = decode_record(&rec)?;
+        if !trx.visible(creator, deleter) {
+            continue;
+        }
         let matched = match &d.selection {
             Some(sel) => eval_predicate(sel, &schema, &row)?,
             None => true,
         };
         if matched {
-            victims.push((rid, row));
+            victims.push(rid);
         }
     }
-    db.store_delete_all(&d.table, &victims)?;
+    db.store_delete_mark(&d.table, &victims, trx.id)?;
+    for rid in victims {
+        trx.undo.push(Undo::DeleteMark { table: d.table.clone(), rid });
+    }
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
@@ -224,7 +272,7 @@ fn eval_predicate(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<bool> {
     }
 }
 
-fn execute_insert(db: &mut Database, i: &InsertStmt) -> Result<ResultSet> {
+fn execute_insert(db: &mut Database, trx: &mut TrxState, i: &InsertStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&i.table)?.schema.clone();
     for values in &i.rows {
         if values.len() != schema.columns.len() {
@@ -242,13 +290,14 @@ fn execute_insert(db: &mut Database, i: &InsertStmt) -> Result<ResultSet> {
             row.push(coerce(v, col.dtype, &col.name)?);
         }
         let encoded = crate::storage::codec::encode_row(&row);
-        if encoded.len() + 8 > crate::storage::PAGE_SIZE {
+        if encoded.len() + 16 > crate::storage::PAGE_SIZE {
             return Err(Error::Runtime(format!(
                 "record too large ({} bytes does not fit in a page)",
                 encoded.len()
             )));
         }
-        db.store_insert(&i.table, row)?;
+        let rid = db.store_insert(&i.table, row.clone(), trx.id)?;
+        trx.undo.push(Undo::Insert { table: i.table.clone(), rid, row });
     }
     Ok(ResultSet::Message("SUCCESS".into()))
 }
@@ -297,7 +346,7 @@ fn execute_create_table(db: &mut Database, c: &CreateTableStmt) -> Result<Result
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
-fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
+fn execute_select(db: &mut Database, trx: &mut TrxState, s: &SelectStmt) -> Result<ResultSet> {
     if s.from.is_empty() {
         let mut columns = Vec::new();
         let mut row = Vec::new();
@@ -331,10 +380,11 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
                 dtype: col.dtype,
             });
         }
-        let side_rows: Vec<(Rid, Vec<Value>)> = db.store_scan(&tref.name)?;
-        let mut combined = Vec::with_capacity(rows.len() * side_rows.len().max(1));
+        let records = db.store_scan_raw(&tref.name)?;
+        let visible = decode_visible(records, trx)?;
+        let mut combined = Vec::with_capacity(rows.len() * visible.len().max(1));
         for left in rows {
-            for (_, right) in &side_rows {
+            for right in &visible {
                 let mut row = left.clone();
                 row.extend(right.iter().cloned());
                 combined.push(row);
@@ -401,10 +451,7 @@ fn execute_select(db: &mut Database, s: &SelectStmt) -> Result<ResultSet> {
                 BinOp::Ge => scan_rids(&btree, &mut db.pool, Bound::Included(&key), Bound::Unbounded)?,
                 _ => unreachable!("sargable ops are restricted"),
             };
-            source_rows = db.store_get_rows(&s.from[0].name, &rids)?
-                .into_iter()
-                .map(|(_, row)| row)
-                .collect();
+            source_rows = decode_visible(db.store_get_records(&s.from[0].name, &rids)?, trx)?;
         }
     }
     let mut filtered: Vec<Vec<Value>> = Vec::new();

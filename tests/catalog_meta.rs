@@ -7,6 +7,8 @@ fn snapshot() -> CatalogSnapshot {
     CatalogSnapshot {
         next_table_file: 7,
         next_index_file: 3,
+        next_trx_id: 9,
+        committed_trxs: vec![1, 2, 3],
         tables: vec![
             TableMeta {
                 name: "student".into(),
@@ -54,6 +56,8 @@ fn empty_catalog_roundtrips() {
     let snap = CatalogSnapshot {
         next_table_file: 0,
         next_index_file: 0,
+        next_trx_id: 0,
+        committed_trxs: vec![],
         tables: vec![],
         indexes: vec![],
     };
