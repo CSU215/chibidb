@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：M17–M19 评审通过（274 tests 全绿、clippy 零警告、冒烟与基准复验），并录入 M20–M25 执行计划。
+> 最后更新：M20（表约束 PRIMARY KEY / UNIQUE / NOT NULL / DEFAULT）完成，286 tests 全绿、clippy 零警告。M21–M25 待做。
 
 ---
 
@@ -37,7 +37,7 @@ SQL 字符串
 - 运行环境注意：**命令行是 Windows PowerShell**，具体陷阱见 §8
 
 ```powershell
-cargo test                      # 全量回归（274 tests，20+ 个测试二进制）
+cargo test                      # 全量回归（286 tests，20+ 个测试二进制）
 cargo test --test trx           # 单个测试文件
 cargo test --quiet              # 安静模式（注意配合退出码判断，见 §8）
 cargo build
@@ -82,7 +82,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `client.rs` | TCP 客户端 | `run_client` |
 | `wire.rs` | ResultSet/帧二进制编解码 | `encode_result_frame` / `decode_frame` |
 | `catalog/mod.rs` | `Catalog`：`Table`/`HeapStore`/`IndexEntry`、`Schema`/`ColumnDesc`（带 `owner`）、`resolve()` 歧义检测 | |
-| `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT4**（v4：含事务簿记 + 视图定义） | `CatalogSnapshot` |
+| `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT5**（v5：事务簿记 + 视图定义 + 列约束 + 唯一索引标记） | `CatalogSnapshot` |
 | `storage/page.rs` | 页常量：`PAGE_SIZE=8192`、`FileId=u32`、`PageNo=u32`、`zeroed_page` | |
 | `storage/disk.rs` | `DiskManager`：分页文件读写、建文件、魔数校验 | |
 | `storage/buffer.rs` | `BufferPool`：64 帧、LRU `VecDeque`、脏页写回、Drop flush；`with_page(file,no,f)` 闭包式访问（访问即脏）、`read_page`（只读不脏） | |
@@ -94,11 +94,12 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `index/btree.rs` | B+ 树主体：`init/open/open_or_repair/at`、递归插入双级分裂长高、search（跨叶重复键回退）、scan_range 叶链、delete 借用/合并/根收缩（~880 行） | |
 | `wal.rs` | 预写日志：帧 `[u32 len][u8 type][u32 trx][payload]`，Record::Insert/DeleteMark/Commit，追加 + `sync()`（提交点）+ `truncate()`（checkpoint）；`plan_recovery` 解析日志（容忍截断尾帧），纯函数有单测 | `Wal` / `plan_recovery` |
 
-### 3.2 测试（`tests/`，25 个文件 / 274 tests）
+### 3.2 测试（`tests/`，26 个文件 / 286 tests）
 
 - 与源码分层对应：`lexer / parser / eval / agg / join / db / db_index / db_persist / trx / wal / storage_* / index_* / wire / server / repl / datetime / codec / catalog_meta / miniob_compat`
 - `miniob_compat`：student/course/sc 端到端组合场景（CRUD+聚合、分组/having、内外连接、不相关子查询、索引/EXPLAIN）
 - `correlated`：相关 EXISTS/NOT EXISTS/标量（投影与 WHERE）、多外层列、跨两级引用外层列
+- `constraints`：NOT NULL/DEFAULT/列清单 INSERT、PK/UNIQUE 唯一性（含 UPDATE、多行批内、NULL 语义）、约束索引不可 DROP、重启后约束仍在
 - `bench`：`#[ignore]` 的索引 vs 全表扫计时，默认不进回归；`cargo test --release --test bench -- --ignored --nocapture`
 - `tests/wal.rs` 用 `Database::simulate_crash()`（跳过 BufferPool Drop flush）模拟 SIGKILL，配合自己的 `tempfile::TempDir` 复开同一目录
 - 集成测试常用模式：
@@ -133,6 +134,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | M17 表达式面 | ✅ `%` 标点入 lexer；`expr [NOT] LIKE`（`%`/`_` 通配，无转义）；MOD 运算符；字符串函数 concat/upper/lower/length/substring；exec.rs 拆分为 exec/ 六模块 | `d3a85ad` |
 | M18 查询/性能 | ✅ miniob 经典 student/course/sc 端到端回归；忽略式索引基准（`tests/bench.rs`）；修复单表索引扫描仍先全表扫的空转；AND 链同列上下界合并为一段范围扫；只读事务不再重写 catalog | `5c4e26e` + `546b601` |
 | M19 相关子查询 | ✅ `EvalCtx` 改为带父链的作用域（列解析逐层向外）；子查询改为在求值点按当前行/组物化（`bind_expr`/`eval_bound`），支持多层嵌套的相关引用 | `8dce9a3` |
+| M20 表约束 | ✅ 列选项 PRIMARY KEY / UNIQUE / NOT NULL / DEFAULT 解析并持久化（CHIDCAT5）；INSERT 列清单 + DEFAULT 补全；NOT NULL 在 INSERT/UPDATE 校验；PK/UNIQUE 自动建唯一索引并在 DML 查重（`duplicate key`），约束索引不可单独 DROP | `18e940d`…`e381c87` |
 
 ---
 
@@ -140,14 +142,16 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 
 ```sql
 -- DDL
-CREATE TABLE t (id int, name char(10), score float, d date, body text);
+CREATE TABLE t (id int primary key, name char(10) not null,
+                score float default 0, email char(20) unique);
 CREATE INDEX idx_name ON t (col);
-DROP INDEX idx_name;
+DROP INDEX idx_name;                       -- 约束索引（PK/UNIQUE）拒绝 DROP
 DROP TABLE t;
 CREATE VIEW v AS SELECT ...;               -- 定义以原 SQL 文本存入 catalog
 DROP VIEW v;
 -- DML
 INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.0);   -- 多值行，字面量允许负号，null 关键字
+INSERT INTO t (name, id) VALUES ('a', 1);        -- 列清单（可乱序/省略，省略列取 DEFAULT）
 UPDATE t SET score = score + 1 WHERE id < 10;
 DELETE FROM t WHERE name IS NULL;
 -- 查询
@@ -196,6 +200,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 - JOIN 中同名非限定列报 `ambiguous column`，用 `alias.col` 限定
 - LIMIT 只接受非负整数字面量
 - 显式事务内执行 DDL 报错（`DDL inside a transaction is not supported`）
+- 列约束：`primary key` 隐含 `not null` + `unique`；PK/UNIQUE 各自动建名为 `__unique_<table>_<column>` 的唯一索引（约束索引不可单独 DROP）；UNIQUE 允许多个 NULL，PK 因 NOT NULL 不允许；INSERT/UPDATE 走索引查重并过 MVCC 可见性，报 `duplicate key`；同语句内多行用 claimed-key 集合查重；`INSERT INTO t (cols) VALUES` 省略列取 DEFAULT，否则 NULL；DEFAULT 在建表时按列类型 coerce 成 `Value` 存 catalog
 
 ---
 
@@ -205,7 +210,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ```
 <data_dir>/
-  catalog.bin            # 魔数 CHIDCAT3 + next_table_file/next_index_file/next_trx_id/committed[]
+  catalog.bin            # 魔数 CHIDCAT5 + next_table_file/next_index_file/next_trx_id/committed[]
                           # + 表元数据（列定义+file_no）+ 索引元数据（name/table/column/file_no）
   wal.bin                # 预写日志（见 §6.3）；干净关闭/flush 后为 0 字节
   tables/000000.dbf ...  # 每表一个 HeapFile；page 0 头魔数 CHD2，数据页从 1 起，first-fit
@@ -310,7 +315,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ## 9. 执行计划（已评审确认，按序执行；上一轮 1–6 全部完成，里程碑见表）
 
-1. **表约束：PRIMARY KEY / UNIQUE / NOT NULL / DEFAULT**（中大，miniob 对齐最大缺口，M20）
+1. **表约束：PRIMARY KEY / UNIQUE / NOT NULL / DEFAULT**（中大，miniob 对齐最大缺口，M20）✅
    - `CREATE TABLE` 字段选项入 AST/`ColumnDef`；catalog 元数据扩展 → **bump CHIDCAT5**
    - 主键/唯一约束自动建唯一索引（沿用现有 `IndexStore`）；INSERT/UPDATE 前借该索引查重 → `duplicate key` 报错
    - NOT NULL 在 `coerce` 处校验；DEFAULT 值存 catalog，INSERT 缺列时补（需支持 `INSERT INTO t (a,b) VALUES ...` 列清单，当前要求全列）
@@ -323,4 +328,6 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 工作纪律：TDD 红绿节奏、每项一个里程碑提交、提交前全量 `cargo test` + clippy 清零 + 更新本文档与 README。
 
-提交基线：`8411999 docs: link m17-m19 milestones to their commits`（HEAD）。
+进度：M20 完成（286 tests）。接下来依次 M21 RIGHT JOIN → M22 UNION → M23 SQL 小补齐 → M24 元数据锁 → M25 索引消除排序。
+
+提交基线：`e381c87 feat: enforce PRIMARY KEY and UNIQUE via constraint indexes`（HEAD）。

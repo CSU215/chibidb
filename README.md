@@ -11,7 +11,7 @@ cargo run -q                    # 内存数据库 REPL（临时目录后端，�
 cargo run -q -- <dir>           # 文件数据库 REPL（数据落盘，重启不丢）
 cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（274 tests）
+cargo test                      # 全量回归（286 tests）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -30,14 +30,16 @@ scripts\smoke.ps1
 
 ```sql
 -- DDL
-CREATE TABLE t (id int, name char(10), score float, d date, body text);
+CREATE TABLE t (id int primary key, name char(10) not null,
+                score float default 0, email char(20) unique);
 CREATE INDEX idx_name ON t (col);
-DROP INDEX idx_name;
+DROP INDEX idx_name;              -- 约束索引（PK/UNIQUE）拒绝 DROP
 DROP TABLE t;
 CREATE VIEW v AS SELECT id, score FROM t WHERE score >= 75.0;
 DROP VIEW v;
 -- DML
 INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.0);   -- 多值行，null 关键字
+INSERT INTO t (name, id) VALUES ('a', 1);        -- 列清单，省略列取 DEFAULT
 UPDATE t SET score = score + 1 WHERE id < 10;
 DELETE FROM t WHERE name IS NULL;
 -- 查询
@@ -72,6 +74,8 @@ EXPLAIN SELECT ...;            -- 输出 FullScan / IndexScan / NestedLoopJoin
 - `LEFT JOIN` 未匹配的左侧行保留，右列补 NULL
 - `date` 严格按 `YYYY-MM-DD` 校验（闰年正确）；与字符串比较时隐式转换
 - `char(n)` 按字符数校验；`text` 无长度限制但单行超页报错
+- 列约束：`primary key` 隐含 `not null`+`unique`；PK/UNIQUE 自动建唯一索引，违反报 `duplicate key`；
+  UNIQUE 允许多个 NULL；`default` 在建表时定型，`INSERT (列清单)` 省略列取默认值
 - `LIKE` 的 `%`/`_` 通配、区分大小写、无转义字符；任一侧为 NULL 时结果为 NULL
 - `concat` 将任意标量转为文本拼接（任一参数 NULL 则结果 NULL）；`upper`/`lower`/`length`/
   `substring` 仅接受字符串，NULL 传播；`substring` 下标从 1 起，缺省长度到串尾
@@ -115,9 +119,9 @@ SQL 字符串
 
 ## 测试
 
-`cargo test` 跑 274 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/
-索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等，另有 `tests/miniob_compat.rs` 用经典
-student/course/sc 场景做端到端回归。集成测试的 `with_dbs` 模式让同一用例在内存后端
+`cargo test` 跑 286 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/
+表约束（PK/UNIQUE/NOT NULL/DEFAULT）/索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等，
+另有 `tests/miniob_compat.rs` 用经典 student/course/sc 场景做端到端回归。集成测试的 `with_dbs` 模式让同一用例在内存后端
 与文件后端各跑一遍；WAL 测试用 `Database::simulate_crash()` 模拟进程被杀。
 
 ## 性能
