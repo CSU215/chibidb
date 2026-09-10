@@ -39,6 +39,32 @@ fn uncommitted_inserts_are_invisible_to_others() {
 }
 
 #[test]
+fn ddl_is_blocked_while_another_transaction_is_open() {
+    let mut db = Database::open_in_memory().unwrap();
+    let mut a = Session::new();
+    let mut b = Session::new();
+    setup(&mut db, &mut a);
+
+    db.execute_sql_with(&mut a, "begin;").unwrap();
+    db.execute_sql_with(&mut a, "insert into t values (1, 'x');").unwrap();
+
+    for sql in [
+        "drop table t;",
+        "create table u (id int);",
+        "create index i on t (id);",
+        "drop index i;",
+        "create view v as select id from t;",
+        "drop view v;",
+    ] {
+        let err = db.execute_sql_with(&mut b, sql).unwrap_err();
+        assert!(err.to_string().contains("locked"), "{sql}: {err}");
+    }
+
+    db.execute_sql_with(&mut a, "rollback;").unwrap();
+    db.execute_sql_with(&mut b, "create table u (id int);").unwrap();
+}
+
+#[test]
 fn rollback_discards_inserts() {
     let mut db = Database::open_in_memory().unwrap();
     let mut a = Session::new();

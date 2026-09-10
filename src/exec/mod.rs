@@ -28,6 +28,21 @@ use plan::{execute_explain, index_scan_source};
 use subquery::{eval_bound, eval_predicate_bound};
 
 pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Result<ResultSet> {
+    // Schema changes are not isolated from other sessions' open transactions
+    // (their undo log points at tables that could vanish), so refuse them.
+    if matches!(
+        stmt,
+        Stmt::CreateTable(_)
+            | Stmt::CreateView(_)
+            | Stmt::CreateIndex(_)
+            | Stmt::DropIndex(_)
+            | Stmt::DropTable(_)
+            | Stmt::DropView(_)
+    ) && !trx.explicit
+        && db.has_open_trxs_excluding(trx.id)
+    {
+        return Err(Error::Runtime("schema is locked by an open transaction".into()));
+    }
     match stmt {
         Stmt::CreateTable(c) if trx.explicit => ddl_in_trx(trx),
         Stmt::CreateTable(c) => execute_create_table(db, c),
