@@ -11,7 +11,7 @@ cargo run -q                    # 内存数据库 REPL（临时目录后端，�
 cargo run -q -- <dir>           # 文件数据库 REPL（数据落盘，重启不丢）
 cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（286 tests）
+cargo test                      # 全量回归（287 tests）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -45,7 +45,7 @@ DELETE FROM t WHERE name IS NULL;
 -- 查询
 SELECT [DISTINCT] * | expr [AS alias] (, ...)
   FROM tref | view (, ...)*    -- 逗号 = cross join
-  [JOIN | LEFT [OUTER] JOIN tref ON cond]*   -- INNER / LEFT
+  [JOIN | LEFT [OUTER] | RIGHT [OUTER] JOIN tref ON cond]*   -- INNER / LEFT / RIGHT
   [WHERE expr]
   [GROUP BY expr (, expr)*]
   [HAVING expr]
@@ -71,7 +71,7 @@ EXPLAIN SELECT ...;            -- 输出 FullScan / IndexScan / NestedLoopJoin
 - 标识符大小写不敏感；`NULL` 遵循 SQL 三值逻辑（`1/0=2`：NULL 比较为 UNKNOWN，WHERE 只放行 TRUE）
 - `IN (值列表)` 与 `IN (子查询)` 均遵循三值语义：列表/子查询含 NULL 时 `NOT IN` 永不返回 TRUE
 - `DISTINCT` 对投影结果去重，NULL 彼此相等
-- `LEFT JOIN` 未匹配的左侧行保留，右列补 NULL
+- `LEFT JOIN` / `RIGHT JOIN` 保留未匹配的左/右侧行，另一侧补 NULL
 - `date` 严格按 `YYYY-MM-DD` 校验（闰年正确）；与字符串比较时隐式转换
 - `char(n)` 按字符数校验；`text` 无长度限制但单行超页报错
 - 列约束：`primary key` 隐含 `not null`+`unique`；PK/UNIQUE 自动建唯一索引，违反报 `duplicate key`；
@@ -119,7 +119,7 @@ SQL 字符串
 
 ## 测试
 
-`cargo test` 跑 286 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/
+`cargo test` 跑 287 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/
 表约束（PK/UNIQUE/NOT NULL/DEFAULT）/索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等，
 另有 `tests/miniob_compat.rs` 用经典 student/course/sc 场景做端到端回归。集成测试的 `with_dbs` 模式让同一用例在内存后端
 与文件后端各跑一遍；WAL 测试用 `Database::simulate_crash()` 模拟进程被杀。

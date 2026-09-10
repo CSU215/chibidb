@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：M20（表约束 PRIMARY KEY / UNIQUE / NOT NULL / DEFAULT）完成，286 tests 全绿、clippy 零警告。M21–M25 待做。
+> 最后更新：M21（RIGHT JOIN）完成，287 tests 全绿、clippy 零警告。M22–M25 待做。
 
 ---
 
@@ -37,7 +37,7 @@ SQL 字符串
 - 运行环境注意：**命令行是 Windows PowerShell**，具体陷阱见 §8
 
 ```powershell
-cargo test                      # 全量回归（286 tests，20+ 个测试二进制）
+cargo test                      # 全量回归（287 tests，20+ 个测试二进制）
 cargo test --test trx           # 单个测试文件
 cargo test --quiet              # 安静模式（注意配合退出码判断，见 §8）
 cargo build
@@ -94,7 +94,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `index/btree.rs` | B+ 树主体：`init/open/open_or_repair/at`、递归插入双级分裂长高、search（跨叶重复键回退）、scan_range 叶链、delete 借用/合并/根收缩（~880 行） | |
 | `wal.rs` | 预写日志：帧 `[u32 len][u8 type][u32 trx][payload]`，Record::Insert/DeleteMark/Commit，追加 + `sync()`（提交点）+ `truncate()`（checkpoint）；`plan_recovery` 解析日志（容忍截断尾帧），纯函数有单测 | `Wal` / `plan_recovery` |
 
-### 3.2 测试（`tests/`，26 个文件 / 286 tests）
+### 3.2 测试（`tests/`，26 个文件 / 287 tests）
 
 - 与源码分层对应：`lexer / parser / eval / agg / join / db / db_index / db_persist / trx / wal / storage_* / index_* / wire / server / repl / datetime / codec / catalog_meta / miniob_compat`
 - `miniob_compat`：student/course/sc 端到端组合场景（CRUD+聚合、分组/having、内外连接、不相关子查询、索引/EXPLAIN）
@@ -135,6 +135,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | M18 查询/性能 | ✅ miniob 经典 student/course/sc 端到端回归；忽略式索引基准（`tests/bench.rs`）；修复单表索引扫描仍先全表扫的空转；AND 链同列上下界合并为一段范围扫；只读事务不再重写 catalog | `5c4e26e` + `546b601` |
 | M19 相关子查询 | ✅ `EvalCtx` 改为带父链的作用域（列解析逐层向外）；子查询改为在求值点按当前行/组物化（`bind_expr`/`eval_bound`），支持多层嵌套的相关引用 | `8dce9a3` |
 | M20 表约束 | ✅ 列选项 PRIMARY KEY / UNIQUE / NOT NULL / DEFAULT 解析并持久化（CHIDCAT5）；INSERT 列清单 + DEFAULT 补全；NOT NULL 在 INSERT/UPDATE 校验；PK/UNIQUE 自动建唯一索引并在 DML 查重（`duplicate key`），约束索引不可单独 DROP | `18e940d`…`e381c87` |
+| M21 RIGHT JOIN | ✅ `JoinKind::Right`，与 LEFT 对称：未匹配右行保留、左列补 NULL（补宽 = 加入第 i 表前的累计列数） | `3433843` |
 
 ---
 
@@ -157,7 +158,7 @@ DELETE FROM t WHERE name IS NULL;
 -- 查询
 SELECT [DISTINCT] * | expr [AS alias] (, ...)
   FROM tref (, tref)*                      -- 逗号 = cross join
-  [JOIN | LEFT [OUTER] JOIN tref ON cond]* -- INNER / LEFT（未匹配左行右列补 NULL）
+  [JOIN | LEFT [OUTER] | RIGHT [OUTER] JOIN tref ON cond]* -- INNER/LEFT/RIGHT（未匹配侧补 NULL）
   [WHERE expr]
   [GROUP BY expr (, expr)*]
   [HAVING expr]
@@ -299,7 +300,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ## 8. 已知技术债 / 明确的边界
 
-- 无 RIGHT/FULL OUTER JOIN、无 UNION、无 ALTER TABLE、无视图上的 INSERT/UPDATE（视图只读）
+- 无 FULL OUTER JOIN、无 UNION、无 ALTER TABLE、无视图上的 INSERT/UPDATE（视图只读）
 - 相关子查询**无缓存**：每个外层行都会重新执行子查询（不相关子查询也因此按行重复执行）；仅 SELECT 路径支持子查询，UPDATE/DELETE 的 WHERE/SET 里子查询仍报错
 - LIKE 无 ESCAPE 转义；无其它字符串/数学函数（仅 concat/upper/lower/length/substring 与 `%` 取模）
 - 索引访问路径只做单列：AND 链里若同列出现多个下界（或上界）只保留最后一个，不做“取更紧者”的择优化；跨列不合并
@@ -320,7 +321,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
    - 主键/唯一约束自动建唯一索引（沿用现有 `IndexStore`）；INSERT/UPDATE 前借该索引查重 → `duplicate key` 报错
    - NOT NULL 在 `coerce` 处校验；DEFAULT 值存 catalog，INSERT 缺列时补（需支持 `INSERT INTO t (a,b) VALUES ...` 列清单，当前要求全列）
    - 红测试先行：约束 DDL 解析、违反各约束的报错、重启后约束仍在
-2. **RIGHT JOIN**（小，M21）：`JoinKind::Right` 与 LEFT 对称；未匹配右行保留、左列补 NULL；注意 NULL 填充宽度是"累计左侧行"的列数（`schema.columns.len()` 在加入第 i 表之前）
+2. **RIGHT JOIN**（小，M21）✅：`JoinKind::Right` 与 LEFT 对称；未匹配右行保留、左列补 NULL（补宽 = 加入第 i 表前 `schema.columns.len()`）；parser 支持 `RIGHT [OUTER] JOIN`
 3. **UNION / UNION ALL**（中，M22）：`select ... union [all] select ...`；列数必须一致；UNION 走 `dedup_rows`；ORDER BY/LIMIT 归属整个并集；建议 AST 包一层（如 `Stmt::Select` 加 `combine: Option<(bool /*all*/, Box<SelectStmt>)>`）
 4. **SQL 小补齐**（小，M23）：`count(DISTINCT expr)`；LIKE `ESCAPE` 子句（匹配器加转义分支）；UPDATE/DELETE 的 WHERE 支持子查询（mod.rs 两处 `eval_predicate` → `eval_predicate_bound`，outer=None）
 5. **元数据锁 / DDL 隔离**（中，M24）：现有洞——连接 A BEGIN+写 t 时连接 B 可 DROP t，破坏 A 的 undo 目标。最小修法：DDL（create/drop table/index/view）在 `has_open_trxs_excluding(自身)` 为真时报 `schema is locked by an open transaction`；文档更新 §8
@@ -328,6 +329,6 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 工作纪律：TDD 红绿节奏、每项一个里程碑提交、提交前全量 `cargo test` + clippy 清零 + 更新本文档与 README。
 
-进度：M20 完成（286 tests）。接下来依次 M21 RIGHT JOIN → M22 UNION → M23 SQL 小补齐 → M24 元数据锁 → M25 索引消除排序。
+进度：M20、M21 完成（287 tests）。接下来依次 M22 UNION → M23 SQL 小补齐 → M24 元数据锁 → M25 索引消除排序。
 
-提交基线：`e381c87 feat: enforce PRIMARY KEY and UNIQUE via constraint indexes`（HEAD）。
+提交基线：`3433843 feat: add RIGHT [OUTER] JOIN`（HEAD）。
