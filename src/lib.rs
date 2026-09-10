@@ -588,14 +588,16 @@ impl Database {
     /// Enforces UNIQUE / PRIMARY KEY constraints for `row` using the
     /// constraint-backed indexes and MVCC visibility. `exclude` skips the
     /// row being updated; `claimed` catches duplicates among rows touched by
-    /// the same statement before they reach the index.
+    /// the same statement before they reach the index. Claims are keyed by
+    /// column index so equal values in different constraint columns do not
+    /// collide.
     pub(crate) fn check_unique(
         &mut self,
         table: &str,
         row: &[Value],
         exclude: Option<Rid>,
         trx: &TrxState,
-        claimed: &mut Vec<Vec<u8>>,
+        claimed: &mut Vec<(usize, Vec<u8>)>,
     ) -> Result<()> {
         let (checks, heap_file) = {
             let schema = &self.catalog.table(table)?.schema;
@@ -619,10 +621,10 @@ impl Database {
                 continue; // UNIQUE permits multiple NULLs
             }
             let key = encode_key(&row[ci])?;
-            if claimed.contains(&key) {
+            if claimed.iter().any(|(c, k)| *c == ci && k == &key) {
                 return Err(Error::Runtime(format!("duplicate key: {table}({column})")));
             }
-            claimed.push(key.clone());
+            claimed.push((ci, key.clone()));
             for rid in BTree::at(ix_file).search(&mut self.pool, &key)? {
                 if Some(rid) == exclude {
                     continue;

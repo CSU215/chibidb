@@ -188,7 +188,7 @@ fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Resu
     }
     let records = db.store_scan_raw(&u.table)?;
     let mut updates = Vec::new();
-    let mut claimed = Vec::new();
+    let mut claimed: Vec<(usize, Vec<u8>)> = Vec::new();
     for (rid, rec) in records {
         let (creator, deleter, row) = decode_record(&rec)?;
         if !trx.visible(creator, deleter) {
@@ -289,7 +289,7 @@ fn execute_insert(db: &mut Database, trx: &mut TrxState, i: &InsertStmt) -> Resu
             )));
         }
     }
-    let mut claimed = Vec::new();
+    let mut claimed: Vec<(usize, Vec<u8>)> = Vec::new();
     for values in &i.rows {
         // start from defaults, then overlay the supplied values
         let mut row: Vec<Value> = schema

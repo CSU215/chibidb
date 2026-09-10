@@ -114,6 +114,24 @@ fn unique_is_enforced_on_update() {
 }
 
 #[test]
+fn uniqueness_is_checked_per_column_not_across_constraints() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int primary key, ref int unique);").unwrap();
+    // the same encoded value in two DIFFERENT unique columns of one row is legal
+    db.execute_sql("insert into t values (1, 1);").unwrap();
+
+    // multi-row: values may repeat across distinct constraint columns
+    db.execute_sql("create table u (a int unique, b int unique);").unwrap();
+    db.execute_sql("insert into u values (1, 2), (2, 1);").unwrap();
+
+    // real duplicates are still rejected
+    let e = err(&mut db, "insert into t values (1, 3);");
+    assert!(e.contains("duplicate key"), "{e}");
+    let e = err(&mut db, "insert into u values (1, 9);");
+    assert!(e.contains("duplicate key: u(a)"), "{e}");
+}
+
+#[test]
 fn constraint_index_cannot_be_dropped() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int primary key);").unwrap();
