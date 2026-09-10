@@ -11,7 +11,8 @@ cargo run -q                    # 内存数据库 REPL（临时目录后端，�
 cargo run -q -- <dir>           # 文件数据库 REPL（数据落盘，重启不丢）
 cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（231 tests）
+cargo test                      # 全量回归（274 tests）
+cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
 REPL / client 中输入 `exit` 或 `quit` 退出。
@@ -49,9 +50,13 @@ SELECT [DISTINCT] * | expr [AS alias] (, ...)
   [ORDER BY expr [ASC|DESC] (, ...)*]
   [LIMIT n [OFFSET m]]
 -- 聚合：count(*)/count(x)/sum/avg/min/max；空集 sum/avg/min/max → NULL
--- 表达式：+ - * /、and/or/not（三值逻辑）、比较、is [not] null、括号
---          expr [NOT] IN (值列表)、expr [NOT] IN (SELECT ...)（单列）
+-- 表达式：+ - * / %（整数取模/浮点 fmod，模零报错）、and/or/not（三值逻辑）、
+--          比较、is [not] null、括号
+--          expr [NOT] LIKE 'pattern'（% 任意串、_ 单字符，区分大小写、无转义）
+--          字符串函数：concat / upper / lower / length / substring(s, start[, len])
+--          expr [NOT] IN (值列表)、expr [NOT] IN (SELECT ...)（单列，可相关）
 --          [NOT] EXISTS (SELECT ...)、标量 (SELECT ...)（可用于比较与算术）
+--          子查询可引用外层列（相关子查询，支持多层）
 -- 事务
 BEGIN; COMMIT; ROLLBACK;
 CHECKPOINT;                    -- 刷盘 + 截断日志（开事务时拒绝）
@@ -67,9 +72,12 @@ EXPLAIN SELECT ...;            -- 输出 FullScan / IndexScan / NestedLoopJoin
 - `LEFT JOIN` 未匹配的左侧行保留，右列补 NULL
 - `date` 严格按 `YYYY-MM-DD` 校验（闰年正确）；与字符串比较时隐式转换
 - `char(n)` 按字符数校验；`text` 无长度限制但单行超页报错
-- 整数除法向零截断；除零报错
+- `LIKE` 的 `%`/`_` 通配、区分大小写、无转义字符；任一侧为 NULL 时结果为 NULL
+- `concat` 将任意标量转为文本拼接（任一参数 NULL 则结果 NULL）；`upper`/`lower`/`length`/
+  `substring` 仅接受字符串，NULL 传播；`substring` 下标从 1 起，缺省长度到串尾
+- 整数除法向零截断；除零、模零报错
 - ORDER BY 可引用 SELECT 别名；JOIN 中同名非限定列报 ambiguous
-- 子查询不相关（不引用外层列），视图可叠在 JOIN 中、可套视图
+- 子查询支持相关（引用外层列，多层嵌套 OK）：按外层行求值并改写为字面量；视图可叠在 JOIN 中、可套视图
 - 显式事务内执行 DDL 报错
 
 ## 架构（SQL 的一生）
@@ -79,8 +87,8 @@ SQL 字符串
   → lexer          分词（int/float/str/标识符/标点/注释）
   → parser         手写递归下降 → AST
   → executor       常量求值/过滤/投影/聚合/分组/排序/limit/连接/索引扫描
-  → 规则优化器      AND 链提取索引谓词（EXPLAIN 可观测）
-  → 子查询物化      执行前一次性求值 IN/EXISTS/标量子查询并改写为字面量
+  → 规则优化器      AND 链提取索引谓词（等值/上下界合并成一段范围扫，EXPLAIN 可观测）
+  → 子查询物化      按外层行求值 IN/EXISTS/标量子查询并改写为字面量（支持相关子查询）
   → B+ 树索引      保序字节键、分裂/借用/合并、范围扫描
   → MVCC           快照隔离、undo 回滚、BEGIN/COMMIT/ROLLBACK
   → WAL            提交时 fsync；崩溃后重放已提交事务
@@ -107,9 +115,23 @@ SQL 字符串
 
 ## 测试
 
-`cargo test` 跑 252 个测试，覆盖词法/语法/求值/聚合/连接/索引/持久化/事务/
-WAL 恢复/vacuum/存储层/网络协议等。集成测试的 `with_dbs` 模式让同一用例在内存后端
+`cargo test` 跑 274 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/
+索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等，另有 `tests/miniob_compat.rs` 用经典
+student/course/sc 场景做端到端回归。集成测试的 `with_dbs` 模式让同一用例在内存后端
 与文件后端各跑一遍；WAL 测试用 `Database::simulate_crash()` 模拟进程被杀。
+
+## 性能
+
+`tests/bench.rs`（release、5 万行）对比索引访问路径与全表扫：
+
+| 查询 | 索引 | 全表扫 |
+|---|---|---|
+| 点查 `id = 12345` | ~19 µs | ~27 ms |
+| 单边范围 `id < 100` | ~54 µs | ~24 ms |
+| 双边范围 `id in [10000,10100)` | ~0.11 ms | ~29 ms |
+
+要点：单表 SELECT 会在扫描前先选定访问路径，命中索引时完全跳过堆扫描；AND 链里
+同一索引列的 `>`/`>=`/`<`/`<=` 会合并为一段 B+ 树范围扫；只读事务不重写 catalog。
 
 ## 依赖
 

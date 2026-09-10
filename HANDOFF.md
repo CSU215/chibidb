@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：M16（VACUUM 空间回收 + flush 开事务守卫）完成后，252 个测试全绿，clippy 零警告，共 78 个提交。
+> 最后更新：M19（相关子查询）完成后，274 个测试全绿，clippy 零警告。
 
 ---
 
@@ -37,7 +37,7 @@ SQL 字符串
 - 运行环境注意：**命令行是 Windows PowerShell**，具体陷阱见 §8
 
 ```powershell
-cargo test                      # 全量回归（约 239 tests，20+ 个测试二进制）
+cargo test                      # 全量回归（274 tests，20+ 个测试二进制）
 cargo test --test trx           # 单个测试文件
 cargo test --quiet              # 安静模式（注意配合退出码判断，见 §8）
 cargo build
@@ -66,7 +66,12 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `lexer.rs` | 分词：整数/浮点/字符串/标识符/标点/`--` 注释 | `lex(src) -> Result<Vec<Token>>` |
 | `parser.rs` | 递归下降解析全部 SQL（文法见 §5） | `parse(sql) -> Result<Vec<Stmt>>` |
 | `ast.rs` | AST：`Stmt` / `Expr` / `SelectStmt` / DDL / `TrxCtl` 等 | |
-| `exec.rs` | **最大的文件（~950 行）**：语句执行、表达式双上下文求值、聚合、分组、排序、JOIN、可见性过滤、EXPLAIN 计划 | `execute(db, trx, stmt)` |
+| `exec/mod.rs` | 执行器入口：语句分发、DDL/DML、`execute_select` 流水线（**先定访问路径**→可见性过滤→分组/排序→投影→distinct/limit）、`decode_visible`/`coerce` | `execute(db, trx, stmt)` |
+| `exec/eval.rs` | 表达式双上下文求值（`EvalCtx` 带父链的 Row/Group 作用域，`resolve_column` 逐层向外）、算子、三值逻辑、LIKE、标量函数、`eval_const` | `eval` / `eval_const` |
+| `exec/aggregate.rs` | 聚合求值、GROUP BY/HAVING、ORDER BY（聚合与普通行两路）、DISTINCT、LIMIT | `execute_grouped_select` |
+| `exec/join.rs` | FROM 展开（表/视图）与嵌套循环 INNER/LEFT JOIN | `nested_loop` / `from_source` |
+| `exec/plan.rs` | EXPLAIN 计划、规则式索引访问路径（sargable）、**同列上下界合并为范围扫**、索引扫描取行 | `execute_explain` / `index_scan_source` |
+| `exec/subquery.rs` | 子查询物化改写（IN/EXISTS/标量）：按当前外层行求值后改写为字面量；`eval_bound`/`eval_predicate_bound` 是接入点 | `bind_expr` |
 | `value.rs` | `Value`：Null/Bool/Int(i64)/Float(f64)/Str/Date(i32 纪元天数)/Text | Display 决定 REPL 输出 |
 | `datetime.rs` | 日期校验：civil-date 算法（Hinnant），`'YYYY-MM-DD'` 比较时隐式转日期 | `parse_date` |
 | `trx.rs` | 事务：`Session` / `TrxState`（id+快照+undo）/ 可见性判定 / `Undo` | `TrxState::visible` |
@@ -89,9 +94,12 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `index/btree.rs` | B+ 树主体：`init/open/open_or_repair/at`、递归插入双级分裂长高、search（跨叶重复键回退）、scan_range 叶链、delete 借用/合并/根收缩（~880 行） | |
 | `wal.rs` | 预写日志：帧 `[u32 len][u8 type][u32 trx][payload]`，Record::Insert/DeleteMark/Commit，追加 + `sync()`（提交点）+ `truncate()`（checkpoint）；`plan_recovery` 解析日志（容忍截断尾帧），纯函数有单测 | `Wal` / `plan_recovery` |
 
-### 3.2 测试（`tests/`，22 个文件 / 239 tests）
+### 3.2 测试（`tests/`，25 个文件 / 274 tests）
 
-- 与源码分层对应：`lexer / parser / eval / agg / join / db / db_index / db_persist / trx / wal / storage_* / index_* / wire / server / repl / datetime / codec / catalog_meta`
+- 与源码分层对应：`lexer / parser / eval / agg / join / db / db_index / db_persist / trx / wal / storage_* / index_* / wire / server / repl / datetime / codec / catalog_meta / miniob_compat`
+- `miniob_compat`：student/course/sc 端到端组合场景（CRUD+聚合、分组/having、内外连接、不相关子查询、索引/EXPLAIN）
+- `correlated`：相关 EXISTS/NOT EXISTS/标量（投影与 WHERE）、多外层列、跨两级引用外层列
+- `bench`：`#[ignore]` 的索引 vs 全表扫计时，默认不进回归；`cargo test --release --test bench -- --ignored --nocapture`
 - `tests/wal.rs` 用 `Database::simulate_crash()`（跳过 BufferPool Drop flush）模拟 SIGKILL，配合自己的 `tempfile::TempDir` 复开同一目录
 - 集成测试常用模式：
   - `with_dbs(|db| {...})`：同一用例在临时目录后端和内存（临时目录）后端各跑一遍
@@ -122,6 +130,9 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | M14 加固 | ✅ DROP TABLE（`d0e239c`）、跨语句事务会话修复（`bcfd6ee`）、clippy 清零（`0023a43`）、README + 冒烟脚本（`46c8637`） | `46c8637` |
 | M15 查询/运维增强 | ✅ CHECKPOINT 语句 + WAL 预算护栏（`c8e060e`）、DISTINCT（`2389f99`）、LEFT [OUTER] JOIN（`5f31ea2`） | `5f31ea2` |
 | M16 空间回收 | ✅ VACUUM：物理回收已提交删除标记行/孤儿版本 + stale 索引项清理；flush() 开事务守卫（`975dab2`） | `975dab2` |
+| M17 表达式面 | ✅ `%` 标点入 lexer；`expr [NOT] LIKE`（`%`/`_` 通配，无转义）；MOD 运算符；字符串函数 concat/upper/lower/length/substring；exec.rs 拆分为 exec/ 六模块 | （工作区，未提交） |
+| M18 查询/性能 | ✅ miniob 经典 student/course/sc 端到端回归；忽略式索引基准（`tests/bench.rs`）；修复单表索引扫描仍先全表扫的空转；AND 链同列上下界合并为一段范围扫；只读事务不再重写 catalog | （工作区，未提交） |
+| M19 相关子查询 | ✅ `EvalCtx` 改为带父链的作用域（列解析逐层向外）；子查询改为在求值点按当前行/组物化（`bind_expr`/`eval_bound`），支持多层嵌套的相关引用 | （工作区，未提交） |
 
 ---
 
@@ -149,9 +160,12 @@ SELECT [DISTINCT] * | expr [AS alias] (, ...)
   [ORDER BY expr [ASC|DESC] (, ...)*]      -- NULL 升序在前降序在后，稳定排序
   [LIMIT n [OFFSET m]]
 -- 聚合：count(*)/count(x) 忽略 null / sum / avg（恒 float）/ min / max；空集 sum/avg/min/max → NULL
--- 表达式：+ - * /（int 截断、checked overflow）、and/or/not（SQL 三值逻辑）、
---         = <> < <= > >=、is [not] null、括号、expr [NOT] IN (值列表)、
---         expr [NOT] IN (SELECT..)（单列）、[NOT] EXISTS (SELECT..)、标量 (SELECT..)
+-- 表达式：+ - * / %（int 截断/取模、checked overflow）、and/or/not（SQL 三值逻辑）、
+--         = <> < <= > >=、is [not] null、括号、
+--         expr [NOT] LIKE 'pattern'（`%` 任意串、`_` 单字符，区分大小写、无转义）、
+--         字符串函数 concat / upper / lower / length / substring(s, start[, len])、
+--         expr [NOT] IN (值列表)、expr [NOT] IN (SELECT..)（单列，可相关）、
+--         [NOT] EXISTS (SELECT..)、标量 (SELECT..)；子查询可引用外层列（多层相关）
 -- 事务
 BEGIN; COMMIT; ROLLBACK;
 CHECKPOINT;                                -- flush_all + save_catalog + 截断 wal；有开事务时报错
@@ -162,7 +176,8 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 子查询/视图的实现要点（改相关代码前必读）：
 
 - `IN (值列表)` 在 **parser 里脱糖**成 OR/AND 比较链，三值语义免费正确（列表含 NULL 时 NOT IN 永不 TRUE）
-- 子查询（InSubquery/Exists/ScalarSubquery）走 `exec::lift_subqueries`：execute_select 入口先把整棵 select 表达式树里的子查询**执行一次并改写为 `Expr::Value` 字面量**，eval 本身保持无上下文；嵌套子查询自然递归；**只支持不相关子查询**（引用外层列会报 no such column）
+- 子查询（InSubquery/Exists/ScalarSubquery）走 `exec/subquery.rs`：在每个求值点用 `eval_bound`/`eval_predicate_bound` 先 `bind_expr`，把子查询**按当前行/组上下文执行并改写为 `Expr::Value` 字面量**，之后 eval 仍是无上下文纯函数。**相关子查询**通过 `EvalCtx` 父链实现：内层 schema 解析不到列时逐层向外查（`resolve_column`），最内层歧义不再外查；`execute_select` 多了 `outer: Option<&EvalCtx>` 参数。嵌套/多层相关自然递归
+- 相关子查询为**逐行物化、无缓存**：不相关子查询也会按行重复执行（正确但非最优，见 §8）
 - 标量子查询：0 行 → NULL，>1 行或 >1 列报错；IN 子查询要求单列
 - 视图：定义 SQL 原文存 catalog（parser 用 token 偏移切片，需 `Parser.src`）；查询时 `exec::from_source` 在 FROM 处展开（真实表走 MVCC，视图递归执行其 select）；视图列 dtype 用 Text 占位（查询路径不用 dtype）；视图无索引（find_sargable 直接跳过）；CREATE VIEW 时试执行一次做校验（表/列存在性）
 - catalog 格式已升 **CHIDCAT4**（views 字段）；视图名与表名互斥占用
@@ -173,6 +188,9 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 - 整数除法向零截断；除零报错；`1/0=2` 三值逻辑：NULL 参与比较 → NULL（UNKNOWN），WHERE 只放行 TRUE
 - `date` 列插入字符串时严格按 `YYYY-MM-DD` 校验（闰年用 Hinnant 算法）；与字符串比较时隐式转换
 - `char(n)` 按字符数校验；`text` 无长度限制但单行记录超 8KB 报错
+- `LIKE`：`%` 匹配任意长（含空）子串、`_` 匹配单字符，逐字符比较（非字节），区分大小写，无转义；任一侧 NULL → NULL
+- 字符串函数：`concat` 把任意标量转文本拼接、任一参数 NULL → NULL；`upper`/`lower`/`length`/`substring` 仅接受 Str（否则 type mismatch），NULL 传播；`length` 按字符数；`substring` 下标 1 起，越界得空串，start<1/len<0 报错；`substr` 为别名；未知函数运行时报错
+- `%` 为取模：int 用 checked_rem、float 用 fmod，模零报错
 - 聚合无 GROUP BY 时裸列出现在 SELECT 会报错；GROUP BY 下其它列取首行（宽松语义）
 - ORDER BY 可引用 SELECT 别名（如 `count(*) as total ... order by total`）
 - JOIN 中同名非限定列报 `ambiguous column`，用 `alias.col` 限定
@@ -208,7 +226,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
   - INSERT → 新版本（creator=trx）；undo 物理删除该 rid 并删对应索引项
   - DELETE → `HeapFile::delete_mark`（原位改写 8 字节，记录长度不变；**不做物理回收**）；undo 清标记
   - UPDATE → 标记旧版本 + 追加新版本（新 Rid）；索引只追加新键项，旧项靠读时可见性过滤；undo 删新版本+索引项+解除旧标记
-- 提交：`committed_trxs.insert(id)` 后立即 `save_catalog()`（提交持久化点）
+- 提交：`committed_trxs.insert(id)` 后，**只有写事务**（undo 非空）才追加 Commit 帧 + `wal.sync()` + `save_catalog()`；只读事务只更新内存 committed 集就返回（无版本行引用其 id，落盘无意义，且避免每条 SELECT 重写 catalog）
 - 读路径统一走 `decode_visible(records, trx)`；JOIN 流水线、索引扫描（store_get_records）都要过这层
 - 并发模型：全局单 Mutex 串行化，允许多个 BEGIN 并存但执行串行；连接断开时应 `rollback_session`（server.rs 当前在连接结束路径，确认已接入）
 - 索引与可见性：索引本身**不含** trx 信息，扫到 rid 后回表 + 可见性过滤；UPDATE/DELETE 会积累 stale 索引项（空间债）
@@ -276,26 +294,31 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ## 8. 已知技术债 / 明确的边界
 
-- 无 RIGHT/FULL OUTER JOIN、无 UNION、无 ALTER TABLE、无相关子查询（子查询引用外层列）、无视图上的 INSERT/UPDATE（视图只读）
-- 无 MOD/% / 字符串函数；无 LIKE（除 IS NULL 外）
+- 无 RIGHT/FULL OUTER JOIN、无 UNION、无 ALTER TABLE、无视图上的 INSERT/UPDATE（视图只读）
+- 相关子查询**无缓存**：每个外层行都会重新执行子查询（不相关子查询也因此按行重复执行）；仅 SELECT 路径支持子查询，UPDATE/DELETE 的 WHERE/SET 里子查询仍报错
+- LIKE 无 ESCAPE 转义；无其它字符串/数学函数（仅 concat/upper/lower/length/substring 与 `%` 取模）
+- 索引访问路径只做单列：AND 链里若同列出现多个下界（或上界）只保留最后一个，不做“取更紧者”的择优化；跨列不合并
 - DISTINCT + ORDER BY 引用非投影列时，保留哪一行是按扫描顺序首个（标准 SQL 视为非法，未做校验）
 - VACUUM 回收的空页不归还文件系统（页留给 first-fit 复用）；空页只在该表变小时浪费
 - 单 Mutex 单 writer 串行化；无死锁检测；vacuum 之外长事务 + 未提交孤儿版本仍会占空间
-- BufferPool 无预读；WAL checkpoint 是全量截断（有预算护栏但无模糊检查点）；first-fit 插入是 O(页数)
+- BufferPool 无预读；WAL checkpoint 是全量截断（有预算护栏但无模糊检查点）；first-fit 插入是 O(页数)，建 5 万行表的主要耗时即在此（基准测试因此偏慢）
 - **多连接下的 DDL 隔离不存在**：一个连接持有未提交事务时，另一连接仍可 DROP TABLE / CREATE INDEX / DROP VIEW（open_trxs 注册表只护 WAL 截断与 VACUUM，不锁元数据）；教学场景可接受，修法需先做会话级元数据锁
-- `exec.rs` ~1200 行偏大，未来可拆 eval/aggregate/join/plan/subquery 五个模块
+- `exec/` 已按职责拆分（mod/eval/aggregate/join/plan/subquery，见 §3.1）；跨模块共享项用 `pub(crate)`，`eval_const` 经 `exec::eval_const` 重导出
+- 索引访问路径已修：单表 SELECT 命中索引时不再先全表扫；`id >= a and id < b` 合并成一段范围扫。基准（release/5 万行）：点查 ~19µs vs ~27ms，单边范围 ~54µs vs ~24ms，双边范围 ~0.11ms vs ~29ms
 
 ---
 
 ## 9. 建议的后续顺序（已确认的执行计划，按序执行）
 
-1. **LIKE 匹配**（小）：lexer 补 `%` 标点（顺带解锁 MOD 运算符，一次 lexer 改动两用）；parser 加 `expr [NOT] LIKE 'pattern'`；执行器写 `%`/`_` 通配的简单匹配器；**不支持转义**（方言文档注明）；不做索引下推
-2. **字符串函数**（中）：AST 加 `Expr::Function(name, args)`，先做 CONCAT/UPPER/LOWER/LENGTH/SUBSTRING；eval 保持纯函数，与子查询物化机制互不干扰
-3. **exec.rs 拆分**（中，纯重构）：~1200 行拆成 eval/aggregate/join/plan/subquery 五个模块；趁功能面稳定时做，之后每项改动的成本都会下降
-4. **miniob 兼容性回归用例移植**（测试）：把 miniob 经典测试场景（CRUD、聚合、join、子查询组合拳）转成集成测试，锁定方言行为
-5. **基准测试**（小）：B+ 树点查/范围扫 vs 全表扫的对比计时，README 附数字；顺带验证 3 的重构无回归
-6. **相关子查询**（大，压轴）：eval 传入外层行上下文（EvalCtx 链式），子查询物化改为逐行缓存；复杂度高、教学收益相对低
+1. **LIKE 匹配**（小）✅：lexer 补 `%` 标点（顺带解锁 MOD 运算符，一次 lexer 改动两用）；parser 加 `expr [NOT] LIKE 'pattern'`；执行器写 `%`/`_` 通配的简单匹配器；**不支持转义**（方言文档注明）；不做索引下推
+2. **字符串函数**（中）✅：AST 加 `Expr::Function(name, args)`，先做 CONCAT/UPPER/LOWER/LENGTH/SUBSTRING；eval 保持纯函数，与子查询物化机制互不干扰
+3. **exec.rs 拆分**（中，纯重构）✅：拆成 mod/eval/aggregate/join/plan/subquery；新增 `nested_loop`（join.rs）与 `index_scan_source`（plan.rs）两个提取点；263 tests 全绿、clippy 零警告验证无回归
+4. **miniob 兼容性回归用例移植**（测试）✅：`tests/miniob_compat.rs`，student/course/sc 的 CRUD+聚合、分组/having、内外连接、不相关子查询、索引/EXPLAIN 组合场景
+5. **基准测试**（小）✅：`tests/bench.rs`（`#[ignore]`，release/5 万行）；**顺带修出两处真实性能问题**——单表索引扫描原先仍先全表扫（现已先定路径），AND 链同列上下界未合并（现已合并）；只读事务不再重写 catalog。README 已附数字
+6. **相关子查询**（大，压轴）✅：`EvalCtx` 改为带父链的作用域，列解析逐层向外；子查询改为在求值点按当前行/组物化（`bind_expr`/`eval_bound`），支持多层相关引用。`tests/correlated.rs` 覆盖 EXISTS/NOT EXISTS/标量、多外层列、跨两级引用
 
 理由：1+2 补齐 SQL 表达式面且互相搭车；3 在 4/6 之前做，减少测试改动打架；5 给 README 增色并验证重构。
 
-提交基线：`975dab2 feat: vacuum ...`（HEAD）。
+进度：**1–6 全部完成**（274 tests 全绿，clippy 零警告，改动尚未提交）。计划已清空。
+
+提交基线：`975dab2 feat: vacuum ...`（HEAD）；HEAD 之后当前工作区含 M17–M19 未提交改动。建议按里程碑拆分提交（如 `feat: like/mod/string functions`、`refactor: split exec`、`test: miniob compat + bench`、`perf: index access path + range bounds + read-only catalog`、`feat: correlated subqueries`）。
