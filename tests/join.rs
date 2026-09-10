@@ -114,6 +114,37 @@ fn three_way_join() {
 }
 
 #[test]
+fn right_join_keeps_unmatched_right_rows() {
+    with_dbs(|db| {
+        seeded(db);
+        // dept 3 (hr) has no employee, so it survives with NULL emp columns;
+        // emp 13 (dan, dept_id 9) has no dept and is dropped
+        let rows = rows_of(
+            db,
+            "select emp.name, dept.dname from emp right join dept on emp.dept_id = dept.id \
+             order by dept.id;",
+        );
+        assert_eq!(
+            rows,
+            [
+                [Value::Str("alice".into()), Value::Str("dev".into())],
+                [Value::Str("carol".into()), Value::Str("dev".into())],
+                [Value::Str("bob".into()), Value::Str("ops".into())],
+                [Value::Null, Value::Str("hr".into())],
+            ]
+        );
+
+        // RIGHT OUTER JOIN is accepted too
+        let rows = rows_of(
+            db,
+            "select dept.dname from emp right outer join dept on emp.dept_id = dept.id \
+             where emp.id is null;",
+        );
+        assert_eq!(rows, [[Value::Str("hr".into())]]);
+    });
+}
+
+#[test]
 fn join_errors() {
     with_dbs(|db| {
         seeded(db);

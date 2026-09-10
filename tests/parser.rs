@@ -410,6 +410,12 @@ fn parses_left_join() {
     let s = select("select * from a join b on a.id = b.a_id;");
     assert_eq!(s.joins, vec![JoinKind::Cross, JoinKind::Inner]);
 
+    let s = select("select * from a right join b on a.id = b.a_id;");
+    assert_eq!(s.joins, vec![JoinKind::Cross, JoinKind::Right]);
+
+    let s = select("select * from a right outer join b on a.id = b.a_id;");
+    assert_eq!(s.joins, vec![JoinKind::Cross, JoinKind::Right]);
+
     let s = select("select * from a, b;");
     assert_eq!(s.joins, vec![JoinKind::Cross, JoinKind::Cross]);
 

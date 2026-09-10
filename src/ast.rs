@@ -254,6 +254,8 @@ pub enum JoinKind {
     Inner,
     /// LEFT [OUTER] JOIN ... ON: unmatched left rows survive with NULLs
     Left,
+    /// RIGHT [OUTER] JOIN ... ON: unmatched right rows survive with NULLs
+    Right,
 }
 
 #[derive(Debug, Clone, PartialEq)]

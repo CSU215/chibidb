@@ -61,6 +61,7 @@ pub(crate) fn nested_loop(
         let owner = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
         let (columns, visible) = from_source(db, trx, tref)?;
         let right_cols = columns.len();
+        let left_cols = schema.columns.len();
         for col in columns {
             schema.columns.push(crate::catalog::ColumnDesc::plain(
                 Some(owner.clone()),
@@ -88,6 +89,26 @@ pub(crate) fn nested_loop(
                 if !matched {
                     let mut row = left;
                     row.extend(vec![Value::Null; right_cols]);
+                    combined.push(row);
+                }
+            }
+        } else if i >= 1 && kind == JoinKind::Right {
+            let Some(cond) = cond else {
+                return Err(Error::Runtime("right join requires an on clause".into()));
+            };
+            for right in &visible {
+                let mut matched = false;
+                for left in &rows {
+                    let mut row = left.clone();
+                    row.extend(right.iter().cloned());
+                    if eval_predicate_bound(db, trx, cond, &schema, &row, outer)? {
+                        combined.push(row);
+                        matched = true;
+                    }
+                }
+                if !matched {
+                    let mut row = vec![Value::Null; left_cols];
+                    row.extend(right.iter().cloned());
                     combined.push(row);
                 }
             }

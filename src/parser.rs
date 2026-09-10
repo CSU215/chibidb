@@ -284,6 +284,12 @@ impl<'a> Parser<'a> {
                         return Err(self.unexpected("join"));
                     }
                     JoinKind::Left
+                } else if self.eat_keyword("right") {
+                    self.eat_keyword("outer");
+                    if !self.eat_keyword("join") {
+                        return Err(self.unexpected("join"));
+                    }
+                    JoinKind::Right
                 } else if self.eat_keyword("join") {
                     JoinKind::Inner
                 } else {
