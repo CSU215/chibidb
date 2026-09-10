@@ -136,3 +136,10 @@ fn open_in_memory_honors_config() {
     let db = Database::open_in_memory_with_config(&cfg).unwrap();
     assert_eq!(db.config().storage.buffer_pool_frames, 1);
 }
+
+#[test]
+fn rejects_page_size_differing_from_build() {
+    let cfg = Config::from_toml_str("[storage]\npage_size = 4096\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    assert!(Database::open_with_config(dir.path(), &cfg).is_err());
+}

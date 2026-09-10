@@ -78,6 +78,13 @@ impl Database {
     /// newly created files. Existing files describe themselves and take
     /// precedence over these defaults.
     pub fn open_with_config(path: &Path, config: &Config) -> Result<Self> {
+        if config.storage.page_size as usize != crate::storage::PAGE_SIZE {
+            return Err(Error::Runtime(format!(
+                "storage.page_size {} is not supported yet (this build uses {})",
+                config.storage.page_size,
+                crate::storage::PAGE_SIZE
+            )));
+        }
         let tables_dir = path.join("tables");
         let indexes_dir = path.join("indexes");
         std::fs::create_dir_all(&tables_dir).map_err(dir_err(&tables_dir))?;
