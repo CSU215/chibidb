@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：M12.1（MVCC 核心）完成后，211 个测试全绿，共 57 个提交。
+> 最后更新：M12.3（WAL + 崩溃恢复）完成后，224 个测试全绿，共 59 个提交。
 
 ---
 
@@ -17,8 +17,9 @@ SQL 字符串
   → parser (AST，手写递归下降)
   → executor（常量求值/过滤/投影/聚合/分组/排序/limit/连接/索引扫描）
   → 规则式优化器（AND 链提取索引谓词，EXPLAIN 可观测）
-  → B+ 树索引（保序字节键、分裂/借用/合并、范围扫描）
-  → MVCC（快照隔离、undo 回滚、BEGIN/COMMIT/ROLLBACK）
+   → B+ 树索引（保序字节键、分裂/借用/合并、范围扫描）
+   → MVCC（快照隔离、undo 回滚、BEGIN/COMMIT/ROLLBACK）
+   → WAL（提交时 fsync、崩溃后重放已提交事务、干净关闭即 checkpoint）
   → slotted page（8KB、槽目录、删除压实）
   → HeapFile（Rid 寻址、多页 first-fit）
   → BufferPool（8KB 帧、LRU、脏页写回、Drop 落盘）
@@ -36,7 +37,7 @@ SQL 字符串
 - 运行环境注意：**命令行是 Windows PowerShell**，具体陷阱见 §8
 
 ```powershell
-cargo test                      # 全量回归（约 211 tests，20+ 个测试二进制）
+cargo test                      # 全量回归（约 224 tests，20+ 个测试二进制）
 cargo test --test trx           # 单个测试文件
 cargo test --quiet              # 安静模式（注意配合退出码判断，见 §8）
 cargo build
@@ -94,11 +95,13 @@ Stop-Job $job; Remove-Job $job -Force
 | `storage/codec.rs` | 行/记录编码：自描述 tag（Null=00/Int=01/Float=02/Str=03/Bool=04/Date=05/Text）、值计数前缀；`encode_row/decode_row`；**版本化记录** `encode_record(creator,deleter,row)`（前 8 字节两个隐藏 u32） | |
 | `index/key.rs` | 索引保序键编码：int 符号翻转大端、float 保序变换、str+NUL 结尾、date 符号翻转、null=0x00 | `encode_key` |
 | `index/node.rs` | B+ 树节点页：叶/内部条目、lower/upper bound、bytes 占用阈值 25%、`page_write` 原位重写 | |
-| `index/btree.rs` | B+ 树主体：`init/open/at`、递归插入双级分裂长高、search（跨叶重复键回退）、scan_range 叶链、delete 借用/合并/根收缩（~850 行） | |
+| `index/btree.rs` | B+ 树主体：`init/open/open_or_repair/at`、递归插入双级分裂长高、search（跨叶重复键回退）、scan_range 叶链、delete 借用/合并/根收缩（~880 行） | |
+| `wal.rs` | 预写日志：帧 `[u32 len][u8 type][u32 trx][payload]`，Record::Insert/DeleteMark/Commit，追加 + `sync()`（提交点）+ `truncate()`（checkpoint）；`plan_recovery` 解析日志（容忍截断尾帧），纯函数有单测 | `Wal` / `plan_recovery` |
 
-### 3.2 测试（`tests/`，21 个文件 / 211 tests）
+### 3.2 测试（`tests/`，22 个文件 / 224 tests）
 
-- 与源码分层对应：`lexer / parser / eval / agg / join / db / db_index / db_persist / trx / storage_* / index_* / wire / server / repl / datetime / codec / catalog_meta`
+- 与源码分层对应：`lexer / parser / eval / agg / join / db / db_index / db_persist / trx / wal / storage_* / index_* / wire / server / repl / datetime / codec / catalog_meta`
+- `tests/wal.rs` 用 `Database::simulate_crash()`（跳过 BufferPool Drop flush）模拟 SIGKILL，配合自己的 `tempfile::TempDir` 复开同一目录
 - 集成测试常用模式：
   - `with_dbs(|db| {...})`：同一用例在临时目录后端和内存（临时目录）后端各跑一遍
   - `Database::open_in_memory().unwrap()` 返回 **Result**（注意是 Result，旧代码曾是直接值）
@@ -123,7 +126,7 @@ Stop-Job $job; Remove-Job $job -Force
 | M9 B+ 树索引全套 + CREATE/DROP INDEX + DML 维护 + 规则优化器 + EXPLAIN | ✅ | `7d20698` |
 | M10 查询能力：COUNT/SUM/AVG/MIN/MAX、GROUP BY、HAVING、ORDER BY（多键+NULL 排序）、LIMIT/OFFSET、嵌套循环 INNER JOIN（逗号 + JOIN..ON、别名、限定列） | ✅ | `f440173` |
 | M11 子查询/视图 | ❌ **未开始** | |
-| M12 事务 | 🟡 **进行中**：M12.1 MVCC 核心已完成（`568f62d`）；**M12.3 WAL+崩溃恢复未做**（M12.2 的 update/delete MVCC 化已并入 M12.1） | `568f62d` |
+| M12 事务（MVCC + WAL） | ✅ M12.1 MVCC 核心 `568f62d`；M12.3 WAL+崩溃恢复 `0fe605d`（M12.2 update/delete MVCC 化已并入 M12.1） | `0fe605d` |
 | M13 TCP server + client + wire 协议 | ✅ | `d06103c` |
 | M14 加固 | ❌ 未开始（DROP TABLE、README、基准等） | |
 
@@ -179,6 +182,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 <data_dir>/
   catalog.bin            # 魔数 CHIDCAT3 + next_table_file/next_index_file/next_trx_id/committed[]
                           # + 表元数据（列定义+file_no）+ 索引元数据（name/table/column/file_no）
+  wal.bin                # 预写日志（见 §6.3）；干净关闭/flush 后为 0 字节
   tables/000000.dbf ...  # 每表一个 HeapFile；page 0 头魔数 CHD2，数据页从 1 起，first-fit
   indexes/000000.idxf ...# 每索引一个 B+ 树文件；page 0 头魔数 CHIDBTX1
 ```
@@ -202,30 +206,21 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 - 并发模型：全局单 Mutex 串行化，允许多个 BEGIN 并存但执行串行；连接断开时应 `rollback_session`（server.rs 当前在连接结束路径，确认已接入）
 - 索引与可见性：索引本身**不含** trx 信息，扫到 rid 后回表 + 可见性过滤；UPDATE/DELETE 会积累 stale 索引项（空间债）
 
-### 6.3 下一站：M12.3 WAL + 崩溃恢复（**这是建议的下一个任务**）
+### 6.3 WAL + 崩溃恢复（M12.3，已实现）
 
-当前缺口：进程被杀（BufferPool 的 Drop flush 没跑）时，已 COMMIT 的数据可能只在脏页没进文件 → 丢数据。catalog 在 commit 时落盘，但数据页没有。
+帧格式 `[u32 len][u8 type][u32 trx_id][payload]`（len 覆盖 len 之后的所有字节；type 1=Insert、2=DeleteMark、3=Commit；解析遇截断尾帧/未知 type 即停止）。Update 记为 DeleteMark+Insert 两条。
 
-建议设计（与现有代码契合度最高的方案）：
-
-1. 新模块 `src/wal.rs`：单个 `wal.bin` 追加日志，记录帧 `[u32 len][u8 type][u32 trx_id][payload]`
-   - `INSERT`：file_no + Rid + 完整版本化记录字节
-   - `DELETE_MARK`：file_no + Rid + deleter
-   - `UPDATE` 可直接记为 DELETE_MARK+INSERT 两条（或新类型）
-   - `COMMIT`：trx_id；`BEGIN/ROLLBACK` 可选
-2. 写时机：与 undo 同处追加（在 `lib.rs` 的 store_insert/store_delete_mark/store_update_versions 内），**COMMIT 时 fsync 日志**（tokio 无 fsync——存储层目前全同步 std::fs，用 `File::sync_all()`）
-3. 恢复（`Database::open` 末尾）：
-   - 顺序读 wal，按 trx 收集；只有带 COMMIT 记录的事务做 REDO：
-     - INSERT：仅当目标 Rid 当前为空槽（页不存在/槽空）才重放，避免重复
-     - DELETE_MARK：rid 存在且 deleter==0 时打标记
-   - 未提交事务的插入物理保留但天然不可见（creator 不在任何快照）；其删除标记也不生效（deleter 未提交）→ **只需 REDO 已提交**
-   - catalog 的 committed_trxs 已经在 COMMIT 时持久化，恢复后可见性正确
-4. 干净关闭（flush 成功后）truncate wal.bin（checkpoint 简化版）
-5. 测试（新建 `tests/wal.rs`，红→绿）：
-   - 提交后模拟崩溃：需要一个绕过 Drop flush 的退出路径——给 Database 加 `simulate_crash(self)`（`std::mem::forget(self)` 或显式标记阻止 Drop）
-   - 重开：已提交插入/删除生效；未回滚事务的数据不可见
-   - 截断半个尾部帧时恢复不报错（忽略不完整帧）
-6. 完成标准：`cargo test` 全绿，提交 `feat: wal redo recovery`
+- **写时机**：`store_insert` / `store_delete_mark` / `store_update_versions`（lib.rs）在堆操作成功后追加；`commit_trx(trx_id, wrote)` 在 `committed_trxs.insert` 后追加 Commit 帧 + `sync_all()`（真正的提交点），随后 save_catalog。**只读事务（undo 空）不记 Commit、不 fsync**
+- **恢复**（`Database::open` 末尾，`recover_from_wal`）：
+  - 只重放 wal 中有 Commit 帧的事务，按 Commit 帧出现顺序（=提交顺序）；重放幂等：Insert 仅当目标槽空才用 `slotted::page_put_at` 原位写回原 Rid，DeleteMark 仅当记录存在且 deleter==0 才打标
+  - 未提交事务的脏页若曾被 LRU 驱逐落盘，其行天然不可见（creator 不在 committed 集），无需 UNDO
+  - `next_trx_id` 提升到 max(wal 中见过的 trx id)+1（含未提交的），防止 id 复用把幽灵行"过继"给新事务
+  - wal 的 Commit id 与 catalog committed 集取并集，若 catalog 缺失则修复并 save_catalog（wal 是提交事实来源）
+  - **索引重建**：被重放触及的表（含页0被修复的索引文件所属表）全部重建索引——B+ 树页与堆页一样可能没落盘，且 B+ 树 insert 不幂等（重放会产生重复键）。重建前先 `pool.discard_file`（丢缓存）+ `truncate_file` + `BTree::init`，再全堆扫描重灌
+- **checkpoint**：`flush()` = flush_all → save_catalog → wal.truncate()。干净关闭（REPL 退出）即 0 字节日志
+- **页0修复**：`HeapFile::open_or_repair` / `BTree::open_or_repair`——catalog 已记录但页0魔数没落盘（CREATE TABLE/INDEX 后立刻崩溃）时原位重写魔数；索引文件被修复会触发上述重建
+- **测试**：`tests/wal.rs` 8 个集成用例（提交插入/删除/更新/带索引崩溃恢复、未提交不复活+id 不复用、截断尾帧容忍、干净 flush 截断日志、rollback 无残留）；`src/wal.rs` 内 5 个纯函数单测
+- 已知边界：全量 checkpoint（无模糊检查点）；崩溃后未提交行的物理空间保留（与 MVCC 空间债同性质）；日志未压缩
 
 ---
 
@@ -242,7 +237,8 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 ### PowerShell 5.1 踩坑记录（血泪）
 
 - **不要用 `Set-Content` 写 Rust 源文件**：默认编码非 UTF-8，会把中文注释写成非法字节导致 rustc 报 "stream did not contain valid UTF-8"。必须写文件时用 `[System.IO.File]::WriteAllText($path, $content, [System.Text.UTF8Encoding]::new($false))`，或直接用编辑工具
-- **不要靠 `if ($?)` 串联 cargo 命令做提交判断**：管道后 `$?` 反映的是最后一个 cmdlet（如 Select-String），不代表 cargo 成功，曾导致红灯被提交或提交悄悄没执行。正确做法：分两条命令，先看测试输出，再显式 `git add; git commit`
+- **不要靠 `if ($?)` / `$LASTEXITCODE` 在管道后做 cargo 成败判断**：管道后二者都不可靠，曾导致红灯被提交或提交悄悄没执行。正确做法：分两条命令，先看测试输出全文，再显式 `git add; git commit`
+- **Windows 上 append 模式打开的文件句柄不能 `set_len`**（os error 5 拒绝访问）：wal 的 checkpoint 截断因此用普通 write 句柄 + 每次追加前 `seek(End)`，不要改回 `.append(true)`
 - `Get-Content -Raw` 的正则替换多行内容时注意 `\r?\n`，替换后用 `Set-Content -NoNewline`
 - cargo test 全量在本机约 30~60 秒，含 server 测试（tokio 网络），给足超时（180000ms+）
 - 管道编码问题导致中文乱码时，先怀疑文件编码再怀疑逻辑
@@ -266,9 +262,8 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 - 无 MOD/% / 字符串函数；无 LIKE（除 IS NULL 外）
 - MVCC 删除标记与 stale 索引项不做物理回收（页面会持续膨胀）
 - 单 Mutex 单 writer 串行化；无死锁检测；长事务 + 未提交孤儿版本会长期占空间
-- BufferPool 无预读/检查点；first-fit 插入是 O(页数)
-- WAL 未实现（见 §6.3）；目前仅 catalog 在 COMMIT/DDL 时落盘
-- server 异常断连时的事务回滚需要复核接入点
+- BufferPool 无预读；WAL checkpoint 是全量截断；first-fit 插入是 O(页数)
+- **server.rs 的会话模型有洞**：`handle_conn` 对每条 SQL 调 `execute_sql`（内部新建临时 Session），导致 **TCP 上 BEGIN/COMMIT 无法跨语句**（COMMIT 会报 "no active transaction"），且连接断开不会调 `rollback_session`。本地 REPL 一样（每行一个 execute_sql）。修法：连接/REPL 持有一个 Session，改走 `execute_sql_with`，退出路径调 `rollback_session`
 - `exec.rs` ~950 行偏大，未来可拆 eval/aggregate/join/plan 四个模块
 - 无基准测试、无 README（M14 时写）
 
@@ -276,10 +271,9 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ## 9. 建议的后续顺序
 
-1. **M12.3 WAL + 崩溃恢复**（§6.3 详细方案）——补上事务最后一块
-2. **M14 加固**：DROP TABLE（连索引一起清）、README、全链路冒烟脚本、`cargo clippy` 清零
-3. **M11 子查询/视图**（时间允许）：`WHERE x IN (SELECT ...)` / `EXISTS` / `CREATE VIEW`
+1. **M14 加固**：DROP TABLE（连索引一起清）、README、全链路冒烟脚本、`cargo clippy` 清零
+2. **修复 server/REPL 会话模型**（§8 的洞）：跨语句事务 + 断连回滚
+3. **M11 子查询/视图**：`WHERE x IN (SELECT ...)` / `EXISTS` / `CREATE VIEW`
 4. 可选加分项：DISTINCT、LEFT JOIN、字符串函数、miniob 兼容性回归用例
 
-提交基线：`568f62d feat: mvcc transactions with snapshot isolation and rollback`（HEAD）。
-开工第一步：`cargo test` 确认 211 全绿，然后从 §6.3 的 WAL 红测试开始。
+提交基线：`0fe605d feat: wal redo recovery`（HEAD）。
