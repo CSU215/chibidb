@@ -55,6 +55,7 @@ SELECT [DISTINCT] * | expr [AS alias] (, ...)
 -- 事务
 BEGIN; COMMIT; ROLLBACK;
 CHECKPOINT;                    -- 刷盘 + 截断日志（开事务时拒绝）
+VACUUM;                        -- 物理回收已提交删除的行与失效索引项（开事务时拒绝）
 EXPLAIN SELECT ...;            -- 输出 FullScan / IndexScan / NestedLoopJoin
 ```
 
@@ -101,11 +102,13 @@ SQL 字符串
   支持跨语句事务，连接断开自动回滚
 - 崩溃恢复：WAL 只重放有 COMMIT 记录的事务，重放幂等（精确 Rid 回写 +
   删除标记条件重放）；索引页属派生数据，恢复时对被触及的表重建
+- 空间回收：`VACUUM` 物理删除已提交删除标记的行（含 stale 索引项清理）与
+  崩溃事务遗留的孤儿版本；日志超预算且无开事务时自动 checkpoint
 
 ## 测试
 
-`cargo test` 跑 246 个测试，覆盖词法/语法/求值/聚合/连接/索引/持久化/事务/
-WAL 恢复/存储层/网络协议等。集成测试的 `with_dbs` 模式让同一用例在内存后端
+`cargo test` 跑 252 个测试，覆盖词法/语法/求值/聚合/连接/索引/持久化/事务/
+WAL 恢复/vacuum/存储层/网络协议等。集成测试的 `with_dbs` 模式让同一用例在内存后端
 与文件后端各跑一遍；WAL 测试用 `Database::simulate_crash()` 模拟进程被杀。
 
 ## 依赖

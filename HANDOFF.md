@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：M15（CHECKPOINT / DISTINCT / LEFT JOIN）完成后，246 个测试全绿，clippy 零警告，共 76 个提交。
+> 最后更新：M16（VACUUM 空间回收 + flush 开事务守卫）完成后，252 个测试全绿，clippy 零警告，共 78 个提交。
 
 ---
 
@@ -121,6 +121,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | M13 TCP server + client + wire 协议 | ✅ | `d06103c` |
 | M14 加固 | ✅ DROP TABLE（`d0e239c`）、跨语句事务会话修复（`bcfd6ee`）、clippy 清零（`0023a43`）、README + 冒烟脚本（`46c8637`） | `46c8637` |
 | M15 查询/运维增强 | ✅ CHECKPOINT 语句 + WAL 预算护栏（`c8e060e`）、DISTINCT（`2389f99`）、LEFT [OUTER] JOIN（`5f31ea2`） | `5f31ea2` |
+| M16 空间回收 | ✅ VACUUM：物理回收已提交删除标记行/孤儿版本 + stale 索引项清理；flush() 开事务守卫（`975dab2`） | `975dab2` |
 
 ---
 
@@ -154,6 +155,7 @@ SELECT [DISTINCT] * | expr [AS alias] (, ...)
 -- 事务
 BEGIN; COMMIT; ROLLBACK;
 CHECKPOINT;                                -- flush_all + save_catalog + 截断 wal；有开事务时报错
+VACUUM;                                    -- 物理回收（见 §6.4）；有开事务时报错
 EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / NestedLoopJoin
 ```
 
@@ -226,7 +228,17 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 - **open_trxs 注册表**：Database 持有已 begin 未终局的事务 id 集；begin 两处 insert，commit_trx/Rollback 臂/autocommit 错误路径/rollback_session remove。**它保护日志截断**：截断时若其他事务未提交，其 Commit 帧之后到达会丢 redo → 数据丢失，故护栏必须存在
 - **页0修复**：`HeapFile::open_or_repair` / `BTree::open_or_repair`——catalog 已记录但页0魔数没落盘（CREATE TABLE/INDEX 后立刻崩溃）时原位重写魔数；索引文件被修复会触发上述重建
 - **测试**：`tests/wal.rs` 8 个集成用例（提交插入/删除/更新/带索引崩溃恢复、未提交不复活+id 不复用、截断尾帧容忍、干净 flush 截断日志、rollback 无残留）；`src/wal.rs` 内 5 个纯函数单测
-- 已知边界：全量 checkpoint（无模糊检查点）；崩溃后未提交行的物理空间保留（与 MVCC 空间债同性质）；日志未压缩
+- 已知边界：全量 checkpoint（无模糊检查点）；日志未压缩
+
+### 6.4 VACUUM 空间回收（M16，已实现）
+
+`Database::vacuum()`（`VACUUM` 语句触发，守卫同 CHECKPOINT：排除自身临时事务 + 拒绝显式/他方开事务）。判定条件（前提 `open_trxs` 为空）：
+
+- 行死亡 = `creator ∉ committed_trxs`（崩溃事务遗留的孤儿版本）**或** `deleter ∈ committed_trxs`（已提交删除标记）
+- deleter ∈ open 不可能出现（前提），creator ∈ open 同理；未提交 deleter 的行保留（删除永远不会发生 = 行仍活着）
+- 回收动作：先删该行在所有索引上的 (key, rid) 项（**必须**，否则索引扫描回表报 "no record at rid"），再 `HeapFile::delete` 物理删除（page_delete + 压实；槽号稳定，Rid 不失效）
+- **无需 WAL 记录**：vacuum 只删除"恢复重放也不会复活"的数据——崩溃后重放按序重演 Insert→DeleteMark，最终可见状态一致（tests/vacuum.rs 的 crash-safe 用例锁定此性质）
+- 边界：空页不归还文件（空间留给 first-fit 复用）；`flush()` 新增开事务守卫（截断日志会丢开事务的 redo），CHECKPOINT 走 `flush_inner` 绕过（已自行验证排除自身）
 
 ---
 
@@ -267,19 +279,18 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 - 无 RIGHT/FULL OUTER JOIN、无 UNION、无 ALTER TABLE、无相关子查询（子查询引用外层列）、无视图上的 INSERT/UPDATE（视图只读）
 - 无 MOD/% / 字符串函数；无 LIKE（除 IS NULL 外）
 - DISTINCT + ORDER BY 引用非投影列时，保留哪一行是按扫描顺序首个（标准 SQL 视为非法，未做校验）
-- MVCC 删除标记与 stale 索引项不做物理回收（页面会持续膨胀）
-- 单 Mutex 单 writer 串行化；无死锁检测；长事务 + 未提交孤儿版本会长期占空间
+- VACUUM 回收的空页不归还文件系统（页留给 first-fit 复用）；空页只在该表变小时浪费
+- 单 Mutex 单 writer 串行化；无死锁检测；vacuum 之外长事务 + 未提交孤儿版本仍会占空间
 - BufferPool 无预读；WAL checkpoint 是全量截断（有预算护栏但无模糊检查点）；first-fit 插入是 O(页数)
-- **多连接下的 DDL 隔离不存在**：一个连接持有未提交事务时，另一连接仍可 DROP TABLE / CREATE INDEX / DROP VIEW（open_trxs 注册表只护 WAL 截断，不锁元数据）；教学场景可接受，修法需先做会话级元数据锁
+- **多连接下的 DDL 隔离不存在**：一个连接持有未提交事务时，另一连接仍可 DROP TABLE / CREATE INDEX / DROP VIEW（open_trxs 注册表只护 WAL 截断与 VACUUM，不锁元数据）；教学场景可接受，修法需先做会话级元数据锁
 - `exec.rs` ~1200 行偏大，未来可拆 eval/aggregate/join/plan/subquery 五个模块
 
 ---
 
 ## 9. 建议的后续顺序
 
-1. **MVCC vacuum**（下一个大件）：物理回收已提交的删除标记行与 stale 索引项；需要把 open_trxs 注册表扩展为"活跃快照"记录，回收时保守跳过仍被活跃快照需要的版本
-2. LIKE / 基础字符串函数（CONCAT/UPPER/LOWER/LENGTH），需新增函数调用 AST 节点
-3. miniob 兼容性回归用例移植、基准测试、exec.rs 拆分
-4. 相关子查询：eval 传入外层行上下文（EvalCtx 链式），物化改为逐行缓存
+1. LIKE / 基础字符串函数（CONCAT/UPPER/LOWER/LENGTH），需新增函数调用 AST 节点
+2. miniob 兼容性回归用例移植、基准测试、exec.rs 拆分
+3. 相关子查询：eval 传入外层行上下文（EvalCtx 链式），物化改为逐行缓存
 
-提交基线：`5f31ea2 feat: left outer join ...`（HEAD）。
+提交基线：`975dab2 feat: vacuum ...`（HEAD）。
