@@ -97,9 +97,11 @@ pub(crate) fn bind_expr(
             }
             Expr::Function(name.clone(), bound)
         }
-        Expr::Aggregate(f, Some(inner)) => {
-            Expr::Aggregate(*f, Some(Box::new(bind_expr(db, trx, inner, outer)?)))
-        }
+        Expr::Aggregate(f, Some(inner), distinct) => Expr::Aggregate(
+            *f,
+            Some(Box::new(bind_expr(db, trx, inner, outer)?)),
+            *distinct,
+        ),
         other => other.clone(),
     })
 }

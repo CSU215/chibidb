@@ -42,6 +42,21 @@ fn count_star_and_count_column() {
 }
 
 #[test]
+fn count_distinct() {
+    with_dbs(|db| {
+        seeded(db);
+        assert_eq!(one_row(db, "select count(distinct id) from t;"), [Value::Int(3)]);
+        assert_eq!(one_row(db, "select count(distinct name) from t;"), [Value::Int(2)]);
+        assert_eq!(one_row(db, "select count(distinct score) from t;"), [Value::Int(2)]);
+        // DISTINCT composes with the other aggregates
+        assert_eq!(
+            one_row(db, "select sum(distinct score) from t;"),
+            [Value::Float(170.5)]
+        );
+    });
+}
+
+#[test]
 fn count_empty_table_is_zero() {
     with_dbs(|db| {
         db.execute_sql("create table t (id int);").unwrap();

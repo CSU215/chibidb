@@ -59,7 +59,8 @@ pub enum Expr {
     Like { expr: Box<Expr>, pattern: Box<Expr>, negated: bool },
     /// Scalar function call, e.g. `concat(a, b)`. Name is lowercased.
     Function(String, Vec<Expr>),
-    Aggregate(AggFunc, Option<Box<Expr>>),
+    /// `func([DISTINCT] expr)`; the flag marks `DISTINCT`.
+    Aggregate(AggFunc, Option<Box<Expr>>, bool),
     QualifiedColumn(String, String),
     /// A materialized literal produced by lifting subqueries.
     Value(crate::value::Value),
@@ -97,8 +98,9 @@ impl fmt::Display for Expr {
                 }
                 f.write_str(")")
             }
-            Expr::Aggregate(func, None) => write!(f, "({func} *)"),
-            Expr::Aggregate(func, Some(e)) => write!(f, "({func} {e})"),
+            Expr::Aggregate(func, None, _) => write!(f, "({func} *)"),
+            Expr::Aggregate(func, Some(e), false) => write!(f, "({func} {e})"),
+            Expr::Aggregate(func, Some(e), true) => write!(f, "({func} distinct {e})"),
             Expr::QualifiedColumn(t, c) => write!(f, "{t}.{c}"),
             Expr::Value(v) => write!(f, "{v}"),
             Expr::InSubquery { .. } => write!(f, "(in-subquery)"),

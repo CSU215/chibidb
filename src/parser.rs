@@ -735,16 +735,20 @@ impl<'a> Parser<'a> {
                         Some(TokenKind::Punct(Punct::LParen)))
             {
                 self.pos += 2; // consume name and '('
+                let distinct = self.eat_keyword("distinct");
                 let arg = if self.eat_punct(Punct::Star) {
                     if func != AggFunc::Count {
                         return Err(Error::Syntax("* is only valid in count(*)".into()));
+                    }
+                    if distinct {
+                        return Err(Error::Syntax("count(distinct *) is not valid".into()));
                     }
                     None
                 } else {
                     Some(Box::new(self.parse_expr()?))
                 };
                 self.expect_punct(Punct::RParen)?;
-                return Ok(Expr::Aggregate(func, arg));
+                return Ok(Expr::Aggregate(func, arg, distinct));
             }
         // scalar function call: ident '(' args ')'
         if let Some(TokenKind::Ident(name)) = self.peek().map(|t| &t.kind).cloned()

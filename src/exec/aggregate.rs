@@ -27,10 +27,11 @@ pub(crate) fn expr_has_aggregate(expr: &Expr) -> bool {
 pub(crate) fn eval_aggregate(
     func: AggFunc,
     arg: Option<&Expr>,
+    distinct: bool,
     schema: &Schema,
     rows: &[Vec<Value>],
 ) -> Result<Value> {
-    let vals: Vec<Value> = match arg {
+    let mut vals: Vec<Value> = match arg {
         None => vec![],
         Some(e) => {
             let mut vals = Vec::with_capacity(rows.len());
@@ -43,6 +44,17 @@ pub(crate) fn eval_aggregate(
             vals
         }
     };
+    if distinct {
+        let mut seen: Vec<Value> = Vec::new();
+        vals.retain(|v| {
+            if seen.contains(v) {
+                false
+            } else {
+                seen.push(v.clone());
+                true
+            }
+        });
+    }
     match func {
         AggFunc::Count => Ok(Value::Int(match arg {
             None => rows.len() as i64,

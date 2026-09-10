@@ -92,7 +92,7 @@ pub(crate) fn expr_has_subquery(expr: &Expr) -> bool {
         Expr::Binary(_, l, r) => expr_has_subquery(l) || expr_has_subquery(r),
         Expr::Like { expr, pattern, .. } => expr_has_subquery(expr) || expr_has_subquery(pattern),
         Expr::Function(_, args) => args.iter().any(expr_has_subquery),
-        Expr::Aggregate(_, Some(e)) => expr_has_subquery(e),
+        Expr::Aggregate(_, Some(e), _) => expr_has_subquery(e),
         _ => false,
     }
 }
@@ -105,9 +105,9 @@ pub(crate) fn eval(expr: &Expr, ctx: Option<&EvalCtx>) -> Result<Value> {
         Expr::Null => Ok(Value::Null),
         Expr::Column(c) => resolve_column(ctx, None, c),
         Expr::QualifiedColumn(t, c) => resolve_column(ctx, Some(t), c),
-        Expr::Aggregate(func, arg) => match ctx.map(|c| &c.scope) {
+        Expr::Aggregate(func, arg, distinct) => match ctx.map(|c| &c.scope) {
             Some(Scope::Group(schema, rows)) => {
-                eval_aggregate(*func, arg.as_deref(), schema, rows)
+                eval_aggregate(*func, arg.as_deref(), *distinct, schema, rows)
             }
             _ => Err(Error::Runtime("aggregate not allowed here".into())),
         },
