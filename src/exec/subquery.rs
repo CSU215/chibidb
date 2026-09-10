@@ -85,10 +85,11 @@ pub(crate) fn bind_expr(
         Expr::IsNull(inner, negated) => {
             Expr::IsNull(Box::new(bind_expr(db, trx, inner, outer)?), *negated)
         }
-        Expr::Like { expr, pattern, negated } => Expr::Like {
+        Expr::Like { expr, pattern, negated, escape } => Expr::Like {
             expr: Box::new(bind_expr(db, trx, expr, outer)?),
             pattern: Box::new(bind_expr(db, trx, pattern, outer)?),
             negated: *negated,
+            escape: *escape,
         },
         Expr::Function(name, args) => {
             let mut bound = Vec::with_capacity(args.len());

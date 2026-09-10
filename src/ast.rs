@@ -55,8 +55,8 @@ pub enum Expr {
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     IsNull(Box<Expr>, bool),
-    /// `expr [NOT] LIKE pattern`; `%` and `_` wildcards, no escape.
-    Like { expr: Box<Expr>, pattern: Box<Expr>, negated: bool },
+    /// `expr [NOT] LIKE pattern [ESCAPE c]`; `%`/`_` wildcards.
+    Like { expr: Box<Expr>, pattern: Box<Expr>, negated: bool, escape: Option<char> },
     /// Scalar function call, e.g. `concat(a, b)`. Name is lowercased.
     Function(String, Vec<Expr>),
     /// `func([DISTINCT] expr)`; the flag marks `DISTINCT`.
@@ -84,11 +84,11 @@ impl fmt::Display for Expr {
             Expr::Binary(op, l, r) => write!(f, "({op} {l} {r})"),
             Expr::IsNull(e, false) => write!(f, "(is-null {e})"),
             Expr::IsNull(e, true) => write!(f, "(is-not-null {e})"),
-            Expr::Like { expr, pattern, negated } => {
-                if *negated {
-                    write!(f, "(not-like {expr} {pattern})")
-                } else {
-                    write!(f, "(like {expr} {pattern})")
+            Expr::Like { expr, pattern, negated, escape } => {
+                let head = if *negated { "not-like" } else { "like" };
+                match escape {
+                    Some(c) => write!(f, "({head} {expr} {pattern} escape {c})"),
+                    None => write!(f, "({head} {expr} {pattern})"),
                 }
             }
             Expr::Function(name, args) => {

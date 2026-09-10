@@ -462,8 +462,14 @@ fn parses_like_and_mod() {
     assert_eq!(single_exprs("select 5 % 2;"), ["(% 5 2)"]);
     assert_eq!(single_exprs("select 1 + 2 % 3;"), ["(+ 1 (% 2 3))"]);
     assert_eq!(single_exprs("select 1 * 2 % 3;"), ["(% (* 1 2) 3)"]);
+    assert_eq!(
+        single_exprs("select name like 'a!%' escape '!';"),
+        ["(like name 'a!%' escape !)"]
+    );
     err("select name like;");
     err("select name not 'x';");
+    err("select name like 'a%' escape 'xy';");
+    err("select name like 'a%' escape;");
 }
 
 #[test]

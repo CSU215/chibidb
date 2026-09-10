@@ -597,10 +597,25 @@ impl<'a> Parser<'a> {
                 return Err(self.unexpected("like"));
             }
             let pattern = self.parse_additive()?;
+            let escape = if self.eat_keyword("escape") {
+                match self.bump() {
+                    Some(Token { kind: TokenKind::Str(s), .. }) if s.chars().count() == 1 => {
+                        s.chars().next()
+                    }
+                    _ => {
+                        return Err(Error::Syntax(
+                            "ESCAPE requires a single-character string".into(),
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
             return Ok(Expr::Like {
                 expr: Box::new(lhs),
                 pattern: Box::new(pattern),
                 negated,
+                escape,
             });
         }
         let op = if self.at_punct(Punct::Eq) {

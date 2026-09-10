@@ -140,13 +140,13 @@ pub(crate) fn eval(expr: &Expr, ctx: Option<&EvalCtx>) -> Result<Value> {
             let is_null = matches!(v, Value::Null);
             Ok(Value::Bool(if *negated { !is_null } else { is_null }))
         }
-        Expr::Like { expr, pattern, negated } => {
+        Expr::Like { expr, pattern, negated, escape } => {
             let v = eval(expr, ctx)?;
             let p = eval(pattern, ctx)?;
             match (&v, &p) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Str(s), Value::Str(pat)) => {
-                    let matched = like_match(pat, s);
+                    let matched = like_match(pat, s, *escape)?;
                     Ok(Value::Bool(if *negated { !matched } else { matched }))
                 }
                 _ => Err(type_mismatch()),
@@ -239,17 +239,23 @@ fn float_arith(op: BinOp, a: f64, b: f64) -> Result<Value> {
     Ok(Value::Float(v))
 }
 
-/// SQL LIKE: `%` matches any run of characters (including none), `_`
-/// matches exactly one character. Matching is case-sensitive and there is
-/// no escape character. Runs in O(text * pattern) time and space.
-fn like_match(pattern: &str, text: &str) -> bool {
-    let pat: Vec<char> = pattern.chars().collect();
+enum LikeTok {
+    Any,     // %
+    One,     // _
+    Lit(char),
+}
+
+/// SQL LIKE: `%` matches any run of characters (including none) and `_`
+/// matches exactly one; an ESCAPE character makes the next character
+/// literal. Matching is case-sensitive. O(text * pattern) time and space.
+fn like_match(pattern: &str, text: &str, escape: Option<char>) -> Result<bool> {
+    let toks = compile_like(pattern, escape)?;
     let txt: Vec<char> = text.chars().collect();
-    let (n, m) = (txt.len(), pat.len());
+    let (n, m) = (txt.len(), toks.len());
     let mut prev = vec![false; m + 1];
     prev[0] = true;
-    for (j, p) in pat.iter().enumerate() {
-        if *p == '%' {
+    for (j, t) in toks.iter().enumerate() {
+        if matches!(t, LikeTok::Any) {
             prev[j + 1] = true;
         } else {
             break;
@@ -258,15 +264,43 @@ fn like_match(pattern: &str, text: &str) -> bool {
     for i in 1..=n {
         let mut cur = vec![false; m + 1];
         for j in 1..=m {
-            cur[j] = match pat[j - 1] {
-                '%' => cur[j - 1] || prev[j],
-                '_' => prev[j - 1],
-                c => prev[j - 1] && txt[i - 1] == c,
+            cur[j] = match &toks[j - 1] {
+                LikeTok::Any => cur[j - 1] || prev[j],
+                LikeTok::One => prev[j - 1],
+                LikeTok::Lit(c) => prev[j - 1] && txt[i - 1] == *c,
             };
         }
         prev = cur;
     }
-    prev[m]
+    Ok(prev[m])
+}
+
+fn compile_like(pattern: &str, escape: Option<char>) -> Result<Vec<LikeTok>> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut toks = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if Some(c) == escape {
+            if i + 1 >= chars.len() {
+                return Err(Error::Runtime(
+                    "LIKE pattern ends with the escape character".into(),
+                ));
+            }
+            toks.push(LikeTok::Lit(chars[i + 1]));
+            i += 2;
+        } else if c == '%' {
+            toks.push(LikeTok::Any);
+            i += 1;
+        } else if c == '_' {
+            toks.push(LikeTok::One);
+            i += 1;
+        } else {
+            toks.push(LikeTok::Lit(c));
+            i += 1;
+        }
+    }
+    Ok(toks)
 }
 
 pub(crate) fn cmp_values(l: &Value, r: &Value) -> Result<Option<std::cmp::Ordering>> {
