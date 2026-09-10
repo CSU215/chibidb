@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：M12.3（WAL + 崩溃恢复）完成后，224 个测试全绿，共 59 个提交。
+> 最后更新：M14（加固：DROP TABLE / 会话修复 / clippy 清零 / README / 冒烟脚本）完成后，231 个测试全绿，共 66 个提交。
 
 ---
 
@@ -37,7 +37,7 @@ SQL 字符串
 - 运行环境注意：**命令行是 Windows PowerShell**，具体陷阱见 §8
 
 ```powershell
-cargo test                      # 全量回归（约 224 tests，20+ 个测试二进制）
+cargo test                      # 全量回归（约 231 tests，20+ 个测试二进制）
 cargo test --test trx           # 单个测试文件
 cargo test --quiet              # 安静模式（注意配合退出码判断，见 §8）
 cargo build
@@ -47,19 +47,10 @@ cargo run -q -- serve <dir>     # TCP server，监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 交互式客户端
 ```
 
-冒烟演示（PowerShell 后台起 server）：
+全链路冒烟（起 server → client 建表/插入/跨语句事务 → 强杀进程 → 复开验证 WAL 恢复）已脚本化：
 
 ```powershell
-$job = Start-Job -ScriptBlock { Set-Location E:\WorkBench\MiniProjects\chibidb; cargo run -q -- serve tmp\demo }
-Start-Sleep -Seconds 3
-"create table t (id int, name char(10));
-insert into t values (1, 'alice');
-explain select * from t where id = 1;
-create index idx on t (id);
-explain select * from t where id = 1;
-select * from t where id = 1;
-exit" | cargo run -q -- client
-Stop-Job $job; Remove-Job $job -Force
+powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOKE OK
 ```
 
 ---
@@ -98,7 +89,7 @@ Stop-Job $job; Remove-Job $job -Force
 | `index/btree.rs` | B+ 树主体：`init/open/open_or_repair/at`、递归插入双级分裂长高、search（跨叶重复键回退）、scan_range 叶链、delete 借用/合并/根收缩（~880 行） | |
 | `wal.rs` | 预写日志：帧 `[u32 len][u8 type][u32 trx][payload]`，Record::Insert/DeleteMark/Commit，追加 + `sync()`（提交点）+ `truncate()`（checkpoint）；`plan_recovery` 解析日志（容忍截断尾帧），纯函数有单测 | `Wal` / `plan_recovery` |
 
-### 3.2 测试（`tests/`，22 个文件 / 224 tests）
+### 3.2 测试（`tests/`，22 个文件 / 231 tests）
 
 - 与源码分层对应：`lexer / parser / eval / agg / join / db / db_index / db_persist / trx / wal / storage_* / index_* / wire / server / repl / datetime / codec / catalog_meta`
 - `tests/wal.rs` 用 `Database::simulate_crash()`（跳过 BufferPool Drop flush）模拟 SIGKILL，配合自己的 `tempfile::TempDir` 复开同一目录
@@ -128,7 +119,7 @@ Stop-Job $job; Remove-Job $job -Force
 | M11 子查询/视图 | ❌ **未开始** | |
 | M12 事务（MVCC + WAL） | ✅ M12.1 MVCC 核心 `568f62d`；M12.3 WAL+崩溃恢复 `0fe605d`（M12.2 update/delete MVCC 化已并入 M12.1） | `0fe605d` |
 | M13 TCP server + client + wire 协议 | ✅ | `d06103c` |
-| M14 加固 | ❌ 未开始（DROP TABLE、README、基准等） | |
+| M14 加固 | ✅ DROP TABLE（`d0e239c`）、跨语句事务会话修复（`bcfd6ee`）、clippy 清零（`0023a43`）、README + 冒烟脚本（`46c8637`） | `46c8637` |
 
 ---
 
@@ -139,6 +130,7 @@ Stop-Job $job; Remove-Job $job -Force
 CREATE TABLE t (id int, name char(10), score float, d date, body text);
 CREATE INDEX idx_name ON t (col);
 DROP INDEX idx_name;
+DROP TABLE t;
 -- DML
 INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.0);   -- 多值行，字面量允许负号，null 关键字
 UPDATE t SET score = score + 1 WHERE id < 10;
@@ -258,22 +250,20 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ## 8. 已知技术债 / 明确的边界
 
-- 无 LEFT/RIGHT/FULL OUTER JOIN、无子查询（IN/EXISTS/标量子查询）、无视图、无 DISTINCT/UNION、无 DROP TABLE、无 ALTER TABLE
+- 无 LEFT/RIGHT/FULL OUTER JOIN、无子查询（IN/EXISTS/标量子查询）、无视图、无 DISTINCT/UNION、无 ALTER TABLE
 - 无 MOD/% / 字符串函数；无 LIKE（除 IS NULL 外）
 - MVCC 删除标记与 stale 索引项不做物理回收（页面会持续膨胀）
 - 单 Mutex 单 writer 串行化；无死锁检测；长事务 + 未提交孤儿版本会长期占空间
 - BufferPool 无预读；WAL checkpoint 是全量截断；first-fit 插入是 O(页数)
-- **server.rs 的会话模型有洞**：`handle_conn` 对每条 SQL 调 `execute_sql`（内部新建临时 Session），导致 **TCP 上 BEGIN/COMMIT 无法跨语句**（COMMIT 会报 "no active transaction"），且连接断开不会调 `rollback_session`。本地 REPL 一样（每行一个 execute_sql）。修法：连接/REPL 持有一个 Session，改走 `execute_sql_with`，退出路径调 `rollback_session`
-- `exec.rs` ~950 行偏大，未来可拆 eval/aggregate/join/plan 四个模块
-- 无基准测试、无 README（M14 时写）
+- **多连接下的 DDL 隔离不存在**：一个连接持有未提交事务时，另一连接仍可 DROP TABLE / CREATE INDEX（无全局事务注册表）；教学场景可接受，修法需先做会话级元数据锁
+- `exec.rs` ~980 行偏大，未来可拆 eval/aggregate/join/plan 四个模块
 
 ---
 
 ## 9. 建议的后续顺序
 
-1. **M14 加固**：DROP TABLE（连索引一起清）、README、全链路冒烟脚本、`cargo clippy` 清零
-2. **修复 server/REPL 会话模型**（§8 的洞）：跨语句事务 + 断连回滚
-3. **M11 子查询/视图**：`WHERE x IN (SELECT ...)` / `EXISTS` / `CREATE VIEW`
-4. 可选加分项：DISTINCT、LEFT JOIN、字符串函数、miniob 兼容性回归用例
+1. **M11 子查询/视图**：`WHERE x IN (SELECT ...)` / `EXISTS` / `CREATE VIEW`（语法骨架已有，parser/executor 扩展点在 `Expr` 与 select 执行路径）
+2. 可选加分项：DISTINCT、LEFT JOIN、字符串函数、miniob 兼容性回归用例
+3. 工程项：MVCC/stale 索引空间回收（vacuum）、模糊 checkpoint、基准测试
 
-提交基线：`0fe605d feat: wal redo recovery`（HEAD）。
+提交基线：`46c8637 docs: add readme and crash-recovery smoke script`（HEAD）。
