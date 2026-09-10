@@ -248,6 +248,26 @@ fn auto_checkpoint_bounds_wal_and_respects_open_trxs() {
 }
 
 #[test]
+fn flush_during_open_transaction_is_rejected() {
+    // flushing (and thus truncating the log) while a transaction is open
+    // would drop its redo records, losing the COMMIT on recovery
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+    db.execute_sql("create table t (id int);").unwrap();
+    let mut session = chibidb::Session::new();
+    db.execute_sql_with(&mut session, "begin;").unwrap();
+    db.execute_sql_with(&mut session, "insert into t values (1);").unwrap();
+    let err = db.flush().unwrap_err();
+    assert!(err.to_string().contains("transaction"), "{err}");
+
+    // the transaction still commits durably afterwards
+    db.execute_sql_with(&mut session, "commit;").unwrap();
+    drop(db);
+    let mut db = Database::open(dir.path()).unwrap();
+    assert_eq!(rows(&mut db, "select * from t;"), vec![vec![Value::Int(1)]]);
+}
+
+#[test]
 fn rollback_leaves_no_redo() {
     let dir = tempfile::tempdir().unwrap();
     {

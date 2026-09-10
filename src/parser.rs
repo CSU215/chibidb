@@ -99,6 +99,9 @@ impl<'a> Parser<'a> {
         if self.eat_keyword("checkpoint") {
             return Ok(Stmt::Checkpoint);
         }
+        if self.eat_keyword("vacuum") {
+            return Ok(Stmt::Vacuum);
+        }
         if self.eat_keyword("explain") {
             if !self.at_keyword("select") {
                 return Err(self.unexpected("select after explain"));
@@ -211,7 +214,7 @@ impl<'a> Parser<'a> {
 
     const RESERVED: &'static [&'static str] = &[
         "where", "group", "having", "order", "limit", "on", "join", "inner", "left", "right",
-        "outer", "in", "exists", "distinct",
+        "outer", "in", "exists", "distinct", "vacuum",
     ];
 
     fn agg_func(name: &str) -> Option<AggFunc> {

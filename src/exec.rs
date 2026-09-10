@@ -27,6 +27,7 @@ pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Res
         Stmt::DropView(d) if trx.explicit => ddl_in_trx(trx),
         Stmt::DropView(d) => execute_drop_view(db, d),
         Stmt::Checkpoint => execute_checkpoint(db, trx),
+        Stmt::Vacuum => execute_vacuum(db, trx),
         Stmt::Insert(i) => execute_insert(db, trx, i),
         Stmt::Select(s) => execute_select(db, trx, s),
         Stmt::Delete(d) => execute_delete(db, trx, d),
@@ -243,8 +244,21 @@ fn execute_checkpoint(db: &mut Database, trx: &TrxState) -> Result<ResultSet> {
             "cannot checkpoint while transactions are open".into(),
         ));
     }
-    db.flush()?;
+    // verified no one else is open; skip flush()'s blanket open-trx guard
+    // because the statement's own temp transaction is still registered
+    db.flush_inner()?;
     Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_vacuum(db: &mut Database, trx: &TrxState) -> Result<ResultSet> {
+    // same guard as checkpoint: no transaction may depend on physical state
+    if trx.explicit || db.has_open_trxs_excluding(trx.id) {
+        return Err(Error::Runtime(
+            "cannot vacuum while transactions are open".into(),
+        ));
+    }
+    let purged = db.vacuum()?;
+    Ok(ResultSet::Message(format!("VACUUM COMPLETE: {purged} rows purged")))
 }
 
 fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<ResultSet> {

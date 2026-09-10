@@ -260,4 +260,5 @@ pub enum Stmt {
     Update(UpdateStmt),
     Trx(TrxCtl),
     Checkpoint,
+    Vacuum,
 }

@@ -186,10 +186,49 @@ impl Database {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        if !self.open_trxs.is_empty() {
+            // truncating the log now would drop the open transaction's redo
+            // records, so its later COMMIT could not be recovered
+            return Err(Error::Runtime(
+                "cannot flush while transactions are open".into(),
+            ));
+        }
+        self.flush_inner()
+    }
+
+    pub(crate) fn flush_inner(&mut self) -> Result<()> {
         self.pool.flush_all()?;
         self.save_catalog()?;
         // checkpoint: every page is on disk, so the log has nothing left to redo
         self.wal.truncate()
+    }
+
+    /// Physically removes rows no transaction can ever see again:
+    /// delete-marked rows whose deleter committed, and orphan versions whose
+    /// creator never committed (left behind by a crashed transaction).
+    /// Stale index entries of purged rows are removed too. Must run with no
+    /// open transactions (the VACUUM statement enforces this).
+    pub(crate) fn vacuum(&mut self) -> Result<usize> {
+        let mut purged = 0;
+        for meta in self.catalog.table_metas() {
+            let ops = self.index_ops(&meta.name)?;
+            for (rid, rec) in self.store_scan_raw(&meta.name)? {
+                let (creator, deleter, row) = crate::storage::codec::decode_record(&rec)?;
+                let dead = !self.committed_trxs.contains(&creator)
+                    || (deleter != 0 && self.committed_trxs.contains(&deleter));
+                if !dead {
+                    continue;
+                }
+                for (ci, ix_file) in &ops {
+                    let key = encode_key(&row[*ci])?;
+                    BTree::at(*ix_file).delete(&mut self.pool, &key, rid)?;
+                }
+                let file = self.catalog.table(&meta.name)?.heap.file;
+                HeapFile::at(file).delete(&mut self.pool, rid)?;
+                purged += 1;
+            }
+        }
+        Ok(purged)
     }
 
     /// Replays committed WAL records into the buffer pool (they reach the
