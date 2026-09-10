@@ -287,10 +287,15 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ---
 
-## 9. 建议的后续顺序
+## 9. 建议的后续顺序（已确认的执行计划，按序执行）
 
-1. LIKE / 基础字符串函数（CONCAT/UPPER/LOWER/LENGTH），需新增函数调用 AST 节点
-2. miniob 兼容性回归用例移植、基准测试、exec.rs 拆分
-3. 相关子查询：eval 传入外层行上下文（EvalCtx 链式），物化改为逐行缓存
+1. **LIKE 匹配**（小）：lexer 补 `%` 标点（顺带解锁 MOD 运算符，一次 lexer 改动两用）；parser 加 `expr [NOT] LIKE 'pattern'`；执行器写 `%`/`_` 通配的简单匹配器；**不支持转义**（方言文档注明）；不做索引下推
+2. **字符串函数**（中）：AST 加 `Expr::Function(name, args)`，先做 CONCAT/UPPER/LOWER/LENGTH/SUBSTRING；eval 保持纯函数，与子查询物化机制互不干扰
+3. **exec.rs 拆分**（中，纯重构）：~1200 行拆成 eval/aggregate/join/plan/subquery 五个模块；趁功能面稳定时做，之后每项改动的成本都会下降
+4. **miniob 兼容性回归用例移植**（测试）：把 miniob 经典测试场景（CRUD、聚合、join、子查询组合拳）转成集成测试，锁定方言行为
+5. **基准测试**（小）：B+ 树点查/范围扫 vs 全表扫的对比计时，README 附数字；顺带验证 3 的重构无回归
+6. **相关子查询**（大，压轴）：eval 传入外层行上下文（EvalCtx 链式），子查询物化改为逐行缓存；复杂度高、教学收益相对低
+
+理由：1+2 补齐 SQL 表达式面且互相搭车；3 在 4/6 之前做，减少测试改动打架；5 给 README 增色并验证重构。
 
 提交基线：`975dab2 feat: vacuum ...`（HEAD）。
