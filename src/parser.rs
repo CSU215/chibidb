@@ -1,23 +1,24 @@
 use crate::ast::{
-    AggFunc, BinOp, ColumnDef, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt,
-    DropIndexStmt, DropTableStmt, ExplainStmt, Expr, InsertStmt, Limit, SelectItem, SelectStmt,
-    Stmt, TableRef, TrxCtl, UnOp, UpdateStmt,
+    AggFunc, BinOp, ColumnDef, CreateIndexStmt, CreateTableStmt, CreateViewStmt, DataType,
+    DeleteStmt, DropIndexStmt, DropTableStmt, DropViewStmt, ExplainStmt, Expr, InsertStmt, Limit,
+    SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp, UpdateStmt,
 };
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
 
 pub fn parse(sql: &str) -> Result<Vec<Stmt>> {
     let tokens = lex(sql)?;
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser { tokens, src: sql, pos: 0 };
     p.parse_statements()
 }
 
-struct Parser {
+struct Parser<'a> {
     tokens: Vec<Token>,
+    src: &'a str,
     pos: usize,
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
     }
@@ -106,6 +107,31 @@ impl Parser {
             return self.parse_select();
         }
         if self.eat_keyword("create") {
+            if self.eat_keyword("view") {
+                let name = self.parse_ident("view name")?;
+                if !self.eat_keyword("as") {
+                    return Err(self.unexpected("as"));
+                }
+                // keep the original select text for the catalog
+                let start = self
+                    .tokens
+                    .get(self.pos)
+                    .map(|t| t.pos)
+                    .ok_or_else(|| self.unexpected("select after as"))?;
+                let stmt = self.parse_statement()?;
+                let end = self
+                    .tokens
+                    .get(self.pos)
+                    .map(|t| t.pos)
+                    .unwrap_or(self.src.len());
+                let sql = self.src[start..end].trim_end().to_string();
+                match stmt {
+                    Stmt::Select(_) => {
+                        return Ok(Stmt::CreateView(CreateViewStmt { name, sql }))
+                    }
+                    _ => return Err(self.unexpected("select after as")),
+                }
+            }
             if self.eat_keyword("index") {
                 let name = self.parse_ident("index name")?;
                 if !self.eat_keyword("on") {
@@ -127,8 +153,12 @@ impl Parser {
                 let name = self.parse_ident("index name")?;
                 return Ok(Stmt::DropIndex(DropIndexStmt { name }));
             }
+            if self.eat_keyword("view") {
+                let name = self.parse_ident("view name")?;
+                return Ok(Stmt::DropView(DropViewStmt { name }));
+            }
             if !self.eat_keyword("table") {
-                return Err(self.unexpected("index or table"));
+                return Err(self.unexpected("index, view or table"));
             }
             let name = self.parse_ident("table name")?;
             return Ok(Stmt::DropTable(DropTableStmt { name }));
@@ -176,7 +206,7 @@ impl Parser {
         }
     }
 
-    const RESERVED: &[&str] = &[
+    const RESERVED: &'static [&'static str] = &[
         "where", "group", "having", "order", "limit", "on", "join", "inner", "left", "right",
         "in", "exists",
     ];

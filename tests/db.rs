@@ -495,6 +495,72 @@ fn scalar_subquery() {
 }
 
 #[test]
+fn create_view_select_drop_view() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int, score float);").unwrap();
+        db.execute_sql("insert into t values (1, 55.0), (2, 75.0), (3, 95.0);").unwrap();
+
+        let m = message(&db.execute_sql("create view passed as select id, score from t where score >= 75.0;").unwrap());
+        assert_eq!(m, "SUCCESS");
+
+        // query through the view
+        let rs = db.execute_sql("select * from passed order by id;").unwrap();
+        let (cols, r) = rows(&rs);
+        assert_eq!(cols, ["id", "score"]);
+        assert_eq!(r, [[Value::Int(2), Value::Float(75.0)], [Value::Int(3), Value::Float(95.0)]]);
+
+        // filtering on the view
+        let rs = db.execute_sql("select id from passed where score > 80.0;").unwrap();
+        assert_eq!(rows(&rs).1, [[Value::Int(3)]]);
+
+        // aggregates over views
+        let rs = db.execute_sql("select count(*) from passed;").unwrap();
+        assert_eq!(rows(&rs).1, [[Value::Int(2)]]);
+
+        // joins between views and tables
+        let rs = db.execute_sql("select t.id from t join passed on t.id = passed.id order by t.id;").unwrap();
+        assert_eq!(rows(&rs).1, [[Value::Int(2)], [Value::Int(3)]]);
+
+        // name collisions
+        let err = db.execute_sql("create view passed as select 1;").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        let err = db.execute_sql("create table passed (x int);").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+
+        // drop and recreate
+        assert_eq!(message(&db.execute_sql("drop view passed;").unwrap()), "SUCCESS");
+        let err = db.execute_sql("select * from passed;").unwrap_err();
+        assert!(err.to_string().contains("no such table"), "{err}");
+        let err = db.execute_sql("drop view passed;").unwrap_err();
+        assert!(err.to_string().contains("no such view"), "{err}");
+        db.execute_sql("create view passed as select id from t where id = 1;").unwrap();
+        assert_eq!(rows(&db.execute_sql("select * from passed;").unwrap()).1, [[Value::Int(1)]]);
+    });
+}
+
+#[test]
+fn view_validation_and_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = Database::open(dir.path()).unwrap();
+        db.execute_sql("create table t (id int);").unwrap();
+        db.execute_sql("insert into t values (1), (2);").unwrap();
+
+        // view over a missing table is rejected at creation
+        let err = db.execute_sql("create view v as select * from missing;").unwrap_err();
+        assert!(err.to_string().contains("no such table"), "{err}");
+        // self-reference is rejected (the view does not exist yet)
+        let err = db.execute_sql("create view v as select * from v;").unwrap_err();
+        assert!(err.to_string().contains("no such table"), "{err}");
+
+        db.execute_sql("create view v as select id from t where id > 1;").unwrap();
+    }
+    let mut db = Database::open(dir.path()).unwrap();
+    let rs = db.execute_sql("select * from v;").unwrap();
+    assert_eq!(rows(&rs).1, [[Value::Int(2)]]);
+}
+
+#[test]
 fn date_type() {
     with_dbs(|db| {
         db.execute_sql("create table t (id int, birthday date);").unwrap();

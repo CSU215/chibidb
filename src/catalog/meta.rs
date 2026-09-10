@@ -1,7 +1,7 @@
 ﻿use crate::ast::DataType;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"CHIDCAT3";
+const MAGIC: [u8; 8] = *b"CHIDCAT4"; // v4: views stored as sql text
 
 const DTYPE_INT: u8 = 0x00;
 const DTYPE_FLOAT: u8 = 0x01;
@@ -25,6 +25,12 @@ pub struct IndexMeta {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ViewMeta {
+    pub name: String,
+    pub sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CatalogSnapshot {
     pub next_table_file: u32,
     pub next_index_file: u32,
@@ -32,6 +38,7 @@ pub struct CatalogSnapshot {
     pub committed_trxs: Vec<u32>,
     pub tables: Vec<TableMeta>,
     pub indexes: Vec<IndexMeta>,
+    pub views: Vec<ViewMeta>,
 }
 
 pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
@@ -69,6 +76,11 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
         put_str(&mut buf, &ix.table);
         put_str(&mut buf, &ix.column);
         put_u32(&mut buf, ix.file_no);
+    }
+    put_u32(&mut buf, snap.views.len() as u32);
+    for v in &snap.views {
+        put_str(&mut buf, &v.name);
+        put_str(&mut buf, &v.sql);
     }
     buf
 }
@@ -117,10 +129,25 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
         let file_no = take_u32(data, &mut pos)?;
         indexes.push(IndexMeta { name, table, column, file_no });
     }
+    let n_views = take_u32(data, &mut pos)?;
+    let mut views = Vec::new();
+    for _ in 0..n_views {
+        let name = take_str(data, &mut pos)?;
+        let sql = take_str(data, &mut pos)?;
+        views.push(ViewMeta { name, sql });
+    }
     if pos != data.len() {
         return Err(Error::Runtime("trailing bytes in catalog file".into()));
     }
-    Ok(CatalogSnapshot { next_table_file, next_index_file, next_trx_id, committed_trxs, tables, indexes })
+    Ok(CatalogSnapshot {
+        next_table_file,
+        next_index_file,
+        next_trx_id,
+        committed_trxs,
+        tables,
+        indexes,
+        views,
+    })
 }
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {

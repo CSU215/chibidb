@@ -387,6 +387,35 @@ fn parses_in_list() {
 }
 
 #[test]
+fn parses_create_and_drop_view() {
+    let stmts = parse("create view v as select id, score from student where score > 60;").unwrap();
+    match &stmts[0] {
+        Stmt::CreateView(c) => {
+            assert_eq!(c.name, "v");
+            assert_eq!(c.sql, "select id, score from student where score > 60");
+        }
+        other => panic!("expected create view, got {other:?}"),
+    }
+
+    let stmts = parse("create view w as select 1;").unwrap();
+    match &stmts[0] {
+        Stmt::CreateView(c) => assert_eq!(c.sql, "select 1"),
+        other => panic!("expected create view, got {other:?}"),
+    }
+
+    let stmts = parse("drop view v;").unwrap();
+    match &stmts[0] {
+        Stmt::DropView(d) => assert_eq!(d.name, "v"),
+        other => panic!("expected drop view, got {other:?}"),
+    }
+
+    err("create view v select 1;");
+    err("create view v as;");
+    err("create view v as insert into t values (1);");
+    err("drop view;");
+}
+
+#[test]
 fn parses_create_index() {
     let stmts = parse("create index idx_name on student (id);").unwrap();
     match &stmts[0] {

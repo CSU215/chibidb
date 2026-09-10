@@ -120,6 +120,9 @@ impl Database {
                     IndexStore { file, file_no: ix.file_no },
                 )?;
             }
+            for v in &snap.views {
+                catalog.create_view(&v.name, v.sql.clone())?;
+            }
             next_table_file = snap.next_table_file;
             next_index_file = snap.next_index_file;
             next_trx_id = snap.next_trx_id;
@@ -428,6 +431,7 @@ impl Database {
             committed_trxs: self.committed_trxs.iter().copied().collect(),
             tables: self.catalog.table_metas(),
             indexes: self.catalog.index_metas(),
+            views: self.catalog.view_metas(),
         };
         let bytes = encode_catalog(&snap);
         std::fs::write(self.data_dir.join("catalog.bin"), bytes)

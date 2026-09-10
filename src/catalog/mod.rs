@@ -6,7 +6,7 @@ use crate::{Error, Result};
 
 pub mod meta;
 
-use meta::{IndexMeta, TableMeta};
+use meta::{IndexMeta, TableMeta, ViewMeta};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDesc {
@@ -87,6 +87,7 @@ pub struct Table {
 pub struct Catalog {
     tables: BTreeMap<String, Table>,
     indexes: BTreeMap<String, IndexEntry>,
+    views: BTreeMap<String, String>,
 }
 
 impl Catalog {
@@ -96,7 +97,7 @@ impl Catalog {
         schema: Schema,
         heap: HeapStore,
     ) -> Result<()> {
-        if self.tables.contains_key(name) {
+        if self.tables.contains_key(name) || self.views.contains_key(name) {
             return Err(Error::Runtime(format!("table already exists: {name}")));
         }
         self.tables.insert(name.to_string(), Table { schema, heap });
@@ -193,5 +194,32 @@ impl Catalog {
     /// (heap file_no, FileId) for every table, for WAL replay mapping.
     pub(crate) fn heap_files(&self) -> Vec<(u32, FileId)> {
         self.tables.values().map(|t| (t.heap.file_no, t.heap.file)).collect()
+    }
+
+    pub(crate) fn create_view(&mut self, name: &str, sql: String) -> Result<()> {
+        if self.tables.contains_key(name) || self.views.contains_key(name) {
+            return Err(Error::Runtime(format!("already exists: {name}")));
+        }
+        self.views.insert(name.to_string(), sql);
+        Ok(())
+    }
+
+    pub(crate) fn drop_view(&mut self, name: &str) -> Result<()> {
+        self.views
+            .remove(name)
+            .ok_or_else(|| Error::Runtime(format!("no such view: {name}")))?;
+        Ok(())
+    }
+
+    /// The stored select text of a view, if the name is one.
+    pub fn view(&self, name: &str) -> Option<&String> {
+        self.views.get(name)
+    }
+
+    pub(crate) fn view_metas(&self) -> Vec<ViewMeta> {
+        self.views
+            .iter()
+            .map(|(name, sql)| ViewMeta { name: name.clone(), sql: sql.clone() })
+            .collect()
     }
 }

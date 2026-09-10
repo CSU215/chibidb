@@ -1,6 +1,6 @@
 use chibidb::ast::DataType;
 use chibidb::catalog::meta::{
-    decode_catalog, encode_catalog, CatalogSnapshot, IndexMeta, TableMeta,
+    decode_catalog, encode_catalog, CatalogSnapshot, IndexMeta, TableMeta, ViewMeta,
 };
 
 fn snapshot() -> CatalogSnapshot {
@@ -31,6 +31,10 @@ fn snapshot() -> CatalogSnapshot {
             column: "id".into(),
             file_no: 0,
         }],
+        views: vec![ViewMeta {
+            name: "passed".into(),
+            sql: "select id from student where score >= 75.0".into(),
+        }],
     }
 }
 
@@ -49,6 +53,9 @@ fn roundtrips_snapshot() {
     assert_eq!(back.indexes.len(), 1);
     assert_eq!(back.indexes[0].name, "idx_id");
     assert_eq!(back.indexes[0].column, "id");
+    assert_eq!(back.views.len(), 1);
+    assert_eq!(back.views[0].name, "passed");
+    assert_eq!(back.views[0].sql, "select id from student where score >= 75.0");
 }
 
 #[test]
@@ -60,12 +67,14 @@ fn empty_catalog_roundtrips() {
         committed_trxs: vec![],
         tables: vec![],
         indexes: vec![],
+        views: vec![],
     };
     let bytes = encode_catalog(&snap);
     let back = decode_catalog(&bytes).unwrap();
     assert_eq!(back.next_table_file, 0);
     assert_eq!(back.tables.len(), 0);
     assert_eq!(back.indexes.len(), 0);
+    assert_eq!(back.views.len(), 0);
 }
 
 #[test]

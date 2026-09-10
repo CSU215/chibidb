@@ -177,6 +177,18 @@ pub struct DropTableStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CreateViewStmt {
+    pub name: String,
+    /// The original select text after AS, stored verbatim in the catalog.
+    pub sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropViewStmt {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExplainStmt {
     pub stmt: Box<Stmt>,
 }
@@ -223,9 +235,11 @@ pub struct SelectStmt {
 pub enum Stmt {
     CreateIndex(CreateIndexStmt),
     CreateTable(CreateTableStmt),
+    CreateView(CreateViewStmt),
     Delete(DeleteStmt),
     DropIndex(DropIndexStmt),
     DropTable(DropTableStmt),
+    DropView(DropViewStmt),
     Explain(ExplainStmt),
     Insert(InsertStmt),
     Select(Box<SelectStmt>),

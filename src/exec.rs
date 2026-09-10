@@ -1,6 +1,7 @@
 use crate::ast::{
-    BinOp, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt, DropTableStmt,
-    ExplainStmt, Expr, InsertStmt, Limit, SelectItem, SelectStmt, Stmt, UnOp, UpdateStmt,
+    BinOp, CreateIndexStmt, CreateTableStmt, CreateViewStmt, DataType, DeleteStmt, DropIndexStmt,
+    DropTableStmt, DropViewStmt, ExplainStmt, Expr, InsertStmt, Limit, SelectItem, SelectStmt,
+    Stmt, TableRef, UnOp, UpdateStmt,
 };
 use crate::catalog::Schema;
 use crate::index::{encode_key, BTree, Bound};
@@ -15,12 +16,16 @@ pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Res
     match stmt {
         Stmt::CreateTable(c) if trx.explicit => ddl_in_trx(trx),
         Stmt::CreateTable(c) => execute_create_table(db, c),
+        Stmt::CreateView(c) if trx.explicit => ddl_in_trx(trx),
+        Stmt::CreateView(c) => execute_create_view(db, trx, c),
         Stmt::CreateIndex(c) if trx.explicit => ddl_in_trx(trx),
         Stmt::CreateIndex(c) => execute_create_index(db, trx, c),
         Stmt::DropIndex(d) if trx.explicit => ddl_in_trx(trx),
         Stmt::DropIndex(d) => execute_drop_index(db, d),
         Stmt::DropTable(d) if trx.explicit => ddl_in_trx(trx),
         Stmt::DropTable(d) => execute_drop_table(db, d),
+        Stmt::DropView(d) if trx.explicit => ddl_in_trx(trx),
+        Stmt::DropView(d) => execute_drop_view(db, d),
         Stmt::Insert(i) => execute_insert(db, trx, i),
         Stmt::Select(s) => execute_select(db, trx, s),
         Stmt::Delete(d) => execute_delete(db, trx, d),
@@ -125,6 +130,10 @@ fn find_sargable(
     let Some(sel) = selection else {
         return Ok(None);
     };
+    // views have no indexes, so no access path choice applies
+    if db.catalog().view(table).is_some() {
+        return Ok(None);
+    }
     let schema = &db.catalog().table(table)?.schema;
     for conj in split_conjuncts(sel) {
         let (col_expr, op, lit) = match conj {
@@ -200,6 +209,28 @@ fn execute_drop_index(db: &mut Database, d: &DropIndexStmt) -> Result<ResultSet>
 
 fn execute_drop_table(db: &mut Database, d: &DropTableStmt) -> Result<ResultSet> {
     db.drop_table(&d.name)?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_create_view(
+    db: &mut Database,
+    trx: &mut TrxState,
+    c: &CreateViewStmt,
+) -> Result<ResultSet> {
+    // validate the definition by executing its select once (read-only)
+    let stmts = crate::parser::parse(&c.sql)?;
+    let Some(Stmt::Select(sel)) = stmts.into_iter().next() else {
+        return Err(Error::Runtime("view must be defined by a select".into()));
+    };
+    execute_select(db, trx, &sel)?;
+    db.catalog_mut().create_view(&c.name, c.sql.clone())?;
+    db.save_catalog()?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_drop_view(db: &mut Database, d: &DropViewStmt) -> Result<ResultSet> {
+    db.catalog_mut().drop_view(&d.name)?;
+    db.save_catalog()?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
@@ -460,6 +491,46 @@ fn run_subquery(
     }
 }
 
+/// Resolves a FROM reference: a real table (MVCC-visible rows) or a view
+/// (executes its stored select; views over views recurse).
+fn from_source(
+    db: &mut Database,
+    trx: &mut TrxState,
+    tref: &TableRef,
+) -> Result<(Vec<crate::catalog::ColumnDesc>, Vec<Vec<Value>>)> {
+    if let Ok(table) = db.catalog().table(&tref.name) {
+        let cols = table.schema.columns.clone();
+        let records = db.store_scan_raw(&tref.name)?;
+        return Ok((cols, decode_visible(records, trx)?));
+    }
+    let sql = db
+        .catalog()
+        .view(&tref.name)
+        .ok_or_else(|| Error::Runtime(format!("no such table: {}", tref.name)))?
+        .clone();
+    let stmts = crate::parser::parse(&sql)?;
+    let Some(Stmt::Select(sel)) = stmts.into_iter().next() else {
+        return Err(Error::Runtime(format!("corrupt view definition: {}", tref.name)));
+    };
+    match execute_select(db, trx, &sel)? {
+        ResultSet::Rows { columns, rows } => Ok((
+            columns
+                .into_iter()
+                .map(|name| crate::catalog::ColumnDesc {
+                    owner: None,
+                    name,
+                    // view columns carry no storage type; unused in queries
+                    dtype: DataType::Text,
+                })
+                .collect(),
+            rows,
+        )),
+        ResultSet::Message(_) => {
+            Err(Error::Runtime(format!("corrupt view definition: {}", tref.name)))
+        }
+    }
+}
+
 fn execute_select(db: &mut Database, trx: &mut TrxState, s: &SelectStmt) -> Result<ResultSet> {
     let s = &lift_subqueries(db, trx, s)?;
     if s.from.is_empty() {
@@ -486,17 +557,15 @@ fn execute_select(db: &mut Database, trx: &mut TrxState, s: &SelectStmt) -> Resu
     let mut schema = Schema::default();
     let mut rows: Vec<Vec<Value>> = vec![vec![]];
     for (i, tref) in s.from.iter().enumerate() {
-        let table = db.catalog().table(&tref.name)?;
         let owner = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
-        for col in &table.schema.columns {
+        let (columns, visible) = from_source(db, trx, tref)?;
+        for col in columns {
             schema.columns.push(crate::catalog::ColumnDesc {
                 owner: Some(owner.clone()),
-                name: col.name.clone(),
+                name: col.name,
                 dtype: col.dtype,
             });
         }
-        let records = db.store_scan_raw(&tref.name)?;
-        let visible = decode_visible(records, trx)?;
         let mut combined = Vec::with_capacity(rows.len() * visible.len().max(1));
         for left in rows {
             for right in &visible {
