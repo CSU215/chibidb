@@ -182,6 +182,7 @@ fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Resu
             let v = eval(expr, Some(&EvalCtx::row(&schema, &row)))?;
             new_row[*idx] = coerce(v, *dtype, col)?;
         }
+        check_not_null(&schema, &new_row)?;
         updates.push((rid, new_row));
     }
     let new_rids = db.store_update_versions(&u.table, &updates, trx.id)?;
@@ -220,23 +221,61 @@ fn execute_delete(db: &mut Database, trx: &mut TrxState, d: &DeleteStmt) -> Resu
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
+/// Resolves the schema positions targeted by an INSERT: either every column
+/// or the explicit column list (which may be reordered or partial).
+fn insert_targets(schema: &Schema, columns: &Option<Vec<String>>) -> Result<Vec<usize>> {
+    let Some(cols) = columns else {
+        return Ok((0..schema.columns.len()).collect());
+    };
+    let mut seen = vec![false; schema.columns.len()];
+    let mut targets = Vec::with_capacity(cols.len());
+    for c in cols {
+        let idx = schema
+            .index_of(c)
+            .ok_or_else(|| Error::Runtime(format!("no such column: {c}")))?;
+        if seen[idx] {
+            return Err(Error::Runtime(format!("column specified twice: {c}")));
+        }
+        seen[idx] = true;
+        targets.push(idx);
+    }
+    Ok(targets)
+}
+
+fn check_not_null(schema: &Schema, row: &[Value]) -> Result<()> {
+    for (col, v) in schema.columns.iter().zip(row) {
+        if col.not_null && matches!(v, Value::Null) {
+            return Err(Error::Runtime(format!("column {} cannot be null", col.name)));
+        }
+    }
+    Ok(())
+}
+
 fn execute_insert(db: &mut Database, trx: &mut TrxState, i: &InsertStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&i.table)?.schema.clone();
+    let targets = insert_targets(&schema, &i.columns)?;
     for values in &i.rows {
-        if values.len() != schema.columns.len() {
+        if values.len() != targets.len() {
             return Err(Error::Runtime(format!(
                 "expected {} values, got {}",
-                schema.columns.len(),
+                targets.len(),
                 values.len()
             )));
         }
     }
     for values in &i.rows {
-        let mut row = Vec::with_capacity(values.len());
-        for (expr, col) in values.iter().zip(&schema.columns) {
+        // start from defaults, then overlay the supplied values
+        let mut row: Vec<Value> = schema
+            .columns
+            .iter()
+            .map(|c| c.default.clone().unwrap_or(Value::Null))
+            .collect();
+        for (expr, &idx) in values.iter().zip(&targets) {
+            let col = &schema.columns[idx];
             let v = eval_const(expr)?;
-            row.push(coerce(v, col.dtype, &col.name)?);
+            row[idx] = coerce(v, col.dtype, &col.name)?;
         }
+        check_not_null(&schema, &row)?;
         let encoded = crate::storage::codec::encode_row(&row);
         if encoded.len() + 16 > crate::storage::PAGE_SIZE {
             return Err(Error::Runtime(format!(
