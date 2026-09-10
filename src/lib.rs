@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
+use crate::config::Config;
 use crate::index::{encode_key, BTree};
 use crate::storage::codec::{decode_record, encode_record};
 use crate::storage::slotted::{page_get, page_put_at};
@@ -37,13 +38,8 @@ use crate::wal::{Record, Wal};
 
 pub use crate::trx::Session;
 
-pub const BUFFER_POOL_FRAMES: usize = 64;
-
-/// Auto-checkpoint when the log outgrows this many bytes (and no open
-/// transaction depends on it).
-pub const WAL_CHECKPOINT_THRESHOLD: u64 = 8 * 1024 * 1024;
-
 pub struct Database {
+    config: Config,
     catalog: Catalog,
     pool: BufferPool,
     wal: Wal,
@@ -63,18 +59,30 @@ pub struct Database {
 impl Database {
     /// A throwaway database in an automatically-cleaned temporary directory.
     pub fn open_in_memory() -> Result<Self> {
+        Self::open_in_memory_with_config(&Config::default())
+    }
+
+    /// Like [`Database::open_in_memory`] but applying `config` defaults.
+    pub fn open_in_memory_with_config(config: &Config) -> Result<Self> {
         let temp = tempfile::tempdir()
             .map_err(|e| Error::Runtime(format!("cannot create temp dir: {e}")))?;
-        let db = Self::open(temp.path())?;
+        let db = Self::open_with_config(temp.path(), config)?;
         Ok(Self { _temp: Some(temp), ..db })
     }
 
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_config(path, &Config::default())
+    }
+
+    /// Opens (or creates) a database directory using `config` defaults for
+    /// newly created files. Existing files describe themselves and take
+    /// precedence over these defaults.
+    pub fn open_with_config(path: &Path, config: &Config) -> Result<Self> {
         let tables_dir = path.join("tables");
         let indexes_dir = path.join("indexes");
         std::fs::create_dir_all(&tables_dir).map_err(dir_err(&tables_dir))?;
         std::fs::create_dir_all(&indexes_dir).map_err(dir_err(&indexes_dir))?;
-        let mut pool = BufferPool::new(DiskManager::new(), BUFFER_POOL_FRAMES);
+        let mut pool = BufferPool::new(DiskManager::new(), config.storage.buffer_pool_frames);
         let mut catalog = Catalog::default();
         let mut next_table_file = 0;
         let mut next_index_file = 0;
@@ -160,6 +168,7 @@ impl Database {
         }
 
         let mut db = Self {
+            config: config.clone(),
             catalog,
             pool,
             wal: Wal::open(&wal_path)?,
@@ -169,7 +178,7 @@ impl Database {
             next_trx_id,
             committed_trxs,
             open_trxs: HashSet::new(),
-            wal_checkpoint_threshold: WAL_CHECKPOINT_THRESHOLD,
+            wal_checkpoint_threshold: config.wal.checkpoint_threshold,
             _temp: None,
         };
         db.recover_from_wal(&plan, &mut touched)?;
@@ -189,6 +198,10 @@ impl Database {
             db.save_catalog()?;
         }
         Ok(db)
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     pub fn flush(&mut self) -> Result<()> {

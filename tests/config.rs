@@ -1,6 +1,8 @@
 use std::io::Write;
 
 use chibidb::config::{Config, EngineKind, ExecutionMode};
+use chibidb::value::Value;
+use chibidb::{Database, ResultSet};
 
 #[test]
 fn defaults_are_sane() {
@@ -108,4 +110,29 @@ fn load_rejects_invalid_file() {
     let path = dir.path().join("config.toml");
     std::fs::write(&path, "[storage]\npage_size = 1000\n").unwrap();
     assert!(Config::load(&path).is_err());
+}
+
+#[test]
+fn database_applies_config_buffer_pool_frames() {
+    let cfg = Config::from_toml_str("[storage]\nbuffer_pool_frames = 2\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open_with_config(dir.path(), &cfg).unwrap();
+    assert_eq!(db.config().storage.buffer_pool_frames, 2);
+
+    db.execute_sql("create table t (id int);").unwrap();
+    for i in 0..50 {
+        db.execute_sql(&format!("insert into t values ({i});")).unwrap();
+    }
+    let rs = db.execute_sql("select count(*) from t;").unwrap();
+    match &rs[0] {
+        ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(50)),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn open_in_memory_honors_config() {
+    let cfg = Config::from_toml_str("[storage]\nbuffer_pool_frames = 1\n").unwrap();
+    let db = Database::open_in_memory_with_config(&cfg).unwrap();
+    assert_eq!(db.config().storage.buffer_pool_frames, 1);
 }
