@@ -1,7 +1,7 @@
 use crate::ast::{
     AggFunc, BinOp, ColumnDef, CreateIndexStmt, CreateTableStmt, CreateViewStmt, DataType,
-    DeleteStmt, DropIndexStmt, DropTableStmt, DropViewStmt, ExplainStmt, Expr, InsertStmt, Limit,
-    SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp, UpdateStmt,
+    DeleteStmt, DropIndexStmt, DropTableStmt, DropViewStmt, ExplainStmt, Expr, InsertStmt, JoinKind,
+    Limit, SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp, UpdateStmt,
 };
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
@@ -211,7 +211,7 @@ impl<'a> Parser<'a> {
 
     const RESERVED: &'static [&'static str] = &[
         "where", "group", "having", "order", "limit", "on", "join", "inner", "left", "right",
-        "in", "exists", "distinct",
+        "outer", "in", "exists", "distinct",
     ];
 
     fn agg_func(name: &str) -> Option<AggFunc> {
@@ -262,25 +262,37 @@ impl<'a> Parser<'a> {
         }
         let mut from = Vec::new();
         let mut on = Vec::new();
+        let mut joins = Vec::new();
         if self.eat_keyword("from") {
             from.push(self.parse_table_ref()?);
+            joins.push(JoinKind::Cross);
             loop {
                 if self.eat_punct(Punct::Comma) {
                     from.push(self.parse_table_ref()?);
+                    joins.push(JoinKind::Cross);
                     continue;
                 }
                 if self.eat_keyword("inner") && !self.at_keyword("join") {
                     return Err(self.unexpected("join"));
                 }
-                if self.eat_keyword("join") {
-                    from.push(self.parse_table_ref()?);
-                    if !self.eat_keyword("on") {
-                        return Err(self.unexpected("on"));
+                let kind = if self.eat_keyword("left") {
+                    self.eat_keyword("outer");
+                    if !self.eat_keyword("join") {
+                        return Err(self.unexpected("join"));
                     }
-                    on.push(self.parse_expr()?);
-                    continue;
+                    JoinKind::Left
+                } else if self.eat_keyword("join") {
+                    JoinKind::Inner
+                } else {
+                    break;
+                };
+                from.push(self.parse_table_ref()?);
+                joins.push(kind);
+                if !self.eat_keyword("on") {
+                    return Err(self.unexpected("on"));
                 }
-                break;
+                on.push(self.parse_expr()?);
+                continue;
             }
         }
         let selection = if self.eat_keyword("where") {
@@ -348,6 +360,7 @@ impl<'a> Parser<'a> {
             distinct,
             items,
             from,
+            joins,
             on,
             selection,
             group_by,

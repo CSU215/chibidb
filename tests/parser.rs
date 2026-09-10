@@ -1,4 +1,4 @@
-use chibidb::ast::{DataType, SelectItem, Stmt};
+use chibidb::ast::{DataType, JoinKind, SelectItem, Stmt};
 use chibidb::parser::parse;
 
 fn single_exprs(sql: &str) -> Vec<String> {
@@ -366,6 +366,28 @@ fn parses_is_null() {
 }
 
 #[test]
+fn parses_left_join() {
+    let s = select("select * from a left join b on a.id = b.a_id;");
+    assert_eq!(s.from.len(), 2);
+    assert_eq!(s.joins, vec![JoinKind::Cross, JoinKind::Left]);
+    assert_eq!(s.on.len(), 1);
+
+    // optional OUTER keyword
+    let s = select("select * from a left outer join b on a.id = b.a_id;");
+    assert_eq!(s.joins, vec![JoinKind::Cross, JoinKind::Left]);
+
+    let s = select("select * from a join b on a.id = b.a_id;");
+    assert_eq!(s.joins, vec![JoinKind::Cross, JoinKind::Inner]);
+
+    let s = select("select * from a, b;");
+    assert_eq!(s.joins, vec![JoinKind::Cross, JoinKind::Cross]);
+
+    err("select * from a outer join b on a.id = b.a_id;");
+    err("select * from a left b on a.id = b.a_id;");
+    err("select * from a left join b;");
+}
+
+#[test]
 fn parses_distinct() {
     let s = select("select distinct id from t;");
     assert!(s.distinct, "distinct flag must be set");
@@ -478,6 +500,7 @@ fn parses_explain() {
                     distinct: false,
                     items: vec![chibidb::ast::SelectItem::Expr(chibidb::ast::Expr::Int(1))],
                     from: vec![],
+                    joins: vec![],
                     on: vec![],
                     selection: None,
                     group_by: vec![],

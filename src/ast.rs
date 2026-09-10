@@ -219,11 +219,24 @@ pub struct Limit {
     pub offset: Option<Expr>,
 }
 
+/// How each FROM entry (after the first) is attached to the accumulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// comma list: cartesian product
+    Cross,
+    /// JOIN ... ON / INNER JOIN ... ON
+    Inner,
+    /// LEFT [OUTER] JOIN ... ON: unmatched left rows survive with NULLs
+    Left,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub from: Vec<TableRef>,
+    /// one per `from` entry; the first is a placeholder
+    pub joins: Vec<JoinKind>,
     pub on: Vec<Expr>,
     pub selection: Option<Expr>,
     pub group_by: Vec<Expr>,

@@ -64,6 +64,11 @@ impl Wal {
         self.file.metadata().map(|m| m.len()).map_err(wal_io)
     }
 
+    /// True when the log holds no frames.
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
     /// Checkpoint: only call this after all data pages reached the disk.
     pub fn truncate(&mut self) -> Result<()> {
         self.file.set_len(0).map_err(wal_io)?;

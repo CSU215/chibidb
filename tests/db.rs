@@ -596,6 +596,73 @@ fn distinct_deduplicates_projected_rows() {
 }
 
 #[test]
+fn left_join_keeps_unmatched_left_rows() {
+    with_dbs(|db| {
+        db.execute_sql("create table a (id int);").unwrap();
+        db.execute_sql("create table b (a_id int, v char(4));").unwrap();
+        db.execute_sql("insert into a values (1), (2), (3);").unwrap();
+        db.execute_sql("insert into b values (1, 'x'), (3, 'y');").unwrap();
+
+        let rs = db
+            .execute_sql("select a.id, b.v from a left join b on a.id = b.a_id order by a.id;")
+            .unwrap();
+        assert_eq!(
+            rows(&rs).1,
+            [
+                [Value::Int(1), Value::Str("x".into())],
+                [Value::Int(2), Value::Null],
+                [Value::Int(3), Value::Str("y".into())],
+            ]
+        );
+
+        // inner join only keeps matches
+        let rs = db
+            .execute_sql("select a.id, b.v from a join b on a.id = b.a_id order by a.id;")
+            .unwrap();
+        assert_eq!(
+            rows(&rs).1,
+            [[Value::Int(1), Value::Str("x".into())], [Value::Int(3), Value::Str("y".into())]]
+        );
+
+        // where over the left-join result
+        let rs = db
+            .execute_sql(
+                "select a.id, b.v from a left join b on a.id = b.a_id where b.v is null;",
+            )
+            .unwrap();
+        assert_eq!(rows(&rs).1, [[Value::Int(2), Value::Null]]);
+
+        // chained left joins
+        db.execute_sql("create table c (a_id int, w char(4));").unwrap();
+        db.execute_sql("insert into c values (1, 'z');").unwrap();
+        let rs = db
+            .execute_sql(
+                "select a.id, b.v, c.w from a left join b on a.id = b.a_id
+                 left join c on a.id = c.a_id order by a.id;",
+            )
+            .unwrap();
+        assert_eq!(
+            rows(&rs).1,
+            [
+                [Value::Int(1), Value::Str("x".into()), Value::Str("z".into())],
+                [Value::Int(2), Value::Null, Value::Null],
+                [Value::Int(3), Value::Str("y".into()), Value::Null],
+            ]
+        );
+
+        // empty right side: every left row survives with NULLs
+        db.execute_sql("create table e (a_id int);").unwrap();
+        let rs = db
+            .execute_sql("select a.id, e.a_id from a left join e on a.id = e.a_id order by a.id;")
+            .unwrap();
+        assert_eq!(
+            rows(&rs).1,
+            [[Value::Int(1), Value::Null], [Value::Int(2), Value::Null], [Value::Int(3), Value::Null]]
+        );
+    });
+}
+
+#[test]
 fn date_type() {
     with_dbs(|db| {
         db.execute_sql("create table t (id int, birthday date);").unwrap();

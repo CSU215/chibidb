@@ -1,7 +1,7 @@
 use crate::ast::{
     BinOp, CreateIndexStmt, CreateTableStmt, CreateViewStmt, DataType, DeleteStmt, DropIndexStmt,
-    DropTableStmt, DropViewStmt, ExplainStmt, Expr, InsertStmt, Limit, SelectItem, SelectStmt,
-    Stmt, TableRef, UnOp, UpdateStmt,
+    DropTableStmt, DropViewStmt, ExplainStmt, Expr, InsertStmt, JoinKind, Limit, SelectItem,
+    SelectStmt, Stmt, TableRef, UnOp, UpdateStmt,
 };
 use crate::catalog::Schema;
 use crate::index::{encode_key, BTree, Bound};
@@ -429,7 +429,7 @@ fn lift_subqueries(db: &mut Database, trx: &mut TrxState, s: &SelectStmt) -> Res
     for (e, desc) in &s.order_by {
         order_by.push((lift_expr(db, trx, e)?, *desc));
     }
-    Ok(SelectStmt { distinct: s.distinct, items, from: s.from.clone(), on, selection, group_by, having, order_by, limit: s.limit.clone() })
+    Ok(SelectStmt { distinct: s.distinct, items, from: s.from.clone(), joins: s.joins.clone(), on, selection, group_by, having, order_by, limit: s.limit.clone() })
 }
 
 fn lift_expr(db: &mut Database, trx: &mut TrxState, e: &Expr) -> Result<Expr> {
@@ -572,6 +572,7 @@ fn execute_select(db: &mut Database, trx: &mut TrxState, s: &SelectStmt) -> Resu
     for (i, tref) in s.from.iter().enumerate() {
         let owner = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
         let (columns, visible) = from_source(db, trx, tref)?;
+        let right_cols = columns.len();
         for col in columns {
             schema.columns.push(crate::catalog::ColumnDesc {
                 owner: Some(owner.clone()),
@@ -579,27 +580,49 @@ fn execute_select(db: &mut Database, trx: &mut TrxState, s: &SelectStmt) -> Resu
                 dtype: col.dtype,
             });
         }
+        let kind = s.joins.get(i).copied().unwrap_or(JoinKind::Cross);
+        let cond = if i >= 1 { s.on.get(i - 1) } else { None };
         let mut combined = Vec::with_capacity(rows.len() * visible.len().max(1));
-        for left in rows {
-            for right in &visible {
-                let mut row = left.clone();
-                row.extend(right.iter().cloned());
-                combined.push(row);
-            }
-        }
-        rows = combined;
-        if i >= 1 {
-            // on[i-1] joins the newly added table with everything before it
-            if let Some(cond) = s.on.get(i - 1) {
-                let mut kept = Vec::with_capacity(rows.len());
-                for row in rows {
+        if i >= 1 && kind == JoinKind::Left {
+            let Some(cond) = cond else {
+                return Err(Error::Runtime("left join requires an on clause".into()));
+            };
+            for left in rows {
+                let mut matched = false;
+                for right in &visible {
+                    let mut row = left.clone();
+                    row.extend(right.iter().cloned());
                     if eval_predicate(cond, &schema, &row)? {
-                        kept.push(row);
+                        combined.push(row);
+                        matched = true;
                     }
                 }
-                rows = kept;
+                if !matched {
+                    let mut row = left;
+                    row.extend(vec![Value::Null; right_cols]);
+                    combined.push(row);
+                }
             }
+        } else {
+            for left in rows {
+                for right in &visible {
+                    let mut row = left.clone();
+                    row.extend(right.iter().cloned());
+                    combined.push(row);
+                }
+            }
+            if i >= 1
+                && let Some(cond) = cond {
+                    let mut kept = Vec::with_capacity(combined.len());
+                    for row in combined {
+                        if eval_predicate(cond, &schema, &row)? {
+                            kept.push(row);
+                        }
+                    }
+                    combined = kept;
+                }
         }
+        rows = combined;
     }
     let mut headers = Vec::new();
     let mut exprs = Vec::new();
