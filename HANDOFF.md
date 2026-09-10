@@ -130,9 +130,9 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | M14 加固 | ✅ DROP TABLE（`d0e239c`）、跨语句事务会话修复（`bcfd6ee`）、clippy 清零（`0023a43`）、README + 冒烟脚本（`46c8637`） | `46c8637` |
 | M15 查询/运维增强 | ✅ CHECKPOINT 语句 + WAL 预算护栏（`c8e060e`）、DISTINCT（`2389f99`）、LEFT [OUTER] JOIN（`5f31ea2`） | `5f31ea2` |
 | M16 空间回收 | ✅ VACUUM：物理回收已提交删除标记行/孤儿版本 + stale 索引项清理；flush() 开事务守卫（`975dab2`） | `975dab2` |
-| M17 表达式面 | ✅ `%` 标点入 lexer；`expr [NOT] LIKE`（`%`/`_` 通配，无转义）；MOD 运算符；字符串函数 concat/upper/lower/length/substring；exec.rs 拆分为 exec/ 六模块 | （工作区，未提交） |
-| M18 查询/性能 | ✅ miniob 经典 student/course/sc 端到端回归；忽略式索引基准（`tests/bench.rs`）；修复单表索引扫描仍先全表扫的空转；AND 链同列上下界合并为一段范围扫；只读事务不再重写 catalog | （工作区，未提交） |
-| M19 相关子查询 | ✅ `EvalCtx` 改为带父链的作用域（列解析逐层向外）；子查询改为在求值点按当前行/组物化（`bind_expr`/`eval_bound`），支持多层嵌套的相关引用 | （工作区，未提交） |
+| M17 表达式面 | ✅ `%` 标点入 lexer；`expr [NOT] LIKE`（`%`/`_` 通配，无转义）；MOD 运算符；字符串函数 concat/upper/lower/length/substring；exec.rs 拆分为 exec/ 六模块 | `d3a85ad` |
+| M18 查询/性能 | ✅ miniob 经典 student/course/sc 端到端回归；忽略式索引基准（`tests/bench.rs`）；修复单表索引扫描仍先全表扫的空转；AND 链同列上下界合并为一段范围扫；只读事务不再重写 catalog | `5c4e26e` + `546b601` |
+| M19 相关子查询 | ✅ `EvalCtx` 改为带父链的作用域（列解析逐层向外）；子查询改为在求值点按当前行/组物化（`bind_expr`/`eval_bound`），支持多层嵌套的相关引用 | `8dce9a3` |
 
 ---
 
@@ -321,4 +321,4 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 进度：**1–6 全部完成**（274 tests 全绿，clippy 零警告）。计划已清空。
 
-提交基线：`975dab2 feat: vacuum ...`（HEAD）；HEAD 之后当前工作区含 M17–M19 未提交改动。建议按里程碑拆分提交（如 `feat: like/mod/string functions`、`refactor: split exec`、`test: miniob compat + bench`、`perf: index access path + range bounds + read-only catalog`、`feat: correlated subqueries`）。
+提交基线：`9102ab7 docs: link m17-m19 milestones to their commits`（HEAD）。M17–M19 已按里程碑拆分入库：`d3a85ad`（LIKE/函数/exec 拆分）、`5c4e26e`（miniob 回归）、`546b601`（索引选路+范围合并+只读提交）、`8dce9a3`（相关子查询）。
