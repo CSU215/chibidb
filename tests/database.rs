@@ -71,12 +71,25 @@ fn create_use_and_query_across_databases() {
 }
 
 #[test]
-fn statements_need_a_selected_database() {
+fn table_statements_auto_select_a_default_database() {
     let dir = tempfile::tempdir().unwrap();
     let mut inst = instance(&dir);
     let mut s = Session::new();
-    inst.execute_with(&mut s, "create database shop;").unwrap();
-    assert!(inst.execute_with(&mut s, "create table t (id int);").is_err());
+
+    // no USE needed: the first table statement lands in `main`
+    inst.execute_with(&mut s, "create table t (id int);").unwrap();
+    assert_eq!(s.current_db(), Some("main"));
+    inst.execute_with(&mut s, "insert into t values (1);").unwrap();
+    assert_eq!(
+        first_int(&inst.execute_with(&mut s, "select count(*) from t;").unwrap()),
+        1
+    );
+
+    // an explicit database can still be selected and isolated
+    inst.execute_with(&mut s, "create database other;").unwrap();
+    inst.execute_with(&mut s, "use other;").unwrap();
+    assert_eq!(s.current_db(), Some("other"));
+    assert!(inst.execute_with(&mut s, "select * from t;").is_err());
 }
 
 #[test]
