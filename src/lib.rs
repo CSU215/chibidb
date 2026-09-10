@@ -391,73 +391,88 @@ impl Database {
     ) -> Result<Vec<ResultSet>> {
         let stmts = parser::parse(sql)?;
         let mut out = Vec::new();
-        let pipeline = Pipeline::new(vec![Box::new(ExecuteStage)]);
         for stmt in &stmts {
-            match stmt {
-                crate::ast::Stmt::Trx(crate::ast::TrxCtl::Begin) => {
-                    if session.trx.is_some() {
-                        return Err(Error::Runtime("transaction already begun".into()));
-                    }
+            if let Some(rs) = self.execute_stmt_with(session, stmt)? {
+                out.push(rs);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Executes one parsed statement. Transaction-control statements produce
+    /// no result set (`None`).
+    pub(crate) fn execute_stmt_with(
+        &mut self,
+        session: &mut Session,
+        stmt: &crate::ast::Stmt,
+    ) -> Result<Option<ResultSet>> {
+        let pipeline = Pipeline::new(vec![Box::new(ExecuteStage)]);
+        match stmt {
+            crate::ast::Stmt::Trx(crate::ast::TrxCtl::Begin) => {
+                if session.trx.is_some() {
+                    return Err(Error::Runtime("transaction already begun".into()));
+                }
+                let id = self.next_trx_id;
+                self.next_trx_id += 1;
+                session.begin(id, &self.committed_trxs, true);
+                self.open_trxs.insert(id);
+                Ok(None)
+            }
+            crate::ast::Stmt::Trx(crate::ast::TrxCtl::Commit) => {
+                if session.trx.is_none() {
+                    return Err(Error::Runtime("no active transaction".into()));
+                }
+                if let Some(trx) = session.trx.take() {
+                    let wrote = !trx.undo.is_empty();
+                    self.commit_trx(trx.id, wrote)?;
+                }
+                Ok(None)
+            }
+            crate::ast::Stmt::Trx(crate::ast::TrxCtl::Rollback) => {
+                if session.trx.is_none() {
+                    return Err(Error::Runtime("no active transaction".into()));
+                }
+                if let Some(mut trx) = session.trx.take() {
+                    self.rollback_trx(&mut trx)?;
+                    self.open_trxs.remove(&trx.id);
+                }
+                Ok(None)
+            }
+            other => {
+                let autocommit = session.trx.is_none();
+                if autocommit {
                     let id = self.next_trx_id;
                     self.next_trx_id += 1;
-                    session.begin(id, &self.committed_trxs, true);
+                    session.begin(id, &self.committed_trxs, false);
                     self.open_trxs.insert(id);
                 }
-                crate::ast::Stmt::Trx(crate::ast::TrxCtl::Commit) => {
-                    if session.trx.is_none() {
-                        return Err(Error::Runtime("no active transaction".into()));
-                    }
-                    if let Some(trx) = session.trx.take() {
-                        let wrote = !trx.undo.is_empty();
-                        self.commit_trx(trx.id, wrote)?;
-                    }
-                }
-                crate::ast::Stmt::Trx(crate::ast::TrxCtl::Rollback) => {
-                    if session.trx.is_none() {
-                        return Err(Error::Runtime("no active transaction".into()));
-                    }
-                    if let Some(mut trx) = session.trx.take() {
-                        self.rollback_trx(&mut trx)?;
-                        self.open_trxs.remove(&trx.id);
-                    }
-                }
-                other => {
-                    let autocommit = session.trx.is_none();
-                    if autocommit {
-                        let id = self.next_trx_id;
-                        self.next_trx_id += 1;
-                        session.begin(id, &self.committed_trxs, false);
-                        self.open_trxs.insert(id);
-                    }
-                    let mut event = SqlEvent::new(other);
-                    match pipeline.run(self, session, &mut event) {
-                        Ok(()) => {
-                            let rs = event.result.take().expect("execute stage produced no result");
-                            if autocommit
-                                && let Some(trx) = session.trx.take() {
-                                    let wrote = !trx.undo.is_empty();
-                                    self.commit_trx(trx.id, wrote)?;
-                                }
-                            out.push(rs);
-                        }
-                        Err(e) => {
-                            // undo partial statement work; an explicit
-                            // transaction stays open for retry or rollback
-                            if let Some(mut trx) = session.trx.take() {
-                                self.rollback_trx(&mut trx)?;
-                                if !autocommit {
-                                    session.trx = Some(trx);
-                                } else {
-                                    self.open_trxs.remove(&trx.id);
-                                }
+                let mut event = SqlEvent::new(other);
+                match pipeline.run(self, session, &mut event) {
+                    Ok(()) => {
+                        let rs = event.result.take().expect("execute stage produced no result");
+                        if autocommit
+                            && let Some(trx) = session.trx.take() {
+                                let wrote = !trx.undo.is_empty();
+                                self.commit_trx(trx.id, wrote)?;
                             }
-                            return Err(e);
+                        Ok(Some(rs))
+                    }
+                    Err(e) => {
+                        // undo partial statement work; an explicit
+                        // transaction stays open for retry or rollback
+                        if let Some(mut trx) = session.trx.take() {
+                            self.rollback_trx(&mut trx)?;
+                            if !autocommit {
+                                session.trx = Some(trx);
+                            } else {
+                                self.open_trxs.remove(&trx.id);
+                            }
                         }
+                        Err(e)
                     }
                 }
             }
         }
-        Ok(out)
     }
 
     /// Rolls back any open transaction when a session goes away.

@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::ast::Stmt;
 use crate::config::Config;
+use crate::parser;
+use crate::result::ResultSet;
+use crate::trx::Session;
 use crate::{Database, Error, Result};
 
 /// Directory under the data root reserved for instance-wide metadata
@@ -83,6 +87,61 @@ impl Instance {
             self.databases.insert(name.to_string(), db);
         }
         Ok(self.databases.get_mut(name).expect("database was just opened"))
+    }
+
+    /// Top-level SQL entry. Database-level statements (`CREATE/DROP DATABASE`,
+    /// `USE`) are handled here; everything else is routed to the session's
+    /// current database.
+    pub fn execute_with(&mut self, session: &mut Session, sql: &str) -> Result<Vec<ResultSet>> {
+        let stmts = parser::parse(sql)?;
+        let mut out = Vec::new();
+        for stmt in &stmts {
+            match stmt {
+                Stmt::CreateDatabase(c) => {
+                    self.reject_in_trx(session)?;
+                    self.create_database(&c.name)?;
+                    out.push(ResultSet::Message("SUCCESS".into()));
+                }
+                Stmt::DropDatabase(d) => {
+                    self.reject_in_trx(session)?;
+                    self.drop_database(&d.name)?;
+                    out.push(ResultSet::Message("SUCCESS".into()));
+                }
+                Stmt::Use(u) => {
+                    self.reject_in_trx(session)?;
+                    self.use_database(session, &u.name)?;
+                    out.push(ResultSet::Message("SUCCESS".into()));
+                }
+                other => {
+                    let db_name = session
+                        .current_db()
+                        .ok_or_else(|| Error::Runtime("no database selected".into()))?
+                        .to_string();
+                    let db = self.database_mut(&db_name)?;
+                    if let Some(rs) = db.execute_stmt_with(session, other)? {
+                        out.push(rs);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn use_database(&self, session: &mut Session, name: &str) -> Result<()> {
+        if !self.databases()?.iter().any(|d| d == name) {
+            return Err(Error::Runtime(format!("no such database: {name}")));
+        }
+        session.set_current_db(Some(name.to_string()));
+        Ok(())
+    }
+
+    fn reject_in_trx(&self, session: &Session) -> Result<()> {
+        if session.trx.is_some() {
+            return Err(Error::Runtime(
+                "cannot run database statements inside a transaction".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

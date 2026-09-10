@@ -2,14 +2,24 @@ use std::collections::HashSet;
 
 use crate::storage::Rid;
 
-/// Per-connection state: at most one active transaction at a time.
+/// Per-connection state: at most one active transaction at a time, plus the
+/// database the statements route to (selected with `USE`).
 pub struct Session {
     pub(crate) trx: Option<TrxState>,
+    current_db: Option<String>,
 }
 
 impl Session {
     pub fn new() -> Self {
-        Self { trx: None }
+        Self { trx: None, current_db: None }
+    }
+
+    pub fn current_db(&self) -> Option<&str> {
+        self.current_db.as_deref()
+    }
+
+    pub(crate) fn set_current_db(&mut self, name: Option<String>) {
+        self.current_db = name;
     }
 
     pub(crate) fn begin(&mut self, id: u32, committed: &HashSet<u32>, explicit: bool) {

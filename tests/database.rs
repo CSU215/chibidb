@@ -1,5 +1,23 @@
 use chibidb::ast::{CreateDatabaseStmt, DropDatabaseStmt, Stmt, UseStmt};
+use chibidb::config::Config;
+use chibidb::instance::Instance;
 use chibidb::parser::parse;
+use chibidb::value::Value;
+use chibidb::{ResultSet, Session};
+
+fn instance(dir: &tempfile::TempDir) -> Instance {
+    Instance::open(dir.path(), &Config::default()).unwrap()
+}
+
+fn first_int(rs: &[ResultSet]) -> i64 {
+    match &rs[0] {
+        ResultSet::Rows { rows, .. } => match rows[0][0] {
+            Value::Int(n) => n,
+            ref v => panic!("expected int, got {v:?}"),
+        },
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
 
 fn one(sql: &str) -> Stmt {
     parse(sql).unwrap().remove(0)
@@ -32,4 +50,62 @@ fn rejects_malformed_database_statements() {
     assert!(parse("create database;").is_err());
     assert!(parse("use;").is_err());
     assert!(parse("drop;").is_err());
+}
+
+#[test]
+fn create_use_and_query_across_databases() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut inst = instance(&dir);
+    let mut s = Session::new();
+
+    inst.execute_with(&mut s, "create database shop;").unwrap();
+    inst.execute_with(&mut s, "use shop;").unwrap();
+    assert_eq!(s.current_db(), Some("shop"));
+    inst.execute_with(&mut s, "create table t (id int);").unwrap();
+    inst.execute_with(&mut s, "insert into t values (5);").unwrap();
+    assert_eq!(first_int(&inst.execute_with(&mut s, "select id from t;").unwrap()), 5);
+
+    inst.execute_with(&mut s, "create database blog;").unwrap();
+    inst.execute_with(&mut s, "use blog;").unwrap();
+    assert!(inst.execute_with(&mut s, "select id from t;").is_err());
+}
+
+#[test]
+fn statements_need_a_selected_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut inst = instance(&dir);
+    let mut s = Session::new();
+    inst.execute_with(&mut s, "create database shop;").unwrap();
+    assert!(inst.execute_with(&mut s, "create table t (id int);").is_err());
+}
+
+#[test]
+fn use_unknown_database_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut inst = instance(&dir);
+    let mut s = Session::new();
+    assert!(inst.execute_with(&mut s, "use nope;").is_err());
+    assert_eq!(s.current_db(), None);
+}
+
+#[test]
+fn dropped_database_cannot_be_queried() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut inst = instance(&dir);
+    let mut s = Session::new();
+    inst.execute_with(&mut s, "create database shop;").unwrap();
+    inst.execute_with(&mut s, "use shop;").unwrap();
+    inst.execute_with(&mut s, "drop database shop;").unwrap();
+    assert!(inst.execute_with(&mut s, "select 1;").is_err());
+}
+
+#[test]
+fn database_statements_are_rejected_inside_a_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut inst = instance(&dir);
+    let mut s = Session::new();
+    inst.execute_with(&mut s, "create database shop;").unwrap();
+    inst.execute_with(&mut s, "use shop;").unwrap();
+    inst.execute_with(&mut s, "begin;").unwrap();
+    assert!(inst.execute_with(&mut s, "create database other;").is_err());
 }
