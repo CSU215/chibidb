@@ -72,6 +72,59 @@ fn insert_column_list_validates_and_reorders() {
 }
 
 #[test]
+fn primary_key_rejects_null_and_duplicates() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int primary key, name char(10));").unwrap();
+
+    let e = err(&mut db, "insert into t values (null, 'a');");
+    assert!(e.contains("cannot be null"), "{e}");
+
+    db.execute_sql("insert into t values (1, 'a');").unwrap();
+    let e = err(&mut db, "insert into t values (1, 'b');");
+    assert!(e.contains("duplicate key"), "{e}");
+
+    // duplicate within a single multi-row statement
+    let e = err(&mut db, "insert into t values (2, 'b'), (2, 'c');");
+    assert!(e.contains("duplicate key"), "{e}");
+}
+
+#[test]
+fn unique_allows_multiple_nulls_but_not_duplicates() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int, email char(20) unique);").unwrap();
+
+    db.execute_sql("insert into t values (1, null), (2, null);").unwrap();
+    db.execute_sql("insert into t values (3, 'x');").unwrap();
+    let e = err(&mut db, "insert into t values (4, 'x');");
+    assert!(e.contains("duplicate key"), "{e}");
+}
+
+#[test]
+fn unique_is_enforced_on_update() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int, email char(20) unique);").unwrap();
+    db.execute_sql("insert into t values (1, 'a'), (2, 'b');").unwrap();
+
+    let e = err(&mut db, "update t set email = 'b' where id = 1;");
+    assert!(e.contains("duplicate key"), "{e}");
+
+    // same value and NULL remain allowed
+    db.execute_sql("update t set email = 'a' where id = 1;").unwrap();
+    db.execute_sql("update t set email = null where id = 1;").unwrap();
+}
+
+#[test]
+fn constraint_index_cannot_be_dropped() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int primary key);").unwrap();
+    let e = err(&mut db, "drop index __unique_t_id;");
+    assert!(e.contains("cannot drop"), "{e}");
+    // a plain user index is still droppable
+    db.execute_sql("create index idx on t (id);").unwrap();
+    db.execute_sql("drop index idx;").unwrap();
+}
+
+#[test]
 fn constraints_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
@@ -83,4 +136,18 @@ fn constraints_survive_reopen() {
     assert_eq!(q(&mut db, "select id, age from t;"), [[Value::Int(1), Value::Int(7)]]);
     let e = err(&mut db, "insert into t (age) values (3);");
     assert!(e.contains("cannot be null"), "{e}");
+}
+
+#[test]
+fn unique_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = Database::open(dir.path()).unwrap();
+        db.execute_sql("create table t (id int primary key);").unwrap();
+        db.execute_sql("insert into t values (1);").unwrap();
+    }
+    let mut db = Database::open(dir.path()).unwrap();
+    let e = err(&mut db, "insert into t values (1);");
+    assert!(e.contains("duplicate key"), "{e}");
+    db.execute_sql("insert into t values (2);").unwrap();
 }

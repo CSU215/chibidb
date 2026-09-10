@@ -97,6 +97,12 @@ fn execute_create_index(db: &mut Database, trx: &mut TrxState, c: &CreateIndexSt
 }
 
 fn execute_drop_index(db: &mut Database, d: &DropIndexStmt) -> Result<ResultSet> {
+    if db.catalog().index(&d.name).is_some_and(|ix| ix.unique) {
+        return Err(Error::Runtime(format!(
+            "cannot drop index backing a constraint: {}",
+            d.name
+        )));
+    }
     db.catalog_mut().drop_index(&d.name)?;
     db.save_catalog()?;
     Ok(ResultSet::Message("SUCCESS".into()))
@@ -165,6 +171,7 @@ fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Resu
     }
     let records = db.store_scan_raw(&u.table)?;
     let mut updates = Vec::new();
+    let mut claimed = Vec::new();
     for (rid, rec) in records {
         let (creator, deleter, row) = decode_record(&rec)?;
         if !trx.visible(creator, deleter) {
@@ -183,6 +190,7 @@ fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Resu
             new_row[*idx] = coerce(v, *dtype, col)?;
         }
         check_not_null(&schema, &new_row)?;
+        db.check_unique(&u.table, &new_row, Some(rid), trx, &mut claimed)?;
         updates.push((rid, new_row));
     }
     let new_rids = db.store_update_versions(&u.table, &updates, trx.id)?;
@@ -263,6 +271,7 @@ fn execute_insert(db: &mut Database, trx: &mut TrxState, i: &InsertStmt) -> Resu
             )));
         }
     }
+    let mut claimed = Vec::new();
     for values in &i.rows {
         // start from defaults, then overlay the supplied values
         let mut row: Vec<Value> = schema
@@ -276,6 +285,7 @@ fn execute_insert(db: &mut Database, trx: &mut TrxState, i: &InsertStmt) -> Resu
             row[idx] = coerce(v, col.dtype, &col.name)?;
         }
         check_not_null(&schema, &row)?;
+        db.check_unique(&i.table, &row, None, trx, &mut claimed)?;
         let encoded = crate::storage::codec::encode_row(&row);
         if encoded.len() + 16 > crate::storage::PAGE_SIZE {
             return Err(Error::Runtime(format!(
@@ -341,8 +351,21 @@ fn execute_create_table(db: &mut Database, c: &CreateTableStmt) -> Result<Result
     let schema = Schema { columns };
     let heap = db.new_table_heap(&c.name)?;
     db.catalog_mut().create_table(&c.name, schema, heap)?;
+    // PRIMARY KEY / UNIQUE get a constraint-backed unique index; the table is
+    // empty here, so there is nothing to populate.
+    for cd in &c.columns {
+        if cd.primary_key || cd.unique {
+            let name = unique_index_name(&c.name, &cd.name);
+            let store = db.new_index_heap(&name)?;
+            db.catalog_mut().create_index(&name, c.name.clone(), cd.name.clone(), true, store)?;
+        }
+    }
     db.save_catalog()?;
     Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn unique_index_name(table: &str, column: &str) -> String {
+    format!("__unique_{table}_{column}")
 }
 
 /// Schema of a single real table (owner-qualified), without scanning rows.

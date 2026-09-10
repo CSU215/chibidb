@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
 use crate::index::{encode_key, BTree};
-use crate::storage::codec::encode_record;
+use crate::storage::codec::{decode_record, encode_record};
 use crate::storage::slotted::{page_get, page_put_at};
 use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, Rid};
 use crate::trx::{TrxState, Undo};
@@ -583,6 +583,58 @@ impl Database {
             out.push((*rid, rec));
         }
         Ok(out)
+    }
+
+    /// Enforces UNIQUE / PRIMARY KEY constraints for `row` using the
+    /// constraint-backed indexes and MVCC visibility. `exclude` skips the
+    /// row being updated; `claimed` catches duplicates among rows touched by
+    /// the same statement before they reach the index.
+    pub(crate) fn check_unique(
+        &mut self,
+        table: &str,
+        row: &[Value],
+        exclude: Option<Rid>,
+        trx: &TrxState,
+        claimed: &mut Vec<Vec<u8>>,
+    ) -> Result<()> {
+        let (checks, heap_file) = {
+            let schema = &self.catalog.table(table)?.schema;
+            let checks: Vec<(usize, FileId, String)> = self
+                .catalog
+                .unique_indexes_for(table)
+                .into_iter()
+                .map(|ix| {
+                    let ci = schema.index_of(&ix.column).expect("index column validated");
+                    (ci, ix.store.file, ix.column.clone())
+                })
+                .collect();
+            (checks, self.catalog.table(table)?.heap.file)
+        };
+        if checks.is_empty() {
+            return Ok(());
+        }
+        let heap = HeapFile::at(heap_file);
+        for (ci, ix_file, column) in checks {
+            if matches!(row[ci], Value::Null) {
+                continue; // UNIQUE permits multiple NULLs
+            }
+            let key = encode_key(&row[ci])?;
+            if claimed.contains(&key) {
+                return Err(Error::Runtime(format!("duplicate key: {table}({column})")));
+            }
+            claimed.push(key.clone());
+            for rid in BTree::at(ix_file).search(&mut self.pool, &key)? {
+                if Some(rid) == exclude {
+                    continue;
+                }
+                let rec = heap.get(&mut self.pool, rid)?;
+                let (creator, deleter, _) = decode_record(&rec)?;
+                if trx.visible(creator, deleter) {
+                    return Err(Error::Runtime(format!("duplicate key: {table}({column})")));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn store_insert(
