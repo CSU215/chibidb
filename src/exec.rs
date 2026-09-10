@@ -26,6 +26,7 @@ pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Res
         Stmt::DropTable(d) => execute_drop_table(db, d),
         Stmt::DropView(d) if trx.explicit => ddl_in_trx(trx),
         Stmt::DropView(d) => execute_drop_view(db, d),
+        Stmt::Checkpoint => execute_checkpoint(db, trx),
         Stmt::Insert(i) => execute_insert(db, trx, i),
         Stmt::Select(s) => execute_select(db, trx, s),
         Stmt::Delete(d) => execute_delete(db, trx, d),
@@ -231,6 +232,18 @@ fn execute_create_view(
 fn execute_drop_view(db: &mut Database, d: &DropViewStmt) -> Result<ResultSet> {
     db.catalog_mut().drop_view(&d.name)?;
     db.save_catalog()?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_checkpoint(db: &mut Database, trx: &TrxState) -> Result<ResultSet> {
+    // the statement's own autocommit transaction does not count, but an
+    // explicit one does (truncating the log would drop its future COMMIT)
+    if trx.explicit || db.has_open_trxs_excluding(trx.id) {
+        return Err(Error::Runtime(
+            "cannot checkpoint while transactions are open".into(),
+        ));
+    }
+    db.flush()?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 

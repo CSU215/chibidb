@@ -245,4 +245,5 @@ pub enum Stmt {
     Select(Box<SelectStmt>),
     Update(UpdateStmt),
     Trx(TrxCtl),
+    Checkpoint,
 }

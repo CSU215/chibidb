@@ -38,6 +38,10 @@ pub use crate::trx::Session;
 
 pub const BUFFER_POOL_FRAMES: usize = 64;
 
+/// Auto-checkpoint when the log outgrows this many bytes (and no open
+/// transaction depends on it).
+pub const WAL_CHECKPOINT_THRESHOLD: u64 = 8 * 1024 * 1024;
+
 pub struct Database {
     catalog: Catalog,
     pool: BufferPool,
@@ -47,6 +51,11 @@ pub struct Database {
     next_index_file: u32,
     next_trx_id: u32,
     committed_trxs: HashSet<u32>,
+    /// Transactions that have begun but not committed/rolled back yet. The
+    /// log must not be truncated while this is non-empty, or a later COMMIT
+    /// would lose its redo records.
+    open_trxs: HashSet<u32>,
+    wal_checkpoint_threshold: u64,
     _temp: Option<tempfile::TempDir>,
 }
 
@@ -153,6 +162,8 @@ impl Database {
             next_index_file,
             next_trx_id,
             committed_trxs,
+            open_trxs: HashSet::new(),
+            wal_checkpoint_threshold: WAL_CHECKPOINT_THRESHOLD,
             _temp: None,
         };
         db.recover_from_wal(&plan, &mut touched)?;
@@ -268,13 +279,20 @@ impl Database {
     /// Commit bookkeeping shared by explicit COMMIT and autocommit.
     fn commit_trx(&mut self, trx_id: u32, wrote: bool) -> Result<()> {
         self.committed_trxs.insert(trx_id);
+        self.open_trxs.remove(&trx_id);
         if wrote {
             // log durability first: after this point the transaction commits
             // even if the process dies before its pages are flushed
             self.wal.append(trx_id, &Record::Commit)?;
             self.wal.sync()?;
         }
-        self.save_catalog()
+        self.save_catalog()?;
+        // opportunistic checkpoint once the log outgrew its budget and no
+        // open transaction is counting on its contents
+        if self.wal.len()? > self.wal_checkpoint_threshold && self.open_trxs.is_empty() {
+            self.flush()?;
+        }
+        Ok(())
     }
 
     /// Emulates a process crash: dirty buffer-pool pages are lost while
@@ -308,6 +326,7 @@ impl Database {
                     let id = self.next_trx_id;
                     self.next_trx_id += 1;
                     session.begin(id, &self.committed_trxs, true);
+                    self.open_trxs.insert(id);
                 }
                 crate::ast::Stmt::Trx(crate::ast::TrxCtl::Commit) => {
                     if session.trx.is_none() {
@@ -324,6 +343,7 @@ impl Database {
                     }
                     if let Some(mut trx) = session.trx.take() {
                         self.rollback_trx(&mut trx)?;
+                        self.open_trxs.remove(&trx.id);
                     }
                 }
                 other => {
@@ -332,6 +352,7 @@ impl Database {
                         let id = self.next_trx_id;
                         self.next_trx_id += 1;
                         session.begin(id, &self.committed_trxs, false);
+                        self.open_trxs.insert(id);
                     }
                     match exec::execute(self, session.trx(), other) {
                         Ok(rs) => {
@@ -349,6 +370,8 @@ impl Database {
                                 self.rollback_trx(&mut trx)?;
                                 if !autocommit {
                                     session.trx = Some(trx);
+                                } else {
+                                    self.open_trxs.remove(&trx.id);
                                 }
                             }
                             return Err(e);
@@ -364,8 +387,19 @@ impl Database {
     pub fn rollback_session(&mut self, session: &mut Session) -> Result<()> {
         if let Some(mut trx) = session.trx.take() {
             self.rollback_trx(&mut trx)?;
+            self.open_trxs.remove(&trx.id);
         }
         Ok(())
+    }
+
+    /// Whether any session other than `trx_id` has a transaction open.
+    pub(crate) fn has_open_trxs_excluding(&self, trx_id: u32) -> bool {
+        self.open_trxs.iter().any(|&id| id != trx_id)
+    }
+
+    /// Overrides the auto-checkpoint log budget in bytes; mainly for tests.
+    pub fn set_wal_checkpoint_threshold(&mut self, bytes: u64) {
+        self.wal_checkpoint_threshold = bytes;
     }
 
     fn rollback_trx(&mut self, trx: &mut TrxState) -> Result<()> {

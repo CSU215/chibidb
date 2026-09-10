@@ -178,6 +178,76 @@ fn drop_table_survives_crash_with_stale_wal() {
 }
 
 #[test]
+fn checkpoint_statement_flushes_and_truncates_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().join("wal.bin");
+    let mut db = Database::open(dir.path()).unwrap();
+    db.execute_sql("create table t (id int);").unwrap();
+    db.execute_sql("insert into t values (1);").unwrap();
+    assert!(std::fs::metadata(&wal_path).unwrap().len() > 0, "precondition: wal has records");
+
+    db.execute_sql("checkpoint;").unwrap();
+
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0, "checkpoint clears the log");
+    assert_eq!(rows(&mut db, "select * from t;"), vec![vec![Value::Int(1)]]);
+    drop(db);
+    let mut db = Database::open(dir.path()).unwrap();
+    assert_eq!(rows(&mut db, "select * from t;"), vec![vec![Value::Int(1)]]);
+}
+
+#[test]
+fn checkpoint_rejects_open_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+    db.execute_sql("create table t (id int);").unwrap();
+    let mut session = chibidb::Session::new();
+    db.execute_sql_with(&mut session, "begin;").unwrap();
+    let err = db.execute_sql_with(&mut session, "checkpoint;").unwrap_err();
+    assert!(err.to_string().contains("transaction"), "{err}");
+    db.execute_sql_with(&mut session, "rollback;").unwrap();
+}
+
+#[test]
+fn auto_checkpoint_bounds_wal_and_respects_open_trxs() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().join("wal.bin");
+    let mut db = Database::open(dir.path()).unwrap();
+    // budget of one byte: every commit outgrows it immediately
+    db.set_wal_checkpoint_threshold(1);
+    db.execute_sql("create table t (id int);").unwrap();
+    db.execute_sql("insert into t values (1);").unwrap();
+    assert_eq!(
+        std::fs::metadata(&wal_path).unwrap().len(),
+        0,
+        "auto checkpoint after commit"
+    );
+
+    // while another session's transaction is open, the log must NOT be cut:
+    // a later COMMIT of that trx needs its records in the log
+    let mut open_trx = chibidb::Session::new();
+    db.execute_sql_with(&mut open_trx, "begin;").unwrap();
+    db.execute_sql_with(&mut open_trx, "insert into t values (2);").unwrap();
+    db.execute_sql_with(&mut chibidb::Session::new(), "insert into t values (3);").unwrap();
+    assert!(
+        std::fs::metadata(&wal_path).unwrap().len() > 0,
+        "no auto checkpoint while a transaction is open"
+    );
+
+    db.execute_sql_with(&mut open_trx, "commit;").unwrap();
+    db.execute_sql_with(&mut chibidb::Session::new(), "insert into t values (4);").unwrap();
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0, "resumes once idle");
+    assert_eq!(
+        rows(&mut db, "select * from t order by id;"),
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+            vec![Value::Int(4)],
+        ]
+    );
+}
+
+#[test]
 fn rollback_leaves_no_redo() {
     let dir = tempfile::tempdir().unwrap();
     {

@@ -96,6 +96,9 @@ impl<'a> Parser<'a> {
         if self.eat_keyword("rollback") {
             return Ok(Stmt::Trx(TrxCtl::Rollback));
         }
+        if self.eat_keyword("checkpoint") {
+            return Ok(Stmt::Checkpoint);
+        }
         if self.eat_keyword("explain") {
             if !self.at_keyword("select") {
                 return Err(self.unexpected("select after explain"));

@@ -59,6 +59,11 @@ impl Wal {
         self.file.sync_all().map_err(wal_io)
     }
 
+    /// Current log size in bytes (for budget checks).
+    pub fn len(&self) -> Result<u64> {
+        self.file.metadata().map(|m| m.len()).map_err(wal_io)
+    }
+
     /// Checkpoint: only call this after all data pages reached the disk.
     pub fn truncate(&mut self) -> Result<()> {
         self.file.set_len(0).map_err(wal_io)?;
