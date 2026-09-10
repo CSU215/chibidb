@@ -6,6 +6,7 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Mod,
     Eq,
     NotEq,
     Lt,
@@ -54,6 +55,10 @@ pub enum Expr {
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     IsNull(Box<Expr>, bool),
+    /// `expr [NOT] LIKE pattern`; `%` and `_` wildcards, no escape.
+    Like { expr: Box<Expr>, pattern: Box<Expr>, negated: bool },
+    /// Scalar function call, e.g. `concat(a, b)`. Name is lowercased.
+    Function(String, Vec<Expr>),
     Aggregate(AggFunc, Option<Box<Expr>>),
     QualifiedColumn(String, String),
     /// A materialized literal produced by lifting subqueries.
@@ -78,6 +83,20 @@ impl fmt::Display for Expr {
             Expr::Binary(op, l, r) => write!(f, "({op} {l} {r})"),
             Expr::IsNull(e, false) => write!(f, "(is-null {e})"),
             Expr::IsNull(e, true) => write!(f, "(is-not-null {e})"),
+            Expr::Like { expr, pattern, negated } => {
+                if *negated {
+                    write!(f, "(not-like {expr} {pattern})")
+                } else {
+                    write!(f, "(like {expr} {pattern})")
+                }
+            }
+            Expr::Function(name, args) => {
+                write!(f, "({name}")?;
+                for a in args {
+                    write!(f, " {a}")?;
+                }
+                f.write_str(")")
+            }
             Expr::Aggregate(func, None) => write!(f, "({func} *)"),
             Expr::Aggregate(func, Some(e)) => write!(f, "({func} {e})"),
             Expr::QualifiedColumn(t, c) => write!(f, "{t}.{c}"),
@@ -96,6 +115,7 @@ impl fmt::Display for BinOp {
             BinOp::Sub => "-",
             BinOp::Mul => "*",
             BinOp::Div => "/",
+            BinOp::Mod => "%",
             BinOp::Eq => "=",
             BinOp::NotEq => "<>",
             BinOp::Lt => "<",

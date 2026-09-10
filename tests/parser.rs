@@ -419,6 +419,29 @@ fn parses_in_list() {
 }
 
 #[test]
+fn parses_like_and_mod() {
+    assert_eq!(single_exprs("select name like 'a%';"), ["(like name 'a%')"]);
+    assert_eq!(single_exprs("select name not like 'a_%';"), ["(not-like name 'a_%')"]);
+    assert_eq!(single_exprs("select 5 % 2;"), ["(% 5 2)"]);
+    assert_eq!(single_exprs("select 1 + 2 % 3;"), ["(+ 1 (% 2 3))"]);
+    assert_eq!(single_exprs("select 1 * 2 % 3;"), ["(% (* 1 2) 3)"]);
+    err("select name like;");
+    err("select name not 'x';");
+}
+
+#[test]
+fn parses_scalar_functions() {
+    assert_eq!(single_exprs("select concat('a', 'b');"), ["(concat 'a' 'b')"]);
+    assert_eq!(single_exprs("select upper(name);"), ["(upper name)"]);
+    assert_eq!(single_exprs("select length(name) + 1;"), ["(+ (length name) 1)"]);
+    assert_eq!(single_exprs("select substring(a, 1, 2);"), ["(substring a 1 2)"]);
+    assert_eq!(single_exprs("select CONCAT(a, b);"), ["(concat a b)"], "name lowercased");
+    assert_eq!(single_exprs("select length(name) from t where upper(name) = 'A';"),
+        ["(length name)"]);
+    err("select upper(;");
+}
+
+#[test]
 fn parses_create_and_drop_view() {
     let stmts = parse("create view v as select id, score from student where score > 60;").unwrap();
     match &stmts[0] {

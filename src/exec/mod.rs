@@ -1,0 +1,386 @@
+use crate::ast::{
+    CreateIndexStmt, CreateTableStmt, CreateViewStmt, DataType, DeleteStmt, DropIndexStmt,
+    DropTableStmt, DropViewStmt, Expr, InsertStmt, SelectItem, SelectStmt, Stmt, UpdateStmt,
+};
+use crate::catalog::Schema;
+use crate::result::ResultSet;
+use crate::storage::codec::decode_record;
+use crate::storage::Rid;
+use crate::trx::{TrxState, Undo};
+use crate::value::Value;
+use crate::{Database, Error, Result};
+
+mod aggregate;
+mod eval;
+mod join;
+mod plan;
+mod subquery;
+
+pub use eval::eval_const;
+
+use aggregate::{apply_limit, dedup_rows, execute_grouped_select, expr_has_aggregate, sort_rows};
+use eval::{eval, eval_predicate, EvalCtx};
+use join::nested_loop;
+use plan::{execute_explain, index_scan_source};
+use subquery::lift_subqueries;
+
+pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Result<ResultSet> {
+    match stmt {
+        Stmt::CreateTable(c) if trx.explicit => ddl_in_trx(trx),
+        Stmt::CreateTable(c) => execute_create_table(db, c),
+        Stmt::CreateView(c) if trx.explicit => ddl_in_trx(trx),
+        Stmt::CreateView(c) => execute_create_view(db, trx, c),
+        Stmt::CreateIndex(c) if trx.explicit => ddl_in_trx(trx),
+        Stmt::CreateIndex(c) => execute_create_index(db, trx, c),
+        Stmt::DropIndex(d) if trx.explicit => ddl_in_trx(trx),
+        Stmt::DropIndex(d) => execute_drop_index(db, d),
+        Stmt::DropTable(d) if trx.explicit => ddl_in_trx(trx),
+        Stmt::DropTable(d) => execute_drop_table(db, d),
+        Stmt::DropView(d) if trx.explicit => ddl_in_trx(trx),
+        Stmt::DropView(d) => execute_drop_view(db, d),
+        Stmt::Checkpoint => execute_checkpoint(db, trx),
+        Stmt::Vacuum => execute_vacuum(db, trx),
+        Stmt::Insert(i) => execute_insert(db, trx, i),
+        Stmt::Select(s) => execute_select(db, trx, s),
+        Stmt::Delete(d) => execute_delete(db, trx, d),
+        Stmt::Update(u) => execute_update(db, trx, u),
+        Stmt::Explain(e) => execute_explain(db, e),
+        Stmt::Trx(_) => Err(Error::Runtime("transaction control handled elsewhere".into())),
+    }
+}
+
+fn ddl_in_trx(_trx: &TrxState) -> Result<ResultSet> {
+    Err(Error::Runtime("DDL inside a transaction is not supported".into()))
+}
+
+/// Decodes versioned records and keeps only rows visible to `trx`.
+pub(crate) fn decode_visible(
+    records: Vec<(Rid, Vec<u8>)>,
+    trx: &TrxState,
+) -> Result<Vec<Vec<Value>>> {
+    let mut out = Vec::new();
+    for (_, rec) in records {
+        let (creator, deleter, row) = decode_record(&rec)?;
+        if trx.visible(creator, deleter) {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+fn execute_create_index(db: &mut Database, trx: &mut TrxState, c: &CreateIndexStmt) -> Result<ResultSet> {
+    let schema = db.catalog().table(&c.table)?.schema.clone();
+    let col_idx = schema
+        .index_of(&c.column)
+        .ok_or_else(|| Error::Runtime(format!("no such column: {}", c.column)))?;
+    let store = db.new_index_heap(&c.name)?;
+    let records = db.store_scan_raw(&c.table)?;
+    let btree = crate::index::BTree::at(store.file);
+    for (rid, rec) in records {
+        let (creator, deleter, row) = decode_record(&rec)?;
+        if !trx.visible(creator, deleter) {
+            continue;
+        }
+        let key = crate::index::encode_key(&row[col_idx])?;
+        btree.insert(&mut db.pool, &key, rid)?;
+    }
+    db.catalog_mut().create_index(
+        &c.name,
+        c.table.clone(),
+        c.column.clone(),
+        store,
+    )?;
+    db.save_catalog()?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_drop_index(db: &mut Database, d: &DropIndexStmt) -> Result<ResultSet> {
+    db.catalog_mut().drop_index(&d.name)?;
+    db.save_catalog()?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_drop_table(db: &mut Database, d: &DropTableStmt) -> Result<ResultSet> {
+    db.drop_table(&d.name)?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_create_view(
+    db: &mut Database,
+    trx: &mut TrxState,
+    c: &CreateViewStmt,
+) -> Result<ResultSet> {
+    // validate the definition by executing its select once (read-only)
+    let stmts = crate::parser::parse(&c.sql)?;
+    let Some(Stmt::Select(sel)) = stmts.into_iter().next() else {
+        return Err(Error::Runtime("view must be defined by a select".into()));
+    };
+    execute_select(db, trx, &sel)?;
+    db.catalog_mut().create_view(&c.name, c.sql.clone())?;
+    db.save_catalog()?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_drop_view(db: &mut Database, d: &DropViewStmt) -> Result<ResultSet> {
+    db.catalog_mut().drop_view(&d.name)?;
+    db.save_catalog()?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_checkpoint(db: &mut Database, trx: &TrxState) -> Result<ResultSet> {
+    // the statement's own autocommit transaction does not count, but an
+    // explicit one does (truncating the log would drop its future COMMIT)
+    if trx.explicit || db.has_open_trxs_excluding(trx.id) {
+        return Err(Error::Runtime(
+            "cannot checkpoint while transactions are open".into(),
+        ));
+    }
+    // verified no one else is open; skip flush()'s blanket open-trx guard
+    // because the statement's own temp transaction is still registered
+    db.flush_inner()?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_vacuum(db: &mut Database, trx: &TrxState) -> Result<ResultSet> {
+    // same guard as checkpoint: no transaction may depend on physical state
+    if trx.explicit || db.has_open_trxs_excluding(trx.id) {
+        return Err(Error::Runtime(
+            "cannot vacuum while transactions are open".into(),
+        ));
+    }
+    let purged = db.vacuum()?;
+    Ok(ResultSet::Message(format!("VACUUM COMPLETE: {purged} rows purged")))
+}
+
+fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<ResultSet> {
+    let schema = db.catalog().table(&u.table)?.schema.clone();
+    let mut assigns = Vec::new();
+    for (col, expr) in &u.assignments {
+        let idx = schema
+            .index_of(col)
+            .ok_or_else(|| Error::Runtime(format!("no such column: {col}")))?;
+        assigns.push((idx, col.clone(), schema.columns[idx].dtype, expr));
+    }
+    let records = db.store_scan_raw(&u.table)?;
+    let mut updates = Vec::new();
+    for (rid, rec) in records {
+        let (creator, deleter, row) = decode_record(&rec)?;
+        if !trx.visible(creator, deleter) {
+            continue;
+        }
+        let matched = match &u.selection {
+            Some(sel) => eval_predicate(sel, &schema, &row)?,
+            None => true,
+        };
+        if !matched {
+            continue;
+        }
+        let mut new_row = row.clone();
+        for (idx, col, dtype, expr) in &assigns {
+            let v = eval(expr, Some(&EvalCtx::Row(&schema, &row)))?;
+            new_row[*idx] = coerce(v, *dtype, col)?;
+        }
+        updates.push((rid, new_row));
+    }
+    let new_rids = db.store_update_versions(&u.table, &updates, trx.id)?;
+    for ((old_rid, new_row), new_rid) in updates.into_iter().zip(new_rids) {
+        trx.undo.push(Undo::Update {
+            table: u.table.clone(),
+            old_rid,
+            new_rid,
+            new_row,
+        });
+    }
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_delete(db: &mut Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<ResultSet> {
+    let schema = db.catalog().table(&d.table)?.schema.clone();
+    let records = db.store_scan_raw(&d.table)?;
+    let mut victims = Vec::new();
+    for (rid, rec) in records {
+        let (creator, deleter, row) = decode_record(&rec)?;
+        if !trx.visible(creator, deleter) {
+            continue;
+        }
+        let matched = match &d.selection {
+            Some(sel) => eval_predicate(sel, &schema, &row)?,
+            None => true,
+        };
+        if matched {
+            victims.push(rid);
+        }
+    }
+    db.store_delete_mark(&d.table, &victims, trx.id)?;
+    for rid in victims {
+        trx.undo.push(Undo::DeleteMark { table: d.table.clone(), rid });
+    }
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_insert(db: &mut Database, trx: &mut TrxState, i: &InsertStmt) -> Result<ResultSet> {
+    let schema = db.catalog().table(&i.table)?.schema.clone();
+    for values in &i.rows {
+        if values.len() != schema.columns.len() {
+            return Err(Error::Runtime(format!(
+                "expected {} values, got {}",
+                schema.columns.len(),
+                values.len()
+            )));
+        }
+    }
+    for values in &i.rows {
+        let mut row = Vec::with_capacity(values.len());
+        for (expr, col) in values.iter().zip(&schema.columns) {
+            let v = eval_const(expr)?;
+            row.push(coerce(v, col.dtype, &col.name)?);
+        }
+        let encoded = crate::storage::codec::encode_row(&row);
+        if encoded.len() + 16 > crate::storage::PAGE_SIZE {
+            return Err(Error::Runtime(format!(
+                "record too large ({} bytes does not fit in a page)",
+                encoded.len()
+            )));
+        }
+        let rid = db.store_insert(&i.table, row.clone(), trx.id)?;
+        trx.undo.push(Undo::Insert { table: i.table.clone(), rid, row });
+    }
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+pub(crate) fn coerce(v: Value, dtype: DataType, col: &str) -> Result<Value> {
+    match (v, dtype) {
+        (Value::Null, _) => Ok(Value::Null),
+        (v @ Value::Int(_), DataType::Int) => Ok(v),
+        (Value::Int(n), DataType::Float) => Ok(Value::Float(n as f64)),
+        (v @ Value::Float(_), DataType::Float) => Ok(v),
+        (Value::Str(s), DataType::Char(n)) => {
+            if s.chars().count() <= n as usize {
+                Ok(Value::Str(s))
+            } else {
+                Err(Error::Runtime(format!(
+                    "cannot insert '{s}' into column {col}"
+                )))
+            }
+        }
+        (v @ Value::Date(_), DataType::Date) => Ok(v),
+        (v @ Value::Str(_), DataType::Text) => Ok(v),
+        (Value::Str(s), DataType::Date) => crate::datetime::parse_date(&s)
+            .map(Value::Date)
+            .map_err(|e| Error::Runtime(format!("cannot insert into column {col}: {e}"))),
+        (v, _) => Err(Error::Runtime(format!(
+            "cannot insert {v} into column {col}"
+        ))),
+    }
+}
+
+fn execute_create_table(db: &mut Database, c: &CreateTableStmt) -> Result<ResultSet> {
+    let schema = Schema {
+        columns: c
+            .columns
+            .iter()
+            .map(|cd| crate::catalog::ColumnDesc {
+                owner: None,
+                name: cd.name.clone(),
+                dtype: cd.dtype,
+            })
+            .collect(),
+    };
+    let heap = db.new_table_heap(&c.name)?;
+    db.catalog_mut().create_table(&c.name, schema, heap)?;
+    db.save_catalog()?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+pub(crate) fn execute_select(
+    db: &mut Database,
+    trx: &mut TrxState,
+    s: &SelectStmt,
+) -> Result<ResultSet> {
+    let s = &lift_subqueries(db, trx, s)?;
+    if s.from.is_empty() {
+        let mut columns = Vec::new();
+        let mut row = Vec::new();
+        for item in &s.items {
+            match item {
+                SelectItem::Expr(e) => {
+                    columns.push(e.to_string());
+                    row.push(eval_const(e)?);
+                }
+                SelectItem::Aliased(e, alias) => {
+                    columns.push(alias.clone());
+                    row.push(eval_const(e)?);
+                }
+                SelectItem::Star => {
+                    return Err(Error::Runtime("select * requires from".into()))
+                }
+            }
+        }
+        return Ok(ResultSet::Rows { columns, rows: vec![row] });
+    }
+    let (schema, rows) = nested_loop(db, trx, s)?;
+    let mut headers = Vec::new();
+    let mut exprs = Vec::new();
+    for item in &s.items {
+        match item {
+            SelectItem::Star => {
+                for col in &schema.columns {
+                    headers.push(col.name.clone());
+                    // qualified reference avoids ambiguity when column names repeat
+                    match &col.owner {
+                        Some(owner) => exprs.push(Expr::QualifiedColumn(owner.clone(), col.name.clone())),
+                        None => exprs.push(Expr::Column(col.name.clone())),
+                    }
+                }
+            }
+            SelectItem::Expr(e) => {
+                headers.push(e.to_string());
+                exprs.push(e.clone());
+            }
+            SelectItem::Aliased(e, alias) => {
+                headers.push(alias.clone());
+                exprs.push(e.clone());
+            }
+        }
+    }
+    // index scan only helps single-table scans
+    let mut source_rows: Vec<Vec<Value>> = rows;
+    if s.from.len() == 1
+        && let Some(scanned) =
+            index_scan_source(db, trx, &s.from[0].name, s.selection.as_ref())? {
+                source_rows = scanned;
+        }
+    let mut filtered: Vec<Vec<Value>> = Vec::new();
+    for row in source_rows {
+        if let Some(sel) = &s.selection
+            && !eval_predicate(sel, &schema, &row)? {
+                continue;
+            }
+        filtered.push(row);
+    }
+    let has_aggregate = s
+        .items
+        .iter()
+        .any(|it| matches!(it, SelectItem::Expr(e) | SelectItem::Aliased(e, _) if expr_has_aggregate(e)))
+        || s.having.as_ref().is_some_and(expr_has_aggregate);
+
+    if !s.group_by.is_empty() || has_aggregate {
+        return execute_grouped_select(&schema, s, filtered, headers, exprs);
+    }
+    if !s.order_by.is_empty() {
+        sort_rows(&schema, &mut filtered, &s.order_by, &s.items)?;
+    }
+    let mut out_rows = Vec::new();
+    for row in filtered {
+        let mut out_row = Vec::with_capacity(exprs.len());
+        for e in &exprs {
+            out_row.push(eval(e, Some(&EvalCtx::Row(&schema, &row)))?);
+        }
+        out_rows.push(out_row);
+    }
+    if s.distinct {
+        dedup_rows(&mut out_rows);
+    }
+    apply_limit(&mut out_rows, &s.limit)?;
+    Ok(ResultSet::Rows { columns: headers, rows: out_rows })
+}

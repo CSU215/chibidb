@@ -214,7 +214,7 @@ impl<'a> Parser<'a> {
 
     const RESERVED: &'static [&'static str] = &[
         "where", "group", "having", "order", "limit", "on", "join", "inner", "left", "right",
-        "outer", "in", "exists", "distinct", "vacuum",
+        "outer", "in", "exists", "distinct", "vacuum", "like",
     ];
 
     fn agg_func(name: &str) -> Option<AggFunc> {
@@ -534,6 +534,21 @@ impl<'a> Parser<'a> {
             }
             return self.finish_in(lhs, negated);
         }
+        // [NOT] LIKE 'pattern'
+        let next_is_like = matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            Some(TokenKind::Ident(s)) if s.eq_ignore_ascii_case("like"));
+        if self.at_keyword("like") || (self.at_keyword("not") && next_is_like) {
+            let negated = self.eat_keyword("not");
+            if !self.eat_keyword("like") {
+                return Err(self.unexpected("like"));
+            }
+            let pattern = self.parse_additive()?;
+            return Ok(Expr::Like {
+                expr: Box::new(lhs),
+                pattern: Box::new(pattern),
+                negated,
+            });
+        }
         let op = if self.at_punct(Punct::Eq) {
             BinOp::Eq
         } else if self.at_punct(Punct::NotEq) {
@@ -612,6 +627,8 @@ impl<'a> Parser<'a> {
                 BinOp::Mul
             } else if self.at_punct(Punct::Slash) {
                 BinOp::Div
+            } else if self.at_punct(Punct::Percent) {
+                BinOp::Mod
             } else {
                 break;
             };
@@ -675,6 +692,25 @@ impl<'a> Parser<'a> {
                 self.expect_punct(Punct::RParen)?;
                 return Ok(Expr::Aggregate(func, arg));
             }
+        // scalar function call: ident '(' args ')'
+        if let Some(TokenKind::Ident(name)) = self.peek().map(|t| &t.kind).cloned()
+            && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                        Some(TokenKind::Punct(Punct::LParen)))
+        {
+            self.pos += 1; // function name
+            self.expect_punct(Punct::LParen)?;
+            let mut args = Vec::new();
+            if !self.at_punct(Punct::RParen) {
+                loop {
+                    args.push(self.parse_expr()?);
+                    if !self.eat_punct(Punct::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect_punct(Punct::RParen)?;
+            return Ok(Expr::Function(name.to_ascii_lowercase(), args));
+        }
         // qualified column: ident '.' ident
         if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Ident(_)))
             && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::Punct(Punct::Dot)))

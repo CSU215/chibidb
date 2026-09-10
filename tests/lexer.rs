@@ -115,6 +115,19 @@ fn tokenizes_arithmetic_operators() {
 }
 
 #[test]
+fn tokenizes_percent() {
+    let toks = lex("a % b").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![
+            TokenKind::Ident("a".into()),
+            TokenKind::Punct(Punct::Percent),
+            TokenKind::Ident("b".into()),
+        ]
+    );
+}
+
+#[test]
 fn tokenizes_comparison_operators() {
     let toks = lex("= <> != < <= > >=").unwrap();
     assert_eq!(

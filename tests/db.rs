@@ -197,6 +197,46 @@ fn selects_expressions_over_columns() {
 }
 
 #[test]
+fn filters_with_like() {
+    with_dbs(|db| {
+        seed(db);
+        let rs = db.execute_sql("select name from student where name like 'a%';").unwrap();
+        let (_, starts_with_a) = rows(&rs);
+        assert_eq!(starts_with_a, [[Value::Str("alice".into())]]);
+
+        let rs = db
+            .execute_sql("select name from student where name not like '_o%';")
+            .unwrap();
+        let (_, matched) = rows(&rs);
+        assert_eq!(matched, [[Value::Str("alice".into())], [Value::Str("carol".into())]]);
+    });
+}
+
+#[test]
+fn filters_with_modulo() {
+    with_dbs(|db| {
+        seed(db);
+        let rs = db.execute_sql("select id from student where id % 2 = 1;").unwrap();
+        let (_, rows) = rows(&rs);
+        assert_eq!(rows, [[Value::Int(1)], [Value::Int(3)]]);
+    });
+}
+
+#[test]
+fn selects_with_string_functions() {
+    with_dbs(|db| {
+        seed(db);
+        let rs = db.execute_sql("select upper(name) from student where id = 1;").unwrap();
+        let (_, upper) = rows(&rs);
+        assert_eq!(upper, [[Value::Str("ALICE".into())]]);
+
+        let rs = db.execute_sql("select name from student where length(name) = 3;").unwrap();
+        let (_, matched) = rows(&rs);
+        assert_eq!(matched, [[Value::Str("bob".into())]]);
+    });
+}
+
+#[test]
 fn selects_empty_table_yields_header_only() {
     with_dbs(|db| {
         db.execute_sql("create table t (id int);").unwrap();

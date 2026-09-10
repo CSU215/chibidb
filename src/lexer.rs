@@ -10,6 +10,7 @@ pub enum Punct {
     Minus,
     Star,
     Slash,
+    Percent,
     Eq,
     NotEq,
     Lt,
@@ -99,6 +100,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             }
             b'*' => push_punct(&mut out, &mut i, Punct::Star, 1),
             b'/' => push_punct(&mut out, &mut i, Punct::Slash, 1),
+            b'%' => push_punct(&mut out, &mut i, Punct::Percent, 1),
             b'=' => push_punct(&mut out, &mut i, Punct::Eq, 1),
             b'.' => push_punct(&mut out, &mut i, Punct::Dot, 1),
             b'<' => {
