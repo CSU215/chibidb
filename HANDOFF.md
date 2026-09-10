@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：M24（元数据锁 / DDL 隔离）完成，295 tests 全绿、clippy 零警告。M25 待做。
+> 最后更新：M25（索引有序性消除排序）完成，296 tests 全绿、clippy 零警告。M20–M25 计划全部完成。
 
 ---
 
@@ -37,7 +37,7 @@ SQL 字符串
 - 运行环境注意：**命令行是 Windows PowerShell**，具体陷阱见 §8
 
 ```powershell
-cargo test                      # 全量回归（295 tests，20+ 个测试二进制）
+cargo test                      # 全量回归（296 tests，20+ 个测试二进制）
 cargo test --test trx           # 单个测试文件
 cargo test --quiet              # 安静模式（注意配合退出码判断，见 §8）
 cargo build
@@ -70,7 +70,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `exec/eval.rs` | 表达式双上下文求值（`EvalCtx` 带父链的 Row/Group 作用域，`resolve_column` 逐层向外）、算子、三值逻辑、LIKE、标量函数、`eval_const` | `eval` / `eval_const` |
 | `exec/aggregate.rs` | 聚合求值、GROUP BY/HAVING、ORDER BY（聚合与普通行两路）、DISTINCT、LIMIT | `execute_grouped_select` |
 | `exec/join.rs` | FROM 展开（表/视图）与嵌套循环 INNER/LEFT JOIN | `nested_loop` / `from_source` |
-| `exec/plan.rs` | EXPLAIN 计划、规则式索引访问路径（sargable）、**同列上下界合并为范围扫**、索引扫描取行 | `execute_explain` / `index_scan_source` |
+| `exec/plan.rs` | EXPLAIN 计划、规则式索引访问路径（sargable）、同列上下界合并为范围扫、**有序索引扫描判定**（`order_by_matches`）、索引扫描取行 | `execute_explain` / `index_scan_source` |
 | `exec/subquery.rs` | 子查询物化改写（IN/EXISTS/标量）：按当前外层行求值后改写为字面量；`eval_bound`/`eval_predicate_bound` 是接入点 | `bind_expr` |
 | `value.rs` | `Value`：Null/Bool/Int(i64)/Float(f64)/Str/Date(i32 纪元天数)/Text | Display 决定 REPL 输出 |
 | `datetime.rs` | 日期校验：civil-date 算法（Hinnant），`'YYYY-MM-DD'` 比较时隐式转日期 | `parse_date` |
@@ -94,7 +94,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `index/btree.rs` | B+ 树主体：`init/open/open_or_repair/at`、递归插入双级分裂长高、search（跨叶重复键回退）、scan_range 叶链、delete 借用/合并/根收缩（~880 行） | |
 | `wal.rs` | 预写日志：帧 `[u32 len][u8 type][u32 trx][payload]`，Record::Insert/DeleteMark/Commit，追加 + `sync()`（提交点）+ `truncate()`（checkpoint）；`plan_recovery` 解析日志（容忍截断尾帧），纯函数有单测 | `Wal` / `plan_recovery` |
 
-### 3.2 测试（`tests/`，27 个文件 / 295 tests）
+### 3.2 测试（`tests/`，27 个文件 / 296 tests）
 
 - 与源码分层对应：`lexer / parser / eval / agg / join / db / db_index / db_persist / trx / wal / storage_* / index_* / wire / server / repl / datetime / codec / catalog_meta / miniob_compat`
 - `miniob_compat`：student/course/sc 端到端组合场景（CRUD+聚合、分组/having、内外连接、不相关子查询、索引/EXPLAIN）
@@ -140,6 +140,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | M22 UNION | ✅ `SelectStmt.set_ops: Vec<(bool /*all*/, Box<SelectStmt>)>` 左结合；列数必须一致；UNION 去重、UNION ALL 不去重；尾部 ORDER BY/LIMIT 作用于整个并集（ORDER BY 解析输出列名） | `83b2a23` |
 | M23 SQL 小补齐 | ✅ 聚合 `DISTINCT`（count/sum/avg/min/max）；`LIKE ... ESCAPE`；UPDATE/DELETE 的 WHERE 与 UPDATE SET 支持子查询 | `5f8be7f`…`8d2adcd` |
 | M24 元数据锁 | ✅ 其它会话有开事务时，CREATE/DROP TABLE/INDEX/VIEW 报 `schema is locked by an open transaction`（`execute` 入口统一守卫） | `2a3a5a0` |
+| M25 消除排序 | ✅ 单表 + 索引扫描 + `ORDER BY` 单列且为该索引列升序时跳过 `sort_rows`（叶链本身有序）；EXPLAIN 报 `OrderedIndexScan`；DESC/异列仍排序 | `e897b08` |
 
 ---
 
@@ -310,6 +311,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 - 相关子查询**无缓存**：每个外层行都会重新执行子查询（不相关子查询也因此按行重复执行）
 - LIKE 无 ESCAPE 转义；无其它字符串/数学函数（仅 concat/upper/lower/length/substring 与 `%` 取模）
 - 索引访问路径只做单列：AND 链里若同列出现多个下界（或上界）只保留最后一个，不做“取更紧者”的择优化；跨列不合并
+- 排序消除仅覆盖「单表 + 索引扫描 + ORDER BY 单列 = 该索引列 + ASC」；DESC 未做反向叶链迭代，多列/异列仍走 `sort_rows`
 - DISTINCT + ORDER BY 引用非投影列时，保留哪一行是按扫描顺序首个（标准 SQL 视为非法，未做校验）
 - VACUUM 回收的空页不归还文件系统（页留给 first-fit 复用）；空页只在该表变小时浪费
 - 单 Mutex 单 writer 串行化；无死锁检测；vacuum 之外长事务 + 未提交孤儿版本仍会占空间
@@ -331,10 +333,10 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 3. **UNION / UNION ALL**（中，M22）✅：AST 用 `set_ops` 左结合列表（比计划的单 `combine` 更贴合 SQL 左结合语义）；列数必须一致；UNION 走 `dedup_rows`；尾部 ORDER BY/LIMIT 作用于整个并集，ORDER BY 按输出列名解析（`sort_projected`）
 4. **SQL 小补齐**（小，M23）✅：`count(DISTINCT expr)`（推广到 sum/avg/min/max）；LIKE `ESCAPE`（模式先编译成 token）；UPDATE/DELETE 的 WHERE 与 UPDATE SET 支持子查询
 5. **元数据锁 / DDL 隔离**（中，M24）✅：`execute` 入口对 DDL 统一守卫，`has_open_trxs_excluding(自身)` 为真时报 `schema is locked by an open transaction`（粗粒度全库锁）
-6. **索引有序性消除排序**（中小，M25）：单表且 ORDER BY 单列 = 选路索引列时跳过 `sort_rows`（仅 ASC——叶链升序；DESC 若无反向迭代则先不做）；跑 `tests/bench.rs` 对比并更新 README 数字
+6. **索引有序性消除排序**（中小，M25）✅：`plan::order_by_matches` 判定单表单列 ASC 且等于选路索引列时跳过 `sort_rows`；EXPLAIN 报 `OrderedIndexScan`；`tests/bench.rs` 增 `ORDER BY id` 用例（~0.23ms vs 全表 ~24ms）；DESC 与异列仍排序
 
 工作纪律：TDD 红绿节奏、每项一个里程碑提交、提交前全量 `cargo test` + clippy 清零 + 更新本文档与 README。
 
-进度：M20–M24 完成（295 tests）。仅剩 M25 索引消除排序。
+进度：**M20–M25 计划全部完成**（296 tests，clippy 零警告，改动已按里程碑细粒度提交）。
 
-提交基线：`2a3a5a0 feat: block DDL while another transaction is open`（HEAD）。
+提交基线：`e897b08 perf: skip sort when an index already provides the order`（HEAD）。

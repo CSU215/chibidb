@@ -78,4 +78,12 @@ fn index_vs_full_scan() {
         20,
         50,
     );
+    bench(
+        &mut db,
+        "ordered id > 49900",
+        "select id from t where id > 49900 order by id;",
+        "select id from t where id + 0 > 49900 order by id;",
+        200,
+        20,
+    );
 }

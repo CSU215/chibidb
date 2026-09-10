@@ -11,7 +11,7 @@ cargo run -q                    # 内存数据库 REPL（临时目录后端，�
 cargo run -q -- <dir>           # 文件数据库 REPL（数据落盘，重启不丢）
 cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（295 tests）
+cargo test                      # 全量回归（296 tests）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -120,7 +120,7 @@ SQL 字符串
 
 ## 测试
 
-`cargo test` 跑 295 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
+`cargo test` 跑 296 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
 表约束（PK/UNIQUE/NOT NULL/DEFAULT）/索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等，
 另有 `tests/miniob_compat.rs` 用经典 student/course/sc 场景做端到端回归。集成测试的 `with_dbs` 模式让同一用例在内存后端
 与文件后端各跑一遍；WAL 测试用 `Database::simulate_crash()` 模拟进程被杀。
@@ -131,12 +131,14 @@ SQL 字符串
 
 | 查询 | 索引 | 全表扫 |
 |---|---|---|
-| 点查 `id = 12345` | ~19 µs | ~27 ms |
-| 单边范围 `id < 100` | ~54 µs | ~24 ms |
-| 双边范围 `id in [10000,10100)` | ~0.11 ms | ~29 ms |
+| 点查 `id = 12345` | ~16 µs | ~29 ms |
+| 单边范围 `id < 100` | ~67 µs | ~27 ms |
+| 双边范围 `id in [10000,10100)` | ~0.14 ms | ~34 ms |
+| 有序范围 `id > 49900 ORDER BY id` | ~0.23 ms | ~24 ms |
 
 要点：单表 SELECT 会在扫描前先选定访问路径，命中索引时完全跳过堆扫描；AND 链里
-同一索引列的 `>`/`>=`/`<`/`<=` 会合并为一段 B+ 树范围扫；只读事务不重写 catalog。
+同一索引列的 `>`/`>=`/`<`/`<=` 会合并为一段 B+ 树范围扫；ORDER BY 恰为索引列升序时
+直接复用叶链顺序、跳过排序（EXPLAIN 为 `OrderedIndexScan`）；只读事务不重写 catalog。
 
 ## 依赖
 
