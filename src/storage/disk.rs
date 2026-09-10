@@ -81,6 +81,12 @@ impl DiskManager {
         Ok((len / PAGE_SIZE as u64) as PageNo)
     }
 
+    /// Empties a file in place (used when rebuilding derived structures).
+    pub fn truncate_file(&mut self, file: FileId) -> Result<()> {
+        let f = self.file(file)?;
+        f.set_len(0).map_err(io_err)
+    }
+
     fn file(&mut self, file: FileId) -> Result<&mut File> {
         self.files
             .get_mut(&file)

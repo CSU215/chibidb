@@ -52,6 +52,27 @@ impl HeapFile {
         Ok(Self { file })
     }
 
+    /// Opens the file, re-initializing a header that a crash lost before it
+    /// reached the disk. Returns true when the file was re-initialized.
+    pub fn open_or_repair(bp: &mut BufferPool, file: FileId) -> Result<bool> {
+        if bp.page_count(file)? == 0 {
+            Self::init(bp, file)?;
+            return Ok(true);
+        }
+        let header_lost = bp.read_page(file, 0, |page| {
+            Ok(page[0..4] != MAGIC && page.iter().all(|&b| b == 0))
+        })?;
+        if !header_lost {
+            Self::open(bp, file)?;
+            return Ok(false);
+        }
+        bp.with_page(file, 0, |page| {
+            page[0..4].copy_from_slice(&MAGIC);
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
     pub fn file_id(&self) -> FileId {
         self.file
     }

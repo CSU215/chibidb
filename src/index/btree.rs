@@ -60,6 +60,30 @@ impl BTree {
         Ok(Self { file })
     }
 
+    /// Opens the file, re-initializing a header that a crash lost before it
+    /// reached the disk. Returns true when the file was re-initialized; the
+    /// caller must then rebuild the tree contents.
+    pub fn open_or_repair(bp: &mut BufferPool, file: FileId) -> Result<bool> {
+        if bp.page_count(file)? == 0 {
+            Self::init(bp, file)?;
+            return Ok(true);
+        }
+        let header_lost = bp.read_page(file, 0, |page| {
+            Ok(page[0..8] != MAGIC && page.iter().all(|&b| b == 0))
+        })?;
+        if !header_lost {
+            Self::open(bp, file)?;
+            return Ok(false);
+        }
+        bp.with_page(file, 0, |page| {
+            page[0..8].copy_from_slice(&MAGIC);
+            u32_put(page, 8, 0); // root: empty tree
+            u32_put(page, 12, 0); // first leaf
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
     pub fn file_id(&self) -> FileId {
         self.file
     }

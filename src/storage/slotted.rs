@@ -68,6 +68,36 @@ pub fn page_insert(page: &mut [u8; PAGE_SIZE], record: &[u8]) -> Result<u16> {
     })
 }
 
+/// Writes `record` at exactly `slot`, extending the slot directory as
+/// needed. The target slot must be empty. Used by WAL replay to restore
+/// records at their original rids.
+pub fn page_put_at(page: &mut [u8; PAGE_SIZE], slot: u16, record: &[u8]) -> Result<()> {
+    let slot = slot as usize;
+    let n = num_slots(page);
+    let upper = free_upper(page);
+    if slot < n && get_slot(page, slot) != (0, 0) {
+        return Err(Error::Runtime(format!("slot {slot} already occupied")));
+    }
+    let grow = if slot < n { 0 } else { (slot + 1 - n) * SLOT_SIZE };
+    let dir_end = HEADER_SIZE + (slot + 1).max(n) * SLOT_SIZE;
+    if dir_end + record.len() > upper {
+        return Err(Error::PageFull);
+    }
+    let off = upper - record.len();
+    page[off..upper].copy_from_slice(record);
+    if grow > 0 {
+        // entries between the old count and the new slot stay empty
+        let from = HEADER_SIZE + n * SLOT_SIZE;
+        for b in page[from..from + grow].iter_mut() {
+            *b = 0;
+        }
+        set_num_slots(page, slot + 1);
+    }
+    set_slot(page, slot, off, record.len());
+    set_free_upper(page, off);
+    Ok(())
+}
+
 pub fn page_get<'a>(page: &'a [u8; PAGE_SIZE], slot: u16) -> Result<Option<&'a [u8]>> {
     let n = num_slots(page);
     if slot as usize >= n {

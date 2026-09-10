@@ -14,6 +14,7 @@ pub mod server;
 pub mod storage;
 pub mod trx;
 pub mod value;
+pub mod wal;
 pub mod wire;
 
 pub use error::{Error, Result};
@@ -27,9 +28,11 @@ use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
 use crate::index::{encode_key, BTree};
 use crate::storage::codec::encode_record;
+use crate::storage::slotted::{page_get, page_put_at};
 use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, Rid};
 use crate::trx::{TrxState, Undo};
 use crate::value::Value;
+use crate::wal::{Record, Wal};
 
 pub use crate::trx::Session;
 
@@ -38,6 +41,7 @@ pub const BUFFER_POOL_FRAMES: usize = 64;
 pub struct Database {
     catalog: Catalog,
     pool: BufferPool,
+    wal: Wal,
     data_dir: PathBuf,
     next_table_file: u32,
     next_index_file: u32,
@@ -66,6 +70,9 @@ impl Database {
         let mut next_index_file = 0;
         let mut next_trx_id = 1;
         let mut committed_trxs: HashSet<u32> = HashSet::new();
+        // tables whose index file headers were rebuilt after a crash; their
+        // contents must be re-derived from the heap
+        let mut repaired_index_tables: Vec<String> = Vec::new();
 
         let catalog_path = path.join("catalog.bin");
         if catalog_path.exists() {
@@ -75,7 +82,7 @@ impl Database {
             for meta in &snap.tables {
                 let fpath = tables_dir.join(format!("{:06}.dbf", meta.file_no));
                 let file = pool.open_file(&fpath)?;
-                HeapFile::open(&mut pool, file)?;
+                HeapFile::open_or_repair(&mut pool, file)?;
                 let schema = Schema {
                     columns: meta
                         .columns
@@ -96,7 +103,9 @@ impl Database {
             for ix in &snap.indexes {
                 let fpath = indexes_dir.join(format!("{:06}.idxf", ix.file_no));
                 let file = pool.open_file(&fpath)?;
-                BTree::open(&mut pool, file)?;
+                if BTree::open_or_repair(&mut pool, file)? {
+                    repaired_index_tables.push(ix.table.clone());
+                }
                 let schema = &catalog.table(&ix.table)?.schema;
                 if schema.index_of(&ix.column).is_none() {
                     return Err(Error::Runtime(format!(
@@ -117,21 +126,161 @@ impl Database {
             committed_trxs = snap.committed_trxs.into_iter().collect();
         }
 
-        Ok(Self {
+        // WAL recovery: redo the committed transactions whose data pages
+        // never reached the disk, then repair derived structures.
+        let wal_path = path.join("wal.bin");
+        let wal_bytes = match std::fs::read(&wal_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(Error::Runtime(format!("cannot read wal: {e}"))),
+        };
+        let plan = wal::plan_recovery(&wal_bytes);
+
+        let mut touched: HashSet<u32> = HashSet::new();
+        for table in &repaired_index_tables {
+            touched.insert(catalog.table(table)?.heap.file_no);
+        }
+
+        let mut db = Self {
             catalog,
             pool,
+            wal: Wal::open(&wal_path)?,
             data_dir: path.to_path_buf(),
             next_table_file,
             next_index_file,
             next_trx_id,
             committed_trxs,
             _temp: None,
-        })
+        };
+        db.recover_from_wal(&plan, &mut touched)?;
+
+        // never hand a crashed transaction's id to a new transaction
+        if plan.max_trx_id >= db.next_trx_id {
+            db.next_trx_id = plan.max_trx_id.saturating_add(1);
+        }
+        let committed_repaired =
+            plan.committed_ids.iter().any(|id| !db.committed_trxs.contains(id));
+        if committed_repaired {
+            db.committed_trxs.extend(plan.committed_ids);
+        }
+        // persist the repaired committed set so it survives a second crash
+        // even if nothing else is written in this session
+        if committed_repaired {
+            db.save_catalog()?;
+        }
+        Ok(db)
     }
 
     pub fn flush(&mut self) -> Result<()> {
         self.pool.flush_all()?;
+        self.save_catalog()?;
+        // checkpoint: every page is on disk, so the log has nothing left to redo
+        self.wal.truncate()
+    }
+
+    /// Replays committed WAL records into the buffer pool (they reach the
+    /// disk with the next flush) and rebuilds indexes of touched tables.
+    /// `touched` accumulates heap file numbers that must have their indexes
+    /// rebuilt; it may arrive pre-seeded with repaired index files.
+    fn recover_from_wal(&mut self, plan: &wal::RecoveryPlan, touched: &mut HashSet<u32>) -> Result<()> {
+        let file_map: std::collections::HashMap<u32, FileId> =
+            self.catalog.heap_files().into_iter().collect();
+        for (_, _, records) in &plan.committed {
+            for rec in records {
+                match rec {
+                    Record::Insert { file_no, rid, record } => {
+                        let file = *file_map
+                            .get(file_no)
+                            .ok_or_else(|| Error::Runtime(format!("wal references unknown table file {file_no}")))?;
+                        while self.pool.page_count(file)? <= rid.page_no {
+                            self.pool.alloc_page(file)?;
+                        }
+                        let occupied = self.pool.read_page(file, rid.page_no, |page| {
+                            Ok(page_get(page, rid.slot)?.is_some())
+                        })?;
+                        if !occupied {
+                            self.pool.with_page(file, rid.page_no, |page| {
+                                page_put_at(page, rid.slot, record)
+                            })?;
+                            touched.insert(*file_no);
+                        }
+                    }
+                    Record::DeleteMark { file_no, rid, deleter } => {
+                        let file = *file_map
+                            .get(file_no)
+                            .ok_or_else(|| Error::Runtime(format!("wal references unknown table file {file_no}")))?;
+                        if self.pool.page_count(file)? <= rid.page_no {
+                            continue;
+                        }
+                        let unmarked = self.pool.read_page(file, rid.page_no, |page| {
+                            match page_get(page, rid.slot)? {
+                                Some(rec) if rec.len() >= 8 => {
+                                    Ok(u32::from_le_bytes(rec[4..8].try_into().unwrap()) == 0)
+                                }
+                                _ => Ok(false),
+                            }
+                        })?;
+                        if unmarked {
+                            HeapFile::at(file).delete_mark(&mut self.pool, *rid, *deleter)?;
+                            touched.insert(*file_no);
+                        }
+                    }
+                    Record::Commit => {}
+                }
+            }
+        }
+        for file_no in std::mem::take(touched) {
+            self.rebuild_indexes(file_no)?;
+        }
+        Ok(())
+    }
+
+    /// Rebuilds every index of the table owning heap file `file_no` from the
+    /// heap contents. Index pages are derived data and a crash may have lost
+    /// unflushed ones.
+    fn rebuild_indexes(&mut self, file_no: u32) -> Result<()> {
+        let table = self
+            .catalog
+            .table_metas()
+            .into_iter()
+            .find(|m| m.file_no == file_no)
+            .map(|m| m.name)
+            .ok_or_else(|| Error::Runtime(format!("no table owns file {file_no}")))?;
+        let ops = self.index_ops(&table)?;
+        for (_, ix_file) in &ops {
+            self.pool.discard_file(*ix_file);
+            self.pool.truncate_file(*ix_file)?;
+            BTree::init(&mut self.pool, *ix_file)?;
+        }
+        for (rid, rec) in self.store_scan_raw(&table)? {
+            let (_, _, row) = crate::storage::codec::decode_record(&rec)?;
+            for (ci, ix_file) in &ops {
+                let key = encode_key(&row[*ci])?;
+                BTree::at(*ix_file).insert(&mut self.pool, &key, rid)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit bookkeeping shared by explicit COMMIT and autocommit.
+    fn commit_trx(&mut self, trx_id: u32, wrote: bool) -> Result<()> {
+        self.committed_trxs.insert(trx_id);
+        if wrote {
+            // log durability first: after this point the transaction commits
+            // even if the process dies before its pages are flushed
+            self.wal.append(trx_id, &Record::Commit)?;
+            self.wal.sync()?;
+        }
         self.save_catalog()
+    }
+
+    /// Emulates a process crash: dirty buffer-pool pages are lost while
+    /// already-appended WAL bytes (OS page cache) survive, like SIGKILL.
+    /// Leaks the temp dir of in-memory databases; use file-backed ones.
+    pub fn simulate_crash(self) {
+        let Database { pool, _temp, .. } = self;
+        std::mem::forget(pool);
+        std::mem::forget(_temp);
     }
 
     pub fn execute_sql(&mut self, sql: &str) -> Result<Vec<ResultSet>> {
@@ -162,10 +311,8 @@ impl Database {
                         return Err(Error::Runtime("no active transaction".into()));
                     }
                     if let Some(trx) = session.trx.take() {
-                        self.committed_trxs.insert(trx.id);
-                        // commit durability: the committed set (and thus
-                        // visibility of the transaction's rows) is persisted
-                        self.save_catalog()?;
+                        let wrote = !trx.undo.is_empty();
+                        self.commit_trx(trx.id, wrote)?;
                     }
                 }
                 crate::ast::Stmt::Trx(crate::ast::TrxCtl::Rollback) => {
@@ -187,7 +334,8 @@ impl Database {
                         Ok(rs) => {
                             if autocommit {
                                 if let Some(trx) = session.trx.take() {
-                                    self.committed_trxs.insert(trx.id);
+                                    let wrote = !trx.undo.is_empty();
+                                    self.commit_trx(trx.id, wrote)?;
                                 }
                             }
                             out.push(rs);
@@ -336,10 +484,14 @@ impl Database {
         row: Vec<Value>,
         creator: u32,
     ) -> Result<Rid> {
-        let file = self.catalog.table(name)?.heap.file;
+        let (file, file_no) = {
+            let t = self.catalog.table(name)?;
+            (t.heap.file, t.heap.file_no)
+        };
         let heap = HeapFile::at(file);
         let data = encode_record(creator, 0, &row);
         let rid = heap.insert(&mut self.pool, &data)?;
+        self.wal.append(creator, &Record::Insert { file_no, rid, record: data.clone() })?;
         for (ci, ix_file) in self.index_ops(name)? {
             let key = encode_key(&row[ci])?;
             BTree::at(ix_file).insert(&mut self.pool, &key, rid)?;
@@ -355,10 +507,14 @@ impl Database {
         rids: &[Rid],
         deleter: u32,
     ) -> Result<()> {
-        let file = self.catalog.table(name)?.heap.file;
+        let (file, file_no) = {
+            let t = self.catalog.table(name)?;
+            (t.heap.file, t.heap.file_no)
+        };
         let heap = HeapFile::at(file);
         for rid in rids {
             heap.delete_mark(&mut self.pool, *rid, deleter)?;
+            self.wal.append(deleter, &Record::DeleteMark { file_no, rid: *rid, deleter })?;
         }
         Ok(())
     }
@@ -372,14 +528,23 @@ impl Database {
         updates: &[(Rid, Vec<Value>)],
         trx_id: u32,
     ) -> Result<Vec<Rid>> {
-        let file = self.catalog.table(name)?.heap.file;
+        let (file, file_no) = {
+            let t = self.catalog.table(name)?;
+            (t.heap.file, t.heap.file_no)
+        };
         let heap = HeapFile::at(file);
         let ops = self.index_ops(name)?;
         let mut new_rids = Vec::with_capacity(updates.len());
         for (rid, new_row) in updates {
             heap.delete_mark(&mut self.pool, *rid, trx_id)?;
+            self.wal
+                .append(trx_id, &Record::DeleteMark { file_no, rid: *rid, deleter: trx_id })?;
             let data = encode_record(trx_id, 0, new_row);
             let new_rid = heap.insert(&mut self.pool, &data)?;
+            self.wal.append(
+                trx_id,
+                &Record::Insert { file_no, rid: new_rid, record: data.clone() },
+            )?;
             for (ci, ix_file) in &ops {
                 let key = encode_key(&new_row[*ci])?;
                 BTree::at(*ix_file).insert(&mut self.pool, &key, new_rid)?;

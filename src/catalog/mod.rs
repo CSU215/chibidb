@@ -163,4 +163,9 @@ impl Catalog {
     pub(crate) fn indexes_for(&self, table: &str) -> Vec<&IndexEntry> {
         self.indexes.values().filter(|ix| ix.table == table).collect()
     }
+
+    /// (heap file_no, FileId) for every table, for WAL replay mapping.
+    pub(crate) fn heap_files(&self) -> Vec<(u32, FileId)> {
+        self.tables.values().map(|t| (t.heap.file_no, t.heap.file)).collect()
+    }
 }

@@ -110,6 +110,36 @@ impl BufferPool {
         self.disk.page_count(file)
     }
 
+    /// Empties a file in place. Cached frames of the file must be dropped
+    /// first (see `discard_file`).
+    pub fn truncate_file(&mut self, file: FileId) -> Result<()> {
+        self.disk.truncate_file(file)
+    }
+
+    /// Drops all cached frames of a file without writing them back.
+    pub fn discard_file(&mut self, file: FileId) {
+        // every live frame is referenced exactly once by the lru list
+        let lru_order: Vec<usize> = self.lru.drain(..).collect();
+        let mut old_frames: Vec<Option<Frame>> =
+            std::mem::take(&mut self.frames).into_iter().map(Some).collect();
+        let mut remap: HashMap<usize, usize> = HashMap::new();
+        let mut new_frames = Vec::with_capacity(old_frames.len());
+        for old_idx in lru_order {
+            if let Some(frame) = old_frames[old_idx].take() {
+                if frame.key.0 != file {
+                    remap.insert(old_idx, new_frames.len());
+                    new_frames.push(frame);
+                }
+            }
+        }
+        self.page_table.retain(|k, _| k.0 != file);
+        for v in self.page_table.values_mut() {
+            *v = remap[v];
+        }
+        self.frames = new_frames;
+        self.lru = (0..self.frames.len()).collect();
+    }
+
     pub fn flush_file(&mut self, file: FileId) -> Result<()> {
         for i in 0..self.frames.len() {
             if self.frames[i].dirty && self.frames[i].key.0 == file {
