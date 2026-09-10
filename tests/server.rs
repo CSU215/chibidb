@@ -1,17 +1,19 @@
 use std::sync::Arc;
 
+use chibidb::config::Config;
+use chibidb::instance::Instance;
 use chibidb::result::ResultSet;
-use chibidb::server::{serve, SharedDb};
+use chibidb::server::{serve, SharedInstance};
 use chibidb::value::Value;
-use chibidb::{Database, Result};
+use chibidb::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-async fn start_server() -> (SharedDb, std::net::SocketAddr, tempfile::TempDir) {
+async fn start_server() -> (SharedInstance, std::net::SocketAddr, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let db = Database::open(dir.path()).unwrap();
-    let shared: SharedDb = Arc::new(Mutex::new(db));
+    let instance = Instance::open(dir.path(), &Config::default()).unwrap();
+    let shared: SharedInstance = Arc::new(Mutex::new(instance));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(serve(shared.clone(), listener));
@@ -152,6 +154,31 @@ async fn concurrent_statements_serialize() {
     let rs = exec_remote(&mut a, "select count(*) from t;").await.unwrap();
     match &rs[0] {
         ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(40)),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn databases_are_selectable_over_tcp() {
+    let (_shared, addr, _dir) = start_server().await;
+
+    // default `main` database
+    let mut a = TcpStream::connect(addr).await.unwrap();
+    exec_remote(&mut a, "create table t (id int);").await.unwrap();
+    exec_remote(&mut a, "insert into t values (1);").await.unwrap();
+
+    // switch this connection to a fresh database; `t` is gone
+    exec_remote(&mut a, "create database shop;").await.unwrap();
+    exec_remote(&mut a, "use shop;").await.unwrap();
+    assert!(exec_remote(&mut a, "select * from t;").await.is_err());
+    exec_remote(&mut a, "create table t (name char(8));").await.unwrap();
+    exec_remote(&mut a, "insert into t values ('x');").await.unwrap();
+
+    // a different connection still sees the default main database
+    let mut b = TcpStream::connect(addr).await.unwrap();
+    let rs = exec_remote(&mut b, "select id from t;").await.unwrap();
+    match &rs[0] {
+        ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(1)),
         other => panic!("expected rows, got {other:?}"),
     }
 }

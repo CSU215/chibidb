@@ -12,12 +12,16 @@ use crate::{Database, Error, Result};
 /// (database catalogue, users, privileges). It is never a user database.
 pub const META_DIR: &str = "chibi_meta";
 
+/// Database selected when a session runs a table statement before choosing one.
+pub const DEFAULT_DB: &str = "main";
+
 /// One server instance: a data root holding multiple named databases, each in
 /// its own directory (MySQL-style). Databases are opened lazily and cached.
 pub struct Instance {
     config: Config,
     root: PathBuf,
     databases: HashMap<String, Database>,
+    _temp: Option<tempfile::TempDir>,
 }
 
 impl Instance {
@@ -32,7 +36,16 @@ impl Instance {
             config: config.clone(),
             root: root.to_path_buf(),
             databases: HashMap::new(),
+            _temp: None,
         })
+    }
+
+    /// A throwaway instance in an automatically-cleaned temporary directory.
+    pub fn open_in_memory(config: &Config) -> Result<Self> {
+        let temp = tempfile::tempdir()
+            .map_err(|e| Error::Runtime(format!("cannot create temp dir: {e}")))?;
+        let inst = Self::open(temp.path(), config)?;
+        Ok(Self { _temp: Some(temp), ..inst })
     }
 
     /// Names of all databases on disk, sorted. Purely directory-based so it
@@ -113,10 +126,7 @@ impl Instance {
                     out.push(ResultSet::Message("SUCCESS".into()));
                 }
                 other => {
-                    let db_name = session
-                        .current_db()
-                        .ok_or_else(|| Error::Runtime("no database selected".into()))?
-                        .to_string();
+                    let db_name = self.ensure_current_db(session)?;
                     let db = self.database_mut(&db_name)?;
                     if let Some(rs) = db.execute_stmt_with(session, other)? {
                         out.push(rs);
@@ -125,6 +135,43 @@ impl Instance {
             }
         }
         Ok(out)
+    }
+
+    /// Returns the current database name, creating and selecting the default
+    /// one when the session has not chosen one yet.
+    fn ensure_current_db(&mut self, session: &mut Session) -> Result<String> {
+        if let Some(name) = session.current_db() {
+            return Ok(name.to_string());
+        }
+        if !self.databases()?.iter().any(|d| d == DEFAULT_DB) {
+            self.create_database(DEFAULT_DB)?;
+        }
+        session.set_current_db(Some(DEFAULT_DB.to_string()));
+        Ok(DEFAULT_DB.to_string())
+    }
+
+    /// Flushes (checkpoints) every currently open database. Used on clean
+    /// shutdown so the WAL is truncated.
+    pub fn flush(&mut self) -> Result<()> {
+        for db in self.databases.values_mut() {
+            db.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Rolls back a session's open transaction, if any, on its current db.
+    pub fn rollback_session(&mut self, session: &mut Session) -> Result<()> {
+        let Some(name) = session.current_db().map(str::to_string) else {
+            return Ok(());
+        };
+        if self.root.join(&name).is_dir() {
+            self.database_mut(&name)?.rollback_session(session)?;
+        } else {
+            // the database was dropped out from under the session; its undo
+            // log references gone tables, so just drop the handle
+            session.trx = None;
+        }
+        Ok(())
     }
 
     fn use_database(&self, session: &mut Session, name: &str) -> Result<()> {

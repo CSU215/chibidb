@@ -1,16 +1,18 @@
-use chibidb::{Database, run_repl};
+use chibidb::config::Config;
+use chibidb::instance::Instance;
+use chibidb::run_repl;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, duplex};
 
 async fn run_with(input: &[u8]) -> String {
     let (mut cmd_tx, repl_input) = duplex(4096);
     let repl_input = BufReader::new(repl_input);
     let (mut repl_output, mut out_rx) = duplex(4096);
-    let mut db = Database::open_in_memory().unwrap();
+    let mut instance = Instance::open_in_memory(&Config::default()).unwrap();
 
     cmd_tx.write_all(input).await.unwrap();
     cmd_tx.shutdown().await.unwrap();
 
-    run_repl(&mut db, repl_input, &mut repl_output)
+    run_repl(&mut instance, repl_input, &mut repl_output)
         .await
         .unwrap();
     drop(repl_output);
