@@ -838,6 +838,9 @@ pub(crate) fn eval(expr: &Expr, ctx: Option<&EvalCtx>) -> Result<Value> {
             let is_null = matches!(v, Value::Null);
             Ok(Value::Bool(if *negated { !is_null } else { is_null }))
         }
+        Expr::InSubquery { .. } => {
+            Err(Error::Runtime("subqueries are materialized before evaluation".into()))
+        }
     }
 }
 

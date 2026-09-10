@@ -367,6 +367,34 @@ fn text_type() {
 }
 
 #[test]
+fn in_list_filters_with_three_valued_logic() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int, name char(4));").unwrap();
+        db.execute_sql("insert into t values (1, 'a'), (2, 'b'), (3, 'c'), (null, 'n');")
+            .unwrap();
+        let ids = |db: &mut Database, sql: &str| -> Vec<i64> {
+            let rs = db.execute_sql(sql).unwrap();
+            let (_, r) = rows(&rs);
+            r.iter()
+                .map(|row| match row[0] {
+                    Value::Int(n) => n,
+                    ref v => panic!("{v:?}"),
+                })
+                .collect()
+        };
+
+        assert_eq!(ids(db, "select id from t where id in (1, 3) order by id;"), [1, 3]);
+        assert_eq!(ids(db, "select id from t where id not in (1, 3) order by id;"), [2]);
+        // NULL comparisons are UNKNOWN: excluded from IN results
+        assert_eq!(ids(db, "select id from t where id in (1, null);"), [1]);
+        // NOT IN over a list containing NULL can never be TRUE
+        assert_eq!(ids(db, "select id from t where id not in (1, null);"), Vec::<i64>::new());
+        // the literal NULL row never matches either direction
+        assert_eq!(ids(db, "select id from t where id not in (1, 3);"), [2]);
+    });
+}
+
+#[test]
 fn date_type() {
     with_dbs(|db| {
         db.execute_sql("create table t (id int, birthday date);").unwrap();

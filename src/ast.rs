@@ -56,6 +56,8 @@ pub enum Expr {
     IsNull(Box<Expr>, bool),
     Aggregate(AggFunc, Option<Box<Expr>>),
     QualifiedColumn(String, String),
+    /// `[NOT] IN (SELECT ...)`; materialized before row evaluation.
+    InSubquery { expr: Box<Expr>, sub: Box<SelectStmt>, negated: bool },
 }
 
 impl fmt::Display for Expr {
@@ -73,6 +75,7 @@ impl fmt::Display for Expr {
             Expr::Aggregate(func, None) => write!(f, "({func} *)"),
             Expr::Aggregate(func, Some(e)) => write!(f, "({func} {e})"),
             Expr::QualifiedColumn(t, c) => write!(f, "{t}.{c}"),
+            Expr::InSubquery { .. } => write!(f, "(in-subquery)"),
         }
     }
 }

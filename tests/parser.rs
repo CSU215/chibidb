@@ -366,6 +366,27 @@ fn parses_is_null() {
 }
 
 #[test]
+fn parses_in_list() {
+    let s = select("select * from t where id in (1, 2, 3);");
+    let sel = s.selection.as_ref().unwrap();
+    assert_eq!(
+        sel.to_string(),
+        "(or (or (= id 1) (= id 2)) (= id 3))",
+        "in-list desugars to an OR of equalities"
+    );
+
+    let s = select("select * from t where id not in (1, 2);");
+    let sel = s.selection.as_ref().unwrap();
+    assert_eq!(
+        sel.to_string(),
+        "(and (<> id 1) (<> id 2))",
+        "not-in desugars to an AND of inequalities"
+    );
+
+    err("select * from t where id in ();");
+}
+
+#[test]
 fn parses_create_index() {
     let stmts = parse("create index idx_name on student (id);").unwrap();
     match &stmts[0] {

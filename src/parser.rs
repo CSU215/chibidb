@@ -176,8 +176,10 @@ impl Parser {
         }
     }
 
-    const RESERVED: &[&str] =
-        &["where", "group", "having", "order", "limit", "on", "join", "inner", "left", "right"];
+    const RESERVED: &[&str] = &[
+        "where", "group", "having", "order", "limit", "on", "join", "inner", "left", "right",
+        "in", "exists",
+    ];
 
     fn agg_func(name: &str) -> Option<AggFunc> {
         if name.eq_ignore_ascii_case("count") {
@@ -471,6 +473,16 @@ impl Parser {
             }
             return Ok(Expr::IsNull(Box::new(lhs), negated));
         }
+        // [NOT] IN (value list | subquery)
+        let next_is_in = matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            Some(TokenKind::Ident(s)) if s.eq_ignore_ascii_case("in"));
+        if self.at_keyword("in") || (self.at_keyword("not") && next_is_in) {
+            let negated = self.eat_keyword("not");
+            if !self.eat_keyword("in") {
+                return Err(self.unexpected("in"));
+            }
+            return self.finish_in(lhs, negated);
+        }
         let op = if self.at_punct(Punct::Eq) {
             BinOp::Eq
         } else if self.at_punct(Punct::NotEq) {
@@ -489,6 +501,40 @@ impl Parser {
         self.pos += 1;
         let rhs = self.parse_additive()?;
         Ok(Expr::Binary(op, Box::new(lhs), Box::new(rhs)))
+    }
+
+    /// Parses the parenthesized part of `[NOT] IN (...)`: either a value
+    /// list (desugared to an OR of / AND of comparisons, which keeps NULL
+    /// three-valued semantics correct) or a subquery.
+    fn finish_in(&mut self, lhs: Expr, negated: bool) -> Result<Expr> {
+        self.expect_punct(Punct::LParen)?;
+        if self.at_keyword("select") {
+            if !self.eat_keyword("select") {
+                return Err(self.unexpected("select"));
+            }
+            let sub = match self.parse_select()? {
+                Stmt::Select(s) => *s,
+                _ => unreachable!("parse_select only returns select"),
+            };
+            self.expect_punct(Punct::RParen)?;
+            return Ok(Expr::InSubquery {
+                expr: Box::new(lhs),
+                sub: Box::new(sub),
+                negated,
+            });
+        }
+        let mut items = vec![self.parse_additive()?];
+        while self.eat_punct(Punct::Comma) {
+            items.push(self.parse_additive()?);
+        }
+        self.expect_punct(Punct::RParen)?;
+        let (fold, cmp) = if negated { (BinOp::And, BinOp::NotEq) } else { (BinOp::Or, BinOp::Eq) };
+        let mut acc = Expr::Binary(cmp, Box::new(lhs.clone()), Box::new(items.remove(0)));
+        for item in items {
+            let eq = Expr::Binary(cmp, Box::new(lhs.clone()), Box::new(item));
+            acc = Expr::Binary(fold, Box::new(acc), Box::new(eq));
+        }
+        Ok(acc)
     }
 
     fn parse_additive(&mut self) -> Result<Expr> {
