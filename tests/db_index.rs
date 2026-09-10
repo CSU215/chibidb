@@ -112,6 +112,37 @@ fn explain_combines_range_bounds() {
 }
 
 #[test]
+fn index_order_by_skips_sort() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int, name char(10));").unwrap();
+    for i in 0..50i64 {
+        db.execute_sql(&format!("insert into t values ({i}, 'n{i:02}');")).unwrap();
+    }
+    db.execute_sql("create index idx on t (id);").unwrap();
+
+    let plan =
+        message(&db.execute_sql("explain select * from t where id > 5 order by id;").unwrap());
+    assert!(plan.contains("OrderedIndexScan"), "ascending order uses the index: {plan}");
+
+    let plan = message(
+        &db.execute_sql("explain select * from t where id > 5 order by id desc;").unwrap(),
+    );
+    assert!(!plan.contains("OrderedIndexScan"), "descending still sorts: {plan}");
+
+    let plan =
+        message(&db.execute_sql("explain select * from t where id > 5 order by name;").unwrap());
+    assert!(!plan.contains("OrderedIndexScan"), "other column still sorts: {plan}");
+
+    // and the rows really come out ascending without an explicit sort step
+    let rs = db.execute_sql("select id from t where id > 45 order by id;").unwrap();
+    let (_, rows) = rows(&rs);
+    assert_eq!(
+        rows,
+        [[Value::Int(46)], [Value::Int(47)], [Value::Int(48)], [Value::Int(49)]]
+    );
+}
+
+#[test]
 fn index_scan_results_match_full_scan() {
     with_dbs(|db| {
         seeded(db);

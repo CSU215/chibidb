@@ -28,13 +28,35 @@ fn plan_select(db: &mut Database, s: &SelectStmt) -> Result<String> {
         ));
     }
     match find_sargable(db, &s.from[0].name, s.selection.as_ref())? {
-        Some(sarg) => Ok(format!(
-            "IndexScan(index={}, table={}, {}) -> Filter -> Project",
-            sarg.index,
-            s.from[0].name,
-            describe_sarg(&sarg)
-        )),
+        Some(sarg) => {
+            let kind = if order_by_matches(&sarg.column, &s.order_by) {
+                "OrderedIndexScan"
+            } else {
+                "IndexScan"
+            };
+            Ok(format!(
+                "{kind}(index={}, table={}, {}) -> Filter -> Project",
+                sarg.index,
+                s.from[0].name,
+                describe_sarg(&sarg)
+            ))
+        }
         None => Ok(format!("FullScan(table={}) -> Filter -> Project", s.from[0].name)),
+    }
+}
+
+/// True when ORDER BY is a single ascending key on `column`, so an index
+/// scan over that column already yields the requested order.
+pub(crate) fn order_by_matches(column: &str, order_by: &[(Expr, bool)]) -> bool {
+    let [(e, desc)] = order_by else {
+        return false;
+    };
+    if *desc {
+        return false;
+    }
+    match e {
+        Expr::Column(n) | Expr::QualifiedColumn(_, n) => n == column,
+        _ => false,
     }
 }
 
@@ -197,12 +219,13 @@ fn bound<'a>(key: Option<&'a Vec<u8>>, inclusive: bool) -> Bound<'a> {
 
 /// If the selection is sargable, scans the index and returns the visible
 /// rows for the referenced table; otherwise returns `None`.
+/// Returns the visible rows plus the indexed column they are ordered by.
 pub(crate) fn index_scan_source(
     db: &mut Database,
     trx: &mut TrxState,
     table: &str,
     selection: Option<&Expr>,
-) -> Result<Option<Vec<Vec<Value>>>> {
+) -> Result<Option<(Vec<Vec<Value>>, String)>> {
     let Some(sarg) = find_sargable(db, table, selection)? else {
         return Ok(None);
     };
@@ -233,7 +256,8 @@ pub(crate) fn index_scan_source(
             scan_rids(&btree, &mut db.pool, start, end)?
         }
     };
-    Ok(Some(decode_visible(db.store_get_records(table, &rids)?, trx)?))
+    let rows = decode_visible(db.store_get_records(table, &rids)?, trx)?;
+    Ok(Some((rows, sarg.column)))
 }
 
 fn scan_rids(

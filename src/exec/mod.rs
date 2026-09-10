@@ -501,13 +501,19 @@ pub(crate) fn execute_select(
     }
     // For a single table, resolve the access path before scanning: when an
     // index applies we never touch the rest of the heap.
-    let (schema, source_rows) = if s.from.len() == 1 {
+    let (schema, source_rows, ordered_by) = if s.from.len() == 1 {
         match index_scan_source(db, trx, &s.from[0].name, s.selection.as_ref())? {
-            Some(scanned) => (single_table_schema(db, &s.from[0])?, scanned),
-            None => nested_loop(db, trx, s, outer)?,
+            Some((scanned, column)) => {
+                (single_table_schema(db, &s.from[0])?, scanned, Some(column))
+            }
+            None => {
+                let (schema, rows) = nested_loop(db, trx, s, outer)?;
+                (schema, rows, None)
+            }
         }
     } else {
-        nested_loop(db, trx, s, outer)?
+        let (schema, rows) = nested_loop(db, trx, s, outer)?;
+        (schema, rows, None)
     };
     let mut headers = Vec::new();
     let mut exprs = Vec::new();
@@ -550,7 +556,11 @@ pub(crate) fn execute_select(
     if !s.group_by.is_empty() || has_aggregate {
         return execute_grouped_select(db, trx, outer, &schema, s, filtered, headers, exprs);
     }
-    if !s.order_by.is_empty() {
+    // An index scan already yields ascending order on its column.
+    let skip_sort = ordered_by
+        .as_deref()
+        .is_some_and(|c| plan::order_by_matches(c, &s.order_by));
+    if !s.order_by.is_empty() && !skip_sort {
         sort_rows(db, trx, outer, &schema, &mut filtered, &s.order_by, &s.items)?;
     }
     let mut out_rows = Vec::new();

@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：M23（SQL 小补齐：聚合 DISTINCT、LIKE ESCAPE、UPDATE/DELETE 子查询）完成，294 tests 全绿、clippy 零警告。M24–M25 待做。
+> 最后更新：M24（元数据锁 / DDL 隔离）完成，295 tests 全绿、clippy 零警告。M25 待做。
 
 ---
 
@@ -37,7 +37,7 @@ SQL 字符串
 - 运行环境注意：**命令行是 Windows PowerShell**，具体陷阱见 §8
 
 ```powershell
-cargo test                      # 全量回归（294 tests，20+ 个测试二进制）
+cargo test                      # 全量回归（295 tests，20+ 个测试二进制）
 cargo test --test trx           # 单个测试文件
 cargo test --quiet              # 安静模式（注意配合退出码判断，见 §8）
 cargo build
@@ -94,7 +94,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `index/btree.rs` | B+ 树主体：`init/open/open_or_repair/at`、递归插入双级分裂长高、search（跨叶重复键回退）、scan_range 叶链、delete 借用/合并/根收缩（~880 行） | |
 | `wal.rs` | 预写日志：帧 `[u32 len][u8 type][u32 trx][payload]`，Record::Insert/DeleteMark/Commit，追加 + `sync()`（提交点）+ `truncate()`（checkpoint）；`plan_recovery` 解析日志（容忍截断尾帧），纯函数有单测 | `Wal` / `plan_recovery` |
 
-### 3.2 测试（`tests/`，27 个文件 / 294 tests）
+### 3.2 测试（`tests/`，27 个文件 / 295 tests）
 
 - 与源码分层对应：`lexer / parser / eval / agg / join / db / db_index / db_persist / trx / wal / storage_* / index_* / wire / server / repl / datetime / codec / catalog_meta / miniob_compat`
 - `miniob_compat`：student/course/sc 端到端组合场景（CRUD+聚合、分组/having、内外连接、不相关子查询、索引/EXPLAIN）
@@ -139,6 +139,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | M21 RIGHT JOIN | ✅ `JoinKind::Right`，与 LEFT 对称：未匹配右行保留、左列补 NULL（补宽 = 加入第 i 表前的累计列数） | `3433843` |
 | M22 UNION | ✅ `SelectStmt.set_ops: Vec<(bool /*all*/, Box<SelectStmt>)>` 左结合；列数必须一致；UNION 去重、UNION ALL 不去重；尾部 ORDER BY/LIMIT 作用于整个并集（ORDER BY 解析输出列名） | `83b2a23` |
 | M23 SQL 小补齐 | ✅ 聚合 `DISTINCT`（count/sum/avg/min/max）；`LIKE ... ESCAPE`；UPDATE/DELETE 的 WHERE 与 UPDATE SET 支持子查询 | `5f8be7f`…`8d2adcd` |
+| M24 元数据锁 | ✅ 其它会话有开事务时，CREATE/DROP TABLE/INDEX/VIEW 报 `schema is locked by an open transaction`（`execute` 入口统一守卫） | `2a3a5a0` |
 
 ---
 
@@ -313,7 +314,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 - VACUUM 回收的空页不归还文件系统（页留给 first-fit 复用）；空页只在该表变小时浪费
 - 单 Mutex 单 writer 串行化；无死锁检测；vacuum 之外长事务 + 未提交孤儿版本仍会占空间
 - BufferPool 无预读；WAL checkpoint 是全量截断（有预算护栏但无模糊检查点）；first-fit 插入是 O(页数)，建 5 万行表的主要耗时即在此（基准测试因此偏慢）
-- **多连接下的 DDL 隔离不存在**：一个连接持有未提交事务时，另一连接仍可 DROP TABLE / CREATE INDEX / DROP VIEW（open_trxs 注册表只护 WAL 截断与 VACUUM，不锁元数据）；教学场景可接受，修法需先做会话级元数据锁
+- DDL 隔离：其它会话持有开事务时任何 CREATE/DROP 都被拒绝（M24，`schema is locked by an open transaction`）；这是粗粒度全库锁，无按表锁
 - `exec/` 已按职责拆分（mod/eval/aggregate/join/plan/subquery，见 §3.1）；跨模块共享项用 `pub(crate)`，`eval_const` 经 `exec::eval_const` 重导出
 - 索引访问路径已修：单表 SELECT 命中索引时不再先全表扫；`id >= a and id < b` 合并成一段范围扫。基准（release/5 万行）：点查 ~19µs vs ~27ms，单边范围 ~54µs vs ~24ms，双边范围 ~0.11ms vs ~29ms
 
@@ -329,11 +330,11 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 2. **RIGHT JOIN**（小，M21）✅：`JoinKind::Right` 与 LEFT 对称；未匹配右行保留、左列补 NULL（补宽 = 加入第 i 表前 `schema.columns.len()`）；parser 支持 `RIGHT [OUTER] JOIN`
 3. **UNION / UNION ALL**（中，M22）✅：AST 用 `set_ops` 左结合列表（比计划的单 `combine` 更贴合 SQL 左结合语义）；列数必须一致；UNION 走 `dedup_rows`；尾部 ORDER BY/LIMIT 作用于整个并集，ORDER BY 按输出列名解析（`sort_projected`）
 4. **SQL 小补齐**（小，M23）✅：`count(DISTINCT expr)`（推广到 sum/avg/min/max）；LIKE `ESCAPE`（模式先编译成 token）；UPDATE/DELETE 的 WHERE 与 UPDATE SET 支持子查询
-5. **元数据锁 / DDL 隔离**（中，M24）：现有洞——连接 A BEGIN+写 t 时连接 B 可 DROP t，破坏 A 的 undo 目标。最小修法：DDL（create/drop table/index/view）在 `has_open_trxs_excluding(自身)` 为真时报 `schema is locked by an open transaction`；文档更新 §8
+5. **元数据锁 / DDL 隔离**（中，M24）✅：`execute` 入口对 DDL 统一守卫，`has_open_trxs_excluding(自身)` 为真时报 `schema is locked by an open transaction`（粗粒度全库锁）
 6. **索引有序性消除排序**（中小，M25）：单表且 ORDER BY 单列 = 选路索引列时跳过 `sort_rows`（仅 ASC——叶链升序；DESC 若无反向迭代则先不做）；跑 `tests/bench.rs` 对比并更新 README 数字
 
 工作纪律：TDD 红绿节奏、每项一个里程碑提交、提交前全量 `cargo test` + clippy 清零 + 更新本文档与 README。
 
-进度：M20–M23 完成（294 tests）。接下来依次 M24 元数据锁 → M25 索引消除排序。
+进度：M20–M24 完成（295 tests）。仅剩 M25 索引消除排序。
 
-提交基线：`8d2adcd feat: allow subqueries in UPDATE/DELETE WHERE and SET`（HEAD）。
+提交基线：`2a3a5a0 feat: block DDL while another transaction is open`（HEAD）。
