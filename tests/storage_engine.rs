@@ -42,3 +42,26 @@ fn heap_engine_scans_across_pages() {
     }
     assert_eq!(drain(&mut bp, f).len(), 200);
 }
+
+#[test]
+fn heap_engine_get_roundtrips() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut bp, f) = setup(&dir, "c.dbf");
+    let heap = HeapFile::init(&mut bp, f).unwrap();
+    let rid = heap.insert(&mut bp, b"hello").unwrap();
+
+    let engine = HeapEngine::new(f);
+    assert_eq!(engine.get(&mut bp, rid).unwrap(), b"hello");
+}
+
+#[test]
+fn heap_engine_get_missing_record_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut bp, f) = setup(&dir, "d.dbf");
+    let heap = HeapFile::init(&mut bp, f).unwrap();
+    let rid = heap.insert(&mut bp, b"only").unwrap();
+    heap.delete(&mut bp, rid).unwrap();
+
+    let engine = HeapEngine::new(f);
+    assert!(engine.get(&mut bp, rid).is_err());
+}

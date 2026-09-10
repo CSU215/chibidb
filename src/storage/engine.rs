@@ -1,5 +1,5 @@
 use crate::storage::buffer::BufferPool;
-use crate::storage::heap::Rid;
+use crate::storage::heap::{HeapFile, Rid};
 use crate::storage::page::{FileId, PageNo};
 use crate::storage::slotted::page_iter;
 use crate::Result;
@@ -18,6 +18,9 @@ pub trait RowScanner: Send {
 /// concrete engine (heap today, LSM later).
 pub trait TableEngine: Send + Sync {
     fn scan(&self, bp: &mut BufferPool) -> Result<Box<dyn RowScanner>>;
+
+    /// Point fetch of one encoded record by row id.
+    fn get(&self, bp: &mut BufferPool, rid: Rid) -> Result<Vec<u8>>;
 }
 
 /// Engine backed by the current on-disk heap layout. `new` is an unvalidated
@@ -35,6 +38,10 @@ impl HeapEngine {
 impl TableEngine for HeapEngine {
     fn scan(&self, bp: &mut BufferPool) -> Result<Box<dyn RowScanner>> {
         Ok(Box::new(HeapScanner::new(bp, self.file)?))
+    }
+
+    fn get(&self, bp: &mut BufferPool, rid: Rid) -> Result<Vec<u8>> {
+        HeapFile::at(self.file).get(bp, rid)
     }
 }
 
