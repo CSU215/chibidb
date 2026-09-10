@@ -395,6 +395,106 @@ fn in_list_filters_with_three_valued_logic() {
 }
 
 #[test]
+fn in_subquery_matches_uncorrelated_selects() {
+    with_dbs(|db| {
+        db.execute_sql("create table a (id int);").unwrap();
+        db.execute_sql("create table b (v int, a_id int);").unwrap();
+        db.execute_sql("insert into a values (1), (2), (3), (null);").unwrap();
+        db.execute_sql("insert into b values (10, 1), (20, 2), (30, 3), (40, null);")
+            .unwrap();
+
+        let vs = |db: &mut Database, sql: &str| -> Vec<i64> {
+            let rs = db.execute_sql(sql).unwrap();
+            let (_, r) = rows(&rs);
+            r.iter()
+                .map(|row| match row[0] {
+                    Value::Int(n) => n,
+                    ref v => panic!("{v:?}"),
+                })
+                .collect()
+        };
+
+        // the subquery's NULL row must not match anything (UNKNOWN)
+        assert_eq!(
+            vs(db, "select v from b where a_id in (select id from a) order by v;"),
+            [10, 20, 30]
+        );
+        assert_eq!(
+            vs(db, "select v from b where a_id not in (select id from a) order by v;"),
+            Vec::<i64>::new(),
+            "NOT IN over a set containing NULL yields no rows"
+        );
+        // empty subquery: IN matches nothing, NOT IN matches everything
+        assert_eq!(
+            vs(db, "select v from b where a_id in (select id from a where id > 99);"),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            vs(db, "select v from b where a_id not in (select id from a where id > 99) order by v;"),
+            [10, 20, 30, 40]
+        );
+        // subquery with aggregates and where clauses works too
+        assert_eq!(
+            vs(db, "select v from b where a_id in (select max(id) from a);"),
+            [30]
+        );
+        // multi-column subquery is rejected
+        let err = db.execute_sql("select v from b where a_id in (select id, a_id from a, b);").unwrap_err();
+        assert!(err.to_string().contains("single column"), "{err}");
+    });
+}
+
+#[test]
+fn exists_predicate() {
+    with_dbs(|db| {
+        db.execute_sql("create table a (id int);").unwrap();
+        db.execute_sql("create table b (v int);").unwrap();
+        db.execute_sql("insert into a values (1);").unwrap();
+        db.execute_sql("insert into b values (10), (20);").unwrap();
+
+        // uncorrelated EXISTS: every row of b sees a non-empty a
+        let rs = db.execute_sql("select v from b where exists (select id from a);").unwrap();
+        assert_eq!(rows(&rs).1.len(), 2);
+        // NOT EXISTS folds through the existing unary NOT
+        let rs = db.execute_sql("select v from b where not exists (select id from a);").unwrap();
+        assert_eq!(rows(&rs).1.len(), 0);
+        let rs = db
+            .execute_sql("select v from b where exists (select id from a where id > 99);")
+            .unwrap();
+        assert_eq!(rows(&rs).1.len(), 0);
+    });
+}
+
+#[test]
+fn scalar_subquery() {
+    with_dbs(|db| {
+        db.execute_sql("create table a (id int);").unwrap();
+        db.execute_sql("create table b (v int);").unwrap();
+        db.execute_sql("insert into a values (7), (9);").unwrap();
+        db.execute_sql("insert into b values (7), (9), (100);").unwrap();
+
+        let rs = db.execute_sql("select v from b where v = (select max(id) from a);").unwrap();
+        assert_eq!(rows(&rs).1, [[Value::Int(9)]]);
+
+        // arithmetic over a scalar subquery
+        let rs = db
+            .execute_sql("select v from b where v = (select max(id) from a) - 2;")
+            .unwrap();
+        assert_eq!(rows(&rs).1, [[Value::Int(7)]]);
+
+        // empty scalar subquery yields NULL, which compares UNKNOWN
+        let rs = db
+            .execute_sql("select v from b where v = (select id from a where id > 99);")
+            .unwrap();
+        assert_eq!(rows(&rs).1.len(), 0);
+
+        // more than one row is an error
+        let err = db.execute_sql("select v from b where v = (select id from a);").unwrap_err();
+        assert!(err.to_string().contains("more than one row"), "{err}");
+    });
+}
+
+#[test]
 fn date_type() {
     with_dbs(|db| {
         db.execute_sql("create table t (id int, birthday date);").unwrap();

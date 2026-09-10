@@ -590,6 +590,24 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr> {
+        // EXISTS (SELECT ...)
+        if self.at_keyword("exists")
+            && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                        Some(TokenKind::Punct(Punct::LParen)))
+            && matches!(self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                        Some(TokenKind::Ident(s)) if s.eq_ignore_ascii_case("select"))
+        {
+            self.pos += 2; // 'exists' and '('
+            if !self.eat_keyword("select") {
+                return Err(self.unexpected("select"));
+            }
+            let sub = match self.parse_select()? {
+                Stmt::Select(s) => *s,
+                _ => unreachable!("parse_select only returns select"),
+            };
+            self.expect_punct(Punct::RParen)?;
+            return Ok(Expr::Exists { sub: Box::new(sub) });
+        }
         if let Some(func) = self.peek_agg_fn()
             && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind),
                         Some(TokenKind::Punct(Punct::LParen)))
@@ -631,6 +649,18 @@ impl Parser {
             }
             Some(Token { kind: TokenKind::Ident(s), .. }) => Ok(Expr::Column(s.clone())),
             Some(Token { kind: TokenKind::Punct(Punct::LParen), .. }) => {
+                // scalar subquery: (SELECT ...)
+                if self.at_keyword("select") {
+                    if !self.eat_keyword("select") {
+                        return Err(self.unexpected("select"));
+                    }
+                    let sub = match self.parse_select()? {
+                        Stmt::Select(s) => *s,
+                        _ => unreachable!("parse_select only returns select"),
+                    };
+                    self.expect_punct(Punct::RParen)?;
+                    return Ok(Expr::ScalarSubquery(Box::new(sub)));
+                }
                 let e = self.parse_expr()?;
                 self.expect_punct(Punct::RParen)?;
                 Ok(e)

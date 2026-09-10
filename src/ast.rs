@@ -56,8 +56,14 @@ pub enum Expr {
     IsNull(Box<Expr>, bool),
     Aggregate(AggFunc, Option<Box<Expr>>),
     QualifiedColumn(String, String),
+    /// A materialized literal produced by lifting subqueries.
+    Value(crate::value::Value),
     /// `[NOT] IN (SELECT ...)`; materialized before row evaluation.
     InSubquery { expr: Box<Expr>, sub: Box<SelectStmt>, negated: bool },
+    /// `EXISTS (SELECT ...)` / `NOT EXISTS`; materialized before evaluation.
+    Exists { sub: Box<SelectStmt> },
+    /// A scalar `(SELECT ...)`; materialized to a single value.
+    ScalarSubquery(Box<SelectStmt>),
 }
 
 impl fmt::Display for Expr {
@@ -75,7 +81,10 @@ impl fmt::Display for Expr {
             Expr::Aggregate(func, None) => write!(f, "({func} *)"),
             Expr::Aggregate(func, Some(e)) => write!(f, "({func} {e})"),
             Expr::QualifiedColumn(t, c) => write!(f, "{t}.{c}"),
+            Expr::Value(v) => write!(f, "{v}"),
             Expr::InSubquery { .. } => write!(f, "(in-subquery)"),
+            Expr::Exists { .. } => write!(f, "(exists)"),
+            Expr::ScalarSubquery(_) => write!(f, "(subquery)"),
         }
     }
 }
