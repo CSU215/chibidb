@@ -8,7 +8,7 @@ use crate::{Database, Error, Result};
 
 use super::coerce;
 use super::decode_visible;
-use super::eval::{eval_const, expr_has_column};
+use super::eval::{eval_const, expr_has_column, expr_has_subquery};
 
 pub(crate) fn execute_explain(db: &mut Database, e: &ExplainStmt) -> Result<ResultSet> {
     match &*e.stmt {
@@ -117,9 +117,12 @@ fn find_sargable(
     for conj in split_conjuncts(sel) {
         let (col_expr, op, lit) = match conj {
             Expr::Binary(op @ (BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge), l, r) => {
-                if matches!(**l, Expr::Column(_)) && !expr_has_column(r) {
+                if matches!(**l, Expr::Column(_)) && !expr_has_column(r) && !expr_has_subquery(r) {
                     ((**l).clone(), *op, (**r).clone())
-                } else if matches!(**r, Expr::Column(_)) && !expr_has_column(l) {
+                } else if matches!(**r, Expr::Column(_))
+                    && !expr_has_column(l)
+                    && !expr_has_subquery(l)
+                {
                     match flip_cmp(*op) {
                         Some(flip) => ((**r).clone(), flip, (**l).clone()),
                         None => continue,

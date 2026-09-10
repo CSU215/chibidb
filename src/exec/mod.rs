@@ -23,7 +23,7 @@ use aggregate::{apply_limit, dedup_rows, execute_grouped_select, expr_has_aggreg
 use eval::{eval, eval_predicate, EvalCtx};
 use join::nested_loop;
 use plan::{execute_explain, index_scan_source};
-use subquery::lift_subqueries;
+use subquery::{eval_bound, eval_predicate_bound};
 
 pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Result<ResultSet> {
     match stmt {
@@ -42,7 +42,7 @@ pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Res
         Stmt::Checkpoint => execute_checkpoint(db, trx),
         Stmt::Vacuum => execute_vacuum(db, trx),
         Stmt::Insert(i) => execute_insert(db, trx, i),
-        Stmt::Select(s) => execute_select(db, trx, s),
+        Stmt::Select(s) => execute_select(db, trx, s, None),
         Stmt::Delete(d) => execute_delete(db, trx, d),
         Stmt::Update(u) => execute_update(db, trx, u),
         Stmt::Explain(e) => execute_explain(db, e),
@@ -116,7 +116,7 @@ fn execute_create_view(
     let Some(Stmt::Select(sel)) = stmts.into_iter().next() else {
         return Err(Error::Runtime("view must be defined by a select".into()));
     };
-    execute_select(db, trx, &sel)?;
+    execute_select(db, trx, &sel, None)?;
     db.catalog_mut().create_view(&c.name, c.sql.clone())?;
     db.save_catalog()?;
     Ok(ResultSet::Message("SUCCESS".into()))
@@ -178,7 +178,7 @@ fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Resu
         }
         let mut new_row = row.clone();
         for (idx, col, dtype, expr) in &assigns {
-            let v = eval(expr, Some(&EvalCtx::Row(&schema, &row)))?;
+            let v = eval(expr, Some(&EvalCtx::row(&schema, &row)))?;
             new_row[*idx] = coerce(v, *dtype, col)?;
         }
         updates.push((rid, new_row));
@@ -313,8 +313,8 @@ pub(crate) fn execute_select(
     db: &mut Database,
     trx: &mut TrxState,
     s: &SelectStmt,
+    outer: Option<&EvalCtx>,
 ) -> Result<ResultSet> {
-    let s = &lift_subqueries(db, trx, s)?;
     if s.from.is_empty() {
         let mut columns = Vec::new();
         let mut row = Vec::new();
@@ -322,11 +322,11 @@ pub(crate) fn execute_select(
             match item {
                 SelectItem::Expr(e) => {
                     columns.push(e.to_string());
-                    row.push(eval_const(e)?);
+                    row.push(eval_bound(db, trx, e, outer)?);
                 }
                 SelectItem::Aliased(e, alias) => {
                     columns.push(alias.clone());
-                    row.push(eval_const(e)?);
+                    row.push(eval_bound(db, trx, e, outer)?);
                 }
                 SelectItem::Star => {
                     return Err(Error::Runtime("select * requires from".into()))
@@ -340,10 +340,10 @@ pub(crate) fn execute_select(
     let (schema, source_rows) = if s.from.len() == 1 {
         match index_scan_source(db, trx, &s.from[0].name, s.selection.as_ref())? {
             Some(scanned) => (single_table_schema(db, &s.from[0])?, scanned),
-            None => nested_loop(db, trx, s)?,
+            None => nested_loop(db, trx, s, outer)?,
         }
     } else {
-        nested_loop(db, trx, s)?
+        nested_loop(db, trx, s, outer)?
     };
     let mut headers = Vec::new();
     let mut exprs = Vec::new();
@@ -372,7 +372,7 @@ pub(crate) fn execute_select(
     let mut filtered: Vec<Vec<Value>> = Vec::new();
     for row in source_rows {
         if let Some(sel) = &s.selection
-            && !eval_predicate(sel, &schema, &row)? {
+            && !eval_predicate_bound(db, trx, sel, &schema, &row, outer)? {
                 continue;
             }
         filtered.push(row);
@@ -384,16 +384,18 @@ pub(crate) fn execute_select(
         || s.having.as_ref().is_some_and(expr_has_aggregate);
 
     if !s.group_by.is_empty() || has_aggregate {
-        return execute_grouped_select(&schema, s, filtered, headers, exprs);
+        return execute_grouped_select(db, trx, outer, &schema, s, filtered, headers, exprs);
     }
     if !s.order_by.is_empty() {
-        sort_rows(&schema, &mut filtered, &s.order_by, &s.items)?;
+        sort_rows(db, trx, outer, &schema, &mut filtered, &s.order_by, &s.items)?;
     }
     let mut out_rows = Vec::new();
     for row in filtered {
+        let mut ctx = EvalCtx::row(&schema, &row);
+        ctx.parent = outer;
         let mut out_row = Vec::with_capacity(exprs.len());
         for e in &exprs {
-            out_row.push(eval(e, Some(&EvalCtx::Row(&schema, &row)))?);
+            out_row.push(eval_bound(db, trx, e, Some(&ctx))?);
         }
         out_rows.push(out_row);
     }

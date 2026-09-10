@@ -5,9 +5,26 @@ use crate::{Error, Result};
 
 use super::aggregate::eval_aggregate;
 
-pub(crate) enum EvalCtx<'a> {
+pub(crate) enum Scope<'a> {
     Row(&'a Schema, &'a [Value]),
     Group(&'a Schema, &'a [Vec<Value>]),
+}
+
+/// An evaluation context. `parent` links to the enclosing query's context
+/// so correlated subqueries can resolve outer columns.
+pub(crate) struct EvalCtx<'a> {
+    pub(crate) scope: Scope<'a>,
+    pub(crate) parent: Option<&'a EvalCtx<'a>>,
+}
+
+impl<'a> EvalCtx<'a> {
+    pub(crate) fn row(schema: &'a Schema, row: &'a [Value]) -> Self {
+        EvalCtx { scope: Scope::Row(schema, row), parent: None }
+    }
+
+    pub(crate) fn group(schema: &'a Schema, rows: &'a [Vec<Value>]) -> Self {
+        EvalCtx { scope: Scope::Group(schema, rows), parent: None }
+    }
 }
 
 pub fn eval_const(expr: &Expr) -> Result<Value> {
@@ -15,13 +32,45 @@ pub fn eval_const(expr: &Expr) -> Result<Value> {
 }
 
 pub(crate) fn eval_predicate(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<bool> {
-    match eval(expr, Some(&EvalCtx::Row(schema, row)))? {
+    match eval(expr, Some(&EvalCtx::row(schema, row)))? {
         Value::Bool(b) => Ok(b),
         Value::Null => Ok(false),
         _ => Err(Error::Runtime(
             "where clause must evaluate to boolean".into(),
         )),
     }
+}
+
+/// Resolves a (possibly qualified) column, walking outward through parent
+/// contexts; this is what makes correlated subqueries work. An ambiguous
+/// column in the innermost scope is an error rather than a fallback.
+fn resolve_column(ctx: Option<&EvalCtx>, qual: Option<&str>, name: &str) -> Result<Value> {
+    let mut cur = ctx;
+    let mut last_err: Option<Error> = None;
+    while let Some(c) = cur {
+        let resolved = match &c.scope {
+            Scope::Row(schema, row) => schema.resolve(qual, name).map(|i| row[i].clone()),
+            Scope::Group(schema, rows) => schema.resolve(qual, name).map(|i| {
+                rows.first().map(|r| r[i].clone()).unwrap_or(Value::Null)
+            }),
+        };
+        match resolved {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if e.to_string().contains("ambiguous") {
+                    return Err(e);
+                }
+                last_err = Some(e);
+            }
+        }
+        cur = c.parent;
+    }
+    Err(last_err.unwrap_or_else(|| {
+        Error::Runtime(match qual {
+            Some(q) => format!("no such column: {q}.{name}"),
+            None => format!("no such column: {name}"),
+        })
+    }))
 }
 
 pub(crate) fn expr_has_column(expr: &Expr) -> bool {
@@ -36,42 +85,30 @@ pub(crate) fn expr_has_column(expr: &Expr) -> bool {
     }
 }
 
+pub(crate) fn expr_has_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => true,
+        Expr::Unary(_, e) | Expr::IsNull(e, _) => expr_has_subquery(e),
+        Expr::Binary(_, l, r) => expr_has_subquery(l) || expr_has_subquery(r),
+        Expr::Like { expr, pattern, .. } => expr_has_subquery(expr) || expr_has_subquery(pattern),
+        Expr::Function(_, args) => args.iter().any(expr_has_subquery),
+        Expr::Aggregate(_, Some(e)) => expr_has_subquery(e),
+        _ => false,
+    }
+}
+
 pub(crate) fn eval(expr: &Expr, ctx: Option<&EvalCtx>) -> Result<Value> {
     match expr {
         Expr::Int(n) => Ok(Value::Int(*n)),
         Expr::Float(x) => Ok(Value::Float(*x)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
         Expr::Null => Ok(Value::Null),
-        Expr::Column(c) => match ctx {
-            None => Err(Error::Runtime(format!("no such column: {c}"))),
-            Some(EvalCtx::Row(schema, row)) => {
-                let idx = schema.resolve(None, c)?;
-                Ok(row[idx].clone())
+        Expr::Column(c) => resolve_column(ctx, None, c),
+        Expr::QualifiedColumn(t, c) => resolve_column(ctx, Some(t), c),
+        Expr::Aggregate(func, arg) => match ctx.map(|c| &c.scope) {
+            Some(Scope::Group(schema, rows)) => {
+                eval_aggregate(*func, arg.as_deref(), schema, rows)
             }
-            Some(EvalCtx::Group(schema, rows)) => {
-                let idx = schema.resolve(None, c)?;
-                Ok(rows
-                    .first()
-                    .map(|row| row[idx].clone())
-                    .unwrap_or(Value::Null))
-            }
-        },
-        Expr::QualifiedColumn(t, c) => match ctx {
-            None => Err(Error::Runtime(format!("no such column: {t}.{c}"))),
-            Some(EvalCtx::Row(schema, row)) => {
-                let idx = schema.resolve(Some(t), c)?;
-                Ok(row[idx].clone())
-            }
-            Some(EvalCtx::Group(schema, rows)) => {
-                let idx = schema.resolve(Some(t), c)?;
-                Ok(rows
-                    .first()
-                    .map(|row| row[idx].clone())
-                    .unwrap_or(Value::Null))
-            }
-        },
-        Expr::Aggregate(func, arg) => match ctx {
-            Some(&EvalCtx::Group(schema, rows)) => eval_aggregate(*func, arg.as_deref(), schema, rows),
             _ => Err(Error::Runtime("aggregate not allowed here".into())),
         },
         Expr::Unary(op, e) => {

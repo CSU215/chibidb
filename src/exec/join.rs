@@ -5,7 +5,8 @@ use crate::trx::TrxState;
 use crate::value::Value;
 use crate::{Database, Error, Result};
 
-use super::eval::eval_predicate;
+use super::eval::EvalCtx;
+use super::subquery::eval_predicate_bound;
 use super::{decode_visible, execute_select};
 
 /// Resolves a FROM reference: a real table (MVCC-visible rows) or a view
@@ -29,7 +30,7 @@ fn from_source(
     let Some(Stmt::Select(sel)) = stmts.into_iter().next() else {
         return Err(Error::Runtime(format!("corrupt view definition: {}", tref.name)));
     };
-    match execute_select(db, trx, &sel)? {
+    match execute_select(db, trx, &sel, None)? {
         ResultSet::Rows { columns, rows } => Ok((
             columns
                 .into_iter()
@@ -54,6 +55,7 @@ pub(crate) fn nested_loop(
     db: &mut Database,
     trx: &mut TrxState,
     s: &SelectStmt,
+    outer: Option<&EvalCtx>,
 ) -> Result<(Schema, Vec<Vec<Value>>)> {
     let mut schema = Schema::default();
     let mut rows: Vec<Vec<Value>> = vec![vec![]];
@@ -80,7 +82,7 @@ pub(crate) fn nested_loop(
                 for right in &visible {
                     let mut row = left.clone();
                     row.extend(right.iter().cloned());
-                    if eval_predicate(cond, &schema, &row)? {
+                    if eval_predicate_bound(db, trx, cond, &schema, &row, outer)? {
                         combined.push(row);
                         matched = true;
                     }
@@ -103,7 +105,7 @@ pub(crate) fn nested_loop(
                 && let Some(cond) = cond {
                     let mut kept = Vec::with_capacity(combined.len());
                     for row in combined {
-                        if eval_predicate(cond, &schema, &row)? {
+                        if eval_predicate_bound(db, trx, cond, &schema, &row, outer)? {
                             kept.push(row);
                         }
                     }

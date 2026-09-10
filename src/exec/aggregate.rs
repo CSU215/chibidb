@@ -1,10 +1,14 @@
 use crate::ast::{AggFunc, BinOp, Expr, Limit, SelectItem, SelectStmt};
 use crate::catalog::Schema;
 use crate::result::ResultSet;
+use crate::trx::TrxState;
 use crate::value::Value;
-use crate::{Error, Result};
+use crate::{Database, Error, Result};
 
-use super::eval::{cmp_values, eval, eval_binary, eval_const, expr_has_column, type_mismatch, EvalCtx};
+use super::eval::{
+    cmp_values, eval, eval_binary, eval_const, expr_has_column, type_mismatch, EvalCtx,
+};
+use super::subquery::eval_bound;
 
 pub(crate) fn expr_has_aggregate(expr: &Expr) -> bool {
     match expr {
@@ -31,7 +35,7 @@ pub(crate) fn eval_aggregate(
         Some(e) => {
             let mut vals = Vec::with_capacity(rows.len());
             for row in rows {
-                match eval(e, Some(&EvalCtx::Row(schema, row)))? {
+                match eval(e, Some(&EvalCtx::row(schema, row)))? {
                     Value::Null => {}
                     v => vals.push(v),
                 }
@@ -92,7 +96,11 @@ pub(crate) fn eval_aggregate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_grouped_select(
+    db: &mut Database,
+    trx: &mut TrxState,
+    outer: Option<&EvalCtx>,
     schema: &Schema,
     s: &SelectStmt,
     filtered: Vec<Vec<Value>>,
@@ -119,9 +127,11 @@ pub(crate) fn execute_grouped_select(
         groups.push((vec![], filtered));
     } else {
         for row in filtered {
+            let mut ctx = EvalCtx::row(schema, &row);
+            ctx.parent = outer;
             let mut key = Vec::with_capacity(s.group_by.len());
             for g in &s.group_by {
-                key.push(eval(g, Some(&EvalCtx::Row(schema, &row)))?);
+                key.push(eval_bound(db, trx, g, Some(&ctx))?);
             }
             match groups.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, rows)) => rows.push(row),
@@ -132,7 +142,9 @@ pub(crate) fn execute_grouped_select(
     let mut surviving: Vec<Vec<Vec<Value>>> = Vec::new();
     for (_, group_rows) in groups {
         if let Some(having) = &s.having {
-            match eval(having, Some(&EvalCtx::Group(schema, &group_rows)))? {
+            let mut ctx = EvalCtx::group(schema, &group_rows);
+            ctx.parent = outer;
+            match eval_bound(db, trx, having, Some(&ctx))? {
                 Value::Bool(true) => {}
                 Value::Bool(false) | Value::Null => continue,
                 _ => {
@@ -145,13 +157,15 @@ pub(crate) fn execute_grouped_select(
         surviving.push(group_rows);
     }
     if !s.order_by.is_empty() {
-        sort_groups(schema, &mut surviving, &s.order_by, &s.items)?;
+        sort_groups(db, trx, outer, schema, &mut surviving, &s.order_by, &s.items)?;
     }
     let mut out_rows = Vec::new();
     for group_rows in surviving {
+        let mut ctx = EvalCtx::group(schema, &group_rows);
+        ctx.parent = outer;
         let mut out_row = Vec::with_capacity(exprs.len());
         for e in &exprs {
-            out_row.push(eval(e, Some(&EvalCtx::Group(schema, &group_rows)))?);
+            out_row.push(eval_bound(db, trx, e, Some(&ctx))?);
         }
         out_rows.push(out_row);
     }
@@ -222,14 +236,17 @@ fn resolve_order_expr<'a>(expr: &'a Expr, aliases: &'a [(String, Expr)]) -> &'a 
 }
 
 fn eval_sort_keys(
+    db: &mut Database,
+    trx: &mut TrxState,
     ctx: EvalCtx,
     order_by: &[(Expr, bool)],
     aliases: &[(String, Expr)],
 ) -> Result<Vec<Value>> {
-    order_by
-        .iter()
-        .map(|(e, _)| eval(resolve_order_expr(e, aliases), Some(&ctx)))
-        .collect()
+    let mut keys = Vec::with_capacity(order_by.len());
+    for (e, _) in order_by {
+        keys.push(eval_bound(db, trx, resolve_order_expr(e, aliases), Some(&ctx))?);
+    }
+    Ok(keys)
 }
 
 fn cmp_sort_keys(a: &[Value], b: &[Value], order_by: &[(Expr, bool)]) -> std::cmp::Ordering {
@@ -250,6 +267,9 @@ fn cmp_sort_keys(a: &[Value], b: &[Value], order_by: &[(Expr, bool)]) -> std::cm
 }
 
 pub(crate) fn sort_rows(
+    db: &mut Database,
+    trx: &mut TrxState,
+    outer: Option<&EvalCtx>,
     schema: &Schema,
     rows: &mut Vec<Vec<Value>>,
     order_by: &[(Expr, bool)],
@@ -258,7 +278,9 @@ pub(crate) fn sort_rows(
     let aliases = select_aliases(items);
     let mut pairs: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
     for row in rows.drain(..) {
-        let keys = eval_sort_keys(EvalCtx::Row(schema, &row), order_by, &aliases)?;
+        let mut ctx = EvalCtx::row(schema, &row);
+        ctx.parent = outer;
+        let keys = eval_sort_keys(db, trx, ctx, order_by, &aliases)?;
         pairs.push((row, keys));
     }
     pairs.sort_by(|(_, ka), (_, kb)| cmp_sort_keys(ka, kb, order_by));
@@ -266,7 +288,11 @@ pub(crate) fn sort_rows(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sort_groups(
+    db: &mut Database,
+    trx: &mut TrxState,
+    outer: Option<&EvalCtx>,
     schema: &Schema,
     groups: &mut Vec<Vec<Vec<Value>>>,
     order_by: &[(Expr, bool)],
@@ -275,7 +301,9 @@ fn sort_groups(
     let aliases = select_aliases(items);
     let mut pairs: Vec<(Vec<Vec<Value>>, Vec<Value>)> = Vec::with_capacity(groups.len());
     for group in groups.drain(..) {
-        let keys = eval_sort_keys(EvalCtx::Group(schema, &group), order_by, &aliases)?;
+        let mut ctx = EvalCtx::group(schema, &group);
+        ctx.parent = outer;
+        let keys = eval_sort_keys(db, trx, ctx, order_by, &aliases)?;
         pairs.push((group, keys));
     }
     pairs.sort_by(|(_, ka), (_, kb)| cmp_sort_keys(ka, kb, order_by));
