@@ -11,11 +11,15 @@ cargo run -q                    # 内存数据库 REPL（临时目录后端，�
 cargo run -q -- <dir>           # 文件数据库 REPL（数据落盘，重启不丢）
 cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（296 tests）
+cargo test                      # 全量回归（312 tests）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
 REPL / client 中输入 `exit` 或 `quit` 退出。
+
+启动时从当前目录读取 `config.toml`（缺失则全用默认值）。已生效条目：
+`storage.buffer_pool_frames`、`wal.checkpoint_threshold`、`server.addr`；其余为后续阶段预留
+（详见 `HANDOFF.md` §10 重构路线图）。
 
 ### 冒烟演示
 
