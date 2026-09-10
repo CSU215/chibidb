@@ -11,7 +11,7 @@ use crate::trx::{TrxState, Undo};
 use crate::value::Value;
 use crate::{Database, Error, Result};
 
-pub fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Result<ResultSet> {
+pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Result<ResultSet> {
     match stmt {
         Stmt::CreateTable(c) if trx.explicit => ddl_in_trx(trx),
         Stmt::CreateTable(c) => execute_create_table(db, c),
@@ -437,8 +437,8 @@ fn execute_select(db: &mut Database, trx: &mut TrxState, s: &SelectStmt) -> Resu
     }
     // index scan only helps single-table scans
     let mut source_rows: Vec<Vec<Value>> = rows;
-    if s.from.len() == 1 {
-        if let Some(sarg) = find_sargable(db, &s.from[0].name, s.selection.as_ref())? {
+    if s.from.len() == 1
+        && let Some(sarg) = find_sargable(db, &s.from[0].name, s.selection.as_ref())? {
             let lit_val = eval_const(&sarg.lit)?;
             let coerced = coerce(lit_val, sarg.dtype, &sarg.column)?;
             let key = encode_key(&coerced)?;
@@ -460,14 +460,12 @@ fn execute_select(db: &mut Database, trx: &mut TrxState, s: &SelectStmt) -> Resu
             };
             source_rows = decode_visible(db.store_get_records(&s.from[0].name, &rids)?, trx)?;
         }
-    }
     let mut filtered: Vec<Vec<Value>> = Vec::new();
     for row in source_rows {
-        if let Some(sel) = &s.selection {
-            if !eval_predicate(sel, &schema, &row)? {
+        if let Some(sel) = &s.selection
+            && !eval_predicate(sel, &schema, &row)? {
                 continue;
             }
-        }
         filtered.push(row);
     }
     let has_aggregate = s
@@ -531,13 +529,12 @@ fn execute_grouped_select(
     }
     if s.group_by.is_empty() {
         for it in &s.items {
-            if let SelectItem::Expr(e) | SelectItem::Aliased(e, _) = it {
-                if expr_has_column(e) {
+            if let SelectItem::Expr(e) | SelectItem::Aliased(e, _) = it
+                && expr_has_column(e) {
                     return Err(Error::Runtime(
                         "column must appear in group by or aggregate".into(),
                     ));
                 }
-            }
         }
     }
     let mut groups: Vec<(Vec<Value>, Vec<Vec<Value>>)> = Vec::new();

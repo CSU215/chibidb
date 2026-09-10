@@ -11,6 +11,12 @@ pub struct DiskManager {
     next_file_id: FileId,
 }
 
+impl Default for DiskManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DiskManager {
     pub fn new() -> Self {
         Self { files: BTreeMap::new(), next_file_id: 0 }

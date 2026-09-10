@@ -12,6 +12,9 @@ use crate::{Error, Result};
 
 const MAGIC: [u8; 8] = *b"CHIDBTX1";
 
+/// (separator key, child page) pairs of an internal node.
+type InternalEntries = Vec<(Vec<u8>, PageNo)>;
+
 /// Pages below this occupancy (in bytes) are underfull and trigger borrow/merge.
 const MIN_OCCUPANCY: usize = PAGE_SIZE / 4;
 
@@ -527,22 +530,20 @@ impl BTree {
             let child_next = self.leaf_chain_next(bp, child)?;
             self.append_leaf_entries(bp, left, child)?;
             self.set_leaf_next(bp, left, child_next)?;
-            if let Some(next) = child_next {
-                if next != 0 {
+            if let Some(next) = child_next
+                && next != 0 {
                     self.set_leaf_prev(bp, next, left)?;
                 }
-            }
             internal_sep_remove(bp, self.file, parent, idx - 1)
         } else if let Some(right) = right {
             if self.can_merge_leaves(bp, child, right)? {
                 let right_next = self.leaf_chain_next(bp, right)?;
                 self.append_leaf_entries(bp, child, right)?;
                 self.set_leaf_next(bp, child, right_next)?;
-                if let Some(next) = right_next {
-                    if next != 0 {
+                if let Some(next) = right_next
+                    && next != 0 {
                         self.set_leaf_prev(bp, next, child)?;
                     }
-                }
                 internal_sep_remove(bp, self.file, parent, idx)
             } else {
                 Err(Error::Runtime("index merge overflow".into()))
@@ -654,7 +655,7 @@ impl BTree {
         &self,
         bp: &mut BufferPool,
         page: PageNo,
-    ) -> Result<(PageNo, Vec<(Vec<u8>, PageNo)>)> {
+    ) -> Result<(PageNo, InternalEntries)> {
         bp.read_page(self.file, page, |p| {
             Ok((internal_first_child(p), internal_entries(p).collect()))
         })
@@ -737,10 +738,9 @@ impl BTree {
         let entries: Vec<(Vec<u8>, Rid)> =
             bp.read_page(self.file, source, |p| Ok(leaf_entries(p).collect()))?;
         bp.with_page(self.file, target, |p| {
-            let mut n = leaf_num(p);
-            for (k, r) in entries {
-                leaf_insert_at(p, n, &k, r)?;
-                n += 1;
+            let n = leaf_num(p);
+            for (i, (k, r)) in (n..).zip(entries) {
+                leaf_insert_at(p, i, &k, r)?;
             }
             Ok(())
         })
@@ -844,7 +844,7 @@ fn u32_get(page: &[u8], off: usize) -> PageNo {
 }
 
 fn u32_put(page: &mut [u8], off: usize, v: PageNo) {
-    page[off..off + 4].copy_from_slice(&(v as u32).to_le_bytes());
+    page[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
 fn leaf_entry(page: &[u8], i: usize) -> (Vec<u8>, Rid) {

@@ -129,7 +129,7 @@ fn uncommitted_updates_are_invisible_to_others() {
 fn rollback_restores_updates() {
     let mut db = Database::open_in_memory().unwrap();
     let mut a = Session::new();
-    let mut b = Session::new();
+    let _b = Session::new();
     setup(&mut db, &mut a);
     db.execute_sql_with(&mut a, "insert into t values (1, 'old');").unwrap();
 

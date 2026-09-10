@@ -72,7 +72,7 @@ fn empty_catalog_roundtrips() {
 fn rejects_garbage() {
     assert!(decode_catalog(&[]).is_err());
     assert!(decode_catalog(b"XXXXXXXX").is_err(), "bad magic");
-    assert!(decode_catalog(&b"CHIDCATX".to_vec()).is_err(), "truncated header");
+    assert!(decode_catalog(b"CHIDCATX".as_ref()).is_err(), "truncated header");
     let mut bytes = encode_catalog(&snapshot());
     bytes.truncate(bytes.len() - 3);
     assert!(decode_catalog(&bytes).is_err(), "truncated body");

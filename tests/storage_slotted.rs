@@ -62,7 +62,7 @@ fn freed_space_is_reusable_after_compact() {
     // delete one record, its space must be reusable (compaction)
     page_delete(&mut page, 0).unwrap();
     assert_eq!(page_iter(&page).count(), used_before - 1);
-    page_insert(&mut page, &vec![b'z'; 100]).unwrap();
+    page_insert(&mut page, &[b'z'; 100]).unwrap();
     assert_eq!(page_iter(&page).count(), used_before);
 }
 

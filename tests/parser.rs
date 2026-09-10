@@ -240,7 +240,7 @@ fn select(sql: &str) -> chibidb::ast::SelectStmt {
     let stmts = parse(sql).unwrap();
     assert_eq!(stmts.len(), 1, "sql: {sql}");
     match stmts.into_iter().next().unwrap() {
-        Stmt::Select(s) => s,
+        Stmt::Select(s) => *s,
         other => panic!("expected select, got {other:?}"),
     }
 }
@@ -414,7 +414,7 @@ fn parses_explain() {
         Stmt::Explain(inner) => {
             assert_eq!(
                 *inner.stmt,
-                Stmt::Select(chibidb::ast::SelectStmt {
+                Stmt::Select(Box::new(chibidb::ast::SelectStmt {
                     items: vec![chibidb::ast::SelectItem::Expr(chibidb::ast::Expr::Int(1))],
                     from: vec![],
                     on: vec![],
@@ -423,7 +423,7 @@ fn parses_explain() {
                     having: None,
                     order_by: vec![],
                     limit: None,
-                })
+                }))
             );
         }
         other => panic!("expected explain, got {other:?}"),
@@ -461,9 +461,9 @@ fn parses_order_by() {
 
     let s = select("select id from t order by score desc, name asc, id;");
     assert_eq!(s.order_by.len(), 3);
-    assert_eq!(s.order_by[0].1, true);
-    assert_eq!(s.order_by[1].1, false);
-    assert_eq!(s.order_by[2].1, false, "default is asc");
+    assert!(s.order_by[0].1);
+    assert!(!s.order_by[1].1);
+    assert!(!s.order_by[2].1, "default is asc");
 
     err("select 1 from t order;");
     err("select 1 from t order by;");

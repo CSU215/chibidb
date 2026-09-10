@@ -39,7 +39,7 @@ async fn main() -> std::io::Result<()> {
             server::serve(db, listener).await
         }
         // client
-        2 if args[1] == "client" => connect(&DEFAULT_ADDR.to_string()).await,
+        2 if args[1] == "client" => connect(DEFAULT_ADDR).await,
         3 if args[1] == "client" => connect(&args[2]).await,
         _ => usage(),
     }

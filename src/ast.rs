@@ -216,7 +216,7 @@ pub enum Stmt {
     DropTable(DropTableStmt),
     Explain(ExplainStmt),
     Insert(InsertStmt),
-    Select(SelectStmt),
+    Select(Box<SelectStmt>),
     Update(UpdateStmt),
     Trx(TrxCtl),
 }

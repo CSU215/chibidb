@@ -58,11 +58,8 @@ fn leaf_remove_shifts_and_frees_space() {
 fn leaf_rejects_when_full() {
     let mut page = leaf_page();
     let mut i = 0u32;
-    loop {
-        match leaf_insert_at(&mut page, i as usize, b"x", Rid::new(1, i as u16)) {
-            Ok(()) => i += 1,
-            Err(_) => break,
-        }
+    while leaf_insert_at(&mut page, i as usize, b"x", Rid::new(1, i as u16)).is_ok() {
+        i += 1;
     }
     assert!(i > 100, "page should hold many entries, got {i}");
     assert!(leaf_insert_at(&mut page, i as usize, b"x", Rid::new(9, 9)).is_err());

@@ -308,7 +308,7 @@ impl Parser {
         } else {
             None
         };
-        Ok(Stmt::Select(SelectStmt {
+        Ok(Stmt::Select(Box::new(SelectStmt {
             items,
             from,
             on,
@@ -317,7 +317,7 @@ impl Parser {
             having,
             order_by,
             limit,
-        }))
+        })))
     }
 
     fn parse_table_ref(&mut self) -> Result<TableRef> {
@@ -544,8 +544,8 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr> {
-        if let Some(func) = self.peek_agg_fn() {
-            if matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind),
+        if let Some(func) = self.peek_agg_fn()
+            && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind),
                         Some(TokenKind::Punct(Punct::LParen)))
             {
                 self.pos += 2; // consume name and '('
@@ -560,7 +560,6 @@ impl Parser {
                 self.expect_punct(Punct::RParen)?;
                 return Ok(Expr::Aggregate(func, arg));
             }
-        }
         // qualified column: ident '.' ident
         if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Ident(_)))
             && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::Punct(Punct::Dot)))

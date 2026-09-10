@@ -332,12 +332,11 @@ impl Database {
                     }
                     match exec::execute(self, session.trx(), other) {
                         Ok(rs) => {
-                            if autocommit {
-                                if let Some(trx) = session.trx.take() {
+                            if autocommit
+                                && let Some(trx) = session.trx.take() {
                                     let wrote = !trx.undo.is_empty();
                                     self.commit_trx(trx.id, wrote)?;
                                 }
-                            }
                             out.push(rs);
                         }
                         Err(e) => {

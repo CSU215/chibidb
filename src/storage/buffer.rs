@@ -132,12 +132,11 @@ impl BufferPool {
         let mut remap: HashMap<usize, usize> = HashMap::new();
         let mut new_frames = Vec::with_capacity(old_frames.len());
         for old_idx in lru_order {
-            if let Some(frame) = old_frames[old_idx].take() {
-                if frame.key.0 != file {
+            if let Some(frame) = old_frames[old_idx].take()
+                && frame.key.0 != file {
                     remap.insert(old_idx, new_frames.len());
                     new_frames.push(frame);
                 }
-            }
         }
         self.page_table.retain(|k, _| k.0 != file);
         for v in self.page_table.values_mut() {

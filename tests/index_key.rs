@@ -61,7 +61,7 @@ fn dates_and_nulls_order_preserving() {
     let null = key(Value::Null);
     let d1 = key(Value::Date(0));
     let d2 = key(Value::Date(10757));
-    let d3 = key(Value::Date(i32::MAX as i32));
+    let d3 = key(Value::Date(i32::MAX));
     assert!(null < d1 && d1 < d2 && d2 < d3);
     assert!(key(Value::Date(-1)) < key(Value::Date(0)));
 }

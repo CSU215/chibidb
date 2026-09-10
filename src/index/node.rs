@@ -23,7 +23,7 @@ fn u32_at(page: &[u8], off: usize) -> PageNo {
 }
 
 fn u32_set(page: &mut [u8], off: usize, v: PageNo) {
-    page[off..off + 4].copy_from_slice(&(v as u32).to_le_bytes());
+    page[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
 pub fn node_type(page: &[u8]) -> u8 {

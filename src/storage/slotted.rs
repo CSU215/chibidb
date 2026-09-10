@@ -62,9 +62,8 @@ pub fn page_insert(page: &mut [u8; PAGE_SIZE], record: &[u8]) -> Result<u16> {
             Ok(n as u16)
         }
     } 
-    .map(|slot| {
+    .inspect(|_slot| {
         set_free_upper(page, off);
-        slot
     })
 }
 
@@ -98,7 +97,7 @@ pub fn page_put_at(page: &mut [u8; PAGE_SIZE], slot: u16, record: &[u8]) -> Resu
     Ok(())
 }
 
-pub fn page_get<'a>(page: &'a [u8; PAGE_SIZE], slot: u16) -> Result<Option<&'a [u8]>> {
+pub fn page_get(page: &[u8; PAGE_SIZE], slot: u16) -> Result<Option<&[u8]>> {
     let n = num_slots(page);
     if slot as usize >= n {
         return Ok(None);
