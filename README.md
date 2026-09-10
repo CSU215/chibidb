@@ -11,7 +11,7 @@ cargo run -q                    # 内存数据库 REPL（临时目录后端，�
 cargo run -q -- <dir>           # 文件数据库 REPL（数据落盘，重启不丢）
 cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（328 tests）
+cargo test                      # 全量回归（336 tests）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -33,6 +33,8 @@ scripts\smoke.ps1
 ## 支持的 SQL
 
 ```sql
+-- 库（单实例多库；chibi_meta 为系统保留目录）
+CREATE DATABASE shop;  DROP DATABASE shop;  USE shop;
 -- DDL
 CREATE TABLE t (id int primary key, name char(10) not null,
                 score float default 0, email char(20) unique);
