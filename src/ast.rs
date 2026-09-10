@@ -160,6 +160,11 @@ pub struct DropIndexStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct DropTableStmt {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExplainStmt {
     pub stmt: Box<Stmt>,
 }
@@ -208,6 +213,7 @@ pub enum Stmt {
     CreateTable(CreateTableStmt),
     Delete(DeleteStmt),
     DropIndex(DropIndexStmt),
+    DropTable(DropTableStmt),
     Explain(ExplainStmt),
     Insert(InsertStmt),
     Select(SelectStmt),

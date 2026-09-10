@@ -63,6 +63,12 @@ pub(crate) struct IndexStore {
     pub file_no: u32,
 }
 
+/// Files to remove from disk after DROP TABLE.
+pub(crate) struct DroppedTable {
+    pub heap_file: FileId,
+    pub index_files: Vec<FileId>,
+}
+
 #[derive(Debug)]
 pub(crate) struct IndexEntry {
     pub name: String,
@@ -146,6 +152,26 @@ impl Catalog {
             .remove(name)
             .ok_or_else(|| Error::Runtime(format!("no such index: {name}")))?;
         Ok(())
+    }
+
+    /// Metadata of everything a DROP TABLE must clean up on disk.
+    pub(crate) fn drop_table(&mut self, name: &str) -> Result<DroppedTable> {
+        let table = self
+            .tables
+            .remove(name)
+            .ok_or_else(|| Error::Runtime(format!("no such table: {name}")))?;
+        let ix_names: Vec<String> = self
+            .indexes
+            .values()
+            .filter(|ix| ix.table == name)
+            .map(|ix| ix.name.clone())
+            .collect();
+        let mut index_files = Vec::with_capacity(ix_names.len());
+        for ix_name in ix_names {
+            let ix = self.indexes.remove(&ix_name).expect("name collected above");
+            index_files.push(ix.store.file);
+        }
+        Ok(DroppedTable { heap_file: table.heap.file, index_files })
     }
 
     pub(crate) fn index_metas(&self) -> Vec<IndexMeta> {

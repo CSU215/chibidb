@@ -189,9 +189,10 @@ impl Database {
             for rec in records {
                 match rec {
                     Record::Insert { file_no, rid, record } => {
-                        let file = *file_map
-                            .get(file_no)
-                            .ok_or_else(|| Error::Runtime(format!("wal references unknown table file {file_no}")))?;
+                        // records of dropped tables (file no longer in the
+                        // catalog) are stale and skipped
+                        let Some(file) = file_map.get(file_no) else { continue };
+                        let file = *file;
                         while self.pool.page_count(file)? <= rid.page_no {
                             self.pool.alloc_page(file)?;
                         }
@@ -206,9 +207,8 @@ impl Database {
                         }
                     }
                     Record::DeleteMark { file_no, rid, deleter } => {
-                        let file = *file_map
-                            .get(file_no)
-                            .ok_or_else(|| Error::Runtime(format!("wal references unknown table file {file_no}")))?;
+                        let Some(file) = file_map.get(file_no) else { continue };
+                        let file = *file;
                         if self.pool.page_count(file)? <= rid.page_no {
                             continue;
                         }
@@ -433,6 +433,28 @@ impl Database {
         let bytes = encode_catalog(&snap);
         std::fs::write(self.data_dir.join("catalog.bin"), bytes)
             .map_err(|e| Error::Runtime(format!("cannot write catalog: {e}")))
+    }
+
+    /// Drops a table: catalog first (durability), then its heap and index
+    /// files. A crash in between leaves harmless orphan files behind.
+    pub(crate) fn drop_table(&mut self, name: &str) -> Result<()> {
+        let dropped = self.catalog.drop_table(name)?;
+        self.save_catalog()?;
+        for file in std::iter::once(dropped.heap_file).chain(dropped.index_files) {
+            let path = self.pool.close_file(file)?;
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                // another DROP in the same statement batch may already have it
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Error::Runtime(format!(
+                        "cannot delete file {}: {e}",
+                        path.display()
+                    )))
+                }
+            }
+        }
+        Ok(())
     }
 
     /// (column index, index file) pairs for every index on `table`.

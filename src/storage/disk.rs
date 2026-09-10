@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::storage::page::{FileId, PageNo, PAGE_SIZE};
 use crate::{Error, Result};
 
 pub struct DiskManager {
-    files: BTreeMap<FileId, File>,
+    files: BTreeMap<FileId, (PathBuf, File)>,
     next_file_id: FileId,
 }
 
@@ -23,7 +23,7 @@ impl DiskManager {
             .create_new(true)
             .open(path)
             .map_err(|e| Error::Runtime(format!("cannot create file {}: {e}", path.display())))?;
-        self.register(file)
+        self.register(path, file)
     }
 
     pub fn open_file(&mut self, path: &Path) -> Result<FileId> {
@@ -32,14 +32,24 @@ impl DiskManager {
             .write(true)
             .open(path)
             .map_err(|e| Error::Runtime(format!("cannot open file {}: {e}", path.display())))?;
-        self.register(file)
+        self.register(path, file)
     }
 
-    fn register(&mut self, file: File) -> Result<FileId> {
+    fn register(&mut self, path: &Path, file: File) -> Result<FileId> {
         let id = self.next_file_id;
         self.next_file_id += 1;
-        self.files.insert(id, file);
+        self.files.insert(id, (path.to_path_buf(), file));
         Ok(id)
+    }
+
+    /// Closes the handle of a file that is about to be deleted and returns
+    /// its path (Windows cannot delete a file while a handle is open).
+    pub fn close_file(&mut self, file: FileId) -> Result<PathBuf> {
+        let (path, _) = self
+            .files
+            .remove(&file)
+            .ok_or_else(|| Error::Runtime(format!("unknown file id {file}")))?;
+        Ok(path)
     }
 
     pub fn read_page(&mut self, file: FileId, no: PageNo, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
@@ -91,6 +101,7 @@ impl DiskManager {
         self.files
             .get_mut(&file)
             .ok_or_else(|| Error::Runtime(format!("unknown file id {file}")))
+            .map(|(_, f)| f)
     }
 }
 

@@ -116,6 +116,13 @@ impl BufferPool {
         self.disk.truncate_file(file)
     }
 
+    /// Drops all cached frames of a file without writing them back, closes
+    /// its handle and returns the path for deletion.
+    pub fn close_file(&mut self, file: FileId) -> Result<std::path::PathBuf> {
+        self.discard_file(file);
+        self.disk.close_file(file)
+    }
+
     /// Drops all cached frames of a file without writing them back.
     pub fn discard_file(&mut self, file: FileId) {
         // every live frame is referenced exactly once by the lru list

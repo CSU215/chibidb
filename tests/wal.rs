@@ -158,6 +158,26 @@ fn clean_flush_truncates_wal() {
 }
 
 #[test]
+fn drop_table_survives_crash_with_stale_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = Database::open(dir.path()).unwrap();
+        db.execute_sql("create table t (id int);").unwrap();
+        db.execute_sql("insert into t values (1);").unwrap();
+        db.execute_sql("drop table t;").unwrap();
+        // the log still holds records for the dropped table's file
+        db.simulate_crash();
+    }
+    // recovery must skip stale records of the dropped table, not fail
+    let mut db = Database::open(dir.path()).unwrap();
+    let err = db.execute_sql("select * from t;").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
+    db.execute_sql("create table t (id int);").unwrap();
+    db.execute_sql("insert into t values (5);").unwrap();
+    assert_eq!(rows(&mut db, "select * from t;"), vec![vec![Value::Int(5)]]);
+}
+
+#[test]
 fn rollback_leaves_no_redo() {
     let dir = tempfile::tempdir().unwrap();
     {

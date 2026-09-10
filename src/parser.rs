@@ -1,7 +1,7 @@
 use crate::ast::{
     AggFunc, BinOp, ColumnDef, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt,
-    DropIndexStmt, ExplainStmt, Expr, InsertStmt, Limit, SelectItem, SelectStmt, Stmt, TableRef,
-    TrxCtl, UnOp, UpdateStmt,
+    DropIndexStmt, DropTableStmt, ExplainStmt, Expr, InsertStmt, Limit, SelectItem, SelectStmt,
+    Stmt, TableRef, TrxCtl, UnOp, UpdateStmt,
 };
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
@@ -123,11 +123,15 @@ impl Parser {
             return self.parse_create_table();
         }
         if self.eat_keyword("drop") {
-            if !self.eat_keyword("index") {
-                return Err(self.unexpected("index"));
+            if self.eat_keyword("index") {
+                let name = self.parse_ident("index name")?;
+                return Ok(Stmt::DropIndex(DropIndexStmt { name }));
             }
-            let name = self.parse_ident("index name")?;
-            return Ok(Stmt::DropIndex(DropIndexStmt { name }));
+            if !self.eat_keyword("table") {
+                return Err(self.unexpected("index or table"));
+            }
+            let name = self.parse_ident("table name")?;
+            return Ok(Stmt::DropTable(DropTableStmt { name }));
         }
         if self.eat_keyword("insert") {
             if !self.eat_keyword("into") {

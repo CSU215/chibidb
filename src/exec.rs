@@ -1,6 +1,6 @@
 use crate::ast::{
-    BinOp, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt, ExplainStmt,
-    Expr, InsertStmt, Limit, SelectItem, SelectStmt, Stmt, UnOp, UpdateStmt,
+    BinOp, CreateIndexStmt, CreateTableStmt, DataType, DeleteStmt, DropIndexStmt, DropTableStmt,
+    ExplainStmt, Expr, InsertStmt, Limit, SelectItem, SelectStmt, Stmt, UnOp, UpdateStmt,
 };
 use crate::catalog::Schema;
 use crate::index::{encode_key, BTree, Bound};
@@ -19,6 +19,8 @@ pub fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Result<Res
         Stmt::CreateIndex(c) => execute_create_index(db, trx, c),
         Stmt::DropIndex(d) if trx.explicit => ddl_in_trx(trx),
         Stmt::DropIndex(d) => execute_drop_index(db, d),
+        Stmt::DropTable(d) if trx.explicit => ddl_in_trx(trx),
+        Stmt::DropTable(d) => execute_drop_table(db, d),
         Stmt::Insert(i) => execute_insert(db, trx, i),
         Stmt::Select(s) => execute_select(db, trx, s),
         Stmt::Delete(d) => execute_delete(db, trx, d),
@@ -193,6 +195,11 @@ fn execute_create_index(db: &mut Database, trx: &mut TrxState, c: &CreateIndexSt
 fn execute_drop_index(db: &mut Database, d: &DropIndexStmt) -> Result<ResultSet> {
     db.catalog_mut().drop_index(&d.name)?;
     db.save_catalog()?;
+    Ok(ResultSet::Message("SUCCESS".into()))
+}
+
+fn execute_drop_table(db: &mut Database, d: &DropTableStmt) -> Result<ResultSet> {
+    db.drop_table(&d.name)?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 

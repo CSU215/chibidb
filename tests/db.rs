@@ -8,6 +8,13 @@ fn rows(rs: &[ResultSet]) -> (&[String], &[Vec<Value>]) {
     }
 }
 
+fn message(rs: &[ResultSet]) -> String {
+    match &rs[0] {
+        ResultSet::Message(m) => m.clone(),
+        other => panic!("expected message, got {other:?}"),
+    }
+}
+
 /// Runs `f` against every backend: in-memory and file-backed.
 fn with_dbs(f: impl Fn(&mut Database)) {
     let mut mem = Database::open_in_memory().unwrap();
@@ -385,5 +392,53 @@ fn date_type() {
 
         let err = db.execute_sql("insert into t values (4, 'not a date');").unwrap_err();
         assert!(err.to_string().contains("invalid date"), "{err}");
+    });
+}
+
+#[test]
+fn drop_table_removes_schema_data_and_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+    db.execute_sql("create table t (id int, name char(8));").unwrap();
+    db.execute_sql("create index idx on t (id);").unwrap();
+    db.execute_sql("insert into t values (1, 'a');").unwrap();
+
+    let m = message(&db.execute_sql("drop table t;").unwrap());
+    assert_eq!(m, "SUCCESS");
+
+    let err = db.execute_sql("select * from t;").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
+    let err = db.execute_sql("insert into t values (2, 'b');").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
+    let err = db.execute_sql("drop table t;").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
+
+    // the table name and index name are free again
+    db.execute_sql("create table t (id int);").unwrap();
+    db.execute_sql("create index idx on t (id);").unwrap();
+
+    // physical files of the dropped table were removed
+    assert_eq!(std::fs::read_dir(dir.path().join("tables")).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(dir.path().join("indexes")).unwrap().count(), 1);
+
+    // and the state is stable across a reopen
+    drop(db);
+    let mut db = Database::open(dir.path()).unwrap();
+    db.execute_sql("insert into t values (7);").unwrap();
+    let rs = db.execute_sql("select id from t;").unwrap();
+    assert_eq!(rows(&rs).1, [[Value::Int(7)]]);
+}
+
+#[test]
+fn drop_table_ddl_validation() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int);").unwrap();
+        let mut session = chibidb::Session::new();
+        db.execute_sql_with(&mut session, "begin;").unwrap();
+        let err = db.execute_sql_with(&mut session, "drop table t;").unwrap_err();
+        assert!(err.to_string().contains("DDL inside a transaction"), "{err}");
+        db.execute_sql_with(&mut session, "rollback;").unwrap();
+        let rs = db.execute_sql_with(&mut session, "drop table t;").unwrap();
+        assert_eq!(message(&rs), "SUCCESS");
     });
 }

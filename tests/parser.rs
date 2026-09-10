@@ -388,6 +388,16 @@ fn parses_drop_index() {
 }
 
 #[test]
+fn parses_drop_table() {
+    let stmts = parse("drop table student;").unwrap();
+    match &stmts[0] {
+        Stmt::DropTable(d) => assert_eq!(d.name, "student"),
+        other => panic!("expected drop table, got {other:?}"),
+    }
+    err("drop table;");
+}
+
+#[test]
 fn index_ddl_syntax_errors() {
     err("create index on t (c);");
     err("create index i t (c);");
