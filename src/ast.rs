@@ -152,6 +152,10 @@ pub enum DataType {
 pub struct ColumnDef {
     pub name: String,
     pub dtype: DataType,
+    pub not_null: bool,
+    pub primary_key: bool,
+    pub unique: bool,
+    pub default: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -163,6 +167,8 @@ pub struct CreateTableStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStmt {
     pub table: String,
+    /// Optional explicit column list: `INSERT INTO t (a, b) VALUES ...`.
+    pub columns: Option<Vec<String>>,
     pub rows: Vec<Vec<Expr>>,
 }
 

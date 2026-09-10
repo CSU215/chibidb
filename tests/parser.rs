@@ -152,6 +152,37 @@ fn parses_create_table() {
 }
 
 #[test]
+fn parses_column_constraints() {
+    let c = create_table(
+        "create table t (\
+         id int primary key, \
+         name char(10) not null, \
+         email char(20) unique, \
+         age int default 0, \
+         city char(8) default 'unk');",
+    );
+    assert!(c.columns[0].primary_key);
+    assert!(c.columns[0].not_null, "primary key implies not null");
+    assert!(c.columns[0].unique, "primary key implies unique");
+    assert!(!c.columns[1].primary_key);
+    assert!(c.columns[1].not_null);
+    assert!(c.columns[2].unique);
+    assert!(!c.columns[2].not_null);
+    assert_eq!(c.columns[3].default.as_ref().unwrap().to_string(), "0");
+    assert_eq!(c.columns[4].default.as_ref().unwrap().to_string(), "'unk'");
+}
+
+#[test]
+fn parses_insert_column_list() {
+    let i = insert("insert into t (b, a) values (1, 2);");
+    assert_eq!(i.columns.unwrap(), vec!["b".to_string(), "a".to_string()]);
+    let i = insert("insert into t values (1, 2);");
+    assert!(i.columns.is_none());
+    err("insert into t (a,) values (1);");
+    err("insert into t (a b) values (1);");
+}
+
+#[test]
 fn parses_date_columns() {
     let c = create_table("create table t (d date);");
     assert_eq!(c.columns[0].dtype, DataType::Date);

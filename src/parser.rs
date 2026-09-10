@@ -392,6 +392,15 @@ impl<'a> Parser<'a> {
             Some(Token { kind: TokenKind::Ident(s), .. }) => s.clone(),
             _ => return Err(self.unexpected("table name")),
         };
+        let mut columns = None;
+        if self.eat_punct(Punct::LParen) {
+            let mut cols = vec![self.parse_ident("column name")?];
+            while self.eat_punct(Punct::Comma) {
+                cols.push(self.parse_ident("column name")?);
+            }
+            self.expect_punct(Punct::RParen)?;
+            columns = Some(cols);
+        }
         if !self.eat_keyword("values") {
             return Err(self.unexpected("values"));
         }
@@ -411,7 +420,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(Stmt::Insert(InsertStmt { table, rows }))
+        Ok(Stmt::Insert(InsertStmt { table, columns, rows }))
     }
 
     fn parse_value(&mut self) -> Result<Expr> {
@@ -454,7 +463,34 @@ impl<'a> Parser<'a> {
             _ => return Err(self.unexpected("column name")),
         };
         let dtype = self.parse_data_type()?;
-        Ok(ColumnDef { name, dtype })
+        let mut not_null = false;
+        let mut primary_key = false;
+        let mut unique = false;
+        let mut default = None;
+        loop {
+            if self.eat_keyword("primary") {
+                if !self.eat_keyword("key") {
+                    return Err(self.unexpected("key"));
+                }
+                primary_key = true;
+                not_null = true;
+                unique = true;
+            } else if self.eat_keyword("unique") {
+                unique = true;
+            } else if self.eat_keyword("not") {
+                if !self.eat_keyword("null") {
+                    return Err(self.unexpected("null"));
+                }
+                not_null = true;
+            } else if self.eat_keyword("default") {
+                default = Some(self.parse_value()?);
+            } else if self.eat_keyword("null") {
+                // explicit "null" column attribute is the default behavior
+            } else {
+                break;
+            }
+        }
+        Ok(ColumnDef { name, dtype, not_null, primary_key, unique, default })
     }
 
     fn parse_data_type(&mut self) -> Result<DataType> {
