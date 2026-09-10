@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：M11（IN 列表 / 子查询 / 视图）完成后，239 个测试全绿，clippy 零警告，共 72 个提交。
+> 最后更新：M15（CHECKPOINT / DISTINCT / LEFT JOIN）完成后，246 个测试全绿，clippy 零警告，共 76 个提交。
 
 ---
 
@@ -77,7 +77,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `client.rs` | TCP 客户端 | `run_client` |
 | `wire.rs` | ResultSet/帧二进制编解码 | `encode_result_frame` / `decode_frame` |
 | `catalog/mod.rs` | `Catalog`：`Table`/`HeapStore`/`IndexEntry`、`Schema`/`ColumnDesc`（带 `owner`）、`resolve()` 歧义检测 | |
-| `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT3**（v3：含事务簿记） | `CatalogSnapshot` |
+| `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT4**（v4：含事务簿记 + 视图定义） | `CatalogSnapshot` |
 | `storage/page.rs` | 页常量：`PAGE_SIZE=8192`、`FileId=u32`、`PageNo=u32`、`zeroed_page` | |
 | `storage/disk.rs` | `DiskManager`：分页文件读写、建文件、魔数校验 | |
 | `storage/buffer.rs` | `BufferPool`：64 帧、LRU `VecDeque`、脏页写回、Drop flush；`with_page(file,no,f)` 闭包式访问（访问即脏）、`read_page`（只读不脏） | |
@@ -120,6 +120,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | M12 事务（MVCC + WAL） | ✅ M12.1 MVCC 核心 `568f62d`；M12.3 WAL+崩溃恢复 `0fe605d`（M12.2 update/delete MVCC 化已并入 M12.1） | `0fe605d` |
 | M13 TCP server + client + wire 协议 | ✅ | `d06103c` |
 | M14 加固 | ✅ DROP TABLE（`d0e239c`）、跨语句事务会话修复（`bcfd6ee`）、clippy 清零（`0023a43`）、README + 冒烟脚本（`46c8637`） | `46c8637` |
+| M15 查询/运维增强 | ✅ CHECKPOINT 语句 + WAL 预算护栏（`c8e060e`）、DISTINCT（`2389f99`）、LEFT [OUTER] JOIN（`5f31ea2`） | `5f31ea2` |
 
 ---
 
@@ -138,9 +139,9 @@ INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.0);   -- 多值行，字面量允许�
 UPDATE t SET score = score + 1 WHERE id < 10;
 DELETE FROM t WHERE name IS NULL;
 -- 查询
-SELECT [DISTINCT 未实现] * | expr [AS alias] (, ...)
+SELECT [DISTINCT] * | expr [AS alias] (, ...)
   FROM tref (, tref)*                      -- 逗号 = cross join
-  [JOIN tref ON cond]*                     -- 仅 INNER（left/right/outer 未实现，遇到关键字会报错）
+  [JOIN | LEFT [OUTER] JOIN tref ON cond]* -- INNER / LEFT（未匹配左行右列补 NULL）
   [WHERE expr]
   [GROUP BY expr (, expr)*]
   [HAVING expr]
@@ -152,6 +153,7 @@ SELECT [DISTINCT 未实现] * | expr [AS alias] (, ...)
 --         expr [NOT] IN (SELECT..)（单列）、[NOT] EXISTS (SELECT..)、标量 (SELECT..)
 -- 事务
 BEGIN; COMMIT; ROLLBACK;
+CHECKPOINT;                                -- flush_all + save_catalog + 截断 wal；有开事务时报错
 EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / NestedLoopJoin
 ```
 
@@ -220,7 +222,8 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
   - `next_trx_id` 提升到 max(wal 中见过的 trx id)+1（含未提交的），防止 id 复用把幽灵行"过继"给新事务
   - wal 的 Commit id 与 catalog committed 集取并集，若 catalog 缺失则修复并 save_catalog（wal 是提交事实来源）
   - **索引重建**：被重放触及的表（含页0被修复的索引文件所属表）全部重建索引——B+ 树页与堆页一样可能没落盘，且 B+ 树 insert 不幂等（重放会产生重复键）。重建前先 `pool.discard_file`（丢缓存）+ `truncate_file` + `BTree::init`，再全堆扫描重灌
-- **checkpoint**：`flush()` = flush_all → save_catalog → wal.truncate()。干净关闭（REPL 退出）即 0 字节日志
+- **checkpoint**：`flush()` = flush_all → save_catalog → wal.truncate()。干净关闭（REPL 退出）即 0 字节日志。M15 起另有两条路：`CHECKPOINT` 语句（`execute_checkpoint`：自身 autocommit 事务不计入、显式事务或其他会话开事务时拒绝）与**自动触发**——`commit_trx` 末尾若 `wal.len() > wal_checkpoint_threshold`（默认 8MB，`set_wal_checkpoint_threshold` 可改）且 `open_trxs` 为空则调 flush()
+- **open_trxs 注册表**：Database 持有已 begin 未终局的事务 id 集；begin 两处 insert，commit_trx/Rollback 臂/autocommit 错误路径/rollback_session remove。**它保护日志截断**：截断时若其他事务未提交，其 Commit 帧之后到达会丢 redo → 数据丢失，故护栏必须存在
 - **页0修复**：`HeapFile::open_or_repair` / `BTree::open_or_repair`——catalog 已记录但页0魔数没落盘（CREATE TABLE/INDEX 后立刻崩溃）时原位重写魔数；索引文件被修复会触发上述重建
 - **测试**：`tests/wal.rs` 8 个集成用例（提交插入/删除/更新/带索引崩溃恢复、未提交不复活+id 不复用、截断尾帧容忍、干净 flush 截断日志、rollback 无残留）；`src/wal.rs` 内 5 个纯函数单测
 - 已知边界：全量 checkpoint（无模糊检查点）；崩溃后未提交行的物理空间保留（与 MVCC 空间债同性质）；日志未压缩
@@ -232,7 +235,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 1. **TDD 节奏**：一个能力点 = 一个/几个红测试 → 最小实现 → `cargo test` 全绿 → 一个细粒度提交。提交消息用 Conventional Commits：`feat: ...` / `fix: ...` / `refactor: ...` / `chore: ...`
 2. **提交前必须看到全量测试通过**。不要把编译错误/红灯混进提交（项目历史里有过两次，随后紧跟 fix 提交，尽量避免）
 3. 测试与实现都放在 `tests/` 与 `src/` 既有分层中；纯函数层（lexer/node/slotted/codec/key）直接单测，系统行为写集成测试（`tests/db*.rs` 风格）
-4. 保持向后兼容的取舍：旧数据文件格式变更要 bump 魔数（heap 已 CHD2，catalog 已 CHIDCAT3，btree CHIDBTX1）
+4. 保持向后兼容的取舍：旧数据文件格式变更要 bump 魔数（heap 已 CHD2，catalog 已 CHIDCAT4，btree CHIDBTX1）
 5. `open_in_memory()` 实际是 `tempfile::TempDir` 后端（M9 时统一的，避免双后端分叉），Database 持有 `_temp: Option<TempDir>` 自动清理
 6. 大的重构优先于打补丁：如 M9 把 Mem/Heap 双存储统一成 Heap-only（`f13f83c`），可参考其风格
 7. 不要引入新依赖，除非确有必要（目前仅 3 个直接依赖）
@@ -261,20 +264,22 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ## 8. 已知技术债 / 明确的边界
 
-- 无 LEFT/RIGHT/FULL OUTER JOIN、无 DISTINCT/UNION、无 ALTER TABLE、无相关子查询（子查询引用外层列）、无视图上的 INSERT/UPDATE（视图只读）
+- 无 RIGHT/FULL OUTER JOIN、无 UNION、无 ALTER TABLE、无相关子查询（子查询引用外层列）、无视图上的 INSERT/UPDATE（视图只读）
 - 无 MOD/% / 字符串函数；无 LIKE（除 IS NULL 外）
+- DISTINCT + ORDER BY 引用非投影列时，保留哪一行是按扫描顺序首个（标准 SQL 视为非法，未做校验）
 - MVCC 删除标记与 stale 索引项不做物理回收（页面会持续膨胀）
 - 单 Mutex 单 writer 串行化；无死锁检测；长事务 + 未提交孤儿版本会长期占空间
-- BufferPool 无预读；WAL checkpoint 是全量截断；first-fit 插入是 O(页数)
-- **多连接下的 DDL 隔离不存在**：一个连接持有未提交事务时，另一连接仍可 DROP TABLE / CREATE INDEX / DROP VIEW（无全局事务注册表）；教学场景可接受，修法需先做会话级元数据锁
-- `exec.rs` ~1130 行偏大，未来可拆 eval/aggregate/join/plan/subquery 五个模块
+- BufferPool 无预读；WAL checkpoint 是全量截断（有预算护栏但无模糊检查点）；first-fit 插入是 O(页数)
+- **多连接下的 DDL 隔离不存在**：一个连接持有未提交事务时，另一连接仍可 DROP TABLE / CREATE INDEX / DROP VIEW（open_trxs 注册表只护 WAL 截断，不锁元数据）；教学场景可接受，修法需先做会话级元数据锁
+- `exec.rs` ~1200 行偏大，未来可拆 eval/aggregate/join/plan/subquery 五个模块
 
 ---
 
 ## 9. 建议的后续顺序
 
-1. 可选 SQL 增强：DISTINCT、LEFT JOIN、LIKE、字符串函数、miniob 兼容性回归用例
-2. 工程项：MVCC/stale 索引空间回收（vacuum）、模糊 checkpoint、基准测试
-3. 若做相关子查询：需要给 eval 传入"外层行"上下文（改 EvalCtx 为链式），子查询物化改为逐行缓存
+1. **MVCC vacuum**（下一个大件）：物理回收已提交的删除标记行与 stale 索引项；需要把 open_trxs 注册表扩展为"活跃快照"记录，回收时保守跳过仍被活跃快照需要的版本
+2. LIKE / 基础字符串函数（CONCAT/UPPER/LOWER/LENGTH），需新增函数调用 AST 节点
+3. miniob 兼容性回归用例移植、基准测试、exec.rs 拆分
+4. 相关子查询：eval 传入外层行上下文（EvalCtx 链式），物化改为逐行缓存
 
-提交基线：`41429e9 feat: views ...`（HEAD）。
+提交基线：`5f31ea2 feat: left outer join ...`（HEAD）。

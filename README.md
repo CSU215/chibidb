@@ -40,9 +40,9 @@ INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.0);   -- 多值行，null 关键字
 UPDATE t SET score = score + 1 WHERE id < 10;
 DELETE FROM t WHERE name IS NULL;
 -- 查询
-SELECT [DISTINCT 未实现] * | expr [AS alias] (, ...)
+SELECT [DISTINCT] * | expr [AS alias] (, ...)
   FROM tref | view (, ...)*    -- 逗号 = cross join
-  [JOIN tref ON cond]*         -- 仅 INNER
+  [JOIN | LEFT [OUTER] JOIN tref ON cond]*   -- INNER / LEFT
   [WHERE expr]
   [GROUP BY expr (, expr)*]
   [HAVING expr]
@@ -54,6 +54,7 @@ SELECT [DISTINCT 未实现] * | expr [AS alias] (, ...)
 --          [NOT] EXISTS (SELECT ...)、标量 (SELECT ...)（可用于比较与算术）
 -- 事务
 BEGIN; COMMIT; ROLLBACK;
+CHECKPOINT;                    -- 刷盘 + 截断日志（开事务时拒绝）
 EXPLAIN SELECT ...;            -- 输出 FullScan / IndexScan / NestedLoopJoin
 ```
 
@@ -61,6 +62,8 @@ EXPLAIN SELECT ...;            -- 输出 FullScan / IndexScan / NestedLoopJoin
 
 - 标识符大小写不敏感；`NULL` 遵循 SQL 三值逻辑（`1/0=2`：NULL 比较为 UNKNOWN，WHERE 只放行 TRUE）
 - `IN (值列表)` 与 `IN (子查询)` 均遵循三值语义：列表/子查询含 NULL 时 `NOT IN` 永不返回 TRUE
+- `DISTINCT` 对投影结果去重，NULL 彼此相等
+- `LEFT JOIN` 未匹配的左侧行保留，右列补 NULL
 - `date` 严格按 `YYYY-MM-DD` 校验（闰年正确）；与字符串比较时隐式转换
 - `char(n)` 按字符数校验；`text` 无长度限制但单行超页报错
 - 整数除法向零截断；除零报错
@@ -101,7 +104,7 @@ SQL 字符串
 
 ## 测试
 
-`cargo test` 跑 239 个测试，覆盖词法/语法/求值/聚合/连接/索引/持久化/事务/
+`cargo test` 跑 246 个测试，覆盖词法/语法/求值/聚合/连接/索引/持久化/事务/
 WAL 恢复/存储层/网络协议等。集成测试的 `with_dbs` 模式让同一用例在内存后端
 与文件后端各跑一遍；WAL 测试用 `Database::simulate_crash()` 模拟进程被杀。
 
