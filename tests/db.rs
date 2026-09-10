@@ -506,6 +506,45 @@ fn exists_predicate() {
 }
 
 #[test]
+fn update_delete_with_subqueries() {
+    with_dbs(|db| {
+        db.execute_sql("create table a (id int);").unwrap();
+        db.execute_sql("insert into a values (1), (2);").unwrap();
+        db.execute_sql("create table b (v int);").unwrap();
+        db.execute_sql("insert into b values (1), (20), (30);").unwrap();
+
+        // DELETE ... WHERE <subquery>
+        db.execute_sql("delete from b where v in (select id from a);").unwrap();
+        assert_eq!(
+            query_ids(db, "select v from b order by v;"),
+            [20, 30]
+        );
+        // uncorrelated EXISTS
+        db.execute_sql("delete from b where exists (select 1 from a where id > 100);")
+            .unwrap();
+        assert_eq!(query_ids(db, "select v from b order by v;"), [20, 30]);
+
+        // UPDATE ... SET <scalar subquery>
+        db.execute_sql("update b set v = (select max(id) from a);").unwrap();
+        assert_eq!(query_ids(db, "select v from b order by v;"), [2, 2]);
+        // UPDATE ... WHERE <subquery>
+        db.execute_sql("update b set v = 99 where v = (select max(id) from a);").unwrap();
+        assert_eq!(query_ids(db, "select v from b order by v;"), [99, 99]);
+    });
+}
+
+fn query_ids(db: &mut Database, sql: &str) -> Vec<i64> {
+    let rs = db.execute_sql(sql).unwrap();
+    let (_, rows) = rows(&rs);
+    rows.iter()
+        .map(|r| match r[0] {
+            Value::Int(n) => n,
+            ref v => panic!("{v:?}"),
+        })
+        .collect()
+}
+
+#[test]
 fn scalar_subquery() {
     with_dbs(|db| {
         db.execute_sql("create table a (id int);").unwrap();

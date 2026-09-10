@@ -31,15 +31,6 @@ pub fn eval_const(expr: &Expr) -> Result<Value> {
     eval(expr, None)
 }
 
-pub(crate) fn eval_predicate(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<bool> {
-    match eval(expr, Some(&EvalCtx::row(schema, row)))? {
-        Value::Bool(b) => Ok(b),
-        Value::Null => Ok(false),
-        _ => Err(Error::Runtime(
-            "where clause must evaluate to boolean".into(),
-        )),
-    }
-}
 
 /// Resolves a (possibly qualified) column, walking outward through parent
 /// contexts; this is what makes correlated subqueries work. An ambiguous

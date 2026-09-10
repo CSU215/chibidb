@@ -22,7 +22,7 @@ pub use eval::eval_const;
 use aggregate::{
     apply_limit, cmp_sort_keys, dedup_rows, execute_grouped_select, expr_has_aggregate, sort_rows,
 };
-use eval::{eval, eval_predicate, EvalCtx};
+use eval::EvalCtx;
 use join::nested_loop;
 use plan::{execute_explain, index_scan_source};
 use subquery::{eval_bound, eval_predicate_bound};
@@ -180,15 +180,16 @@ fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Resu
             continue;
         }
         let matched = match &u.selection {
-            Some(sel) => eval_predicate(sel, &schema, &row)?,
+            Some(sel) => eval_predicate_bound(db, trx, sel, &schema, &row, None)?,
             None => true,
         };
         if !matched {
             continue;
         }
         let mut new_row = row.clone();
+        let row_ctx = EvalCtx::row(&schema, &row);
         for (idx, col, dtype, expr) in &assigns {
-            let v = eval(expr, Some(&EvalCtx::row(&schema, &row)))?;
+            let v = eval_bound(db, trx, expr, Some(&row_ctx))?;
             new_row[*idx] = coerce(v, *dtype, col)?;
         }
         check_not_null(&schema, &new_row)?;
@@ -217,7 +218,7 @@ fn execute_delete(db: &mut Database, trx: &mut TrxState, d: &DeleteStmt) -> Resu
             continue;
         }
         let matched = match &d.selection {
-            Some(sel) => eval_predicate(sel, &schema, &row)?,
+            Some(sel) => eval_predicate_bound(db, trx, sel, &schema, &row, None)?,
             None => true,
         };
         if matched {
