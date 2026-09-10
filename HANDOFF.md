@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：M19（相关子查询）完成后，274 个测试全绿，clippy 零警告。
+> 最后更新：M17–M19 评审通过（274 tests 全绿、clippy 零警告、冒烟与基准复验），并录入 M20–M25 执行计划。
 
 ---
 
@@ -308,17 +308,19 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ---
 
-## 9. 建议的后续顺序（已确认的执行计划，按序执行）
+## 9. 执行计划（已评审确认，按序执行；上一轮 1–6 全部完成，里程碑见表）
 
-1. **LIKE 匹配**（小）✅：lexer 补 `%` 标点（顺带解锁 MOD 运算符，一次 lexer 改动两用）；parser 加 `expr [NOT] LIKE 'pattern'`；执行器写 `%`/`_` 通配的简单匹配器；**不支持转义**（方言文档注明）；不做索引下推
-2. **字符串函数**（中）✅：AST 加 `Expr::Function(name, args)`，先做 CONCAT/UPPER/LOWER/LENGTH/SUBSTRING；eval 保持纯函数，与子查询物化机制互不干扰
-3. **exec.rs 拆分**（中，纯重构）✅：拆成 mod/eval/aggregate/join/plan/subquery；新增 `nested_loop`（join.rs）与 `index_scan_source`（plan.rs）两个提取点；263 tests 全绿、clippy 零警告验证无回归
-4. **miniob 兼容性回归用例移植**（测试）✅：`tests/miniob_compat.rs`，student/course/sc 的 CRUD+聚合、分组/having、内外连接、不相关子查询、索引/EXPLAIN 组合场景
-5. **基准测试**（小）✅：`tests/bench.rs`（`#[ignore]`，release/5 万行）；**顺带修出两处真实性能问题**——单表索引扫描原先仍先全表扫（现已先定路径），AND 链同列上下界未合并（现已合并）；只读事务不再重写 catalog。README 已附数字
-6. **相关子查询**（大，压轴）✅：`EvalCtx` 改为带父链的作用域，列解析逐层向外；子查询改为在求值点按当前行/组物化（`bind_expr`/`eval_bound`），支持多层相关引用。`tests/correlated.rs` 覆盖 EXISTS/NOT EXISTS/标量、多外层列、跨两级引用
+1. **表约束：PRIMARY KEY / UNIQUE / NOT NULL / DEFAULT**（中大，miniob 对齐最大缺口，M20）
+   - `CREATE TABLE` 字段选项入 AST/`ColumnDef`；catalog 元数据扩展 → **bump CHIDCAT5**
+   - 主键/唯一约束自动建唯一索引（沿用现有 `IndexStore`）；INSERT/UPDATE 前借该索引查重 → `duplicate key` 报错
+   - NOT NULL 在 `coerce` 处校验；DEFAULT 值存 catalog，INSERT 缺列时补（需支持 `INSERT INTO t (a,b) VALUES ...` 列清单，当前要求全列）
+   - 红测试先行：约束 DDL 解析、违反各约束的报错、重启后约束仍在
+2. **RIGHT JOIN**（小，M21）：`JoinKind::Right` 与 LEFT 对称；未匹配右行保留、左列补 NULL；注意 NULL 填充宽度是"累计左侧行"的列数（`schema.columns.len()` 在加入第 i 表之前）
+3. **UNION / UNION ALL**（中，M22）：`select ... union [all] select ...`；列数必须一致；UNION 走 `dedup_rows`；ORDER BY/LIMIT 归属整个并集；建议 AST 包一层（如 `Stmt::Select` 加 `combine: Option<(bool /*all*/, Box<SelectStmt>)>`）
+4. **SQL 小补齐**（小，M23）：`count(DISTINCT expr)`；LIKE `ESCAPE` 子句（匹配器加转义分支）；UPDATE/DELETE 的 WHERE 支持子查询（mod.rs 两处 `eval_predicate` → `eval_predicate_bound`，outer=None）
+5. **元数据锁 / DDL 隔离**（中，M24）：现有洞——连接 A BEGIN+写 t 时连接 B 可 DROP t，破坏 A 的 undo 目标。最小修法：DDL（create/drop table/index/view）在 `has_open_trxs_excluding(自身)` 为真时报 `schema is locked by an open transaction`；文档更新 §8
+6. **索引有序性消除排序**（中小，M25）：单表且 ORDER BY 单列 = 选路索引列时跳过 `sort_rows`（仅 ASC——叶链升序；DESC 若无反向迭代则先不做）；跑 `tests/bench.rs` 对比并更新 README 数字
 
-理由：1+2 补齐 SQL 表达式面且互相搭车；3 在 4/6 之前做，减少测试改动打架；5 给 README 增色并验证重构。
+工作纪律：TDD 红绿节奏、每项一个里程碑提交、提交前全量 `cargo test` + clippy 清零 + 更新本文档与 README。
 
-进度：**1–6 全部完成**（274 tests 全绿，clippy 零警告）。计划已清空。
-
-提交基线：`9102ab7 docs: link m17-m19 milestones to their commits`（HEAD）。M17–M19 已按里程碑拆分入库：`d3a85ad`（LIKE/函数/exec 拆分）、`5c4e26e`（miniob 回归）、`546b601`（索引选路+范围合并+只读提交）、`8dce9a3`（相关子查询）。
+提交基线：`8411999 docs: link m17-m19 milestones to their commits`（HEAD）。
