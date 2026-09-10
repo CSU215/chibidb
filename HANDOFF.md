@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：M14（加固：DROP TABLE / 会话修复 / clippy 清零 / README / 冒烟脚本）完成后，231 个测试全绿，共 66 个提交。
+> 最后更新：M11（IN 列表 / 子查询 / 视图）完成后，239 个测试全绿，clippy 零警告，共 72 个提交。
 
 ---
 
@@ -37,7 +37,7 @@ SQL 字符串
 - 运行环境注意：**命令行是 Windows PowerShell**，具体陷阱见 §8
 
 ```powershell
-cargo test                      # 全量回归（约 231 tests，20+ 个测试二进制）
+cargo test                      # 全量回归（约 239 tests，20+ 个测试二进制）
 cargo test --test trx           # 单个测试文件
 cargo test --quiet              # 安静模式（注意配合退出码判断，见 §8）
 cargo build
@@ -89,7 +89,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `index/btree.rs` | B+ 树主体：`init/open/open_or_repair/at`、递归插入双级分裂长高、search（跨叶重复键回退）、scan_range 叶链、delete 借用/合并/根收缩（~880 行） | |
 | `wal.rs` | 预写日志：帧 `[u32 len][u8 type][u32 trx][payload]`，Record::Insert/DeleteMark/Commit，追加 + `sync()`（提交点）+ `truncate()`（checkpoint）；`plan_recovery` 解析日志（容忍截断尾帧），纯函数有单测 | `Wal` / `plan_recovery` |
 
-### 3.2 测试（`tests/`，22 个文件 / 231 tests）
+### 3.2 测试（`tests/`，22 个文件 / 239 tests）
 
 - 与源码分层对应：`lexer / parser / eval / agg / join / db / db_index / db_persist / trx / wal / storage_* / index_* / wire / server / repl / datetime / codec / catalog_meta`
 - `tests/wal.rs` 用 `Database::simulate_crash()`（跳过 BufferPool Drop flush）模拟 SIGKILL，配合自己的 `tempfile::TempDir` 复开同一目录
@@ -116,7 +116,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | M8 类型系统：NULL 三值逻辑、DATE（严格校验）、TEXT（页界） | ✅ | `b9d0175` |
 | M9 B+ 树索引全套 + CREATE/DROP INDEX + DML 维护 + 规则优化器 + EXPLAIN | ✅ | `7d20698` |
 | M10 查询能力：COUNT/SUM/AVG/MIN/MAX、GROUP BY、HAVING、ORDER BY（多键+NULL 排序）、LIMIT/OFFSET、嵌套循环 INNER JOIN（逗号 + JOIN..ON、别名、限定列） | ✅ | `f440173` |
-| M11 子查询/视图 | ❌ **未开始** | |
+| M11 子查询/视图 | ✅ `IN (值列表)`（parser 脱糖，三值语义）`7c662bd`；不相关子查询 IN/EXISTS/标量（执行前物化改写）`3a848ca`；CREATE/DROP VIEW + FROM 展开 + 持久化 `41429e9` | `41429e9` |
 | M12 事务（MVCC + WAL） | ✅ M12.1 MVCC 核心 `568f62d`；M12.3 WAL+崩溃恢复 `0fe605d`（M12.2 update/delete MVCC 化已并入 M12.1） | `0fe605d` |
 | M13 TCP server + client + wire 协议 | ✅ | `d06103c` |
 | M14 加固 | ✅ DROP TABLE（`d0e239c`）、跨语句事务会话修复（`bcfd6ee`）、clippy 清零（`0023a43`）、README + 冒烟脚本（`46c8637`） | `46c8637` |
@@ -131,6 +131,8 @@ CREATE TABLE t (id int, name char(10), score float, d date, body text);
 CREATE INDEX idx_name ON t (col);
 DROP INDEX idx_name;
 DROP TABLE t;
+CREATE VIEW v AS SELECT ...;               -- 定义以原 SQL 文本存入 catalog
+DROP VIEW v;
 -- DML
 INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.0);   -- 多值行，字面量允许负号，null 关键字
 UPDATE t SET score = score + 1 WHERE id < 10;
@@ -146,11 +148,20 @@ SELECT [DISTINCT 未实现] * | expr [AS alias] (, ...)
   [LIMIT n [OFFSET m]]
 -- 聚合：count(*)/count(x) 忽略 null / sum / avg（恒 float）/ min / max；空集 sum/avg/min/max → NULL
 -- 表达式：+ - * /（int 截断、checked overflow）、and/or/not（SQL 三值逻辑）、
---         = <> < <= > >=、is [not] null、括号；字符串连接未实现；%/^/位运算未实现
+--         = <> < <= > >=、is [not] null、括号、expr [NOT] IN (值列表)、
+--         expr [NOT] IN (SELECT..)（单列）、[NOT] EXISTS (SELECT..)、标量 (SELECT..)
 -- 事务
 BEGIN; COMMIT; ROLLBACK;
 EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / NestedLoopJoin
 ```
+
+子查询/视图的实现要点（改相关代码前必读）：
+
+- `IN (值列表)` 在 **parser 里脱糖**成 OR/AND 比较链，三值语义免费正确（列表含 NULL 时 NOT IN 永不 TRUE）
+- 子查询（InSubquery/Exists/ScalarSubquery）走 `exec::lift_subqueries`：execute_select 入口先把整棵 select 表达式树里的子查询**执行一次并改写为 `Expr::Value` 字面量**，eval 本身保持无上下文；嵌套子查询自然递归；**只支持不相关子查询**（引用外层列会报 no such column）
+- 标量子查询：0 行 → NULL，>1 行或 >1 列报错；IN 子查询要求单列
+- 视图：定义 SQL 原文存 catalog（parser 用 token 偏移切片，需 `Parser.src`）；查询时 `exec::from_source` 在 FROM 处展开（真实表走 MVCC，视图递归执行其 select）；视图列 dtype 用 Text 占位（查询路径不用 dtype）；视图无索引（find_sargable 直接跳过）；CREATE VIEW 时试执行一次做校验（表/列存在性）
+- catalog 格式已升 **CHIDCAT4**（views 字段）；视图名与表名互斥占用
 
 细节语义（已被测试锁定，不要随意改）：
 
@@ -250,20 +261,20 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ## 8. 已知技术债 / 明确的边界
 
-- 无 LEFT/RIGHT/FULL OUTER JOIN、无子查询（IN/EXISTS/标量子查询）、无视图、无 DISTINCT/UNION、无 ALTER TABLE
+- 无 LEFT/RIGHT/FULL OUTER JOIN、无 DISTINCT/UNION、无 ALTER TABLE、无相关子查询（子查询引用外层列）、无视图上的 INSERT/UPDATE（视图只读）
 - 无 MOD/% / 字符串函数；无 LIKE（除 IS NULL 外）
 - MVCC 删除标记与 stale 索引项不做物理回收（页面会持续膨胀）
 - 单 Mutex 单 writer 串行化；无死锁检测；长事务 + 未提交孤儿版本会长期占空间
 - BufferPool 无预读；WAL checkpoint 是全量截断；first-fit 插入是 O(页数)
-- **多连接下的 DDL 隔离不存在**：一个连接持有未提交事务时，另一连接仍可 DROP TABLE / CREATE INDEX（无全局事务注册表）；教学场景可接受，修法需先做会话级元数据锁
-- `exec.rs` ~980 行偏大，未来可拆 eval/aggregate/join/plan 四个模块
+- **多连接下的 DDL 隔离不存在**：一个连接持有未提交事务时，另一连接仍可 DROP TABLE / CREATE INDEX / DROP VIEW（无全局事务注册表）；教学场景可接受，修法需先做会话级元数据锁
+- `exec.rs` ~1130 行偏大，未来可拆 eval/aggregate/join/plan/subquery 五个模块
 
 ---
 
 ## 9. 建议的后续顺序
 
-1. **M11 子查询/视图**：`WHERE x IN (SELECT ...)` / `EXISTS` / `CREATE VIEW`（语法骨架已有，parser/executor 扩展点在 `Expr` 与 select 执行路径）
-2. 可选加分项：DISTINCT、LEFT JOIN、字符串函数、miniob 兼容性回归用例
-3. 工程项：MVCC/stale 索引空间回收（vacuum）、模糊 checkpoint、基准测试
+1. 可选 SQL 增强：DISTINCT、LEFT JOIN、LIKE、字符串函数、miniob 兼容性回归用例
+2. 工程项：MVCC/stale 索引空间回收（vacuum）、模糊 checkpoint、基准测试
+3. 若做相关子查询：需要给 eval 传入"外层行"上下文（改 EvalCtx 为链式），子查询物化改为逐行缓存
 
-提交基线：`46c8637 docs: add readme and crash-recovery smoke script`（HEAD）。
+提交基线：`41429e9 feat: views ...`（HEAD）。
