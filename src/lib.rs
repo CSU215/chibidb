@@ -8,6 +8,7 @@ pub mod exec;
 pub mod index;
 pub mod lexer;
 pub mod parser;
+pub mod protocol;
 pub mod render;
 mod repl;
 pub mod result;
