@@ -271,6 +271,9 @@ pub struct SelectStmt {
     pub having: Option<Expr>,
     pub order_by: Vec<(Expr, bool)>,
     pub limit: Option<Limit>,
+    /// UNION [ALL] operands, applied left-to-right after this select's body.
+    /// `bool` is `all` (no dedup).
+    pub set_ops: Vec<(bool, Box<SelectStmt>)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

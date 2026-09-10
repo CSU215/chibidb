@@ -214,7 +214,7 @@ impl<'a> Parser<'a> {
 
     const RESERVED: &'static [&'static str] = &[
         "where", "group", "having", "order", "limit", "on", "join", "inner", "left", "right",
-        "outer", "in", "exists", "distinct", "vacuum", "like",
+        "outer", "in", "exists", "distinct", "vacuum", "like", "union",
     ];
 
     fn agg_func(name: &str) -> Option<AggFunc> {
@@ -245,6 +245,56 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select(&mut self) -> Result<Stmt> {
+        let mut first = self.parse_select_core()?;
+        while self.eat_keyword("union") {
+            let all = self.eat_keyword("all");
+            if !self.eat_keyword("select") {
+                return Err(self.unexpected("select after union"));
+            }
+            let next = self.parse_select_core()?;
+            first.set_ops.push((all, Box::new(next)));
+        }
+        // trailing ORDER BY / LIMIT belong to the whole set operation
+        if self.eat_keyword("order") {
+            if !self.eat_keyword("by") {
+                return Err(self.unexpected("by"));
+            }
+            loop {
+                let expr = self.parse_expr()?;
+                let desc = if self.eat_keyword("desc") {
+                    true
+                } else {
+                    self.eat_keyword("asc");
+                    false
+                };
+                first.order_by.push((expr, desc));
+                if !self.eat_punct(Punct::Comma) {
+                    break;
+                }
+            }
+        }
+        if self.eat_keyword("limit") {
+            let count = self.parse_expr()?;
+            if !matches!(count, Expr::Int(_)) {
+                return Err(Error::Syntax("limit count must be a non-negative integer".into()));
+            }
+            let offset = if self.eat_keyword("offset") {
+                let off = self.parse_expr()?;
+                if !matches!(off, Expr::Int(_)) {
+                    return Err(Error::Syntax(
+                        "limit offset must be a non-negative integer".into(),
+                    ));
+                }
+                Some(off)
+            } else {
+                None
+            };
+            first.limit = Some(Limit { count, offset });
+        }
+        Ok(Stmt::Select(Box::new(first)))
+    }
+
+    fn parse_select_core(&mut self) -> Result<SelectStmt> {
         let distinct = self.eat_keyword("distinct");
         let mut items = Vec::new();
         loop {
@@ -326,46 +376,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let mut order_by = Vec::new();
-        if self.eat_keyword("order") {
-            if !self.eat_keyword("by") {
-                return Err(self.unexpected("by"));
-            }
-            loop {
-                let expr = self.parse_expr()?;
-                let desc = if self.eat_keyword("desc") {
-                    true
-                } else {
-                    self.eat_keyword("asc");
-                    false
-                };
-                order_by.push((expr, desc));
-                if !self.eat_punct(Punct::Comma) {
-                    break;
-                }
-            }
-        }
-        let limit = if self.eat_keyword("limit") {
-            let count = self.parse_expr()?;
-            if !matches!(count, Expr::Int(_)) {
-                return Err(Error::Syntax("limit count must be a non-negative integer".into()));
-            }
-            let offset = if self.eat_keyword("offset") {
-                let off = self.parse_expr()?;
-                if !matches!(off, Expr::Int(_)) {
-                    return Err(Error::Syntax(
-                        "limit offset must be a non-negative integer".into(),
-                    ));
-                }
-                Some(off)
-            } else {
-                None
-            };
-            Some(Limit { count, offset })
-        } else {
-            None
-        };
-        Ok(Stmt::Select(Box::new(SelectStmt {
+        Ok(SelectStmt {
             distinct,
             items,
             from,
@@ -374,9 +385,10 @@ impl<'a> Parser<'a> {
             selection,
             group_by,
             having,
-            order_by,
-            limit,
-        })))
+            order_by: Vec::new(),
+            limit: None,
+            set_ops: Vec::new(),
+        })
     }
 
     fn parse_table_ref(&mut self) -> Result<TableRef> {

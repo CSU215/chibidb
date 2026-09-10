@@ -249,7 +249,7 @@ fn eval_sort_keys(
     Ok(keys)
 }
 
-fn cmp_sort_keys(a: &[Value], b: &[Value], order_by: &[(Expr, bool)]) -> std::cmp::Ordering {
+pub(crate) fn cmp_sort_keys(a: &[Value], b: &[Value], order_by: &[(Expr, bool)]) -> std::cmp::Ordering {
     for ((_, desc), (va, vb)) in order_by.iter().zip(a.iter().zip(b.iter())) {
         // nulls sort as smallest: first on asc, last on desc
         let ord = match (va, vb) {

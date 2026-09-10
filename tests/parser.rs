@@ -567,6 +567,7 @@ fn parses_explain() {
                     having: None,
                     order_by: vec![],
                     limit: None,
+                    set_ops: vec![],
                 }))
             );
         }

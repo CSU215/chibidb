@@ -19,7 +19,9 @@ mod subquery;
 
 pub use eval::eval_const;
 
-use aggregate::{apply_limit, dedup_rows, execute_grouped_select, expr_has_aggregate, sort_rows};
+use aggregate::{
+    apply_limit, cmp_sort_keys, dedup_rows, execute_grouped_select, expr_has_aggregate, sort_rows,
+};
 use eval::{eval, eval_predicate, EvalCtx};
 use join::nested_loop;
 use plan::{execute_explain, index_scan_source};
@@ -380,12 +382,87 @@ fn single_table_schema(db: &Database, tref: &TableRef) -> Result<Schema> {
     })
 }
 
+/// Evaluates a UNION [ALL] chain left-to-right, then applies the trailing
+/// ORDER BY / LIMIT to the whole result set.
+fn execute_set_op(
+    db: &mut Database,
+    trx: &mut TrxState,
+    s: &SelectStmt,
+    outer: Option<&EvalCtx>,
+) -> Result<ResultSet> {
+    let mut base = s.clone();
+    base.set_ops = Vec::new();
+    let order_by = std::mem::take(&mut base.order_by);
+    let limit = base.limit.take();
+    let (columns, mut rows) = rows_of(execute_select(db, trx, &base, outer)?)?;
+    for (all, op) in &s.set_ops {
+        let (cols2, rows2) = rows_of(execute_select(db, trx, op, outer)?)?;
+        if cols2.len() != columns.len() {
+            return Err(Error::Runtime(format!(
+                "union column count mismatch: {} vs {}",
+                columns.len(),
+                cols2.len()
+            )));
+        }
+        rows.extend(rows2);
+        if !*all {
+            dedup_rows(&mut rows);
+        }
+    }
+    if !order_by.is_empty() {
+        sort_projected(db, trx, outer, &columns, &mut rows, &order_by)?;
+    }
+    apply_limit(&mut rows, &limit)?;
+    Ok(ResultSet::Rows { columns, rows })
+}
+
+fn rows_of(rs: ResultSet) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    match rs {
+        ResultSet::Rows { columns, rows } => Ok((columns, rows)),
+        ResultSet::Message(_) => Err(Error::Runtime("set operation requires selects".into())),
+    }
+}
+
+/// ORDER BY over an already-projected result set: column references resolve
+/// against the output column names.
+fn sort_projected(
+    db: &mut Database,
+    trx: &mut TrxState,
+    outer: Option<&EvalCtx>,
+    columns: &[String],
+    rows: &mut Vec<Vec<Value>>,
+    order_by: &[(Expr, bool)],
+) -> Result<()> {
+    let schema = Schema {
+        columns: columns
+            .iter()
+            .map(|c| crate::catalog::ColumnDesc::plain(None, c.clone(), DataType::Text))
+            .collect(),
+    };
+    let mut pairs: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        let mut ctx = EvalCtx::row(&schema, &row);
+        ctx.parent = outer;
+        let mut keys = Vec::with_capacity(order_by.len());
+        for (e, _) in order_by {
+            keys.push(eval_bound(db, trx, e, Some(&ctx))?);
+        }
+        pairs.push((row, keys));
+    }
+    pairs.sort_by(|(_, ka), (_, kb)| cmp_sort_keys(ka, kb, order_by));
+    rows.extend(pairs.into_iter().map(|(r, _)| r));
+    Ok(())
+}
+
 pub(crate) fn execute_select(
     db: &mut Database,
     trx: &mut TrxState,
     s: &SelectStmt,
     outer: Option<&EvalCtx>,
 ) -> Result<ResultSet> {
+    if !s.set_ops.is_empty() {
+        return execute_set_op(db, trx, s, outer);
+    }
     if s.from.is_empty() {
         let mut columns = Vec::new();
         let mut row = Vec::new();
