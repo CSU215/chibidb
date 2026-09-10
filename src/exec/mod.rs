@@ -63,6 +63,9 @@ pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Res
         Stmt::Delete(d) => execute_delete(db, trx, d),
         Stmt::Update(u) => execute_update(db, trx, u),
         Stmt::Explain(e) => execute_explain(db, e),
+        Stmt::CreateDatabase(_) | Stmt::DropDatabase(_) | Stmt::Use(_) => {
+            Err(Error::Runtime("database statements must be run on an instance".into()))
+        }
         Stmt::Trx(_) => Err(Error::Runtime("transaction control handled elsewhere".into())),
     }
 }

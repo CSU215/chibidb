@@ -1,7 +1,8 @@
 use crate::ast::{
-    AggFunc, BinOp, ColumnDef, CreateIndexStmt, CreateTableStmt, CreateViewStmt, DataType,
-    DeleteStmt, DropIndexStmt, DropTableStmt, DropViewStmt, ExplainStmt, Expr, InsertStmt, JoinKind,
-    Limit, SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp, UpdateStmt,
+    AggFunc, BinOp, ColumnDef, CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt, CreateViewStmt,
+    DataType, DeleteStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, DropViewStmt, ExplainStmt,
+    Expr, InsertStmt, JoinKind, Limit, SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp,
+    UpdateStmt, UseStmt,
 };
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
@@ -113,6 +114,10 @@ impl<'a> Parser<'a> {
             return self.parse_select();
         }
         if self.eat_keyword("create") {
+            if self.eat_keyword("database") {
+                let name = self.parse_ident("database name")?;
+                return Ok(Stmt::CreateDatabase(CreateDatabaseStmt { name }));
+            }
             if self.eat_keyword("view") {
                 let name = self.parse_ident("view name")?;
                 if !self.eat_keyword("as") {
@@ -155,6 +160,10 @@ impl<'a> Parser<'a> {
             return self.parse_create_table();
         }
         if self.eat_keyword("drop") {
+            if self.eat_keyword("database") {
+                let name = self.parse_ident("database name")?;
+                return Ok(Stmt::DropDatabase(DropDatabaseStmt { name }));
+            }
             if self.eat_keyword("index") {
                 let name = self.parse_ident("index name")?;
                 return Ok(Stmt::DropIndex(DropIndexStmt { name }));
@@ -168,6 +177,10 @@ impl<'a> Parser<'a> {
             }
             let name = self.parse_ident("table name")?;
             return Ok(Stmt::DropTable(DropTableStmt { name }));
+        }
+        if self.eat_keyword("use") {
+            let name = self.parse_ident("database name")?;
+            return Ok(Stmt::Use(UseStmt { name }));
         }
         if self.eat_keyword("insert") {
             if !self.eat_keyword("into") {

@@ -217,6 +217,21 @@ pub struct DropViewStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CreateDatabaseStmt {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropDatabaseStmt {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseStmt {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExplainStmt {
     pub stmt: Box<Stmt>,
 }
@@ -280,10 +295,12 @@ pub struct SelectStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
+    CreateDatabase(CreateDatabaseStmt),
     CreateIndex(CreateIndexStmt),
     CreateTable(CreateTableStmt),
     CreateView(CreateViewStmt),
     Delete(DeleteStmt),
+    DropDatabase(DropDatabaseStmt),
     DropIndex(DropIndexStmt),
     DropTable(DropTableStmt),
     DropView(DropViewStmt),
@@ -291,6 +308,7 @@ pub enum Stmt {
     Insert(InsertStmt),
     Select(Box<SelectStmt>),
     Update(UpdateStmt),
+    Use(UseStmt),
     Trx(TrxCtl),
     Checkpoint,
     Vacuum,
