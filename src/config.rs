@@ -1,0 +1,134 @@
+use std::path::Path;
+
+use serde::Deserialize;
+
+use crate::{Error, Result};
+
+/// Which storage engine new tables use. Existing files record their own
+/// engine in the file header, so this only affects creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineKind {
+    #[default]
+    Heap,
+    Lsm,
+}
+
+/// Default execution model. Volcano is the baseline; Chunk is an
+/// optimization layer added later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionMode {
+    #[default]
+    Volcano,
+    Chunk,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    pub storage: StorageConfig,
+    pub wal: WalConfig,
+    pub server: ServerConfig,
+    pub execution: ExecutionConfig,
+    pub auth: AuthConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageConfig {
+    pub default_engine: EngineKind,
+    /// Only affects newly created files; open files use their own header.
+    pub page_size: u32,
+    pub buffer_pool_frames: usize,
+    pub double_write: bool,
+    pub inline_lob_limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WalConfig {
+    pub checkpoint_threshold: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerConfig {
+    pub addr: String,
+    pub protocols: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExecutionConfig {
+    pub mode: ExecutionMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    pub enabled: bool,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            default_engine: EngineKind::Heap,
+            page_size: 8192,
+            buffer_pool_frames: 64,
+            double_write: false,
+            inline_lob_limit: 4096,
+        }
+    }
+}
+
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self { checkpoint_threshold: 8 * 1024 * 1024 }
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self { addr: "127.0.0.1:5678".into(), protocols: vec!["text".into()] }
+    }
+}
+
+impl Config {
+    /// Loads `config.toml`. A missing file is not an error: defaults apply.
+    pub fn load(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let cfg = Self::from_toml_str(&text)?;
+                cfg.validate()?;
+                Ok(cfg)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(Error::Runtime(format!(
+                "cannot read config {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Parses a TOML string; missing entries fall back to defaults.
+    /// Callers must call [`Config::validate`] to reject impossible values.
+    pub fn from_toml_str(text: &str) -> Result<Self> {
+        toml::from_str(text).map_err(|e| Error::Runtime(format!("invalid config: {e}")))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let page_size = self.storage.page_size;
+        if page_size < 512 || !page_size.is_power_of_two() {
+            return Err(Error::Runtime(format!(
+                "storage.page_size must be a power of two >= 512, got {page_size}"
+            )));
+        }
+        if self.storage.buffer_pool_frames == 0 {
+            return Err(Error::Runtime(
+                "storage.buffer_pool_frames must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}

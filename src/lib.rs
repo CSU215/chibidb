@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod catalog;
 pub mod client;
+pub mod config;
 pub mod datetime;
 mod error;
 pub mod exec;

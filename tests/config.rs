@@ -1,0 +1,111 @@
+use std::io::Write;
+
+use chibidb::config::{Config, EngineKind, ExecutionMode};
+
+#[test]
+fn defaults_are_sane() {
+    let c = Config::default();
+    assert_eq!(c.storage.page_size, 8192);
+    assert_eq!(c.storage.buffer_pool_frames, 64);
+    assert_eq!(c.storage.default_engine, EngineKind::Heap);
+    assert!(!c.storage.double_write);
+    assert_eq!(c.storage.inline_lob_limit, 4096);
+    assert_eq!(c.wal.checkpoint_threshold, 8 * 1024 * 1024);
+    assert_eq!(c.server.addr, "127.0.0.1:5678");
+    assert_eq!(c.server.protocols, ["text"]);
+    assert_eq!(c.execution.mode, ExecutionMode::Volcano);
+    assert!(!c.auth.enabled);
+}
+
+#[test]
+fn partial_toml_fills_remaining_defaults() {
+    let c = Config::from_toml_str("[storage]\npage_size = 4096\n").unwrap();
+    assert_eq!(c.storage.page_size, 4096);
+    assert_eq!(c.storage.buffer_pool_frames, 64);
+    assert_eq!(c.storage.default_engine, EngineKind::Heap);
+    assert_eq!(c.server.addr, "127.0.0.1:5678");
+}
+
+#[test]
+fn parses_all_sections() {
+    let toml = r#"
+[storage]
+default_engine = "lsm"
+page_size = 16384
+buffer_pool_frames = 128
+double_write = true
+inline_lob_limit = 2048
+
+[wal]
+checkpoint_threshold = 1048576
+
+[server]
+addr = "0.0.0.0:4000"
+protocols = ["text", "mysql"]
+
+[execution]
+mode = "chunk"
+
+[auth]
+enabled = true
+"#;
+    let c = Config::from_toml_str(toml).unwrap();
+    assert_eq!(c.storage.default_engine, EngineKind::Lsm);
+    assert_eq!(c.storage.page_size, 16384);
+    assert_eq!(c.storage.buffer_pool_frames, 128);
+    assert!(c.storage.double_write);
+    assert_eq!(c.storage.inline_lob_limit, 2048);
+    assert_eq!(c.wal.checkpoint_threshold, 1048576);
+    assert_eq!(c.server.addr, "0.0.0.0:4000");
+    assert_eq!(c.server.protocols, ["text", "mysql"]);
+    assert_eq!(c.execution.mode, ExecutionMode::Chunk);
+    assert!(c.auth.enabled);
+}
+
+#[test]
+fn rejects_unknown_field() {
+    assert!(Config::from_toml_str("[storage]\nbogus = 1\n").is_err());
+}
+
+#[test]
+fn rejects_non_power_of_two_page_size() {
+    let c = Config::from_toml_str("[storage]\npage_size = 1000\n").unwrap();
+    assert!(c.validate().is_err());
+}
+
+#[test]
+fn rejects_zero_page_size() {
+    let c = Config::from_toml_str("[storage]\npage_size = 0\n").unwrap();
+    assert!(c.validate().is_err());
+}
+
+#[test]
+fn rejects_zero_buffer_pool_frames() {
+    let c = Config::from_toml_str("[storage]\nbuffer_pool_frames = 0\n").unwrap();
+    assert!(c.validate().is_err());
+}
+
+#[test]
+fn missing_file_yields_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Config::load(&dir.path().join("nope.toml")).unwrap();
+    assert_eq!(c, Config::default());
+}
+
+#[test]
+fn load_reads_and_validates_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "[storage]\npage_size = 4096").unwrap();
+    let c = Config::load(&path).unwrap();
+    assert_eq!(c.storage.page_size, 4096);
+}
+
+#[test]
+fn load_rejects_invalid_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[storage]\npage_size = 1000\n").unwrap();
+    assert!(Config::load(&path).is_err());
+}
