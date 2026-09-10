@@ -1,6 +1,7 @@
 use crate::ast::{
     CreateIndexStmt, CreateTableStmt, CreateViewStmt, DataType, DeleteStmt, DropIndexStmt,
-    DropTableStmt, DropViewStmt, Expr, InsertStmt, SelectItem, SelectStmt, Stmt, UpdateStmt,
+    DropTableStmt, DropViewStmt, Expr, InsertStmt, SelectItem, SelectStmt, Stmt, TableRef,
+    UpdateStmt,
 };
 use crate::catalog::Schema;
 use crate::result::ResultSet;
@@ -292,6 +293,22 @@ fn execute_create_table(db: &mut Database, c: &CreateTableStmt) -> Result<Result
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
+/// Schema of a single real table (owner-qualified), without scanning rows.
+fn single_table_schema(db: &Database, tref: &TableRef) -> Result<Schema> {
+    let owner = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+    let columns = db.catalog().table(&tref.name)?.schema.columns.clone();
+    Ok(Schema {
+        columns: columns
+            .into_iter()
+            .map(|c| crate::catalog::ColumnDesc {
+                owner: Some(owner.clone()),
+                name: c.name,
+                dtype: c.dtype,
+            })
+            .collect(),
+    })
+}
+
 pub(crate) fn execute_select(
     db: &mut Database,
     trx: &mut TrxState,
@@ -318,7 +335,16 @@ pub(crate) fn execute_select(
         }
         return Ok(ResultSet::Rows { columns, rows: vec![row] });
     }
-    let (schema, rows) = nested_loop(db, trx, s)?;
+    // For a single table, resolve the access path before scanning: when an
+    // index applies we never touch the rest of the heap.
+    let (schema, source_rows) = if s.from.len() == 1 {
+        match index_scan_source(db, trx, &s.from[0].name, s.selection.as_ref())? {
+            Some(scanned) => (single_table_schema(db, &s.from[0])?, scanned),
+            None => nested_loop(db, trx, s)?,
+        }
+    } else {
+        nested_loop(db, trx, s)?
+    };
     let mut headers = Vec::new();
     let mut exprs = Vec::new();
     for item in &s.items {
@@ -343,13 +369,6 @@ pub(crate) fn execute_select(
             }
         }
     }
-    // index scan only helps single-table scans
-    let mut source_rows: Vec<Vec<Value>> = rows;
-    if s.from.len() == 1
-        && let Some(scanned) =
-            index_scan_source(db, trx, &s.from[0].name, s.selection.as_ref())? {
-                source_rows = scanned;
-        }
     let mut filtered: Vec<Vec<Value>> = Vec::new();
     for row in source_rows {
         if let Some(sel) = &s.selection

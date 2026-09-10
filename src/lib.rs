@@ -319,12 +319,16 @@ impl Database {
     fn commit_trx(&mut self, trx_id: u32, wrote: bool) -> Result<()> {
         self.committed_trxs.insert(trx_id);
         self.open_trxs.remove(&trx_id);
-        if wrote {
-            // log durability first: after this point the transaction commits
-            // even if the process dies before its pages are flushed
-            self.wal.append(trx_id, &Record::Commit)?;
-            self.wal.sync()?;
+        if !wrote {
+            // A read-only transaction created no versioned rows, so no future
+            // snapshot needs its id and its bookkeeping need not hit disk.
+            // Skipping the catalog rewrite keeps SELECT cheap.
+            return Ok(());
         }
+        // log durability first: after this point the transaction commits
+        // even if the process dies before its pages are flushed
+        self.wal.append(trx_id, &Record::Commit)?;
+        self.wal.sync()?;
         self.save_catalog()?;
         // opportunistic checkpoint once the log outgrew its budget and no
         // open transaction is counting on its contents

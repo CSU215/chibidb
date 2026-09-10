@@ -93,6 +93,25 @@ fn explain_chooses_access_path() {
 }
 
 #[test]
+fn explain_combines_range_bounds() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int);").unwrap();
+    db.execute_sql("insert into t values (1),(2),(3),(4),(5);").unwrap();
+    db.execute_sql("create index idx on t (id);").unwrap();
+
+    let plan =
+        message(&db.execute_sql("explain select * from t where id >= 2 and id < 5;").unwrap());
+    assert!(plan.contains("id >= 2"), "lower bound missing: {plan}");
+    assert!(plan.contains("id < 5"), "upper bound missing: {plan}");
+
+    let rs = db
+        .execute_sql("select id from t where id >= 2 and id < 5 order by id;")
+        .unwrap();
+    let (_, rows) = rows(&rs);
+    assert_eq!(rows, [[Value::Int(2)], [Value::Int(3)], [Value::Int(4)]]);
+}
+
+#[test]
 fn index_scan_results_match_full_scan() {
     with_dbs(|db| {
         seeded(db);

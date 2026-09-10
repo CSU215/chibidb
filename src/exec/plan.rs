@@ -29,19 +29,42 @@ fn plan_select(db: &mut Database, s: &SelectStmt) -> Result<String> {
     }
     match find_sargable(db, &s.from[0].name, s.selection.as_ref())? {
         Some(sarg) => Ok(format!(
-            "IndexScan(index={}, table={}, where {} {}) -> Filter -> Project",
-            sarg.index, s.from[0].name, sarg.column, sarg.op
+            "IndexScan(index={}, table={}, {}) -> Filter -> Project",
+            sarg.index,
+            s.from[0].name,
+            describe_sarg(&sarg)
         )),
         None => Ok(format!("FullScan(table={}) -> Filter -> Project", s.from[0].name)),
     }
+}
+
+fn describe_sarg(s: &Sargable) -> String {
+    match &s.kind {
+        SargKind::Eq(lit) => format!("where {} = {lit}", s.column),
+        SargKind::Range { lower, upper } => {
+            let mut parts = Vec::new();
+            if let Some((inclusive, lit)) = lower {
+                parts.push(format!("{} {} {lit}", s.column, if *inclusive { ">=" } else { ">" }));
+            }
+            if let Some((inclusive, lit)) = upper {
+                parts.push(format!("{} {} {lit}", s.column, if *inclusive { "<=" } else { "<" }));
+            }
+            format!("where {}", parts.join(" and "))
+        }
+    }
+}
+
+enum SargKind {
+    Eq(Expr),
+    /// Bounds are `(inclusive, literal)`; either side may be absent.
+    Range { lower: Option<(bool, Expr)>, upper: Option<(bool, Expr)> },
 }
 
 struct Sargable {
     index: String,
     column: String,
     dtype: DataType,
-    op: BinOp,
-    lit: Expr,
+    kind: SargKind,
 }
 
 fn split_conjuncts(expr: &Expr) -> Vec<&Expr> {
@@ -66,8 +89,10 @@ fn flip_cmp(op: BinOp) -> Option<BinOp> {
     }
 }
 
-/// Rule-based access path choice: an equality or range predicate over an
-/// indexed column (even buried in an AND chain) uses the index.
+/// Rule-based access path choice: equality or range predicates over an
+/// indexed column (even buried in an AND chain) use the index. An equality
+/// wins outright; otherwise all `>`/`>=`/`<`/`<=` conjuncts on one indexed
+/// column are combined into a single bounded range scan.
 fn find_sargable(
     db: &mut Database,
     table: &str,
@@ -80,7 +105,15 @@ fn find_sargable(
     if db.catalog().view(table).is_some() {
         return Ok(None);
     }
+    struct Cand {
+        column: String,
+        index: String,
+        dtype: DataType,
+        op: BinOp,
+        lit: Expr,
+    }
     let schema = &db.catalog().table(table)?.schema;
+    let mut cands: Vec<Cand> = Vec::new();
     for conj in split_conjuncts(sel) {
         let (col_expr, op, lit) = match conj {
             Expr::Binary(op @ (BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge), l, r) => {
@@ -103,22 +136,60 @@ fn find_sargable(
         let Some(col_idx) = schema.index_of(&cname) else {
             continue;
         };
-        let ix = db
+        let Some(ix) = db
             .catalog()
             .indexes_for(table)
             .into_iter()
-            .find(|ix| ix.column == cname);
-        if let Some(ix) = ix {
+            .find(|ix| ix.column == cname)
+        else {
+            continue;
+        };
+        let dtype = schema.columns[col_idx].dtype;
+        if op == BinOp::Eq {
             return Ok(Some(Sargable {
                 index: ix.name.clone(),
                 column: cname,
-                dtype: schema.columns[col_idx].dtype,
-                op,
-                lit,
+                dtype,
+                kind: SargKind::Eq(lit),
             }));
         }
+        cands.push(Cand { column: cname, index: ix.name.clone(), dtype, op, lit });
     }
-    Ok(None)
+    let Some(first) = cands.first() else {
+        return Ok(None);
+    };
+    let column = first.column.clone();
+    let index = first.index.clone();
+    let dtype = first.dtype;
+    let mut lower = None;
+    let mut upper = None;
+    for c in &cands {
+        if c.column != column {
+            continue;
+        }
+        match c.op {
+            BinOp::Gt => lower = Some((false, c.lit.clone())),
+            BinOp::Ge => lower = Some((true, c.lit.clone())),
+            BinOp::Lt => upper = Some((false, c.lit.clone())),
+            BinOp::Le => upper = Some((true, c.lit.clone())),
+            _ => {}
+        }
+    }
+    Ok(Some(Sargable { index, column, dtype, kind: SargKind::Range { lower, upper } }))
+}
+
+fn literal_key(lit: &Expr, dtype: DataType, column: &str) -> Result<Vec<u8>> {
+    let v = eval_const(lit)?;
+    let coerced = coerce(v, dtype, column)?;
+    encode_key(&coerced)
+}
+
+fn bound<'a>(key: Option<&'a Vec<u8>>, inclusive: bool) -> Bound<'a> {
+    match key {
+        Some(k) if inclusive => Bound::Included(k),
+        Some(k) => Bound::Excluded(k),
+        None => Bound::Unbounded,
+    }
 }
 
 /// If the selection is sargable, scans the index and returns the visible
@@ -132,9 +203,6 @@ pub(crate) fn index_scan_source(
     let Some(sarg) = find_sargable(db, table, selection)? else {
         return Ok(None);
     };
-    let lit_val = eval_const(&sarg.lit)?;
-    let coerced = coerce(lit_val, sarg.dtype, &sarg.column)?;
-    let key = encode_key(&coerced)?;
     let ix_file = db
         .catalog()
         .indexes_for(table)
@@ -143,13 +211,24 @@ pub(crate) fn index_scan_source(
         .map(|ix| ix.store.file)
         .expect("sargable index exists");
     let btree = BTree::at(ix_file);
-    let rids: Vec<Rid> = match sarg.op {
-        BinOp::Eq => btree.search(&mut db.pool, &key)?,
-        BinOp::Lt => scan_rids(&btree, &mut db.pool, Bound::Unbounded, Bound::Excluded(&key))?,
-        BinOp::Le => scan_rids(&btree, &mut db.pool, Bound::Unbounded, Bound::Included(&key))?,
-        BinOp::Gt => scan_rids(&btree, &mut db.pool, Bound::Excluded(&key), Bound::Unbounded)?,
-        BinOp::Ge => scan_rids(&btree, &mut db.pool, Bound::Included(&key), Bound::Unbounded)?,
-        _ => unreachable!("sargable ops are restricted"),
+    let rids: Vec<Rid> = match &sarg.kind {
+        SargKind::Eq(lit) => {
+            let key = literal_key(lit, sarg.dtype, &sarg.column)?;
+            btree.search(&mut db.pool, &key)?
+        }
+        SargKind::Range { lower, upper } => {
+            let lower_key = lower
+                .as_ref()
+                .map(|(_, l)| literal_key(l, sarg.dtype, &sarg.column))
+                .transpose()?;
+            let upper_key = upper
+                .as_ref()
+                .map(|(_, l)| literal_key(l, sarg.dtype, &sarg.column))
+                .transpose()?;
+            let start = bound(lower_key.as_ref(), lower.as_ref().is_some_and(|(i, _)| *i));
+            let end = bound(upper_key.as_ref(), upper.as_ref().is_some_and(|(i, _)| *i));
+            scan_rids(&btree, &mut db.pool, start, end)?
+        }
     };
     Ok(Some(decode_visible(db.store_get_records(table, &rids)?, trx)?))
 }
