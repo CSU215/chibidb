@@ -366,6 +366,16 @@ fn parses_is_null() {
 }
 
 #[test]
+fn parses_distinct() {
+    let s = select("select distinct id from t;");
+    assert!(s.distinct, "distinct flag must be set");
+    let s = select("select id from t;");
+    assert!(!s.distinct);
+    let s = select("select distinct * from t;");
+    assert!(s.distinct);
+}
+
+#[test]
 fn parses_in_list() {
     let s = select("select * from t where id in (1, 2, 3);");
     let sel = s.selection.as_ref().unwrap();
@@ -465,6 +475,7 @@ fn parses_explain() {
             assert_eq!(
                 *inner.stmt,
                 Stmt::Select(Box::new(chibidb::ast::SelectStmt {
+                    distinct: false,
                     items: vec![chibidb::ast::SelectItem::Expr(chibidb::ast::Expr::Int(1))],
                     from: vec![],
                     on: vec![],

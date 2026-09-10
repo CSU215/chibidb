@@ -211,7 +211,7 @@ impl<'a> Parser<'a> {
 
     const RESERVED: &'static [&'static str] = &[
         "where", "group", "having", "order", "limit", "on", "join", "inner", "left", "right",
-        "in", "exists",
+        "in", "exists", "distinct",
     ];
 
     fn agg_func(name: &str) -> Option<AggFunc> {
@@ -242,6 +242,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select(&mut self) -> Result<Stmt> {
+        let distinct = self.eat_keyword("distinct");
         let mut items = Vec::new();
         loop {
             if self.eat_punct(Punct::Star) {
@@ -344,6 +345,7 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(Stmt::Select(Box::new(SelectStmt {
+            distinct,
             items,
             from,
             on,

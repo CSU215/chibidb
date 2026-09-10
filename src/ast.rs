@@ -221,6 +221,7 @@ pub struct Limit {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
+    pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub from: Vec<TableRef>,
     pub on: Vec<Expr>,

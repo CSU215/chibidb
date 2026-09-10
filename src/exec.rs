@@ -429,7 +429,7 @@ fn lift_subqueries(db: &mut Database, trx: &mut TrxState, s: &SelectStmt) -> Res
     for (e, desc) in &s.order_by {
         order_by.push((lift_expr(db, trx, e)?, *desc));
     }
-    Ok(SelectStmt { items, from: s.from.clone(), on, selection, group_by, having, order_by, limit: s.limit.clone() })
+    Ok(SelectStmt { distinct: s.distinct, items, from: s.from.clone(), on, selection, group_by, having, order_by, limit: s.limit.clone() })
 }
 
 fn lift_expr(db: &mut Database, trx: &mut TrxState, e: &Expr) -> Result<Expr> {
@@ -678,8 +678,25 @@ fn execute_select(db: &mut Database, trx: &mut TrxState, s: &SelectStmt) -> Resu
         }
         out_rows.push(out_row);
     }
+    if s.distinct {
+        dedup_rows(&mut out_rows);
+    }
     apply_limit(&mut out_rows, &s.limit)?;
     Ok(ResultSet::Rows { columns: headers, rows: out_rows })
+}
+
+/// DISTINCT: keep the first occurrence of every projected row; NULLs are
+/// equal for dedup purposes (SQL semantics).
+fn dedup_rows(out_rows: &mut Vec<Vec<Value>>) {
+    let mut seen: Vec<Vec<Value>> = Vec::new();
+    out_rows.retain(|row| {
+        if seen.iter().any(|s| s == row) {
+            false
+        } else {
+            seen.push(row.clone());
+            true
+        }
+    });
 }
 
 fn apply_limit(out_rows: &mut Vec<Vec<Value>>, limit: &Option<Limit>) -> Result<()> {
@@ -767,6 +784,9 @@ fn execute_grouped_select(
             out_row.push(eval(e, Some(&EvalCtx::Group(schema, &group_rows)))?);
         }
         out_rows.push(out_row);
+    }
+    if s.distinct {
+        dedup_rows(&mut out_rows);
     }
     apply_limit(&mut out_rows, &s.limit)?;
     Ok(ResultSet::Rows { columns: headers, rows: out_rows })

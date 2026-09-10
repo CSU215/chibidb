@@ -561,6 +561,41 @@ fn view_validation_and_persistence() {
 }
 
 #[test]
+fn distinct_deduplicates_projected_rows() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int, name char(8));").unwrap();
+        db.execute_sql(
+            "insert into t values (1, 'a'), (2, 'a'), (3, 'b'), (4, null), (5, null);",
+        )
+        .unwrap();
+
+        // NULLs count as duplicates of each other (SQL semantics)
+        let rs = db.execute_sql("select distinct name from t order by name;").unwrap();
+        assert_eq!(
+            rows(&rs).1,
+            [[Value::Null], [Value::Str("a".into())], [Value::Str("b".into())]]
+        );
+
+        // distinct over an expression (integer division truncates)
+        let rs = db.execute_sql("select distinct id / 2 from t order by id / 2;").unwrap();
+        assert_eq!(rows(&rs).1, [[Value::Int(0)], [Value::Int(1)], [Value::Int(2)]]);
+
+        // multi-column distinct pairs
+        db.execute_sql("create table p (a int, b int);").unwrap();
+        db.execute_sql("insert into p values (1, 1), (1, 2), (1, 1), (2, 1);").unwrap();
+        let rs = db.execute_sql("select distinct a, b from p order by a, b;").unwrap();
+        assert_eq!(
+            rows(&rs).1,
+            [[Value::Int(1), Value::Int(1)], [Value::Int(1), Value::Int(2)], [Value::Int(2), Value::Int(1)]]
+        );
+
+        // distinct then limit
+        let rs = db.execute_sql("select distinct a from p limit 1;").unwrap();
+        assert_eq!(rows(&rs).1, [[Value::Int(1)]]);
+    });
+}
+
+#[test]
 fn date_type() {
     with_dbs(|db| {
         db.execute_sql("create table t (id int, birthday date);").unwrap();
