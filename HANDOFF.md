@@ -319,6 +319,6 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 理由：1+2 补齐 SQL 表达式面且互相搭车；3 在 4/6 之前做，减少测试改动打架；5 给 README 增色并验证重构。
 
-进度：**1–6 全部完成**（274 tests 全绿，clippy 零警告，改动尚未提交）。计划已清空。
+进度：**1–6 全部完成**（274 tests 全绿，clippy 零警告）。计划已清空。
 
 提交基线：`975dab2 feat: vacuum ...`（HEAD）；HEAD 之后当前工作区含 M17–M19 未提交改动。建议按里程碑拆分提交（如 `feat: like/mod/string functions`、`refactor: split exec`、`test: miniob compat + bench`、`perf: index access path + range bounds + read-only catalog`、`feat: correlated subqueries`）。
