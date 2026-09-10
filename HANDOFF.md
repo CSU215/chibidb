@@ -337,6 +337,8 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 工作纪律：TDD 红绿节奏、每项一个里程碑提交、提交前全量 `cargo test` + clippy 清零 + 更新本文档与 README。
 
-进度：**M20–M25 计划全部完成**（296 tests，clippy 零警告，改动已按里程碑细粒度提交）。
+进度：**M20–M25 计划全部完成并通过验收**（297 tests，clippy 零警告，改动已按里程碑细粒度提交）。
 
-提交基线：`e897b08 perf: skip sort when an index already provides the order`（HEAD）。
+验收记录（M20–M25 评审）：296 tests 全绿 + clippy 零警告；人工边界复验（跨列同值、DROP TABLE 清约束索引、链式 RIGHT JOIN、ESCAPE 角例、OrderedIndexScan 含 DESC、DML 子查询、恢复路径 `rebuild_indexes` 覆盖约束索引）均通过。**发现并修复 1 处阻断性缺陷**：`check_unique` 的 `claimed` 查重表跨唯一索引共享，同一行两个不同约束列取同值（如 PK 列与 UNIQUE 列同为 1）会被误判 `duplicate key`——红测试复现后按列下标区分修复，见 `abd0dbb`。已知边界（如实记档）：UNION 各臂不做类型统一，混型结果集上比较会报 type mismatch。
+
+提交基线：`abd0dbb fix: scope uniqueness claims per column`（HEAD）。
