@@ -6,6 +6,7 @@ pub mod datetime;
 mod error;
 pub mod exec;
 pub mod index;
+pub mod instance;
 pub mod lexer;
 pub mod parser;
 pub mod pipeline;
