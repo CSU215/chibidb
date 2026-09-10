@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 
 use crate::ast::DataType;
 use crate::storage::FileId;
+use crate::value::Value;
 use crate::{Error, Result};
 
 pub mod meta;
 
-use meta::{IndexMeta, TableMeta, ViewMeta};
+use meta::{ColumnMeta, IndexMeta, TableMeta, ViewMeta};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDesc {
@@ -14,6 +15,25 @@ pub struct ColumnDesc {
     pub owner: Option<String>,
     pub name: String,
     pub dtype: DataType,
+    pub not_null: bool,
+    pub primary_key: bool,
+    pub unique: bool,
+    pub default: Option<Value>,
+}
+
+impl ColumnDesc {
+    /// A query-time column with no storage constraints attached.
+    pub fn plain(owner: Option<String>, name: String, dtype: DataType) -> Self {
+        ColumnDesc {
+            owner,
+            name,
+            dtype,
+            not_null: false,
+            primary_key: false,
+            unique: false,
+            default: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -74,6 +94,9 @@ pub(crate) struct IndexEntry {
     pub name: String,
     pub table: String,
     pub column: String,
+    /// Backs a PRIMARY KEY / UNIQUE constraint; DML enforces it and it may
+    /// not be dropped on its own.
+    pub unique: bool,
     pub store: IndexStore,
 }
 
@@ -124,7 +147,14 @@ impl Catalog {
                     .schema
                     .columns
                     .iter()
-                    .map(|c| (c.name.clone(), c.dtype))
+                    .map(|c| ColumnMeta {
+                        name: c.name.clone(),
+                        dtype: c.dtype,
+                        not_null: c.not_null,
+                        primary_key: c.primary_key,
+                        unique: c.unique,
+                        default: c.default.clone(),
+                    })
                     .collect();
                 TableMeta { name: name.clone(), columns, file_no: t.heap.file_no }
             })
@@ -136,6 +166,7 @@ impl Catalog {
         name: &str,
         table: String,
         column: String,
+        unique: bool,
         store: IndexStore,
     ) -> Result<()> {
         if self.indexes.contains_key(name) {
@@ -143,7 +174,7 @@ impl Catalog {
         }
         self.indexes.insert(
             name.to_string(),
-            IndexEntry { name: name.to_string(), table, column, store },
+            IndexEntry { name: name.to_string(), table, column, unique, store },
         );
         Ok(())
     }
@@ -182,6 +213,7 @@ impl Catalog {
                 name: ix.name.clone(),
                 table: ix.table.clone(),
                 column: ix.column.clone(),
+                unique: ix.unique,
                 file_no: ix.store.file_no,
             })
             .collect()

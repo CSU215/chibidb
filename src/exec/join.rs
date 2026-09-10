@@ -34,11 +34,9 @@ fn from_source(
         ResultSet::Rows { columns, rows } => Ok((
             columns
                 .into_iter()
-                .map(|name| crate::catalog::ColumnDesc {
-                    owner: None,
-                    name,
+                .map(|name| {
                     // view columns carry no storage type; unused in queries
-                    dtype: DataType::Text,
+                    crate::catalog::ColumnDesc::plain(None, name, DataType::Text)
                 })
                 .collect(),
             rows,
@@ -64,11 +62,11 @@ pub(crate) fn nested_loop(
         let (columns, visible) = from_source(db, trx, tref)?;
         let right_cols = columns.len();
         for col in columns {
-            schema.columns.push(crate::catalog::ColumnDesc {
-                owner: Some(owner.clone()),
-                name: col.name,
-                dtype: col.dtype,
-            });
+            schema.columns.push(crate::catalog::ColumnDesc::plain(
+                Some(owner.clone()),
+                col.name,
+                col.dtype,
+            ));
         }
         let kind = s.joins.get(i).copied().unwrap_or(JoinKind::Cross);
         let cond = if i >= 1 { s.on.get(i - 1) } else { None };

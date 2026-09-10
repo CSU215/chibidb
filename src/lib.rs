@@ -96,10 +96,14 @@ impl Database {
                     columns: meta
                         .columns
                         .iter()
-                        .map(|(name, dtype)| ColumnDesc {
+                        .map(|c| ColumnDesc {
                             owner: None,
-                            name: name.clone(),
-                            dtype: *dtype,
+                            name: c.name.clone(),
+                            dtype: c.dtype,
+                            not_null: c.not_null,
+                            primary_key: c.primary_key,
+                            unique: c.unique,
+                            default: c.default.clone(),
                         })
                         .collect(),
                 };
@@ -126,6 +130,7 @@ impl Database {
                     &ix.name,
                     ix.table.clone(),
                     ix.column.clone(),
+                    ix.unique,
                     IndexStore { file, file_no: ix.file_no },
                 )?;
             }

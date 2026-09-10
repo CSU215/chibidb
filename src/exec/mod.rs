@@ -89,6 +89,7 @@ fn execute_create_index(db: &mut Database, trx: &mut TrxState, c: &CreateIndexSt
         &c.name,
         c.table.clone(),
         c.column.clone(),
+        false,
         store,
     )?;
     db.save_catalog()?;
@@ -276,17 +277,29 @@ pub(crate) fn coerce(v: Value, dtype: DataType, col: &str) -> Result<Value> {
 }
 
 fn execute_create_table(db: &mut Database, c: &CreateTableStmt) -> Result<ResultSet> {
-    let schema = Schema {
-        columns: c
-            .columns
-            .iter()
-            .map(|cd| crate::catalog::ColumnDesc {
-                owner: None,
-                name: cd.name.clone(),
-                dtype: cd.dtype,
-            })
-            .collect(),
-    };
+    let mut columns = Vec::with_capacity(c.columns.len());
+    for cd in &c.columns {
+        let default = match &cd.default {
+            Some(e) => Some(coerce(eval_const(e)?, cd.dtype, &cd.name)?),
+            None => None,
+        };
+        if cd.not_null && matches!(default, Some(Value::Null)) {
+            return Err(Error::Runtime(format!(
+                "column {} cannot have a NULL default",
+                cd.name
+            )));
+        }
+        columns.push(crate::catalog::ColumnDesc {
+            owner: None,
+            name: cd.name.clone(),
+            dtype: cd.dtype,
+            not_null: cd.not_null,
+            primary_key: cd.primary_key,
+            unique: cd.unique,
+            default,
+        });
+    }
+    let schema = Schema { columns };
     let heap = db.new_table_heap(&c.name)?;
     db.catalog_mut().create_table(&c.name, schema, heap)?;
     db.save_catalog()?;
@@ -300,11 +313,7 @@ fn single_table_schema(db: &Database, tref: &TableRef) -> Result<Schema> {
     Ok(Schema {
         columns: columns
             .into_iter()
-            .map(|c| crate::catalog::ColumnDesc {
-                owner: Some(owner.clone()),
-                name: c.name,
-                dtype: c.dtype,
-            })
+            .map(|c| crate::catalog::ColumnDesc::plain(Some(owner.clone()), c.name, c.dtype))
             .collect(),
     })
 }

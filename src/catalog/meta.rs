@@ -1,7 +1,9 @@
 ﻿use crate::ast::DataType;
+use crate::storage::codec::{decode_row, encode_row};
+use crate::value::Value;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"CHIDCAT4"; // v4: views stored as sql text
+const MAGIC: [u8; 8] = *b"CHIDCAT5"; // v5: column constraints + unique indexes
 
 const DTYPE_INT: u8 = 0x00;
 const DTYPE_FLOAT: u8 = 0x01;
@@ -10,9 +12,19 @@ const DTYPE_DATE: u8 = 0x03;
 const DTYPE_TEXT: u8 = 0x04;
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ColumnMeta {
+    pub name: String,
+    pub dtype: DataType,
+    pub not_null: bool,
+    pub primary_key: bool,
+    pub unique: bool,
+    pub default: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableMeta {
     pub name: String,
-    pub columns: Vec<(String, DataType)>,
+    pub columns: Vec<ColumnMeta>,
     pub file_no: u32,
 }
 
@@ -21,6 +33,7 @@ pub struct IndexMeta {
     pub name: String,
     pub table: String,
     pub column: String,
+    pub unique: bool,
     pub file_no: u32,
 }
 
@@ -55,18 +68,22 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
     for t in &snap.tables {
         put_str(&mut buf, &t.name);
         put_u32(&mut buf, t.columns.len() as u32);
-        for (name, dtype) in &t.columns {
-            put_str(&mut buf, name);
-            match dtype {
+        for c in &t.columns {
+            put_str(&mut buf, &c.name);
+            match c.dtype {
                 DataType::Int => buf.push(DTYPE_INT),
                 DataType::Float => buf.push(DTYPE_FLOAT),
                 DataType::Char(n) => {
                     buf.push(DTYPE_CHAR);
-                    put_u32(&mut buf, *n);
+                    put_u32(&mut buf, n);
                 }
                 DataType::Date => buf.push(DTYPE_DATE),
                 DataType::Text => buf.push(DTYPE_TEXT),
             }
+            buf.push(c.not_null as u8);
+            buf.push(c.primary_key as u8);
+            buf.push(c.unique as u8);
+            put_value(&mut buf, c.default.as_ref());
         }
         put_u32(&mut buf, t.file_no);
     }
@@ -75,6 +92,7 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
         put_str(&mut buf, &ix.name);
         put_str(&mut buf, &ix.table);
         put_str(&mut buf, &ix.column);
+        buf.push(ix.unique as u8);
         put_u32(&mut buf, ix.file_no);
     }
     put_u32(&mut buf, snap.views.len() as u32);
@@ -115,7 +133,11 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
                 DTYPE_TEXT => DataType::Text,
                 _ => return Err(Error::Runtime(format!("unknown dtype tag 0x{tag:02x}"))),
             };
-            columns.push((cname, dtype));
+            let not_null = take(data, &mut pos, 1)?[0] != 0;
+            let primary_key = take(data, &mut pos, 1)?[0] != 0;
+            let unique = take(data, &mut pos, 1)?[0] != 0;
+            let default = take_value(data, &mut pos)?;
+            columns.push(ColumnMeta { name: cname, dtype, not_null, primary_key, unique, default });
         }
         let file_no = take_u32(data, &mut pos)?;
         tables.push(TableMeta { name, columns, file_no });
@@ -126,8 +148,9 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
         let name = take_str(data, &mut pos)?;
         let table = take_str(data, &mut pos)?;
         let column = take_str(data, &mut pos)?;
+        let unique = take(data, &mut pos, 1)?[0] != 0;
         let file_no = take_u32(data, &mut pos)?;
-        indexes.push(IndexMeta { name, table, column, file_no });
+        indexes.push(IndexMeta { name, table, column, unique, file_no });
     }
     let n_views = take_u32(data, &mut pos)?;
     let mut views = Vec::new();
@@ -148,6 +171,28 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
         indexes,
         views,
     })
+}
+
+fn put_value(buf: &mut Vec<u8>, v: Option<&Value>) {
+    match v {
+        None => buf.push(0),
+        Some(val) => {
+            buf.push(1);
+            let bytes = encode_row(std::slice::from_ref(val));
+            put_u32(buf, bytes.len() as u32);
+            buf.extend_from_slice(&bytes);
+        }
+    }
+}
+
+fn take_value(data: &[u8], pos: &mut usize) -> Result<Option<Value>> {
+    if take(data, pos, 1)?[0] == 0 {
+        return Ok(None);
+    }
+    let len = take_u32(data, pos)? as usize;
+    let bytes = take(data, pos, len)?;
+    let (row, _) = decode_row(bytes)?;
+    Ok(row.into_iter().next())
 }
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
