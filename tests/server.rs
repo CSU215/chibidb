@@ -87,6 +87,55 @@ async fn sessions_share_the_database() {
 }
 
 #[tokio::test]
+async fn transactions_span_statements_on_one_connection() {
+    let (_shared, addr, _dir) = start_server().await;
+
+    let mut a = TcpStream::connect(addr).await.unwrap();
+    let mut b = TcpStream::connect(addr).await.unwrap();
+
+    exec_remote(&mut a, "create table t (id int);").await.unwrap();
+
+    exec_remote(&mut a, "begin;").await.unwrap();
+    exec_remote(&mut a, "insert into t values (1);").await.unwrap();
+
+    // the writer sees its own uncommitted row...
+    let rs = exec_remote(&mut a, "select count(*) from t;").await.unwrap();
+    match &rs[0] {
+        ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(1)),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // ...but the insert must not have autocommitted: b sees nothing yet
+    let rs = exec_remote(&mut b, "select count(*) from t;").await.unwrap();
+    match &rs[0] {
+        ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(0)),
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    exec_remote(&mut a, "commit;").await.unwrap();
+    let rs = exec_remote(&mut b, "select count(*) from t;").await.unwrap();
+    match &rs[0] {
+        ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(1)),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rolled_back_transaction_leaves_no_rows() {
+    let (_shared, addr, _dir) = start_server().await;
+
+    let mut a = TcpStream::connect(addr).await.unwrap();
+    exec_remote(&mut a, "create table t (id int);").await.unwrap();
+    exec_remote(&mut a, "begin;").await.unwrap();
+    exec_remote(&mut a, "insert into t values (1);").await.unwrap();
+    exec_remote(&mut a, "rollback;").await.unwrap();
+    let rs = exec_remote(&mut a, "select count(*) from t;").await.unwrap();
+    match &rs[0] {
+        ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(0)),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn concurrent_statements_serialize() {
     let (_shared, addr, _dir) = start_server().await;
 

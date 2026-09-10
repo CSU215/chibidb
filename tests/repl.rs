@@ -2,9 +2,9 @@ use chibidb::{Database, run_repl};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, duplex};
 
 async fn run_with(input: &[u8]) -> String {
-    let (mut cmd_tx, repl_input) = duplex(64);
+    let (mut cmd_tx, repl_input) = duplex(4096);
     let repl_input = BufReader::new(repl_input);
-    let (mut repl_output, mut out_rx) = duplex(64);
+    let (mut repl_output, mut out_rx) = duplex(4096);
     let mut db = Database::open_in_memory().unwrap();
 
     cmd_tx.write_all(input).await.unwrap();
@@ -46,4 +46,20 @@ async fn blank_lines_are_ignored() {
 
     assert!(!output.contains("error"), "got: {output:?}");
     assert_eq!(output.matches("db> ").count(), 3, "got: {output:?}");
+}
+
+#[tokio::test]
+async fn transactions_span_lines() {
+    let output = run_with(
+        b"create table t (id int);\nbegin;\ninsert into t values (1);\nrollback;\nselect count(*) from t;\nexit\n",
+    )
+    .await;
+
+    assert!(
+        !output.contains("no active transaction"),
+        "transactions must span lines, got: {output:?}"
+    );
+    assert!(!output.contains("error"), "got: {output:?}");
+    // the rolled-back insert left nothing behind
+    assert!(output.contains("\n0\n"), "got: {output:?}");
 }

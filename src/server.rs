@@ -5,6 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
+use crate::trx::Session;
 use crate::wire;
 use crate::Database;
 
@@ -43,6 +44,21 @@ async fn read_sql(rd: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<String
 }
 
 async fn handle_conn(db: SharedDb, stream: TcpStream) -> io::Result<()> {
+    // one session per connection so transactions span statements
+    let mut session = Session::new();
+    let result = serve_session(&db, stream, &mut session).await;
+    // roll back any open transaction when the session goes away
+    if let Err(e) = db.lock().await.rollback_session(&mut session) {
+        eprintln!("connection cleanup error: {e}");
+    }
+    result
+}
+
+async fn serve_session(
+    db: &SharedDb,
+    stream: TcpStream,
+    session: &mut Session,
+) -> io::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     while let Some(sql) = read_sql(&mut rd).await? {
         let sql = sql.trim();
@@ -52,7 +68,7 @@ async fn handle_conn(db: SharedDb, stream: TcpStream) -> io::Result<()> {
         if sql == "exit" || sql == "quit" {
             break;
         }
-        match db.lock().await.execute_sql(sql) {
+        match db.lock().await.execute_sql_with(session, sql) {
             Ok(results) => {
                 for rs in &results {
                     wr.write_all(&wire::encode_result_frame(rs)).await?;
