@@ -30,6 +30,7 @@ use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
 use crate::config::Config;
 use crate::index::{encode_key, BTree};
 use crate::storage::codec::{decode_record, encode_record};
+use crate::storage::engine::{HeapEngine, TableEngine};
 use crate::storage::slotted::{page_get, page_put_at};
 use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, Rid};
 use crate::trx::{TrxState, Undo};
@@ -582,12 +583,12 @@ impl Database {
     /// Raw versioned records; callers decode and apply visibility.
     pub(crate) fn store_scan_raw(&mut self, name: &str) -> Result<Vec<(Rid, Vec<u8>)>> {
         let file = self.catalog.table(name)?.heap.file;
-        let heap = HeapFile::at(file);
+        let engine = HeapEngine::new(file);
+        let mut scanner = engine.scan(&mut self.pool)?;
         let mut out = Vec::new();
-        heap.for_each(&mut self.pool, |rid, rec| {
-            out.push((rid, rec.to_vec()));
-            Ok(())
-        })?;
+        while let Some(row) = scanner.next(&mut self.pool)? {
+            out.push(row);
+        }
         Ok(out)
     }
 
