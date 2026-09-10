@@ -8,6 +8,7 @@ pub mod exec;
 pub mod index;
 pub mod lexer;
 pub mod parser;
+pub mod pipeline;
 pub mod protocol;
 pub mod render;
 mod repl;
@@ -30,6 +31,7 @@ use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
 use crate::config::Config;
 use crate::index::{encode_key, BTree};
+use crate::pipeline::{ExecuteStage, Pipeline, SqlEvent};
 use crate::storage::codec::{decode_record, encode_record};
 use crate::storage::engine::{HeapEngine, TableEngine};
 use crate::storage::slotted::{page_get, page_put_at};
@@ -388,6 +390,7 @@ impl Database {
     ) -> Result<Vec<ResultSet>> {
         let stmts = parser::parse(sql)?;
         let mut out = Vec::new();
+        let pipeline = Pipeline::new(vec![Box::new(ExecuteStage)]);
         for stmt in &stmts {
             match stmt {
                 crate::ast::Stmt::Trx(crate::ast::TrxCtl::Begin) => {
@@ -425,8 +428,10 @@ impl Database {
                         session.begin(id, &self.committed_trxs, false);
                         self.open_trxs.insert(id);
                     }
-                    match exec::execute(self, session.trx(), other) {
-                        Ok(rs) => {
+                    let mut event = SqlEvent::new(other);
+                    match pipeline.run(self, session, &mut event) {
+                        Ok(()) => {
+                            let rs = event.result.take().expect("execute stage produced no result");
                             if autocommit
                                 && let Some(trx) = session.trx.take() {
                                     let wrote = !trx.undo.is_empty();
