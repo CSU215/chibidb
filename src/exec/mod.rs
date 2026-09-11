@@ -10,6 +10,7 @@ use crate::value::Value;
 use crate::{Database, Error, Result};
 
 mod aggregate;
+mod dml;
 mod eval;
 pub mod operator;
 pub(crate) mod plan;
@@ -53,12 +54,12 @@ pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Res
         Stmt::DropView(d) => execute_drop_view(db, d),
         Stmt::Checkpoint => execute_checkpoint(db, trx),
         Stmt::Vacuum => execute_vacuum(db, trx),
-        Stmt::Insert(i) => execute_insert(db, trx, i),
+        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+            Err(Error::Runtime("DML must be executed through the operator plan".into()))
+        }
         Stmt::Select(_) => {
             Err(Error::Runtime("select must be executed through the operator plan".into()))
         }
-        Stmt::Delete(d) => execute_delete(db, trx, d),
-        Stmt::Update(u) => execute_update(db, trx, u),
         Stmt::Explain(e) => execute_explain(db, e),
         Stmt::CreateDatabase(_)
         | Stmt::DropDatabase(_)
@@ -176,7 +177,7 @@ fn execute_vacuum(db: &mut Database, trx: &TrxState) -> Result<ResultSet> {
     Ok(ResultSet::Message(format!("VACUUM COMPLETE: {purged} rows purged")))
 }
 
-fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<ResultSet> {
+pub(crate) fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&u.table)?.schema.clone();
     let mut assigns = Vec::new();
     for (col, expr) in &u.assignments {
@@ -222,7 +223,7 @@ fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Resu
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
-fn execute_delete(db: &mut Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<ResultSet> {
+pub(crate) fn execute_delete(db: &mut Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&d.table)?.schema.clone();
     let records = db.store_scan_raw(&d.table)?;
     let mut victims = Vec::new();
@@ -276,7 +277,7 @@ fn check_not_null(schema: &Schema, row: &[Value]) -> Result<()> {
     Ok(())
 }
 
-fn execute_insert(db: &mut Database, trx: &mut TrxState, i: &InsertStmt) -> Result<ResultSet> {
+pub(crate) fn execute_insert(db: &mut Database, trx: &mut TrxState, i: &InsertStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&i.table)?.schema.clone();
     let targets = insert_targets(&schema, &i.columns)?;
     for values in &i.rows {

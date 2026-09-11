@@ -1,5 +1,5 @@
 use chibidb::ast::{BinOp, Expr, Stmt};
-use chibidb::exec::operator::{build_select, Filter, Limit, Project, TableScan};
+use chibidb::exec::operator::{build_select, build_statement, Filter, Limit, Project, TableScan};
 use chibidb::value::Value;
 use chibidb::{Database, Session};
 
@@ -222,6 +222,25 @@ fn views_build_an_operator_plan() {
         let select = parse_select(sql);
         assert!(build_select(&mut db, &select).unwrap().is_some(), "{sql}");
     }
+}
+
+#[test]
+fn dml_builds_operator_plans() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int);").unwrap();
+
+    for sql in [
+        "insert into t values (1);",
+        "update t set id = 2 where id = 1;",
+        "delete from t where id = 2;",
+    ] {
+        let stmt = chibidb::parser::parse(sql).unwrap().remove(0);
+        assert!(build_statement(&mut db, &stmt).unwrap().is_some(), "{sql}");
+    }
+
+    // DDL is not an operator statement
+    let ddl = chibidb::parser::parse("create table u (id int);").unwrap().remove(0);
+    assert!(build_statement(&mut db, &ddl).unwrap().is_none());
 }
 
 #[test]

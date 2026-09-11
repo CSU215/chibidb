@@ -68,10 +68,16 @@ impl Stage for ExecuteStage {
         event: &mut SqlEvent<'_>,
     ) -> Result<()> {
         let result = if let Some(plan) = event.physical.as_mut() {
+            let kind = plan.output_kind();
             let columns: Vec<String> =
                 plan.schema().columns.iter().map(|c| c.name.clone()).collect();
             let rows = db.collect_plan(session, plan.as_mut())?;
-            ResultSet::Rows { columns, rows }
+            match kind {
+                crate::exec::operator::OutputKind::Command => {
+                    ResultSet::Message("SUCCESS".into())
+                }
+                crate::exec::operator::OutputKind::Rows => ResultSet::Rows { columns, rows },
+            }
         } else {
             crate::exec::execute(db, session.trx(), event.stmt)?
         };
@@ -115,8 +121,8 @@ impl Stage for OptimizeStage {
     ) -> Result<()> {
         if let Stmt::Select(select) = event.stmt {
             event.plan = Some(crate::exec::plan::plan_select(db, select)?);
-            event.physical = crate::exec::operator::build_select(db, select)?;
         }
+        event.physical = crate::exec::operator::build_statement(db, event.stmt)?;
         Ok(())
     }
 }

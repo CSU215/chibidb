@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    BinOp, DataType, Expr, JoinKind, Limit as LimitClause, SelectItem, SelectStmt, TableRef,
+    BinOp, DataType, Expr, JoinKind, Limit as LimitClause, SelectItem, SelectStmt, Stmt, TableRef,
 };
 use crate::catalog::{ColumnDesc, Schema};
 use crate::index::encode_key;
@@ -25,12 +25,24 @@ pub struct ExecContext<'a> {
     pub(crate) outer: Option<&'a EvalCtx<'a>>,
 }
 
+/// Whether a plan streams rows or is a side-effecting command (DML).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputKind {
+    Rows,
+    Command,
+}
+
 /// Volcano-style physical operator: `open`, repeated `next`, `close`.
 pub trait PhysicalOperator {
     fn schema(&self) -> &Schema;
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()>;
     fn next(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>>;
     fn close(&mut self) -> Result<()>;
+
+    /// Commands (DML) perform their work in `open` and yield no rows.
+    fn output_kind(&self) -> OutputKind {
+        OutputKind::Rows
+    }
 }
 
 /// Sequential scan of a table, filtering by MVCC visibility.
@@ -1059,6 +1071,27 @@ impl PhysicalOperator for IndexScan {
     fn close(&mut self) -> Result<()> {
         self.pos = self.rids.len();
         Ok(())
+    }
+}
+
+/// Builds a plan for statements the operator layer covers: SELECT and DML.
+/// Other statements (DDL, EXPLAIN, transaction control) return `None`.
+pub fn build_statement(
+    db: &mut Database,
+    stmt: &Stmt,
+) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    match stmt {
+        Stmt::Select(select) => build_select(db, select),
+        Stmt::Insert(insert) => {
+            Ok(Some(Box::new(crate::exec::dml::InsertOp::new(insert.clone()))))
+        }
+        Stmt::Update(update) => {
+            Ok(Some(Box::new(crate::exec::dml::UpdateOp::new(update.clone()))))
+        }
+        Stmt::Delete(delete) => {
+            Ok(Some(Box::new(crate::exec::dml::DeleteOp::new(delete.clone()))))
+        }
+        _ => Ok(None),
     }
 }
 
