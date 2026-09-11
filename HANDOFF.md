@@ -374,9 +374,10 @@ MySQL 认证先做 `mysql_native_password`、暂不做 TLS。
 
 并发/事务设计（P10.0 定稿）：保持**快照隔离**；线程模型抽象 `ThreadHandler`，提供
 `per-connection` 与 `thread-pool` 两种后端（config `server.thread_model` / `worker_threads`）；
-分期 P10.1 per-DB `Mutex` 去全局锁 → P10.2 库内 `RwLock` + Catalog `arc-swap` 快照 +
+分期 P10.1 per-DB `Mutex` 去全局锁 → P10.2 库内 `RwLock` + Catalog `RwLock` 快照 +
 BufferPool 页闩 + WAL 组提交 → P10.3 库内多写者，冲突策略**可配置**
-（`transaction.conflict = "fcw" | "2pl"`，先 FCW 后 2PL + 死锁检测）。锁库 `parking_lot`/`arc-swap`。
+（`transaction.conflict = "fcw" | "2pl"`，先 FCW 后 2PL + 死锁检测）。锁库 `parking_lot`
+（实现采 `RwLock<Catalog>`，未引入 `arc-swap`：读路径 `clone` committed 快照，后续可换 arc-swap 免拷贝）。
 DML 先算子化（P5.5），使执行层统一走算子。
 
 物化执行基准（release，5 万行，`cargo test --release --test bench -- --ignored --nocapture`）：
