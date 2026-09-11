@@ -11,7 +11,7 @@ cargo run -q                    # 内存实例 REPL（临时目录后端，自�
 cargo run -q -- <dir>           # 文件实例 REPL（数据根目录，多库落盘）
 cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（345 tests）
+cargo test                      # 全量回归（350 tests）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -37,6 +37,8 @@ scripts\smoke.ps1
 CREATE DATABASE shop;  DROP DATABASE shop;  USE shop;
 -- 用户（存于 chibi_meta 系统库，口令加盐 SHA-256；认证暂未在协议层强制）
 CREATE USER alice IDENTIFIED BY 'secret';  DROP USER alice;
+-- 权限（read/write/all；ON * 表示所有库；暂未在协议层强制）
+GRANT READ, WRITE ON shop TO alice;  GRANT ALL ON * TO alice;  REVOKE WRITE ON shop FROM alice;
 -- DDL
 CREATE TABLE t (id int primary key, name char(10) not null,
                 score float default 0, email char(20) unique);
