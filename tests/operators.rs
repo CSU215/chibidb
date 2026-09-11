@@ -209,6 +209,22 @@ fn hash_join_left_keeps_unmatched_rows() {
 }
 
 #[test]
+fn views_build_an_operator_plan() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int, tag int);").unwrap();
+    db.execute_sql("create view v as select id from t where id > 0;").unwrap();
+
+    for sql in [
+        "select * from v;",
+        "select id from v order by id;",
+        "select a.id from t a, v b where a.id = b.id;",
+    ] {
+        let select = parse_select(sql);
+        assert!(build_select(&mut db, &select).unwrap().is_some(), "{sql}");
+    }
+}
+
+#[test]
 fn unions_build_an_operator_plan() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int);").unwrap();

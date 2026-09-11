@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::ast::{BinOp, DataType, Expr, JoinKind, Limit as LimitClause, SelectItem, SelectStmt};
+use crate::ast::{
+    BinOp, DataType, Expr, JoinKind, Limit as LimitClause, SelectItem, SelectStmt, TableRef,
+};
 use crate::catalog::{ColumnDesc, Schema};
 use crate::index::encode_key;
 use crate::storage::codec::decode_record;
@@ -86,6 +88,69 @@ impl PhysicalOperator for TableScan {
 
     fn close(&mut self) -> Result<()> {
         self.scanner = None;
+        Ok(())
+    }
+}
+
+/// Scans a view by running its stored SELECT as a sub-plan. The view's columns
+/// are exposed with `owner` (the alias or view name) and `Text` placeholders,
+/// matching the materialized view path.
+pub struct ViewScan {
+    child: Box<dyn PhysicalOperator>,
+    schema: Schema,
+    rows: Vec<Vec<Value>>,
+    pos: usize,
+}
+
+impl ViewScan {
+    pub fn new(db: &mut Database, view_sql: &str, owner: &str) -> Result<Option<Self>> {
+        let stmts = crate::parser::parse(view_sql)?;
+        let Some(crate::ast::Stmt::Select(select)) = stmts.into_iter().next() else {
+            return Ok(None);
+        };
+        let Some(plan) = build_select(db, &select)? else {
+            return Ok(None);
+        };
+        let schema = Schema {
+            columns: plan
+                .schema()
+                .columns
+                .iter()
+                .map(|c| ColumnDesc::plain(Some(owner.to_string()), c.name.clone(), DataType::Text))
+                .collect(),
+        };
+        Ok(Some(Self { child: plan, schema, rows: Vec::new(), pos: 0 }))
+    }
+}
+
+impl PhysicalOperator for ViewScan {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
+        self.child.open(ctx)?;
+        self.rows.clear();
+        while let Some(row) = self.child.next(ctx)? {
+            self.rows.push(row);
+        }
+        self.child.close()?;
+        self.pos = 0;
+        Ok(())
+    }
+
+    fn next(&mut self, _ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
+        if self.pos >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.pos].clone();
+        self.pos += 1;
+        Ok(Some(row))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.rows.clear();
+        self.pos = 0;
         Ok(())
     }
 }
@@ -997,6 +1062,19 @@ impl PhysicalOperator for IndexScan {
     }
 }
 
+/// Builds a scan for one FROM entry: a table scan or a view sub-plan.
+fn build_from_source(
+    db: &mut Database,
+    tref: &TableRef,
+) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    let owner = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+    if let Some(sql) = db.catalog().view(&tref.name).cloned() {
+        return Ok(ViewScan::new(db, &sql, &owner)?
+            .map(|scan| Box::new(scan) as Box<dyn PhysicalOperator>));
+    }
+    Ok(Some(Box::new(TableScan::with_owner(db, &tref.name, &owner)?)))
+}
+
 /// Builds a physical plan for a SELECT. Returns `None` for any shape the
 /// operators do not cover yet, leaving the materialized executor as fallback.
 pub fn build_select(
@@ -1022,37 +1100,33 @@ pub fn build_select(
     }
 
     // FROM: a single table uses the best access path; multiple tables build a
-    // left-deep nested-loop join over plain scans.
+    // left-deep nested-loop/hash join over from-sources (tables or views).
     let (mut op, ordered_by): (Box<dyn PhysicalOperator>, Option<String>) = if select.from.len() == 1
     {
-        let table = &select.from[0].name;
-        if db.catalog().view(table).is_some() {
-            return Ok(None);
-        }
-        let owner = select.from[0].alias.as_deref().unwrap_or(table);
-        match IndexScan::with_owner(db, table, owner, select.selection.as_ref())? {
-            Some(scan) => {
-                let column = scan.ordered_column().to_string();
-                (Box::new(scan), Some(column))
+        let tref = &select.from[0];
+        if db.catalog().view(&tref.name).is_some() {
+            let Some(source) = build_from_source(db, tref)? else {
+                return Ok(None);
+            };
+            (source, None)
+        } else {
+            let owner = tref.alias.as_deref().unwrap_or(&tref.name);
+            match IndexScan::with_owner(db, &tref.name, owner, select.selection.as_ref())? {
+                Some(scan) => {
+                    let column = scan.ordered_column().to_string();
+                    (Box::new(scan), Some(column))
+                }
+                None => (Box::new(TableScan::with_owner(db, &tref.name, owner)?), None),
             }
-            None => (Box::new(TableScan::with_owner(db, table, owner)?), None),
         }
     } else {
-        let first = &select.from[0];
-        if db.catalog().view(&first.name).is_some() {
+        let Some(mut op) = build_from_source(db, &select.from[0])? else {
             return Ok(None);
-        }
-        let owner = first.alias.as_deref().unwrap_or(&first.name);
-        let mut op: Box<dyn PhysicalOperator> =
-            Box::new(TableScan::with_owner(db, &first.name, owner)?);
+        };
         for i in 1..select.from.len() {
-            let tref = &select.from[i];
-            if db.catalog().view(&tref.name).is_some() {
+            let Some(right) = build_from_source(db, &select.from[i])? else {
                 return Ok(None);
-            }
-            let owner = tref.alias.as_deref().unwrap_or(&tref.name);
-            let right: Box<dyn PhysicalOperator> =
-                Box::new(TableScan::with_owner(db, &tref.name, owner)?);
+            };
             let kind = select.joins.get(i).copied().unwrap_or(JoinKind::Cross);
             let condition = select.on.get(i - 1).cloned();
             if let Some(keys) =
