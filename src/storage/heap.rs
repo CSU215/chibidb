@@ -109,7 +109,9 @@ impl HeapFile {
     }
 
     /// MVCC delete-mark: rewrites the record in place, setting its deleter id.
-    pub fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u32) -> Result<()> {
+    /// Returns the previous deleter (0 when the version was live), which the
+    /// first-committer-wins check needs.
+    pub fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u32) -> Result<u32> {
         bp.with_page(self.file, rid.page_no, |page| {
             let rec = page_get(page, rid.slot)?
                 .ok_or_else(|| Error::Runtime(format!("no record at {rid:?}")))?;
@@ -117,8 +119,10 @@ impl HeapFile {
             if updated.len() < 8 {
                 return Err(Error::Runtime("record lacks mvcc fields".into()));
             }
+            let prev = u32::from_le_bytes(updated[4..8].try_into().unwrap());
             updated[4..8].copy_from_slice(&deleter.to_le_bytes());
-            page_write(page, rid.slot, &updated)
+            page_write(page, rid.slot, &updated)?;
+            Ok(prev)
         })
     }
 

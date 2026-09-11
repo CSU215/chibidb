@@ -203,3 +203,50 @@ fn transaction_control_errors() {
     db.execute_sql_with(&mut b, "commit;").unwrap();
 }
 
+#[test]
+fn first_committer_wins_aborts_the_lost_update() {
+    let db = Database::open_in_memory().unwrap();
+    let mut a = Session::new();
+    let mut b = Session::new();
+    setup(&db, &mut a);
+    db.execute_sql_with(&mut a, "insert into t values (1, 'base');").unwrap();
+
+    // both transactions update the same row from the same snapshot
+    db.execute_sql_with(&mut a, "begin;").unwrap();
+    db.execute_sql_with(&mut a, "update t set name = 'a' where id = 1;").unwrap();
+    db.execute_sql_with(&mut b, "begin;").unwrap();
+    db.execute_sql_with(&mut b, "update t set name = 'b' where id = 1;").unwrap();
+
+    // the first committer wins
+    db.execute_sql_with(&mut a, "commit;").unwrap();
+    let err = db.execute_sql_with(&mut b, "commit;").unwrap_err();
+    assert!(err.to_string().contains("conflict"), "{err}");
+
+    // the loser's value never lands
+    assert_eq!(rows(&db, &mut b, "select name from t;"), [[Value::Str("a".into())]]);
+    // and its write is not left open
+    assert_eq!(rows(&db, &mut b, "select count(*) from t;"), [[Value::Int(1)]]);
+}
+
+#[test]
+fn first_committer_wins_keeps_independent_updates() {
+    let db = Database::open_in_memory().unwrap();
+    let mut a = Session::new();
+    let mut b = Session::new();
+    setup(&db, &mut a);
+    db.execute_sql_with(&mut a, "insert into t values (1, 'x'), (2, 'y');").unwrap();
+
+    // transactions touch different rows: no conflict
+    db.execute_sql_with(&mut a, "begin;").unwrap();
+    db.execute_sql_with(&mut a, "update t set name = 'a' where id = 1;").unwrap();
+    db.execute_sql_with(&mut b, "begin;").unwrap();
+    db.execute_sql_with(&mut b, "update t set name = 'b' where id = 2;").unwrap();
+    db.execute_sql_with(&mut a, "commit;").unwrap();
+    db.execute_sql_with(&mut b, "commit;").unwrap();
+
+    assert_eq!(
+        rows(&db, &mut a, "select name from t order by id;"),
+        [[Value::Str("a".into())], [Value::Str("b".into())]]
+    );
+}
+

@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use chibidb::config::{Config, EngineKind, ExecutionMode, ThreadModel};
+use chibidb::config::{Config, ConflictStrategy, EngineKind, ExecutionMode, ThreadModel};
 use chibidb::value::Value;
 use chibidb::{Database, ResultSet};
 
@@ -17,6 +17,15 @@ fn defaults_are_sane() {
     assert_eq!(c.server.protocols, ["text"]);
     assert_eq!(c.execution.mode, ExecutionMode::Volcano);
     assert!(!c.auth.enabled);
+    assert_eq!(c.transaction.conflict, ConflictStrategy::Fcw);
+}
+
+#[test]
+fn transaction_conflict_strategy_parses() {
+    let c = Config::from_toml_str("[transaction]\nconflict = \"2pl\"\n").unwrap();
+    assert_eq!(c.transaction.conflict, ConflictStrategy::TwoPl);
+    let c = Config::from_toml_str("[transaction]\nconflict = \"fcw\"\n").unwrap();
+    assert_eq!(c.transaction.conflict, ConflictStrategy::Fcw);
 }
 
 #[test]

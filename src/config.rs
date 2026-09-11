@@ -24,6 +24,18 @@ pub enum ExecutionMode {
     Chunk,
 }
 
+/// How write-write conflicts between concurrent transactions are resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+pub enum ConflictStrategy {
+    /// First-committer-wins: the second committer is aborted. Optimistic.
+    #[default]
+    #[serde(rename = "fcw")]
+    Fcw,
+    /// Two-phase locking: writers block each other. Pessimistic.
+    #[serde(rename = "2pl")]
+    TwoPl,
+}
+
 /// How accepted connections are mapped to execution threads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -43,6 +55,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub execution: ExecutionConfig,
     pub auth: AuthConfig,
+    pub transaction: TransactionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -81,6 +94,12 @@ pub struct ExecutionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransactionConfig {
+    pub conflict: ConflictStrategy,
 }
 
 impl Default for StorageConfig {

@@ -33,7 +33,7 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
-use crate::config::Config;
+use crate::config::{Config, ConflictStrategy};
 use crate::index::{encode_key, BTree};
 use crate::pipeline::{ExecuteStage, OptimizeStage, Pipeline, ResolveStage, SqlEvent};
 use crate::storage::codec::{decode_record, encode_record};
@@ -61,6 +61,7 @@ pub struct Database {
     /// would lose its redo records.
     open_trxs: RwLock<HashSet<u32>>,
     wal_checkpoint_threshold: AtomicU64,
+    conflict: ConflictStrategy,
     _temp: Option<tempfile::TempDir>,
 }
 
@@ -200,6 +201,7 @@ impl Database {
             committed_trxs: RwLock::new(committed_trxs),
             open_trxs: RwLock::new(HashSet::new()),
             wal_checkpoint_threshold: AtomicU64::new(config.wal.checkpoint_threshold),
+            conflict: config.transaction.conflict,
             _temp: None,
         };
         db.recover_from_wal(&plan, &mut touched)?;
@@ -359,8 +361,15 @@ impl Database {
         Ok(())
     }
 
-    /// Commit bookkeeping shared by explicit COMMIT and autocommit.
-    fn commit_trx(&self, trx_id: u32, wrote: bool) -> Result<()> {
+    /// Commit bookkeeping shared by explicit COMMIT and autocommit. Under
+    /// first-committer-wins a write transaction whose target rows were changed
+    /// by a transaction that committed after its snapshot is rejected before
+    /// any commit record is written.
+    fn commit_trx(&self, trx: &TrxState, wrote: bool) -> Result<()> {
+        let trx_id = trx.id;
+        if wrote && self.conflict == ConflictStrategy::Fcw {
+            self.check_conflicts(trx)?;
+        }
         self.committed_trxs.write().insert(trx_id);
         self.open_trxs.write().remove(&trx_id);
         if !wrote {
@@ -382,6 +391,43 @@ impl Database {
             self.flush()?;
         }
         Ok(())
+    }
+
+    /// First-committer-wins validation: for every base version this
+    /// transaction delete-marked, reject when it was modified by a transaction
+    /// that committed after our snapshot. Both the marker we overwrote
+    /// (`prev_deleter`) and the marker currently on the page are checked, so
+    /// the loser is caught regardless of write order.
+    fn check_conflicts(&self, trx: &TrxState) -> Result<()> {
+        for undo in &trx.undo {
+            let (table, rid, prev) = match undo {
+                Undo::DeleteMark { table, rid, prev_deleter } => {
+                    (table, *rid, *prev_deleter)
+                }
+                Undo::Update { table, old_rid, prev_deleter, .. } => {
+                    (table, *old_rid, *prev_deleter)
+                }
+                Undo::Insert { .. } => continue,
+            };
+            if self.conflicting_committer(trx, prev) {
+                return Err(conflict_error(table));
+            }
+            let file = self.catalog().table(table)?.heap.file;
+            let rec = HeapFile::at(file).get(&self.pool, rid)?;
+            let (_, current, _) = decode_record(&rec)?;
+            if self.conflicting_committer(trx, current) {
+                return Err(conflict_error(table));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `id` names a transaction that committed after `trx`'s snapshot.
+    fn conflicting_committer(&self, trx: &TrxState, id: u32) -> bool {
+        id != 0
+            && id != trx.id
+            && !trx.snapshot.contains(&id)
+            && self.committed_trxs.read().contains(&id)
     }
 
     /// Emulates a process crash: dirty buffer-pool pages are lost while
@@ -425,7 +471,7 @@ impl Database {
         if autocommit && let Some(mut trx) = session.trx.take() {
             if result.is_ok() {
                 if !read_only {
-                    self.commit_trx(trx.id, false)?;
+                    self.commit_trx(&trx, false)?;
                 }
             } else {
                 self.rollback_trx(&mut trx)?;
@@ -480,9 +526,14 @@ impl Database {
                 if session.trx.is_none() {
                     return Err(Error::Runtime("no active transaction".into()));
                 }
-                if let Some(trx) = session.trx.take() {
+                if let Some(mut trx) = session.trx.take() {
                     let wrote = !trx.undo.is_empty();
-                    self.commit_trx(trx.id, wrote)?;
+                    if let Err(e) = self.commit_trx(&trx, wrote) {
+                        // a conflict aborts this transaction: undo its work
+                        self.rollback_trx(&mut trx)?;
+                        self.open_trxs.write().remove(&trx.id);
+                        return Err(e);
+                    }
                 }
                 Ok(None)
             }
@@ -515,11 +566,15 @@ impl Database {
                     Ok(()) => {
                         let rs = event.result.take().expect("execute stage produced no result");
                         if autocommit
-                            && let Some(trx) = session.trx.take()
+                            && let Some(mut trx) = session.trx.take()
                             && !read_only
                         {
                             let wrote = !trx.undo.is_empty();
-                            self.commit_trx(trx.id, wrote)?;
+                            if let Err(e) = self.commit_trx(&trx, wrote) {
+                                self.rollback_trx(&mut trx)?;
+                                self.open_trxs.write().remove(&trx.id);
+                                return Err(e);
+                            }
                         }
                         Ok(Some(rs))
                     }
@@ -583,18 +638,18 @@ impl Database {
                         BTree::at(ix_file).delete(&self.pool, &key, rid)?;
                     }
                 }
-                Undo::DeleteMark { table, rid } => {
+                Undo::DeleteMark { table, rid, prev_deleter } => {
                     let file = self.catalog().table(&table)?.heap.file;
-                    HeapFile::at(file).delete_mark(&self.pool, rid, 0)?;
+                    HeapFile::at(file).delete_mark(&self.pool, rid, prev_deleter)?;
                 }
-                Undo::Update { table, old_rid, new_rid, new_row } => {
+                Undo::Update { table, old_rid, new_rid, new_row, prev_deleter } => {
                     let file = self.catalog().table(&table)?.heap.file;
                     HeapFile::at(file).delete(&self.pool, new_rid)?;
                     for (ci, ix_file) in self.index_ops(&table)? {
                         let key = encode_key(&new_row[ci])?;
                         BTree::at(ix_file).delete(&self.pool, &key, new_rid)?;
                     }
-                    HeapFile::at(file).delete_mark(&self.pool, old_rid, 0)?;
+                    HeapFile::at(file).delete_mark(&self.pool, old_rid, prev_deleter)?;
                 }
             }
         }
@@ -778,18 +833,19 @@ impl Database {
         name: &str,
         rids: &[Rid],
         deleter: u32,
-    ) -> Result<()> {
+    ) -> Result<Vec<u32>> {
         let (file, file_no) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
             (t.heap.file, t.heap.file_no)
         };
         let heap = HeapFile::at(file);
+        let mut previous = Vec::with_capacity(rids.len());
         for rid in rids {
-            heap.delete_mark(&self.pool, *rid, deleter)?;
+            previous.push(heap.delete_mark(&self.pool, *rid, deleter)?);
             self.wal.append(deleter, &Record::DeleteMark { file_no, rid: *rid, deleter })?;
         }
-        Ok(())
+        Ok(previous)
     }
 
     /// MVCC update: delete-mark the old version, insert a new one. Index
@@ -800,7 +856,7 @@ impl Database {
         name: &str,
         updates: &[(Rid, Vec<Value>)],
         trx_id: u32,
-    ) -> Result<Vec<Rid>> {
+    ) -> Result<Vec<(Rid, u32)>> {
         let (file, file_no) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
@@ -810,7 +866,7 @@ impl Database {
         let ops = self.index_ops(name)?;
         let mut new_rids = Vec::with_capacity(updates.len());
         for (rid, new_row) in updates {
-            heap.delete_mark(&self.pool, *rid, trx_id)?;
+            let prev_deleter = heap.delete_mark(&self.pool, *rid, trx_id)?;
             self.wal
                 .append(trx_id, &Record::DeleteMark { file_no, rid: *rid, deleter: trx_id })?;
             let data = encode_record(trx_id, 0, new_row);
@@ -823,7 +879,7 @@ impl Database {
                 let key = encode_key(&new_row[*ci])?;
                 BTree::at(*ix_file).insert(&self.pool, &key, new_rid)?;
             }
-            new_rids.push(new_rid);
+            new_rids.push((new_rid, prev_deleter));
         }
         Ok(new_rids)
     }
@@ -837,6 +893,11 @@ pub(crate) fn is_read_only(stmt: &crate::ast::Stmt) -> bool {
         stmt,
         crate::ast::Stmt::Select(_) | crate::ast::Stmt::Explain(_)
     )
+}
+
+/// A first-committer-wins conflict on `table`.
+fn conflict_error(table: &str) -> Error {
+    Error::Runtime(format!("transaction conflict: {table} was modified concurrently"))
 }
 
 /// Drives one operator tree to completion, appending rows to `out`.

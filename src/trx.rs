@@ -87,8 +87,15 @@ impl TrxState {
 pub(crate) enum Undo {
     /// Own insert: physically remove on rollback.
     Insert { table: String, rid: Rid, row: Vec<crate::value::Value> },
-    /// Own delete-mark: clear the marker on rollback.
-    DeleteMark { table: String, rid: Rid },
+    /// Own delete-mark: clear the marker on rollback. `prev_deleter` is the
+    /// marker before our write, used by first-committer-wins conflict checks.
+    DeleteMark { table: String, rid: Rid, prev_deleter: u32 },
     /// MVCC update: remove the new version, unmark the old one.
-    Update { table: String, old_rid: Rid, new_rid: Rid, new_row: Vec<crate::value::Value> },
+    Update {
+        table: String,
+        old_rid: Rid,
+        new_rid: Rid,
+        new_row: Vec<crate::value::Value>,
+        prev_deleter: u32,
+    },
 }

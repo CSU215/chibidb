@@ -212,12 +212,13 @@ pub(crate) fn execute_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) 
         updates.push((rid, new_row));
     }
     let new_rids = db.store_update_versions(&u.table, &updates, trx.id)?;
-    for ((old_rid, new_row), new_rid) in updates.into_iter().zip(new_rids) {
+    for ((old_rid, new_row), (new_rid, prev_deleter)) in updates.into_iter().zip(new_rids) {
         trx.undo.push(Undo::Update {
             table: u.table.clone(),
             old_rid,
             new_rid,
             new_row,
+            prev_deleter,
         });
     }
     Ok(ResultSet::Message("SUCCESS".into()))
@@ -240,9 +241,9 @@ pub(crate) fn execute_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) 
             victims.push(rid);
         }
     }
-    db.store_delete_mark(&d.table, &victims, trx.id)?;
-    for rid in victims {
-        trx.undo.push(Undo::DeleteMark { table: d.table.clone(), rid });
+    let previous = db.store_delete_mark(&d.table, &victims, trx.id)?;
+    for (rid, prev_deleter) in victims.into_iter().zip(previous) {
+        trx.undo.push(Undo::DeleteMark { table: d.table.clone(), rid, prev_deleter });
     }
     Ok(ResultSet::Message("SUCCESS".into()))
 }
