@@ -11,7 +11,7 @@ cargo run -q                    # 内存实例 REPL（临时目录后端，自�
 cargo run -q -- <dir>           # 文件实例 REPL（数据根目录，多库落盘）
 cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（390 tests）
+cargo test                      # 全量回归（393 tests）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -19,8 +19,8 @@ REPL / client 中输入 `exit` 或 `quit` 退出。
 
 启动时从当前目录读取 `config.toml`（缺失则全用默认值）。已生效条目：
 `storage.buffer_pool_frames`、`storage.double_write`、`wal.checkpoint_threshold`、`server.addr`、
-`server.thread_model`/`worker_threads`、`transaction.conflict`（`"fcw"` / `"2pl"`）；
-其余为后续阶段预留（详见 `HANDOFF.md` §10 重构路线图）。
+`server.thread_model`/`worker_threads`、`transaction.conflict`（`"fcw"` / `"2pl"`）、
+`transaction.lock_timeout_ms`；其余为后续阶段预留（详见 `HANDOFF.md` §10 重构路线图）。
 
 ### 冒烟演示
 
@@ -126,7 +126,11 @@ SQL 字符串
   `BufferPool` 用元数据锁 + 每帧页闩，多读互不阻塞；写事务在语句粒度串行
 - 冲突策略可配置：`transaction.conflict = "fcw" | "2pl"`。默认 **FCW**
   （first-committer-wins）：提交时比对被改写基版本的 `prev_deleter` 与当前标记，
-  若其间有后提交的事务改过同一行则回滚失败方；`2pl` 为预留值（尚未实现锁等待）
+  若其间有后提交的事务改过同一行则回滚失败方
+- **2PL**（pessimistic）：每库一把悲观写锁，显式事务在 `BEGIN`（取快照前）持锁至
+  `COMMIT/ROLLBACK`，自动提交写语句在语句内持锁；等待超过
+  `transaction.lock_timeout_ms` 报 `lock wait timeout`。写者串行、后写者基于最新提交，
+  避免丢失更新；`Instance` 先取写锁再取库锁，规避锁序死锁
 - 连接断开自动回滚其未提交事务
 - 崩溃恢复：WAL 只重放有 COMMIT 记录的事务，重放幂等（精确 Rid 回写 +
   删除标记条件重放）；索引页属派生数据，恢复时对被触及的表重建
@@ -135,7 +139,7 @@ SQL 字符串
 
 ## 测试
 
-`cargo test` 跑 390 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
+`cargo test` 跑 393 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
 表约束（PK/UNIQUE/NOT NULL/DEFAULT）/索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等，
 另有 `tests/miniob_compat.rs` 用经典 student/course/sc 场景做端到端回归。集成测试的 `with_dbs` 模式让同一用例在内存后端
 与文件后端各跑一遍；WAL 测试用 `Database::simulate_crash()` 模拟进程被杀。
