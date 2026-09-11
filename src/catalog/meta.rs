@@ -1,9 +1,10 @@
 ﻿use crate::ast::DataType;
 use crate::storage::codec::{decode_row, encode_row};
+use crate::storage::header::{self, FileKind};
 use crate::value::Value;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"CHIDCAT5"; // v5: column constraints + unique indexes
+const MAGIC: [u8; 8] = *b"CHIDCAT6";
 
 const DTYPE_INT: u8 = 0x00;
 const DTYPE_FLOAT: u8 = 0x01;
@@ -55,8 +56,8 @@ pub struct CatalogSnapshot {
 }
 
 pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&MAGIC);
+    let mut buf = vec![0u8; header::HEADER_LEN];
+    header::write_header(&mut buf, &MAGIC, FileKind::Catalog);
     put_u32(&mut buf, snap.next_table_file);
     put_u32(&mut buf, snap.next_index_file);
     put_u32(&mut buf, snap.next_trx_id);
@@ -104,10 +105,8 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
 }
 
 pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
-    if data.len() < MAGIC.len() || data[0..MAGIC.len()] != MAGIC {
-        return Err(Error::Runtime("not a chibidb catalog file".into()));
-    }
-    let mut pos = MAGIC.len();
+    header::read_header(data, &MAGIC, FileKind::Catalog)?;
+    let mut pos = header::HEADER_LEN;
     let next_table_file = take_u32(data, &mut pos)?;
     let next_index_file = take_u32(data, &mut pos)?;
     let next_trx_id = take_u32(data, &mut pos)?;

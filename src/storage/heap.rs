@@ -1,9 +1,10 @@
 use crate::storage::buffer::BufferPool;
+use crate::storage::header::{self, FileKind};
 use crate::storage::page::{FileId, PageNo};
 use crate::storage::slotted::{page_delete, page_get, page_insert, page_iter, page_write};
 use crate::{Error, Result};
 
-const MAGIC: [u8; 4] = *b"CHD2"; // v2: records carry mvcc trx fields
+const MAGIC: [u8; 8] = *b"CHIDHEAP";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Rid {
@@ -32,7 +33,7 @@ impl HeapFile {
         }
         let no = bp.alloc_page(file)?;
         bp.with_page(file, no, |page| {
-            page[0..4].copy_from_slice(&MAGIC);
+            header::write_header(page, &MAGIC, FileKind::Heap);
             Ok(())
         })?;
         Ok(Self { file })
@@ -42,13 +43,7 @@ impl HeapFile {
         if bp.page_count(file)? == 0 {
             return Err(Error::Runtime("cannot open heap file: file is empty".into()));
         }
-        bp.read_page(file, 0, |page| {
-            if page[0..4] == MAGIC {
-                Ok(())
-            } else {
-                Err(Error::Runtime("not a chibidb data file".into()))
-            }
-        })?;
+        bp.read_page(file, 0, |page| header::read_header(page, &MAGIC, FileKind::Heap))?;
         Ok(Self { file })
     }
 
@@ -60,14 +55,14 @@ impl HeapFile {
             return Ok(true);
         }
         let header_lost = bp.read_page(file, 0, |page| {
-            Ok(page[0..4] != MAGIC && page.iter().all(|&b| b == 0))
+            Ok(page[0..8] != MAGIC && page.iter().all(|&b| b == 0))
         })?;
         if !header_lost {
             Self::open(bp, file)?;
             return Ok(false);
         }
         bp.with_page(file, 0, |page| {
-            page[0..4].copy_from_slice(&MAGIC);
+            header::write_header(page, &MAGIC, FileKind::Heap);
             Ok(())
         })?;
         Ok(true)

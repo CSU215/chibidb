@@ -6,11 +6,16 @@ use crate::index::node::{
     leaf_set_prev, leaf_upper_bound, node_type, leaf_entry_at, INTERNAL, LEAF,
 };
 use crate::storage::buffer::BufferPool;
+use crate::storage::header::{self, FileKind};
 use crate::storage::page::{FileId, PageNo, PAGE_SIZE};
 use crate::storage::Rid;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"CHIDBTX1";
+const MAGIC: [u8; 8] = *b"CHIDBITX";
+/// Root page number in the file header.
+const ROOT_OFF: usize = header::HEADER_LEN;
+/// First leaf page number in the file header.
+const FIRST_LEAF_OFF: usize = header::HEADER_LEN + 4;
 
 /// (separator key, child page) pairs of an internal node.
 type InternalEntries = Vec<(Vec<u8>, PageNo)>;
@@ -41,9 +46,9 @@ impl BTree {
         }
         let no = bp.alloc_page(file)?;
         bp.with_page(file, no, |page| {
-            page[0..8].copy_from_slice(&MAGIC);
-            u32_put(page, 8, 0); // root: empty tree
-            u32_put(page, 12, 0); // first leaf
+            header::write_header(page, &MAGIC, FileKind::Index);
+            u32_put(page, ROOT_OFF, 0); // root: empty tree
+            u32_put(page, FIRST_LEAF_OFF, 0); // first leaf
             Ok(())
         })?;
         Ok(Self { file })
@@ -53,13 +58,7 @@ impl BTree {
         if bp.page_count(file)? == 0 {
             return Err(Error::Runtime("cannot open index file: file is empty".into()));
         }
-        bp.read_page(file, 0, |page| {
-            if page[0..8] == MAGIC {
-                Ok(())
-            } else {
-                Err(Error::Runtime("not a chibidb index file".into()))
-            }
-        })?;
+        bp.read_page(file, 0, |page| header::read_header(page, &MAGIC, FileKind::Index))?;
         Ok(Self { file })
     }
 
@@ -79,9 +78,9 @@ impl BTree {
             return Ok(false);
         }
         bp.with_page(file, 0, |page| {
-            page[0..8].copy_from_slice(&MAGIC);
-            u32_put(page, 8, 0); // root: empty tree
-            u32_put(page, 12, 0); // first leaf
+            header::write_header(page, &MAGIC, FileKind::Index);
+            u32_put(page, ROOT_OFF, 0); // root: empty tree
+            u32_put(page, FIRST_LEAF_OFF, 0); // first leaf
             Ok(())
         })?;
         Ok(true)
@@ -96,7 +95,7 @@ impl BTree {
     }
 
     fn root(&self, bp: &mut BufferPool) -> Result<PageNo> {
-        self.header_u32(bp, 8)
+        self.header_u32(bp, ROOT_OFF)
     }
 
     fn set_header_u32(&self, bp: &mut BufferPool, off: usize, v: PageNo) -> Result<()> {
@@ -130,8 +129,8 @@ impl BTree {
                 leaf_init(page, 0, 0);
                 Ok(())
             })?;
-            self.set_header_u32(bp, 8, no)?;
-            self.set_header_u32(bp, 12, no)?;
+            self.set_header_u32(bp, ROOT_OFF, no)?;
+            self.set_header_u32(bp, FIRST_LEAF_OFF, no)?;
             return self.insert_leaf_entry(bp, no, key, rid).map(|_| ());
         }
         match self.insert_rec(bp, root, key, rid)? {
@@ -142,7 +141,7 @@ impl BTree {
                     internal_init(page, root);
                     internal_insert_entry(page, 0, &sep, new_child)
                 })?;
-                self.set_header_u32(bp, 8, new_root)?;
+                self.set_header_u32(bp, ROOT_OFF, new_root)?;
                 Ok(())
             }
         }
@@ -305,7 +304,7 @@ impl BTree {
         }
         let (mut page_no, mut pos) = match start {
             Bound::Unbounded => {
-                let first = self.header_u32(bp, 12)?;
+                let first = self.header_u32(bp, FIRST_LEAF_OFF)?;
                 if first == 0 {
                     return Ok(vec![]);
                 }
@@ -387,10 +386,10 @@ impl BTree {
             })?;
             let (ty, n, first_child) = root_state;
             if ty == LEAF && n == 0 {
-                self.set_header_u32(bp, 8, 0)?;
-                self.set_header_u32(bp, 12, 0)?;
+                self.set_header_u32(bp, ROOT_OFF, 0)?;
+                self.set_header_u32(bp, FIRST_LEAF_OFF, 0)?;
             } else if ty == INTERNAL && n == 0 {
-                self.set_header_u32(bp, 8, first_child)?;
+                self.set_header_u32(bp, ROOT_OFF, first_child)?;
             }
         }
         Ok(())
