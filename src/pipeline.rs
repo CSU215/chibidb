@@ -1,4 +1,5 @@
 use crate::ast::Stmt;
+use crate::exec::operator::PhysicalOperator;
 use crate::result::ResultSet;
 use crate::trx::Session;
 use crate::{Database, Error, Result};
@@ -11,12 +12,14 @@ pub struct SqlEvent<'a> {
     pub tables: Vec<String>,
     /// Access-path description for a SELECT, filled by [`OptimizeStage`].
     pub plan: Option<String>,
+    /// Physical operator tree, when the operators cover the statement.
+    pub physical: Option<Box<dyn PhysicalOperator>>,
     pub result: Option<ResultSet>,
 }
 
 impl<'a> SqlEvent<'a> {
     pub fn new(stmt: &'a Stmt) -> Self {
-        Self { stmt, tables: Vec::new(), plan: None, result: None }
+        Self { stmt, tables: Vec::new(), plan: None, physical: None, result: None }
     }
 }
 
@@ -64,8 +67,15 @@ impl Stage for ExecuteStage {
         session: &mut Session,
         event: &mut SqlEvent<'_>,
     ) -> Result<()> {
-        let trx = session.trx();
-        event.result = Some(crate::exec::execute(db, trx, event.stmt)?);
+        let result = if let Some(plan) = event.physical.as_mut() {
+            let columns: Vec<String> =
+                plan.schema().columns.iter().map(|c| c.name.clone()).collect();
+            let rows = db.collect_plan(session, plan.as_mut())?;
+            ResultSet::Rows { columns, rows }
+        } else {
+            crate::exec::execute(db, session.trx(), event.stmt)?
+        };
+        event.result = Some(result);
         Ok(())
     }
 }
@@ -105,6 +115,7 @@ impl Stage for OptimizeStage {
     ) -> Result<()> {
         if let Stmt::Select(select) = event.stmt {
             event.plan = Some(crate::exec::plan::plan_select(db, select)?);
+            event.physical = crate::exec::operator::build_simple_select(db, select)?;
         }
         Ok(())
     }

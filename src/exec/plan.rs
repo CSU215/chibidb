@@ -226,6 +226,27 @@ pub(crate) fn index_scan_source(
     table: &str,
     selection: Option<&Expr>,
 ) -> Result<Option<(Vec<Vec<Value>>, String)>> {
+    let Some(plan) = plan_index_scan(db, table, selection)? else {
+        return Ok(None);
+    };
+    let rows = decode_visible(db.store_get_records(table, &plan.rids)?, trx)?;
+    Ok(Some((rows, plan.column)))
+}
+
+/// Index-derived row ids for a sargable selection, if one applies. The
+/// executor's materialized path consumes this, as does the `IndexScan`
+/// operator.
+pub(crate) struct IndexScanRids {
+    pub heap_file: crate::storage::FileId,
+    pub column: String,
+    pub rids: Vec<Rid>,
+}
+
+pub(crate) fn plan_index_scan(
+    db: &mut Database,
+    table: &str,
+    selection: Option<&Expr>,
+) -> Result<Option<IndexScanRids>> {
     let Some(sarg) = find_sargable(db, table, selection)? else {
         return Ok(None);
     };
@@ -256,8 +277,8 @@ pub(crate) fn index_scan_source(
             scan_rids(&btree, &mut db.pool, start, end)?
         }
     };
-    let rows = decode_visible(db.store_get_records(table, &rids)?, trx)?;
-    Ok(Some((rows, sarg.column)))
+    let heap_file = db.catalog().table(table)?.heap.file;
+    Ok(Some(IndexScanRids { heap_file, column: sarg.column, rids }))
 }
 
 fn scan_rids(

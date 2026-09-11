@@ -1,5 +1,5 @@
-use chibidb::ast::{BinOp, Expr};
-use chibidb::exec::operator::{Filter, Limit, Project, TableScan};
+use chibidb::ast::{BinOp, Expr, Stmt};
+use chibidb::exec::operator::{build_simple_select, Filter, Limit, Project, TableScan};
 use chibidb::value::Value;
 use chibidb::{Database, Session};
 
@@ -82,4 +82,37 @@ fn project_evaluates_expressions() {
             vec![Value::Int(14)],
         ]
     );
+}
+
+fn parse_select(sql: &str) -> Box<chibidb::ast::SelectStmt> {
+    match chibidb::parser::parse(sql).unwrap().remove(0) {
+        Stmt::Select(s) => s,
+        other => panic!("expected select, got {other:?}"),
+    }
+}
+
+#[test]
+fn simple_select_builds_an_operator_plan() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int, tag int);").unwrap();
+    db.execute_sql("create index idx on t (id);").unwrap();
+
+    let select = parse_select("select id from t where id = 1 limit 1;");
+    assert!(build_simple_select(&mut db, &select).unwrap().is_some());
+}
+
+#[test]
+fn complex_selects_fall_back_to_the_materialized_path() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int);").unwrap();
+
+    for sql in [
+        "select count(*) from t;",
+        "select distinct id from t;",
+        "select id from t order by id;",
+        "select id from t union select id from t;",
+    ] {
+        let select = parse_select(sql);
+        assert!(build_simple_select(&mut db, &select).unwrap().is_none(), "{sql}");
+    }
 }
