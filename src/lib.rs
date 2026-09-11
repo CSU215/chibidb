@@ -398,20 +398,30 @@ impl Database {
         plan: &mut dyn crate::exec::operator::PhysicalOperator,
     ) -> Result<Vec<Vec<Value>>> {
         let autocommit = session.trx.is_none();
+        let read_only = autocommit
+            && plan.output_kind() == crate::exec::operator::OutputKind::Rows;
         if autocommit {
-            let id = self.next_trx_id;
-            self.next_trx_id += 1;
-            session.begin(id, &self.committed_trxs, false);
-            self.open_trxs.insert(id);
+            if read_only {
+                session.begin_readonly(&self.committed_trxs);
+            } else {
+                let id = self.next_trx_id;
+                self.next_trx_id += 1;
+                session.begin(id, &self.committed_trxs, false);
+                self.open_trxs.insert(id);
+            }
         }
         let mut out = Vec::new();
         let result = run_plan(self, session, plan, &mut out);
         if autocommit && let Some(mut trx) = session.trx.take() {
             if result.is_ok() {
-                self.commit_trx(trx.id, false)?;
+                if !read_only {
+                    self.commit_trx(trx.id, false)?;
+                }
             } else {
                 self.rollback_trx(&mut trx)?;
-                self.open_trxs.remove(&trx.id);
+                if !read_only {
+                    self.open_trxs.remove(&trx.id);
+                }
             }
         }
         result.map(|()| out)
@@ -477,28 +487,37 @@ impl Database {
                 Ok(None)
             }
             other => {
+                let read_only = is_read_only(other);
                 let autocommit = session.trx.is_none();
                 if autocommit {
-                    let id = self.next_trx_id;
-                    self.next_trx_id += 1;
-                    session.begin(id, &self.committed_trxs, false);
-                    self.open_trxs.insert(id);
+                    if read_only {
+                        session.begin_readonly(&self.committed_trxs);
+                    } else {
+                        let id = self.next_trx_id;
+                        self.next_trx_id += 1;
+                        session.begin(id, &self.committed_trxs, false);
+                        self.open_trxs.insert(id);
+                    }
                 }
                 let mut event = SqlEvent::new(other);
                 match pipeline.run(self, session, &mut event) {
                     Ok(()) => {
                         let rs = event.result.take().expect("execute stage produced no result");
                         if autocommit
-                            && let Some(trx) = session.trx.take() {
-                                let wrote = !trx.undo.is_empty();
-                                self.commit_trx(trx.id, wrote)?;
-                            }
+                            && let Some(trx) = session.trx.take()
+                            && !read_only
+                        {
+                            let wrote = !trx.undo.is_empty();
+                            self.commit_trx(trx.id, wrote)?;
+                        }
                         Ok(Some(rs))
                     }
                     Err(e) => {
                         // undo partial statement work; an explicit
                         // transaction stays open for retry or rollback
-                        if let Some(mut trx) = session.trx.take() {
+                        if let Some(mut trx) = session.trx.take()
+                            && !read_only
+                        {
                             self.rollback_trx(&mut trx)?;
                             if !autocommit {
                                 session.trx = Some(trx);
@@ -788,6 +807,16 @@ impl Database {
     }
 }
 
+/// Whether a statement only reads, so its autocommit needs no transaction
+/// bookkeeping. Everything else (DML, DDL, CHECKPOINT, VACUUM) may mutate
+/// state and takes the normal round trip.
+fn is_read_only(stmt: &crate::ast::Stmt) -> bool {
+    matches!(
+        stmt,
+        crate::ast::Stmt::Select(_) | crate::ast::Stmt::Explain(_)
+    )
+}
+
 /// Drives one operator tree to completion, appending rows to `out`.
 fn run_plan(
     db: &mut Database,
@@ -806,4 +835,34 @@ fn run_plan(
 
 fn dir_err(dir: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
     move |e| Error::Runtime(format!("cannot create dir {}: {e}", dir.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_autocommit_does_not_touch_bookkeeping() {
+        let mut db = Database::open_in_memory().unwrap();
+        let before = db.next_trx_id;
+
+        db.execute_sql("select 1;").unwrap();
+
+        assert_eq!(db.next_trx_id, before, "read-only must not allocate a trx id");
+        assert!(db.committed_trxs.is_empty(), "read-only must not join committed");
+        assert!(db.open_trxs.is_empty(), "read-only must not stay open");
+    }
+
+    #[test]
+    fn write_autocommit_registers_its_transaction() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.execute_sql("create table t (id int);").unwrap();
+        let before = db.next_trx_id;
+
+        db.execute_sql("insert into t values (1);").unwrap();
+
+        assert!(db.next_trx_id > before, "write must allocate a trx id");
+        assert!(db.committed_trxs.contains(&before), "write must be committed");
+        assert!(db.open_trxs.is_empty(), "write must not stay open");
+    }
 }

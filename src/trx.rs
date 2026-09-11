@@ -2,6 +2,11 @@ use std::collections::HashSet;
 
 use crate::storage::Rid;
 
+/// Sentinel transaction id for an autocommitted read-only snapshot. Real
+/// transactions are numbered from 1, so this can never collide with a creator
+/// or deleter id.
+pub(crate) const READ_ONLY_TRX_ID: u32 = 0;
+
 /// Per-connection state: at most one active transaction at a time, plus the
 /// database the statements route to (selected with `USE`).
 pub struct Session {
@@ -28,6 +33,20 @@ impl Session {
             snapshot: committed.clone(),
             undo: Vec::new(),
             explicit,
+        });
+    }
+
+    /// Begins the snapshot used by an autocommitted read-only statement. It
+    /// carries a snapshot but no undo log, never commits and is never
+    /// registered in the database's bookkeeping, so readers do not mutate
+    /// shared state. The id is `READ_ONLY_TRX_ID`, which no real transaction
+    /// uses (ids start at 1).
+    pub(crate) fn begin_readonly(&mut self, committed: &HashSet<u32>) {
+        self.trx = Some(TrxState {
+            id: READ_ONLY_TRX_ID,
+            snapshot: committed.clone(),
+            undo: Vec::new(),
+            explicit: false,
         });
     }
 
