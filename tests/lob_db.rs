@@ -56,6 +56,62 @@ fn externalized_values_survive_a_checkpoint_reopen() {
     assert_eq!(rows(&db, "select body from t where id = 1;"), [[Value::Str(big)]]);
 }
 
+fn lob_count(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir.join("lobs")).map(|it| it.count()).unwrap_or(0)
+}
+
+#[test]
+fn vacuum_reclaims_lob_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_with_config(dir.path(), &lob_config()).unwrap();
+    db.execute_sql("create table t (id int, body text);").unwrap();
+
+    let big = "q".repeat(300);
+    db.execute_sql(&format!("insert into t values (1, '{big}');")).unwrap();
+    assert_eq!(lob_count(dir.path()), 1);
+
+    db.execute_sql("delete from t;").unwrap();
+    // delete-marked, still visible to snapshots: the object is kept
+    assert_eq!(lob_count(dir.path()), 1);
+
+    db.execute_sql("vacuum;").unwrap();
+    assert_eq!(lob_count(dir.path()), 0);
+}
+
+#[test]
+fn rollback_reclaims_a_lob_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_with_config(dir.path(), &lob_config()).unwrap();
+    db.execute_sql("create table t (id int, body text);").unwrap();
+
+    let mut session = chibidb::Session::new();
+    let big = "r".repeat(300);
+    db.execute_sql_with(&mut session, "begin;").unwrap();
+    db.execute_sql_with(&mut session, &format!("insert into t values (1, '{big}');")).unwrap();
+    assert_eq!(lob_count(dir.path()), 1);
+    db.execute_sql_with(&mut session, "rollback;").unwrap();
+    assert_eq!(lob_count(dir.path()), 0);
+}
+
+#[test]
+fn update_then_vacuum_reclaims_the_old_lob() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_with_config(dir.path(), &lob_config()).unwrap();
+    db.execute_sql("create table t (id int, body text);").unwrap();
+
+    let big = "u".repeat(300);
+    db.execute_sql(&format!("insert into t values (1, '{big}');")).unwrap();
+    assert_eq!(lob_count(dir.path()), 1);
+
+    // the old version keeps its object until it is purged
+    db.execute_sql("update t set body = 'tiny' where id = 1;").unwrap();
+    assert_eq!(lob_count(dir.path()), 1);
+
+    db.execute_sql("vacuum;").unwrap();
+    assert_eq!(lob_count(dir.path()), 0);
+    assert_eq!(rows(&db, "select body from t where id = 1;"), [[Value::Str("tiny".into())]]);
+}
+
 #[test]
 fn externalized_values_recover_from_wal_after_a_crash() {
     let dir = tempfile::tempdir().unwrap();

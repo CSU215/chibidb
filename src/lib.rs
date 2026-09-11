@@ -341,6 +341,7 @@ impl Database {
                     let key = encode_key(&row[*ci])?;
                     BTree::at(*ix_file).delete(&self.pool, &key, rid)?;
                 }
+                self.free_lob_refs(&rec);
                 engine.delete(&self.pool, rid)?;
                 purged += 1;
             }
@@ -787,6 +788,9 @@ impl Database {
             match undo {
                 Undo::Insert { table, rid, row } => {
                     let engine = self.catalog().table(&table)?.engine();
+                    if let Ok(record) = engine.get(&self.pool, rid) {
+                        self.free_lob_refs(&record);
+                    }
                     engine.delete(&self.pool, rid)?;
                     for (ci, ix_file) in self.index_ops(&table)? {
                         let key = encode_key(&row[ci])?;
@@ -799,6 +803,9 @@ impl Database {
                 }
                 Undo::Update { table, old_rid, new_rid, new_row, prev_deleter } => {
                     let engine = self.catalog().table(&table)?.engine();
+                    if let Ok(record) = engine.get(&self.pool, new_rid) {
+                        self.free_lob_refs(&record);
+                    }
                     engine.delete(&self.pool, new_rid)?;
                     for (ci, ix_file) in self.index_ops(&table)? {
                         let key = encode_key(&new_row[ci])?;
@@ -818,6 +825,15 @@ impl Database {
     /// Out-of-line storage for large string values.
     pub(crate) fn lobs(&self) -> &LobStore {
         &self.lobs
+    }
+
+    /// Deletes the large objects referenced by a record that is being
+    /// physically removed (rollback or vacuum). Each object is owned by one
+    /// version, so no other live version can share it.
+    fn free_lob_refs(&self, record: &[u8]) {
+        for id in crate::storage::codec::collect_lob_ids(record) {
+            let _ = self.lobs.delete(id);
+        }
     }
 
     /// Strings longer than this are stored out-of-line.

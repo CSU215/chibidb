@@ -56,6 +56,53 @@ pub fn decode_record(
     Ok((creator, deleter, row))
 }
 
+/// Collects the large-object ids referenced by an encoded record, without
+/// resolving them. Best-effort: malformed bytes end the scan. Used to free an
+/// object when its last version is physically removed.
+pub fn collect_lob_ids(data: &[u8]) -> Vec<u64> {
+    let mut ids = Vec::new();
+    if data.len() >= 8 {
+        collect_row_lob_ids(&data[8..], &mut ids);
+    }
+    ids
+}
+
+fn collect_row_lob_ids(data: &[u8], out: &mut Vec<u64>) {
+    if data.len() < 2 {
+        return;
+    }
+    let count = u16::from_le_bytes([data[0], data[1]]) as usize;
+    let mut pos = 2;
+    for _ in 0..count {
+        let Some(&tag) = data.get(pos) else { return };
+        pos += 1;
+        match tag {
+            TAG_NULL => {}
+            TAG_INT | TAG_FLOAT => pos += 8,
+            TAG_BOOL => pos += 1,
+            TAG_DATE => pos += 4,
+            TAG_STR => {
+                if pos + 2 > data.len() {
+                    return;
+                }
+                let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                pos += 2 + len;
+            }
+            TAG_LOB => {
+                if pos + 8 > data.len() {
+                    return;
+                }
+                out.push(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
+                pos += 8;
+            }
+            _ => return,
+        }
+        if pos > data.len() {
+            return;
+        }
+    }
+}
+
 /// Size (excluding the version header) an externalized row encoding will have,
 /// without writing any large object.
 pub fn encoded_row_size(row: &[Value], inline_limit: usize) -> usize {
