@@ -383,6 +383,34 @@ impl Database {
         self.execute_sql_with(&mut session, sql)
     }
 
+    /// Runs a physical operator tree to completion under an auto-committed
+    /// read transaction, returning the produced rows. Used by tests and the
+    /// future operator-based executor.
+    pub fn collect_plan(
+        &mut self,
+        session: &mut Session,
+        plan: &mut dyn crate::exec::operator::PhysicalOperator,
+    ) -> Result<Vec<Vec<Value>>> {
+        let autocommit = session.trx.is_none();
+        if autocommit {
+            let id = self.next_trx_id;
+            self.next_trx_id += 1;
+            session.begin(id, &self.committed_trxs, false);
+            self.open_trxs.insert(id);
+        }
+        let mut out = Vec::new();
+        let result = run_plan(self, session, plan, &mut out);
+        if autocommit && let Some(mut trx) = session.trx.take() {
+            if result.is_ok() {
+                self.commit_trx(trx.id, false)?;
+            } else {
+                self.rollback_trx(&mut trx)?;
+                self.open_trxs.remove(&trx.id);
+            }
+        }
+        result.map(|()| out)
+    }
+
     /// Executes statements within the session's transaction context.
     pub fn execute_sql_with(
         &mut self,
@@ -766,6 +794,22 @@ impl Database {
         }
         Ok(new_rids)
     }
+}
+
+/// Drives one operator tree to completion, appending rows to `out`.
+fn run_plan(
+    db: &mut Database,
+    session: &mut Session,
+    plan: &mut dyn crate::exec::operator::PhysicalOperator,
+    out: &mut Vec<Vec<Value>>,
+) -> Result<()> {
+    let mut ctx = crate::exec::operator::ExecContext { db, session };
+    plan.open(&mut ctx)?;
+    while let Some(row) = plan.next(&mut ctx)? {
+        out.push(row);
+    }
+    plan.close()?;
+    Ok(())
 }
 
 fn dir_err(dir: &Path) -> impl Fn(std::io::Error) -> Error + '_ {

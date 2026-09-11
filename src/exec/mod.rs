@@ -14,6 +14,7 @@ use crate::{Database, Error, Result};
 mod aggregate;
 mod eval;
 mod join;
+pub mod operator;
 pub(crate) mod plan;
 mod subquery;
 
