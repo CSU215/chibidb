@@ -1,5 +1,8 @@
-use crate::ast::{DataType, Expr, JoinKind, Limit as LimitClause, SelectItem, SelectStmt};
+use std::collections::HashMap;
+
+use crate::ast::{BinOp, DataType, Expr, JoinKind, Limit as LimitClause, SelectItem, SelectStmt};
 use crate::catalog::{ColumnDesc, Schema};
+use crate::index::encode_key;
 use crate::storage::codec::decode_record;
 use crate::storage::engine::{HeapEngine, RowScanner, TableEngine};
 use crate::storage::heap::HeapFile;
@@ -566,6 +569,267 @@ fn drain(op: &mut Box<dyn PhysicalOperator>, ctx: &mut ExecContext<'_>) -> Resul
     Ok(rows)
 }
 
+/// Dtype of a simple column reference, used to reject hash keys whose numerics
+/// would need coercion (the index key encoding is type-sensitive).
+fn column_dtype(schema: &Schema, expr: &Expr) -> Option<DataType> {
+    match expr {
+        Expr::Column(name) => {
+            schema.columns.iter().find(|c| &c.name == name).map(|c| c.dtype)
+        }
+        Expr::QualifiedColumn(owner, name) => schema
+            .columns
+            .iter()
+            .find(|c| c.owner.as_deref() == Some(owner) && &c.name == name)
+            .map(|c| c.dtype),
+        _ => None,
+    }
+}
+
+fn compatible(a: DataType, b: DataType) -> bool {
+    matches!(
+        (a, b),
+        (DataType::Int, DataType::Int)
+            | (DataType::Float, DataType::Float)
+            | (DataType::Date, DataType::Date)
+            | (DataType::Text, DataType::Text)
+            | (DataType::Char(_), DataType::Char(_))
+    )
+}
+
+fn split_conjuncts(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::Binary(BinOp::And, l, r) => {
+            let mut out = split_conjuncts(l);
+            out.extend(split_conjuncts(r));
+            out
+        }
+        other => vec![other],
+    }
+}
+
+fn combine_and(mut parts: Vec<Expr>) -> Option<Expr> {
+    let mut acc = parts.pop()?;
+    while let Some(e) = parts.pop() {
+        acc = Expr::Binary(BinOp::And, Box::new(e), Box::new(acc));
+    }
+    Some(acc)
+}
+
+pub struct HashKeys {
+    left_keys: Vec<Expr>,
+    right_keys: Vec<Expr>,
+    residual: Option<Expr>,
+}
+
+/// Extracts equi-join key pairs from `ON a.k = b.k [and ...]`. Returns `None`
+/// unless at least one pair of plain, same-typed columns is found.
+fn analyze_hash_join(
+    kind: JoinKind,
+    condition: Option<&Expr>,
+    left: &Schema,
+    right: &Schema,
+) -> Option<HashKeys> {
+    if kind == JoinKind::Cross {
+        return None;
+    }
+    let condition = condition?;
+    let mut left_keys = Vec::new();
+    let mut right_keys = Vec::new();
+    let mut residual = Vec::new();
+    for conjunct in split_conjuncts(condition) {
+        if let Expr::Binary(BinOp::Eq, a, b) = conjunct {
+            if let (Some(ld), Some(rd)) = (column_dtype(left, a), column_dtype(right, b))
+                && compatible(ld, rd)
+            {
+                left_keys.push((**a).clone());
+                right_keys.push((**b).clone());
+                continue;
+            }
+            if let (Some(ld), Some(rd)) = (column_dtype(left, b), column_dtype(right, a))
+                && compatible(ld, rd)
+            {
+                left_keys.push((**b).clone());
+                right_keys.push((**a).clone());
+                continue;
+            }
+        }
+        residual.push(conjunct.clone());
+    }
+    if left_keys.is_empty() {
+        return None;
+    }
+    Some(HashKeys { left_keys, right_keys, residual: combine_and(residual) })
+}
+
+fn encode_join_key(
+    keys: &[Expr],
+    schema: &Schema,
+    row: &[Value],
+    db: &mut Database,
+    trx: &mut crate::trx::TrxState,
+) -> Result<Option<Vec<Vec<u8>>>> {
+    let ctx = EvalCtx::row(schema, row);
+    let mut encoded = Vec::with_capacity(keys.len());
+    for key in keys {
+        let value = eval_bound(db, trx, key, Some(&ctx))?;
+        if matches!(value, Value::Null) {
+            return Ok(None);
+        }
+        encoded.push(encode_key(&value)?);
+    }
+    Ok(Some(encoded))
+}
+
+/// Hash equi-join: builds a hash table on one side and probes with the other.
+/// Supports INNER/LEFT (build right) and RIGHT (build left).
+pub struct HashJoin {
+    left: Box<dyn PhysicalOperator>,
+    right: Box<dyn PhysicalOperator>,
+    kind: JoinKind,
+    left_keys: Vec<Expr>,
+    right_keys: Vec<Expr>,
+    residual: Option<Expr>,
+    schema: Schema,
+    rows: Vec<Vec<Value>>,
+    pos: usize,
+}
+
+impl HashJoin {
+    pub fn new(
+        left: Box<dyn PhysicalOperator>,
+        right: Box<dyn PhysicalOperator>,
+        kind: JoinKind,
+        keys: HashKeys,
+    ) -> Self {
+        let mut schema = left.schema().clone();
+        schema.columns.extend(right.schema().columns.iter().cloned());
+        Self {
+            left,
+            right,
+            kind,
+            left_keys: keys.left_keys,
+            right_keys: keys.right_keys,
+            residual: keys.residual,
+            schema,
+            rows: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    fn residual_ok(&self, ctx: &mut ExecContext<'_>, row: &[Value]) -> Result<bool> {
+        match &self.residual {
+            None => Ok(true),
+            Some(predicate) => {
+                eval_predicate_bound(ctx.db, ctx.session.trx(), predicate, &self.schema, row, None)
+            }
+        }
+    }
+}
+
+impl PhysicalOperator for HashJoin {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
+        let left_rows = drain(&mut self.left, ctx)?;
+        let right_rows = drain(&mut self.right, ctx)?;
+        let left_schema = self.left.schema().clone();
+        let right_schema = self.right.schema().clone();
+        let left_cols = left_schema.columns.len();
+        let right_cols = right_schema.columns.len();
+        let mut rows = Vec::new();
+
+        if self.kind == JoinKind::Right {
+            let mut table: HashMap<Vec<Vec<u8>>, Vec<usize>> = HashMap::new();
+            for (i, left) in left_rows.iter().enumerate() {
+                let key =
+                    encode_join_key(&self.left_keys, &left_schema, left, ctx.db, ctx.session.trx())?;
+                if let Some(key) = key {
+                    table.entry(key).or_default().push(i);
+                }
+            }
+            for right in &right_rows {
+                let key = encode_join_key(
+                    &self.right_keys,
+                    &right_schema,
+                    right,
+                    ctx.db,
+                    ctx.session.trx(),
+                )?;
+                let mut matched = false;
+                if let Some(indices) = key.as_ref().and_then(|k| table.get(k)) {
+                    for &i in indices {
+                        let mut row = left_rows[i].clone();
+                        row.extend(right.iter().cloned());
+                        if self.residual_ok(ctx, &row)? {
+                            rows.push(row);
+                            matched = true;
+                        }
+                    }
+                }
+                if !matched {
+                    let mut row = vec![Value::Null; left_cols];
+                    row.extend(right.iter().cloned());
+                    rows.push(row);
+                }
+            }
+        } else {
+            let mut table: HashMap<Vec<Vec<u8>>, Vec<usize>> = HashMap::new();
+            for (i, right) in right_rows.iter().enumerate() {
+                let key = encode_join_key(
+                    &self.right_keys,
+                    &right_schema,
+                    right,
+                    ctx.db,
+                    ctx.session.trx(),
+                )?;
+                if let Some(key) = key {
+                    table.entry(key).or_default().push(i);
+                }
+            }
+            for left in &left_rows {
+                let key =
+                    encode_join_key(&self.left_keys, &left_schema, left, ctx.db, ctx.session.trx())?;
+                let mut matched = false;
+                if let Some(indices) = key.as_ref().and_then(|k| table.get(k)) {
+                    for &i in indices {
+                        let mut row = left.clone();
+                        row.extend(right_rows[i].iter().cloned());
+                        if self.residual_ok(ctx, &row)? {
+                            rows.push(row);
+                            matched = true;
+                        }
+                    }
+                }
+                if !matched && self.kind == JoinKind::Left {
+                    let mut row = left.clone();
+                    row.extend(vec![Value::Null; right_cols]);
+                    rows.push(row);
+                }
+            }
+        }
+        self.rows = rows;
+        self.pos = 0;
+        Ok(())
+    }
+
+    fn next(&mut self, _ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
+        if self.pos >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.pos].clone();
+        self.pos += 1;
+        Ok(Some(row))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.rows.clear();
+        self.pos = 0;
+        Ok(())
+    }
+}
+
 /// UNION [ALL] over a list of plans, then the trailing ORDER BY / LIMIT that
 /// apply to the whole set. `(true, plan)` marks a UNION ALL operand.
 pub struct Union {
@@ -789,7 +1053,13 @@ pub fn build_select(
                 Box::new(TableScan::with_owner(db, &tref.name, owner)?);
             let kind = select.joins.get(i).copied().unwrap_or(JoinKind::Cross);
             let condition = select.on.get(i - 1).cloned();
-            op = Box::new(NestedLoopJoin::new(op, right, kind, condition)?);
+            if let Some(keys) =
+                analyze_hash_join(kind, condition.as_ref(), op.schema(), right.schema())
+            {
+                op = Box::new(HashJoin::new(op, right, kind, keys));
+            } else {
+                op = Box::new(NestedLoopJoin::new(op, right, kind, condition)?);
+            }
         }
         (op, None)
     };
@@ -914,5 +1184,63 @@ fn limit_bound(expr: Option<&Expr>) -> Result<u64> {
     match eval_const(expr)? {
         Value::Int(n) if n >= 0 => Ok(n as u64),
         _ => Err(Error::Runtime("limit must be a non-negative integer".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{ColumnDesc, Schema};
+
+    fn schema(owner: &str, name: &str, dtype: DataType) -> Schema {
+        Schema {
+            columns: vec![ColumnDesc::plain(Some(owner.to_string()), name.to_string(), dtype)],
+        }
+    }
+
+    fn eq(left_owner: &str, right_owner: &str) -> Expr {
+        Expr::Binary(
+            BinOp::Eq,
+            Box::new(Expr::QualifiedColumn(left_owner.into(), "id".into())),
+            Box::new(Expr::QualifiedColumn(right_owner.into(), "id".into())),
+        )
+    }
+
+    #[test]
+    fn extracts_equi_join_keys() {
+        let left = schema("a", "id", DataType::Int);
+        let right = schema("b", "id", DataType::Int);
+        let keys = analyze_hash_join(JoinKind::Inner, Some(&eq("a", "b")), &left, &right).unwrap();
+        assert_eq!(keys.left_keys.len(), 1);
+        assert_eq!(keys.right_keys.len(), 1);
+        assert!(keys.residual.is_none());
+    }
+
+    #[test]
+    fn rejects_mismatched_numeric_key_types() {
+        let left = schema("a", "id", DataType::Int);
+        let right = schema("b", "id", DataType::Float);
+        assert!(analyze_hash_join(JoinKind::Inner, Some(&eq("a", "b")), &left, &right).is_none());
+    }
+
+    #[test]
+    fn cross_join_is_not_hashable() {
+        let left = schema("a", "id", DataType::Int);
+        let right = schema("b", "id", DataType::Int);
+        assert!(analyze_hash_join(JoinKind::Cross, Some(&eq("a", "b")), &left, &right).is_none());
+    }
+
+    #[test]
+    fn non_equi_predicate_is_not_hashable() {
+        let left = schema("a", "id", DataType::Int);
+        let right = schema("b", "id", DataType::Int);
+        let condition = Expr::Binary(
+            BinOp::Gt,
+            Box::new(Expr::QualifiedColumn("a".into(), "id".into())),
+            Box::new(Expr::QualifiedColumn("b".into(), "id".into())),
+        );
+        assert!(
+            analyze_hash_join(JoinKind::Inner, Some(&condition), &left, &right).is_none()
+        );
     }
 }

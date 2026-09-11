@@ -161,6 +161,54 @@ fn representative_selects_all_build_plans() {
 }
 
 #[test]
+fn hash_join_handles_duplicate_keys() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table a (k int, x int);").unwrap();
+    db.execute_sql("create table b (k int, y int);").unwrap();
+    db.execute_sql("insert into a values (1, 10), (2, 20), (2, 21);").unwrap();
+    db.execute_sql("insert into b values (2, 200), (2, 201), (3, 300);").unwrap();
+
+    let rs = db
+        .execute_sql("select a.x, b.y from a join b on a.k = b.k order by a.x, b.y;")
+        .unwrap();
+    match &rs[0] {
+        chibidb::ResultSet::Rows { rows, .. } => assert_eq!(
+            rows,
+            &vec![
+                vec![Value::Int(20), Value::Int(200)],
+                vec![Value::Int(20), Value::Int(201)],
+                vec![Value::Int(21), Value::Int(200)],
+                vec![Value::Int(21), Value::Int(201)],
+            ]
+        ),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn hash_join_left_keeps_unmatched_rows() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table a (k int);").unwrap();
+    db.execute_sql("create table b (k int, y int);").unwrap();
+    db.execute_sql("insert into a values (1), (2);").unwrap();
+    db.execute_sql("insert into b values (2, 200);").unwrap();
+
+    let rs = db
+        .execute_sql("select a.k, b.y from a left join b on a.k = b.k order by a.k;")
+        .unwrap();
+    match &rs[0] {
+        chibidb::ResultSet::Rows { rows, .. } => assert_eq!(
+            rows,
+            &vec![
+                vec![Value::Int(1), Value::Null],
+                vec![Value::Int(2), Value::Int(200)],
+            ]
+        ),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
 fn unions_build_an_operator_plan() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int);").unwrap();
