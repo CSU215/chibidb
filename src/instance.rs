@@ -211,6 +211,16 @@ impl Instance {
                     self.use_database(session, &u.name)?;
                     out.push(ResultSet::Message("SUCCESS".into()));
                 }
+                Stmt::CreateUser(c) => {
+                    self.reject_in_trx(session)?;
+                    self.create_user(&c.name, &c.password)?;
+                    out.push(ResultSet::Message("SUCCESS".into()));
+                }
+                Stmt::DropUser(d) => {
+                    self.reject_in_trx(session)?;
+                    self.drop_user(&d.name)?;
+                    out.push(ResultSet::Message("SUCCESS".into()));
+                }
                 other => {
                     let db_name = self.ensure_current_db(session)?;
                     let db = self.database_mut(&db_name)?;

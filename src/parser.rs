@@ -1,8 +1,8 @@
 use crate::ast::{
-    AggFunc, BinOp, ColumnDef, CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt, CreateViewStmt,
-    DataType, DeleteStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, DropViewStmt, ExplainStmt,
-    Expr, InsertStmt, JoinKind, Limit, SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp,
-    UpdateStmt, UseStmt,
+    AggFunc, BinOp, ColumnDef, CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt,
+    CreateUserStmt, CreateViewStmt, DataType, DeleteStmt, DropDatabaseStmt, DropIndexStmt,
+    DropTableStmt, DropUserStmt, DropViewStmt, ExplainStmt, Expr, InsertStmt, JoinKind, Limit,
+    SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp, UpdateStmt, UseStmt,
 };
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
@@ -118,6 +118,17 @@ impl<'a> Parser<'a> {
                 let name = self.parse_ident("database name")?;
                 return Ok(Stmt::CreateDatabase(CreateDatabaseStmt { name }));
             }
+            if self.eat_keyword("user") {
+                let name = self.parse_name_literal("user name")?;
+                if !self.eat_keyword("identified") {
+                    return Err(self.unexpected("identified"));
+                }
+                if !self.eat_keyword("by") {
+                    return Err(self.unexpected("by"));
+                }
+                let password = self.parse_string("password")?;
+                return Ok(Stmt::CreateUser(CreateUserStmt { name, password }));
+            }
             if self.eat_keyword("view") {
                 let name = self.parse_ident("view name")?;
                 if !self.eat_keyword("as") {
@@ -163,6 +174,10 @@ impl<'a> Parser<'a> {
             if self.eat_keyword("database") {
                 let name = self.parse_ident("database name")?;
                 return Ok(Stmt::DropDatabase(DropDatabaseStmt { name }));
+            }
+            if self.eat_keyword("user") {
+                let name = self.parse_name_literal("user name")?;
+                return Ok(Stmt::DropUser(DropUserStmt { name }));
             }
             if self.eat_keyword("index") {
                 let name = self.parse_ident("index name")?;
@@ -253,6 +268,23 @@ impl<'a> Parser<'a> {
     fn parse_ident(&mut self, want: &str) -> Result<String> {
         match self.bump() {
             Some(Token { kind: TokenKind::Ident(s), .. }) => Ok(s.clone()),
+            _ => Err(self.unexpected(want)),
+        }
+    }
+
+    /// Accepts a bare identifier or a quoted string, for names that may be
+    /// written either way (`create user alice` / `create user 'alice'`).
+    fn parse_name_literal(&mut self, want: &str) -> Result<String> {
+        match self.bump() {
+            Some(Token { kind: TokenKind::Ident(s), .. }) => Ok(s.clone()),
+            Some(Token { kind: TokenKind::Str(s), .. }) => Ok(s.clone()),
+            _ => Err(self.unexpected(want)),
+        }
+    }
+
+    fn parse_string(&mut self, want: &str) -> Result<String> {
+        match self.bump() {
+            Some(Token { kind: TokenKind::Str(s), .. }) => Ok(s.clone()),
             _ => Err(self.unexpected(want)),
         }
     }

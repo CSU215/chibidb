@@ -1,5 +1,6 @@
 use chibidb::config::Config;
 use chibidb::instance::Instance;
+use chibidb::Session;
 
 fn instance(dir: &tempfile::TempDir) -> Instance {
     Instance::open(dir.path(), &Config::default()).unwrap()
@@ -55,4 +56,40 @@ fn users_persist_across_reopen() {
     }
     let mut inst = instance(&dir);
     assert!(inst.authenticate("alice", "secret").unwrap());
+}
+
+#[test]
+fn create_and_drop_user_via_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut inst = instance(&dir);
+    let mut s = Session::new();
+
+    inst.execute_with(&mut s, "create user alice identified by 'secret';")
+        .unwrap();
+    assert!(inst.authenticate("alice", "secret").unwrap());
+
+    inst.execute_with(&mut s, "drop user alice;").unwrap();
+    assert!(!inst.authenticate("alice", "secret").unwrap());
+}
+
+#[test]
+fn parses_user_statements() {
+    use chibidb::ast::{CreateUserStmt, DropUserStmt, Stmt};
+    use chibidb::parser::parse;
+
+    let one = |sql: &str| parse(sql).unwrap().remove(0);
+    assert_eq!(
+        one("create user alice identified by 'pw';"),
+        Stmt::CreateUser(CreateUserStmt { name: "alice".into(), password: "pw".into() })
+    );
+    assert_eq!(
+        one("create user 'bob' identified by 'x';"),
+        Stmt::CreateUser(CreateUserStmt { name: "bob".into(), password: "x".into() })
+    );
+    assert_eq!(
+        one("drop user alice;"),
+        Stmt::DropUser(DropUserStmt { name: "alice".into() })
+    );
+    assert!(parse("create user alice;").is_err());
+    assert!(parse("create user alice identified 'pw';").is_err());
 }

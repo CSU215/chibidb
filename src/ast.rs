@@ -232,6 +232,17 @@ pub struct UseStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CreateUserStmt {
+    pub name: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropUserStmt {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExplainStmt {
     pub stmt: Box<Stmt>,
 }
@@ -298,11 +309,13 @@ pub enum Stmt {
     CreateDatabase(CreateDatabaseStmt),
     CreateIndex(CreateIndexStmt),
     CreateTable(CreateTableStmt),
+    CreateUser(CreateUserStmt),
     CreateView(CreateViewStmt),
     Delete(DeleteStmt),
     DropDatabase(DropDatabaseStmt),
     DropIndex(DropIndexStmt),
     DropTable(DropTableStmt),
+    DropUser(DropUserStmt),
     DropView(DropViewStmt),
     Explain(ExplainStmt),
     Insert(InsertStmt),
