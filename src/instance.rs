@@ -75,8 +75,10 @@ impl Instance {
             meta.execute_sql("create table databases (name char(64) primary key);")?;
         }
         if !meta.table_exists("users") {
+            // `password` is the login hash; `native` is the SHA1-based verifier
+            // the MySQL frontend needs for mysql_native_password.
             meta.execute_sql(
-                "create table users (name char(64) primary key, password char(128) not null);",
+                "create table users (name char(64) primary key, password char(128) not null, native char(40) not null);",
             )?;
         }
         if !meta.table_exists("privileges") {
@@ -455,8 +457,28 @@ impl Instance {
             return Err(Error::Runtime(format!("user already exists: {name}")));
         }
         let hash = hash_password(password);
-        meta.execute_sql(&format!("insert into users values ('{name}', '{hash}');"))?;
+        let native = crate::mysql::native_verifier_hex(password);
+        meta.execute_sql(&format!(
+            "insert into users values ('{name}', '{hash}', '{native}');"
+        ))?;
         Ok(())
+    }
+
+    /// The stored MySQL `mysql_native_password` verifier for `name`, if the
+    /// user exists.
+    pub fn native_verifier(&self, name: &str) -> Result<Option<String>> {
+        let meta = self.meta.read();
+        let result =
+            meta.execute_sql(&format!("select native from users where name = '{name}';"))?;
+        Ok(match result.into_iter().next() {
+            Some(ResultSet::Rows { mut rows, .. }) if !rows.is_empty() => {
+                match rows.remove(0).into_iter().next() {
+                    Some(Value::Str(v)) => Some(v),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
     }
 
     pub fn drop_user(&self, name: &str) -> Result<()> {

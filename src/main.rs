@@ -52,6 +52,16 @@ async fn main() -> std::io::Result<()> {
                     }
                 });
             }
+            if let Some(mysql_addr) = config.server.mysql_addr.clone() {
+                let mysql_listener = tokio::net::TcpListener::bind(&mysql_addr).await?;
+                eprintln!("chibidb mysql listening on {mysql_addr}");
+                let mysql_instance = instance.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = chibidb::mysql::serve(mysql_instance, mysql_listener).await {
+                        eprintln!("mysql server error: {e}");
+                    }
+                });
+            }
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("chibidb server listening on {addr}");
             server::serve(instance, listener).await

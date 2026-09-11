@@ -9,6 +9,7 @@ pub mod http;
 pub mod index;
 pub mod instance;
 pub mod lexer;
+pub mod mysql;
 pub mod parser;
 pub mod pipeline;
 pub mod protocol;
