@@ -11,7 +11,8 @@ cargo run -q                    # 内存实例 REPL（临时目录后端，自�
 cargo run -q -- <dir>           # 文件实例 REPL（数据根目录，多库落盘）
 cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（458 tests）
+# HTTP/JSON 前端：配置 server.http_addr 后，POST /query {"sql":"..."} → {"results":[...]}
+cargo test                      # 全量回归（463 tests）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -20,8 +21,9 @@ REPL / client 中输入 `exit` 或 `quit` 退出。
 启动时从当前目录读取 `config.toml`（缺失则全用默认值）。已生效条目：
 `storage.buffer_pool_frames`、`storage.double_write`、`storage.default_engine`（`"heap"` / `"lsm"`）、
 `storage.inline_lob_limit`、`wal.checkpoint_threshold`、`server.addr`、
-`server.thread_model`/`worker_threads`、`transaction.conflict`（`"fcw"` / `"2pl"`）、
-`transaction.lock_timeout_ms`；其余为后续阶段预留（详见 `HANDOFF.md` §10 重构路线图）。
+`server.http_addr`（可选，另开 HTTP/JSON 监听）、`server.thread_model`/`worker_threads`、
+`transaction.conflict`（`"fcw"` / `"2pl"`）、`transaction.lock_timeout_ms`；
+其余为后续阶段预留（详见 `HANDOFF.md` §10 重构路线图）。
 
 ### 冒烟演示
 
@@ -160,7 +162,7 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
 
 ## 测试
 
-`cargo test` 跑 458 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
+`cargo test` 跑 463 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
 表约束（PK/UNIQUE/NOT NULL/DEFAULT）/索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等，
 另有 `tests/miniob_compat.rs` 用经典 student/course/sc 场景做端到端回归。集成测试的 `with_dbs` 模式让同一用例在内存后端
 与文件后端各跑一遍；WAL 测试用 `Database::simulate_crash()` 模拟进程被杀。
