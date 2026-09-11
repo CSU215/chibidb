@@ -136,10 +136,16 @@ fn joins_build_an_operator_plan() {
 }
 
 #[test]
-fn set_operations_fall_back_to_the_materialized_path() {
+fn unions_build_an_operator_plan() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int);").unwrap();
 
-    let select = parse_select("select id from t union select id from t;");
-    assert!(build_select(&mut db, &select).unwrap().is_none());
+    for sql in [
+        "select id from t union select id from t;",
+        "select id from t union all select id from t;",
+        "select id from t union select id from t order by id limit 1;",
+    ] {
+        let select = parse_select(sql);
+        assert!(build_select(&mut db, &select).unwrap().is_some(), "{sql}");
+    }
 }

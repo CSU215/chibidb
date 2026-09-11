@@ -1,4 +1,4 @@
-use crate::ast::{DataType, Expr, JoinKind, SelectItem, SelectStmt};
+use crate::ast::{DataType, Expr, JoinKind, Limit as LimitClause, SelectItem, SelectStmt};
 use crate::catalog::{ColumnDesc, Schema};
 use crate::storage::codec::decode_record;
 use crate::storage::engine::{HeapEngine, RowScanner, TableEngine};
@@ -566,6 +566,94 @@ fn drain(op: &mut Box<dyn PhysicalOperator>, ctx: &mut ExecContext<'_>) -> Resul
     Ok(rows)
 }
 
+/// UNION [ALL] over a list of plans, then the trailing ORDER BY / LIMIT that
+/// apply to the whole set. `(true, plan)` marks a UNION ALL operand.
+pub struct Union {
+    inputs: Vec<(bool, Box<dyn PhysicalOperator>)>,
+    schema: Schema,
+    rows: Vec<Vec<Value>>,
+    pos: usize,
+    order_by: Vec<(Expr, bool)>,
+    limit: Option<LimitClause>,
+}
+
+impl Union {
+    pub fn new(
+        inputs: Vec<(bool, Box<dyn PhysicalOperator>)>,
+        order_by: Vec<(Expr, bool)>,
+        limit: Option<LimitClause>,
+    ) -> Self {
+        let headers: Vec<String> =
+            inputs[0].1.schema().columns.iter().map(|c| c.name.clone()).collect();
+        let schema = Schema {
+            columns: headers
+                .into_iter()
+                .map(|h| ColumnDesc::plain(None, h, DataType::Text))
+                .collect(),
+        };
+        Self { inputs, schema, rows: Vec::new(), pos: 0, order_by, limit }
+    }
+}
+
+impl PhysicalOperator for Union {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
+        let columns: Vec<String> =
+            self.schema.columns.iter().map(|c| c.name.clone()).collect();
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for (i, (all, plan)) in self.inputs.iter_mut().enumerate() {
+            let mut part = drain(plan, ctx)?;
+            if i == 0 {
+                rows = part;
+                continue;
+            }
+            if plan.schema().columns.len() != columns.len() {
+                return Err(Error::Runtime(format!(
+                    "union column count mismatch: {} vs {}",
+                    columns.len(),
+                    plan.schema().columns.len()
+                )));
+            }
+            rows.append(&mut part);
+            if !*all {
+                super::aggregate::dedup_rows(&mut rows);
+            }
+        }
+        if !self.order_by.is_empty() {
+            super::sort_projected(
+                ctx.db,
+                ctx.session.trx(),
+                None,
+                &columns,
+                &mut rows,
+                &self.order_by,
+            )?;
+        }
+        super::aggregate::apply_limit(&mut rows, &self.limit)?;
+        self.rows = rows;
+        self.pos = 0;
+        Ok(())
+    }
+
+    fn next(&mut self, _ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
+        if self.pos >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.pos].clone();
+        self.pos += 1;
+        Ok(Some(row))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.rows.clear();
+        self.pos = 0;
+        Ok(())
+    }
+}
+
 /// Index scan: fetches exactly the row ids the access path selected.
 pub struct IndexScan {
     schema: Schema,
@@ -649,9 +737,9 @@ pub fn build_select(
     db: &mut Database,
     select: &SelectStmt,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
-    // set operations are not covered yet
+    // set operations: build each operand, then apply the trailing order/limit
     if !select.set_ops.is_empty() {
-        return Ok(None);
+        return build_set_op(db, select);
     }
 
     // no FROM: a single projected tuple (distinct/order/limit are ignored by
@@ -739,6 +827,29 @@ pub fn build_select(
         op = Box::new(Limit::new(op, offset, Some(count)));
     }
     Ok(Some(op))
+}
+
+/// Builds the plan for a UNION [ALL] chain: each operand is planned, then the
+/// trailing ORDER BY / LIMIT apply to the whole result.
+fn build_set_op(
+    db: &mut Database,
+    select: &SelectStmt,
+) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    let mut base = select.clone();
+    base.set_ops = Vec::new();
+    let order_by = std::mem::take(&mut base.order_by);
+    let limit = base.limit.take();
+    let Some(base_plan) = build_select(db, &base)? else {
+        return Ok(None);
+    };
+    let mut inputs: Vec<(bool, Box<dyn PhysicalOperator>)> = vec![(true, base_plan)];
+    for (all, operand) in &select.set_ops {
+        let Some(plan) = build_select(db, operand)? else {
+            return Ok(None);
+        };
+        inputs.push((*all, plan));
+    }
+    Ok(Some(Box::new(Union::new(inputs, order_by, limit))))
 }
 
 fn projection_exprs(items: &[SelectItem]) -> (Vec<Expr>, Vec<String>) {

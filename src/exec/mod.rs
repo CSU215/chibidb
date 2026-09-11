@@ -451,7 +451,7 @@ fn rows_of(rs: ResultSet) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
 
 /// ORDER BY over an already-projected result set: column references resolve
 /// against the output column names.
-fn sort_projected(
+pub(crate) fn sort_projected(
     db: &mut Database,
     trx: &mut TrxState,
     outer: Option<&EvalCtx>,
