@@ -5,6 +5,7 @@ pub mod dwb;
 pub mod engine;
 pub mod header;
 pub mod heap;
+pub mod lsm;
 pub mod page;
 pub mod slotted;
 
