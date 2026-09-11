@@ -17,7 +17,7 @@ pub(crate) fn execute_explain(db: &mut Database, e: &ExplainStmt) -> Result<Resu
     }
 }
 
-fn plan_select(db: &mut Database, s: &SelectStmt) -> Result<String> {
+pub(crate) fn plan_select(db: &mut Database, s: &SelectStmt) -> Result<String> {
     if s.from.is_empty() {
         return Ok("ConstantSelect -> Project".into());
     }

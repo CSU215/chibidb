@@ -32,7 +32,7 @@ use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
 use crate::config::Config;
 use crate::index::{encode_key, BTree};
-use crate::pipeline::{ExecuteStage, Pipeline, SqlEvent};
+use crate::pipeline::{ExecuteStage, OptimizeStage, Pipeline, ResolveStage, SqlEvent};
 use crate::storage::codec::{decode_record, encode_record};
 use crate::storage::engine::{HeapEngine, TableEngine};
 use crate::storage::slotted::{page_get, page_put_at};
@@ -406,7 +406,11 @@ impl Database {
         session: &mut Session,
         stmt: &crate::ast::Stmt,
     ) -> Result<Option<ResultSet>> {
-        let pipeline = Pipeline::new(vec![Box::new(ExecuteStage)]);
+        let pipeline = Pipeline::new(vec![
+            Box::new(ResolveStage),
+            Box::new(OptimizeStage),
+            Box::new(ExecuteStage),
+        ]);
         match stmt {
             crate::ast::Stmt::Trx(crate::ast::TrxCtl::Begin) => {
                 if session.trx.is_some() {

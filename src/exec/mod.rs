@@ -14,7 +14,7 @@ use crate::{Database, Error, Result};
 mod aggregate;
 mod eval;
 mod join;
-mod plan;
+pub(crate) mod plan;
 mod subquery;
 
 pub use eval::eval_const;
