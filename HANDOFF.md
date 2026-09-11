@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：P5.5 DML 算子化完成（执行层全算子化）；P10.0 并发/事务设计定稿；下一步 P10.1；378 tests 全绿、clippy 零警告。
+> 最后更新：P10.1 分库锁落地（去全局锁、跨库并行）；P5.5 DML 算子化完成；380 tests 全绿、clippy 零警告。
 
 ---
 
@@ -85,12 +85,12 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `result.rs` | `ResultSet::Message / Rows` | |
 | `render.rs` | 对齐表格渲染（REPL 与 client 共用） | `write_result` |
 | `repl.rs` | 本地 REPL（`db>` 提示符、exit/quit），持 `Instance` | `run_repl` |
-| `server.rs` | tokio TCP server，`Arc<Mutex<Instance>>`，长度前缀协议，每连接一 Session | `serve(SharedInstance, TcpListener)` |
+| `server.rs` | tokio TCP server，`Arc<Instance>`，长度前缀协议，每连接一 Session；执行时只锁目标库 | `serve(SharedInstance, TcpListener)` |
 | `client.rs` | TCP 客户端 | `run_client` |
 | `wire.rs` | ResultSet/帧二进制编解码 | `encode_result_frame` / `decode_frame` |
 | `protocol.rs` | 前端编解码接缝：`Protocol` trait + `TextProtocol`（`[u32 len][sql]` 请求 / 帧响应） | `decode_request` / `encode_success` / `encode_failure` |
 | `pipeline.rs` | SQL 阶段：`Stage`/`Pipeline`/`SqlEvent`；`ResolveStage`（表/视图存在性）、`OptimizeStage`（记录 `plan` 文本 + 建单表算子物理计划）、`ExecuteStage`（优先跑算子，否则 `exec::execute`） | `Pipeline::run` |
-| `instance.rs` | 单实例多库：数据根 `<db>/` + 系统库 `chibi_meta/`（真实 Database，`databases`/`users`/`privileges` 表；口令加盐 SHA-256）；`execute_with` 顶层入口（拦截库/用户/权限语句，其余路由到 current_db） | `Instance::open` / `execute_with` / `create_user` / `authenticate` / `grant` / `has_privilege` |
+| `instance.rs` | 单实例多库：数据根 `<db>/` + 系统库 `chibi_meta/`；每库一个 `parking_lot::Mutex<Database>`（**跨库并行、库内串行**），系统库同样受锁保护；`execute_with` 顶层入口（拦截库/用户/权限语句，其余路由到 current_db） | `Instance::open` / `execute_with` / `with_database_mut` |
 | `config.rs` | 全局配置中心：`Config`（storage/wal/server/execution/auth），`config.toml` 加载、默认值、校验 | `Config::load` / `from_toml_str` / `validate` |
 | `catalog/mod.rs` | `Catalog`：`Table`/`HeapStore`/`IndexEntry`、`Schema`/`ColumnDesc`（带 `owner`）、`resolve()` 歧义检测 | |
 | `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT6** + 统一文件头（事务簿记 + 视图定义 + 列约束 + 唯一索引标记） | `CatalogSnapshot` |
@@ -356,7 +356,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 验收记录（M20–M25 评审）：296 tests 全绿 + clippy 零警告；人工边界复验（跨列同值、DROP TABLE 清约束索引、链式 RIGHT JOIN、ESCAPE 角例、OrderedIndexScan 含 DESC、DML 子查询、恢复路径 `rebuild_indexes` 覆盖约束索引）均通过。**发现并修复 1 处阻断性缺陷**：`check_unique` 的 `claimed` 查重表跨唯一索引共享，同一行两个不同约束列取同值（如 PK 列与 UNIQUE 列同为 1）会被误判 `duplicate key`——红测试复现后按列下标区分修复，见 `abd0dbb`。已知边界（如实记档）：UNION 各臂不做类型统一，混型结果集上比较会报 type mismatch。
 
-提交基线：`e620154 feat: execute DML through command operators`（HEAD）。
+提交基线：`4984822 feat: per-database locking and removal of the global instance lock`（HEAD）。
 
 ---
 
@@ -397,7 +397,7 @@ DML 先算子化（P5.5），使执行层统一走算子。
 | P7 | LSM 引擎（下一阶段） | ⬜ |
 | P8 | LOB（外存 + `LobReader` 流式） | ⬜ |
 | P9 | 多前端（MySQL/HTTP/Text TCP） | ⬜ |
-| P10 | 并发：`ThreadHandler`（per-connection/thread-pool）+ 去全局锁 + 可配置冲突策略（FCW/2PL） | ⬜ |
+| P10 | 并发：`ThreadHandler`（per-connection/thread-pool）+ 去全局锁 + 可配置冲突策略（FCW/2PL） | 🟡 分库锁 + 去全局锁已落地（`4984822`）；`ThreadHandler` 抽象、库内读并发、FCW/2PL 待做 |
 
 工作纪律：每步先写失败测试（红）再最小实现（绿），提交粒度对齐 chibicc（一次一件事），
 提交前全量 `cargo test` + clippy 零警告，并同步本文档与 README。
