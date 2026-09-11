@@ -54,6 +54,21 @@ fn empty_table_is_readable() {
 }
 
 #[test]
+fn sstable_bloom_filter_is_wired() {
+    let table = SSTable::parse(build(128, 500)).unwrap();
+    for i in 0..500 {
+        assert!(
+            table.bloom().maybe_contains(format!("key{i:04}").as_bytes()),
+            "present key {i} must pass the bloom filter"
+        );
+    }
+    let rejected = (0..500)
+        .filter(|i| !table.bloom().maybe_contains(format!("nope{i:04}").as_bytes()))
+        .count();
+    assert!(rejected > 450, "bloom should reject most absent keys, rejected {rejected}/500");
+}
+
+#[test]
 fn parse_rejects_corruption() {
     // bad magic
     let mut image = build(4096, 3);

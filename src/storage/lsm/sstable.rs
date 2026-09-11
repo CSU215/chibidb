@@ -2,18 +2,21 @@
 //!
 //! Layout:
 //! ```text
-//! [data block 0][data block 1]...[index block][index_offset u64][index_size u64][magic 8]
+//! [data blocks][bloom filter][index block][filter off/size][index off/size][magic 8]
 //! ```
 //! The index block maps the last key of each data block to that block's
-//! `(offset, size)`. Readers binary-search the index, then the chosen block.
+//! `(offset, size)`. A reader consults the bloom filter first, then
+//! binary-searches the index and reads the chosen block.
 
+use crate::storage::lsm::bloom::{BloomBuilder, BloomFilter};
 use crate::storage::lsm::block::{Block, BlockBuilder, DEFAULT_RESTART_INTERVAL};
 use crate::storage::lsm::coding::{get_varint64, put_varint64};
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"SSTBL001";
-const FOOTER_LEN: usize = 8 + 8 + 8;
+const MAGIC: [u8; 8] = *b"SSTBL002";
+const FOOTER_LEN: usize = 8 * 4 + 8;
 const DEFAULT_BLOCK_SIZE: usize = 4096;
+const BLOOM_BITS_PER_KEY: usize = 10;
 
 /// Byte range of one data block within the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,7 @@ pub struct SSTableBuilder {
     data: Vec<u8>,
     index_block: BlockBuilder,
     current: BlockBuilder,
+    bloom: BloomBuilder,
     last_key: Vec<u8>,
     started: bool,
     num_entries: usize,
@@ -62,6 +66,7 @@ impl SSTableBuilder {
             data: Vec::new(),
             index_block: BlockBuilder::new(restart_interval),
             current: BlockBuilder::new(restart_interval),
+            bloom: BloomBuilder::new(BLOOM_BITS_PER_KEY),
             last_key: Vec::new(),
             started: false,
             num_entries: 0,
@@ -78,6 +83,7 @@ impl SSTableBuilder {
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
         self.current.add(key, value);
+        self.bloom.add(key);
         self.num_entries += 1;
         if self.current.current_size_estimate() >= self.block_size {
             self.flush_block();
@@ -92,14 +98,22 @@ impl SSTableBuilder {
     /// returns the complete table image.
     pub fn finish(&mut self) -> Vec<u8> {
         self.flush_block();
+        let filter = self.bloom.finish();
+        let filter_handle = BlockHandle {
+            offset: self.data.len() as u64,
+            size: filter.len() as u64,
+        };
+        self.data.extend_from_slice(&filter);
         let index_block = self.index_block.finish();
         let index_handle = BlockHandle {
             offset: self.data.len() as u64,
             size: index_block.len() as u64,
         };
         self.data.extend_from_slice(&index_block);
-        self.data.extend_from_slice(&index_handle.offset.to_le_bytes());
-        self.data.extend_from_slice(&index_handle.size.to_le_bytes());
+        for handle in [filter_handle, index_handle] {
+            self.data.extend_from_slice(&handle.offset.to_le_bytes());
+            self.data.extend_from_slice(&handle.size.to_le_bytes());
+        }
         self.data.extend_from_slice(&MAGIC);
         std::mem::take(&mut self.data)
     }
@@ -123,6 +137,7 @@ pub struct SSTable {
     data: Vec<u8>,
     /// (last key of a data block, where the block lives), ascending.
     index: Vec<(Vec<u8>, BlockHandle)>,
+    bloom: BloomFilter,
 }
 
 impl SSTable {
@@ -136,17 +151,23 @@ impl SSTable {
             return Err(Error::Runtime("sstable magic mismatch".into()));
         }
         let mut footer = data.len() - FOOTER_LEN;
+        let filter_offset = u64::from_le_bytes(data[footer..footer + 8].try_into().unwrap());
+        footer += 8;
+        let filter_size = u64::from_le_bytes(data[footer..footer + 8].try_into().unwrap());
+        footer += 8;
         let index_offset = u64::from_le_bytes(data[footer..footer + 8].try_into().unwrap());
         footer += 8;
         let index_size = u64::from_le_bytes(data[footer..footer + 8].try_into().unwrap());
+        let filter_handle = BlockHandle { offset: filter_offset, size: filter_size };
         let index_handle = BlockHandle { offset: index_offset, size: index_size };
 
+        let bloom = BloomFilter::decode(slice(&data, filter_handle)?.to_vec());
         let index_block = Block::parse(slice(&data, index_handle)?.to_vec())?;
         let mut index = Vec::new();
         for (key, encoded) in index_block.entries()? {
             index.push((key, BlockHandle::decode(&encoded)?));
         }
-        Ok(Self { data, index })
+        Ok(Self { data, index, bloom })
     }
 
     pub fn num_blocks(&self) -> usize {
@@ -161,8 +182,16 @@ impl SSTable {
         }
     }
 
+    /// The table's bloom filter, exposed for tests and diagnostics.
+    pub fn bloom(&self) -> &BloomFilter {
+        &self.bloom
+    }
+
     /// Exact lookup.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if !self.bloom.maybe_contains(key) {
+            return Ok(None);
+        }
         let pos = self.index.partition_point(|(last, _)| last.as_slice() < key);
         if pos >= self.index.len() {
             return Ok(None);
