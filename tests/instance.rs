@@ -10,8 +10,23 @@ fn open(dir: &tempfile::TempDir) -> Instance {
 #[test]
 fn starts_with_no_databases() {
     let dir = tempfile::tempdir().unwrap();
-    let inst = open(&dir);
+    let mut inst = open(&dir);
     assert!(inst.databases().unwrap().is_empty());
+}
+
+#[test]
+fn database_listing_comes_from_the_registry_not_the_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut inst = open(&dir);
+    // a stray directory is not a database; only registered ones are listed
+    std::fs::create_dir_all(dir.path().join("manual")).unwrap();
+    assert!(inst.databases().unwrap().is_empty());
+
+    inst.create_database("shop").unwrap();
+    assert_eq!(inst.databases().unwrap(), ["shop"]);
+    // the system metadata directory is never a user database
+    assert!(dir.path().join("chibi_meta").is_dir());
+    assert!(!inst.databases().unwrap().iter().any(|d| d == "chibi_meta"));
 }
 
 #[test]

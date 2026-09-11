@@ -527,6 +527,11 @@ impl Database {
         &self.catalog
     }
 
+    /// Whether a table with `name` exists in this database.
+    pub(crate) fn table_exists(&self, name: &str) -> bool {
+        self.catalog.table(name).is_ok()
+    }
+
     pub(crate) fn catalog_mut(&mut self) -> &mut Catalog {
         &mut self.catalog
     }

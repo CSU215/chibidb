@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::parser;
 use crate::result::ResultSet;
 use crate::trx::Session;
+use crate::value::Value;
 use crate::{Database, Error, Result};
 
 /// Directory under the data root reserved for instance-wide metadata
@@ -21,23 +22,30 @@ pub struct Instance {
     config: Config,
     root: PathBuf,
     databases: HashMap<String, Database>,
+    /// The system database under [`META_DIR`], holding the data dictionary
+    /// (`databases` registry today, `users` later).
+    meta: Option<Database>,
     _temp: Option<tempfile::TempDir>,
 }
 
 impl Instance {
-    /// Opens (creating if needed) the data root and its metadata directory.
+    /// Opens (creating if needed) the data root and its metadata directory,
+    /// then bootstraps the system tables.
     pub fn open(root: &Path, config: &Config) -> Result<Self> {
         std::fs::create_dir_all(root)
             .map_err(|e| Error::Runtime(format!("cannot create {}: {e}", root.display())))?;
         let meta = root.join(META_DIR);
         std::fs::create_dir_all(&meta)
             .map_err(|e| Error::Runtime(format!("cannot create {}: {e}", meta.display())))?;
-        Ok(Self {
+        let mut instance = Self {
             config: config.clone(),
             root: root.to_path_buf(),
             databases: HashMap::new(),
+            meta: None,
             _temp: None,
-        })
+        };
+        instance.bootstrap_meta()?;
+        Ok(instance)
     }
 
     /// A throwaway instance in an automatically-cleaned temporary directory.
@@ -48,16 +56,39 @@ impl Instance {
         Ok(Self { _temp: Some(temp), ..inst })
     }
 
-    /// Names of all databases on disk, sorted. Purely directory-based so it
-    /// reflects exactly what exists.
-    pub fn databases(&self) -> Result<Vec<String>> {
+    /// The system database, opening it on first use.
+    fn meta_mut(&mut self) -> Result<&mut Database> {
+        if self.meta.is_none() {
+            let path = self.root.join(META_DIR);
+            self.meta = Some(Database::open_with_config(&path, &self.config)?);
+        }
+        Ok(self.meta.as_mut().expect("meta database was just opened"))
+    }
+
+    fn bootstrap_meta(&mut self) -> Result<()> {
+        let meta = self.meta_mut()?;
+        if !meta.table_exists("databases") {
+            meta.execute_sql("create table databases (name char(64) primary key);")?;
+        }
+        Ok(())
+    }
+
+    /// Names of registered databases, sorted. The `databases` system table is
+    /// the source of truth, so a stray directory is not a database.
+    pub fn databases(&mut self) -> Result<Vec<String>> {
+        let result = self.meta_mut()?.execute_sql("select name from databases;")?;
         let mut names = Vec::new();
-        for entry in read_dir(&self.root)? {
-            let name = entry;
-            if name == META_DIR {
-                continue;
+        if let Some(ResultSet::Rows { rows, .. }) = result.into_iter().next() {
+            for row in rows {
+                match row.into_iter().next() {
+                    Some(Value::Str(name)) => names.push(name),
+                    other => {
+                        return Err(Error::Runtime(format!(
+                            "corrupt database registry: {other:?}"
+                        )))
+                    }
+                }
             }
-            names.push(name);
         }
         names.sort();
         Ok(names)
@@ -65,12 +96,14 @@ impl Instance {
 
     pub fn create_database(&mut self, name: &str) -> Result<()> {
         validate_name(name)?;
-        let path = self.root.join(name);
-        if path.exists() {
+        if self.databases()?.iter().any(|d| d == name) {
             return Err(Error::Runtime(format!("database already exists: {name}")));
         }
+        let path = self.root.join(name);
         std::fs::create_dir_all(&path)
             .map_err(|e| Error::Runtime(format!("cannot create {}: {e}", path.display())))?;
+        self.meta_mut()?
+            .execute_sql(&format!("insert into databases values ('{name}');"))?;
         Ok(())
     }
 
@@ -85,6 +118,8 @@ impl Instance {
         }
         std::fs::remove_dir_all(&path)
             .map_err(|e| Error::Runtime(format!("cannot remove {}: {e}", path.display())))?;
+        self.meta_mut()?
+            .execute_sql(&format!("delete from databases where name = '{name}';"))?;
         Ok(())
     }
 
@@ -174,7 +209,7 @@ impl Instance {
         Ok(())
     }
 
-    fn use_database(&self, session: &mut Session, name: &str) -> Result<()> {
+    fn use_database(&mut self, session: &mut Session, name: &str) -> Result<()> {
         if !self.databases()?.iter().any(|d| d == name) {
             return Err(Error::Runtime(format!("no such database: {name}")));
         }
@@ -190,23 +225,6 @@ impl Instance {
         }
         Ok(())
     }
-}
-
-fn read_dir(dir: &Path) -> Result<Vec<String>> {
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(dir)
-        .map_err(|e| Error::Runtime(format!("cannot read {}: {e}", dir.display())))?
-    {
-        let entry = entry
-            .map_err(|e| Error::Runtime(format!("cannot read {}: {e}", dir.display())))?;
-        if !entry.path().is_dir() {
-            continue;
-        }
-        if let Some(name) = entry.file_name().to_str() {
-            names.push(name.to_string());
-        }
-    }
-    Ok(names)
 }
 
 fn validate_name(name: &str) -> Result<()> {
