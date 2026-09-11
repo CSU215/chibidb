@@ -8,7 +8,7 @@ fn rows(rs: &[ResultSet]) -> (&[String], &[Vec<Value>]) {
     }
 }
 
-fn with_dbs(f: impl Fn(&mut Database)) {
+fn with_dbs(f: impl Fn(&Database)) {
     let mut mem = Database::open_in_memory().unwrap();
     f(&mut mem);
 
@@ -24,7 +24,7 @@ fn message(rs: &[ResultSet]) -> String {
     }
 }
 
-fn seeded(db: &mut Database) {
+fn seeded(db: &Database) {
     db.execute_sql("create table student (id int, name char(10), score float);")
         .unwrap();
     for i in 0..200i64 {
@@ -94,7 +94,7 @@ fn explain_chooses_access_path() {
 
 #[test]
 fn explain_combines_range_bounds() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int);").unwrap();
     db.execute_sql("insert into t values (1),(2),(3),(4),(5);").unwrap();
     db.execute_sql("create index idx on t (id);").unwrap();
@@ -113,7 +113,7 @@ fn explain_combines_range_bounds() {
 
 #[test]
 fn index_order_by_skips_sort() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int, name char(10));").unwrap();
     for i in 0..50i64 {
         db.execute_sql(&format!("insert into t values ({i}, 'n{i:02}');")).unwrap();
@@ -201,11 +201,11 @@ fn index_maintenance_through_dml() {
 fn index_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut db = Database::open(dir.path()).unwrap();
-        seeded(&mut db);
+        let db = Database::open(dir.path()).unwrap();
+        seeded(&db);
         db.execute_sql("create index idx_id on student (id);").unwrap();
     }
-    let mut db = Database::open(dir.path()).unwrap();
+    let db = Database::open(dir.path()).unwrap();
 
     let plan = message(&db.execute_sql("explain select * from student where id = 5;").unwrap());
     assert!(plan.contains("IndexScan"), "{plan}");

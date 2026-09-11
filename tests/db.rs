@@ -16,7 +16,7 @@ fn message(rs: &[ResultSet]) -> String {
 }
 
 /// Runs `f` against every backend: in-memory and file-backed.
-fn with_dbs(f: impl Fn(&mut Database)) {
+fn with_dbs(f: impl Fn(&Database)) {
     let mut mem = Database::open_in_memory().unwrap();
     f(&mut mem);
 
@@ -25,7 +25,7 @@ fn with_dbs(f: impl Fn(&mut Database)) {
     f(&mut file_db);
 }
 
-fn seed(db: &mut Database) {
+fn seed(db: &Database) {
     db.execute_sql("create table student (id int, name char(10), score float);")
         .unwrap();
     db.execute_sql(
@@ -36,7 +36,7 @@ fn seed(db: &mut Database) {
 
 #[test]
 fn executes_constant_select() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     let rs = db.execute_sql("select 1+2, 'ab';").unwrap();
     assert_eq!(rs.len(), 1);
     let (columns, rows) = rows(&rs);
@@ -47,7 +47,7 @@ fn executes_constant_select() {
 
 #[test]
 fn executes_each_statement() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     let rs = db.execute_sql("select 1; select 2;").unwrap();
     assert_eq!(rs.len(), 2);
     let (_, r1) = rows(&rs[0..1]);
@@ -58,20 +58,20 @@ fn executes_each_statement() {
 
 #[test]
 fn empty_sql_yields_no_results() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     assert_eq!(db.execute_sql("").unwrap().len(), 0);
     assert_eq!(db.execute_sql(";;").unwrap().len(), 0);
 }
 
 #[test]
 fn star_requires_from() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     assert!(db.execute_sql("select *;").is_err());
 }
 
 #[test]
 fn runtime_errors_propagate() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     let err = db.execute_sql("select 1/0;").unwrap_err();
     assert!(err.to_string().contains("division by zero"), "{err}");
 }
@@ -412,7 +412,7 @@ fn in_list_filters_with_three_valued_logic() {
         db.execute_sql("create table t (id int, name char(4));").unwrap();
         db.execute_sql("insert into t values (1, 'a'), (2, 'b'), (3, 'c'), (null, 'n');")
             .unwrap();
-        let ids = |db: &mut Database, sql: &str| -> Vec<i64> {
+        let ids = |db: &Database, sql: &str| -> Vec<i64> {
             let rs = db.execute_sql(sql).unwrap();
             let (_, r) = rows(&rs);
             r.iter()
@@ -443,7 +443,7 @@ fn in_subquery_matches_uncorrelated_selects() {
         db.execute_sql("insert into b values (10, 1), (20, 2), (30, 3), (40, null);")
             .unwrap();
 
-        let vs = |db: &mut Database, sql: &str| -> Vec<i64> {
+        let vs = |db: &Database, sql: &str| -> Vec<i64> {
             let rs = db.execute_sql(sql).unwrap();
             let (_, r) = rows(&rs);
             r.iter()
@@ -533,7 +533,7 @@ fn update_delete_with_subqueries() {
     });
 }
 
-fn query_ids(db: &mut Database, sql: &str) -> Vec<i64> {
+fn query_ids(db: &Database, sql: &str) -> Vec<i64> {
     let rs = db.execute_sql(sql).unwrap();
     let (_, rows) = rows(&rs);
     rows.iter()
@@ -621,7 +621,7 @@ fn create_view_select_drop_view() {
 fn view_validation_and_persistence() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut db = Database::open(dir.path()).unwrap();
+        let db = Database::open(dir.path()).unwrap();
         db.execute_sql("create table t (id int);").unwrap();
         db.execute_sql("insert into t values (1), (2);").unwrap();
 
@@ -634,7 +634,7 @@ fn view_validation_and_persistence() {
 
         db.execute_sql("create view v as select id from t where id > 1;").unwrap();
     }
-    let mut db = Database::open(dir.path()).unwrap();
+    let db = Database::open(dir.path()).unwrap();
     let rs = db.execute_sql("select * from v;").unwrap();
     assert_eq!(rows(&rs).1, [[Value::Int(2)]]);
 }
@@ -773,7 +773,7 @@ fn date_type() {
 #[test]
 fn drop_table_removes_schema_data_and_files() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Database::open(dir.path()).unwrap();
+    let db = Database::open(dir.path()).unwrap();
     db.execute_sql("create table t (id int, name char(8));").unwrap();
     db.execute_sql("create index idx on t (id);").unwrap();
     db.execute_sql("insert into t values (1, 'a');").unwrap();
@@ -798,7 +798,7 @@ fn drop_table_removes_schema_data_and_files() {
 
     // and the state is stable across a reopen
     drop(db);
-    let mut db = Database::open(dir.path()).unwrap();
+    let db = Database::open(dir.path()).unwrap();
     db.execute_sql("insert into t values (7);").unwrap();
     let rs = db.execute_sql("select id from t;").unwrap();
     assert_eq!(rows(&rs).1, [[Value::Int(7)]]);

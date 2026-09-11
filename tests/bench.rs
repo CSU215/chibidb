@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 const N: i64 = 50_000;
 
 fn build() -> Database {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int, tag int);").unwrap();
     let chunk = 500i64;
     let mut i = 0i64;
@@ -39,7 +39,7 @@ fn per_op(iterations: u32, mut f: impl FnMut()) -> Duration {
 }
 
 /// `col + 0` defeats the sargable rule, forcing a full table scan.
-fn bench(db: &mut Database, label: &str, indexed: &str, scanned: &str, indexed_iters: u32, scan_iters: u32) {
+fn bench(db: &Database, label: &str, indexed: &str, scanned: &str, indexed_iters: u32, scan_iters: u32) {
     let idx = per_op(indexed_iters, || {
         db.execute_sql(indexed).unwrap();
     });
@@ -52,10 +52,10 @@ fn bench(db: &mut Database, label: &str, indexed: &str, scanned: &str, indexed_i
 #[test]
 #[ignore = "micro-benchmark; run with --ignored --nocapture"]
 fn index_vs_full_scan() {
-    let mut db = build();
+    let db = build();
     println!("rows: {N}");
     bench(
-        &mut db,
+        &db,
         "point id = 12345",
         "select tag from t where id = 12345;",
         "select tag from t where id + 0 = 12345;",
@@ -63,7 +63,7 @@ fn index_vs_full_scan() {
         50,
     );
     bench(
-        &mut db,
+        &db,
         "narrow id < 100",
         "select id from t where id < 100;",
         "select id from t where id + 0 < 100;",
@@ -71,7 +71,7 @@ fn index_vs_full_scan() {
         50,
     );
     bench(
-        &mut db,
+        &db,
         "range 10000..10100",
         "select id from t where id >= 10000 and id < 10100;",
         "select id from t where id + 0 >= 10000 and id + 0 < 10100;",
@@ -79,7 +79,7 @@ fn index_vs_full_scan() {
         50,
     );
     bench(
-        &mut db,
+        &db,
         "ordered id > 49900",
         "select id from t where id > 49900 order by id;",
         "select id from t where id + 0 > 49900 order by id;",
@@ -93,7 +93,7 @@ fn index_vs_full_scan() {
 #[test]
 #[ignore = "micro-benchmark; run with --ignored --nocapture"]
 fn materialized_execution_baseline() {
-    let mut db = build();
+    let db = build();
     println!("rows: {N}");
     let cases: [(&str, &str, u32); 4] = [
         ("scan+project", "select id, tag from t;", 3),
@@ -113,7 +113,7 @@ fn materialized_execution_baseline() {
 #[test]
 #[ignore = "micro-benchmark; run with --ignored --nocapture"]
 fn hash_join_throughput() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table a (id int, v int);").unwrap();
     db.execute_sql("create table b (id int, w int);").unwrap();
     let chunk = 500i64;

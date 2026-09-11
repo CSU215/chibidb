@@ -5,7 +5,7 @@
 use chibidb::value::Value;
 use chibidb::{Database, ResultSet};
 
-fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn query(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     let rs = db.execute_sql(sql).unwrap();
     assert_eq!(rs.len(), 1, "sql: {sql}");
     match &rs[0] {
@@ -14,7 +14,7 @@ fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
     }
 }
 
-fn message(db: &mut Database, sql: &str) -> String {
+fn message(db: &Database, sql: &str) -> String {
     let rs = db.execute_sql(sql).unwrap();
     assert_eq!(rs.len(), 1, "sql: {sql}");
     match &rs[0] {
@@ -23,7 +23,7 @@ fn message(db: &mut Database, sql: &str) -> String {
     }
 }
 
-fn seed(db: &mut Database) {
+fn seed(db: &Database) {
     db.execute_sql("create table student (sno int, sname char(20), sage int, ssex char(2));")
         .unwrap();
     db.execute_sql(
@@ -41,10 +41,10 @@ fn seed(db: &mut Database) {
     .unwrap();
 }
 
-fn with_db(f: impl Fn(&mut Database)) {
-    let mut db = Database::open_in_memory().unwrap();
-    seed(&mut db);
-    f(&mut db);
+fn with_db(f: impl Fn(&Database)) {
+    let db = Database::open_in_memory().unwrap();
+    seed(&db);
+    f(&db);
 }
 
 #[test]

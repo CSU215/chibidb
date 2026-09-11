@@ -111,7 +111,7 @@ pub(crate) fn eval_aggregate(
 /// (with group context), distinct and limit. Used by the `GroupBy` operator.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn grouped_select_rows(
-    db: &mut Database,
+    db: &Database,
     trx: &mut TrxState,
     outer: Option<&EvalCtx>,
     schema: &Schema,
@@ -248,7 +248,7 @@ fn resolve_order_expr<'a>(expr: &'a Expr, aliases: &'a [(String, Expr)]) -> &'a 
 }
 
 fn eval_sort_keys(
-    db: &mut Database,
+    db: &Database,
     trx: &mut TrxState,
     ctx: EvalCtx,
     order_by: &[(Expr, bool)],
@@ -279,7 +279,7 @@ pub(crate) fn cmp_sort_keys(a: &[Value], b: &[Value], order_by: &[(Expr, bool)])
 }
 
 pub(crate) fn sort_rows(
-    db: &mut Database,
+    db: &Database,
     trx: &mut TrxState,
     outer: Option<&EvalCtx>,
     schema: &Schema,
@@ -302,7 +302,7 @@ pub(crate) fn sort_rows(
 
 #[allow(clippy::too_many_arguments)]
 fn sort_groups(
-    db: &mut Database,
+    db: &Database,
     trx: &mut TrxState,
     outer: Option<&EvalCtx>,
     schema: &Schema,

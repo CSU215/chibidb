@@ -1,7 +1,7 @@
 use chibidb::value::Value;
 use chibidb::Database;
 
-fn with_dbs(f: impl Fn(&mut Database)) {
+fn with_dbs(f: impl Fn(&Database)) {
     let mut mem = Database::open_in_memory().unwrap();
     f(&mut mem);
 
@@ -10,7 +10,7 @@ fn with_dbs(f: impl Fn(&mut Database)) {
     f(&mut file_db);
 }
 
-fn seeded(db: &mut Database) {
+fn seeded(db: &Database) {
     db.execute_sql("create table dept (id int, dname char(8));").unwrap();
     db.execute_sql("insert into dept values (1, 'dev'), (2, 'ops'), (3, 'hr');")
         .unwrap();
@@ -21,7 +21,7 @@ fn seeded(db: &mut Database) {
     .unwrap();
 }
 
-fn rows_of(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn rows_of(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     let rs = db.execute_sql(sql).unwrap();
     match &rs[0] {
         chibidb::ResultSet::Rows { rows, .. } => rows.clone(),

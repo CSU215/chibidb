@@ -40,7 +40,7 @@ impl BTree {
         Self { file }
     }
 
-    pub fn init(bp: &mut BufferPool, file: FileId) -> Result<Self> {
+    pub fn init(bp: &BufferPool, file: FileId) -> Result<Self> {
         if bp.page_count(file)? != 0 {
             return Err(Error::Runtime("cannot init index file: file not empty".into()));
         }
@@ -54,7 +54,7 @@ impl BTree {
         Ok(Self { file })
     }
 
-    pub fn open(bp: &mut BufferPool, file: FileId) -> Result<Self> {
+    pub fn open(bp: &BufferPool, file: FileId) -> Result<Self> {
         if bp.page_count(file)? == 0 {
             return Err(Error::Runtime("cannot open index file: file is empty".into()));
         }
@@ -65,7 +65,7 @@ impl BTree {
     /// Opens the file, re-initializing a header that a crash lost before it
     /// reached the disk. Returns true when the file was re-initialized; the
     /// caller must then rebuild the tree contents.
-    pub fn open_or_repair(bp: &mut BufferPool, file: FileId) -> Result<bool> {
+    pub fn open_or_repair(bp: &BufferPool, file: FileId) -> Result<bool> {
         if bp.page_count(file)? == 0 {
             Self::init(bp, file)?;
             return Ok(true);
@@ -90,22 +90,22 @@ impl BTree {
         self.file
     }
 
-    fn header_u32(&self, bp: &mut BufferPool, off: usize) -> Result<PageNo> {
+    fn header_u32(&self, bp: &BufferPool, off: usize) -> Result<PageNo> {
         bp.read_page(self.file, 0, |page| Ok(u32_get(page, off)))
     }
 
-    fn root(&self, bp: &mut BufferPool) -> Result<PageNo> {
+    fn root(&self, bp: &BufferPool) -> Result<PageNo> {
         self.header_u32(bp, ROOT_OFF)
     }
 
-    fn set_header_u32(&self, bp: &mut BufferPool, off: usize, v: PageNo) -> Result<()> {
+    fn set_header_u32(&self, bp: &BufferPool, off: usize, v: PageNo) -> Result<()> {
         bp.with_page(self.file, 0, |page| {
             u32_put(page, off, v);
             Ok(())
         })
     }
 
-    pub fn height(&self, bp: &mut BufferPool) -> Result<u32> {
+    pub fn height(&self, bp: &BufferPool) -> Result<u32> {
         let mut no = self.root(bp)?;
         if no == 0 {
             return Ok(0);
@@ -121,7 +121,7 @@ impl BTree {
         }
     }
 
-    pub fn insert(&self, bp: &mut BufferPool, key: &[u8], rid: Rid) -> Result<()> {
+    pub fn insert(&self, bp: &BufferPool, key: &[u8], rid: Rid) -> Result<()> {
         let root = self.root(bp)?;
         if root == 0 {
             let no = bp.alloc_page(self.file)?;
@@ -149,7 +149,7 @@ impl BTree {
 
     fn insert_rec(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         page_no: PageNo,
         key: &[u8],
         rid: Rid,
@@ -173,7 +173,7 @@ impl BTree {
 
     fn insert_leaf_entry(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         page_no: PageNo,
         key: &[u8],
         rid: Rid,
@@ -185,7 +185,7 @@ impl BTree {
 
     fn insert_leaf(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         page_no: PageNo,
         key: &[u8],
         rid: Rid,
@@ -232,7 +232,7 @@ impl BTree {
 
     fn insert_separator(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         page_no: PageNo,
         child: PageNo,
         sep: Vec<u8>,
@@ -294,7 +294,7 @@ impl BTree {
 
     pub fn scan_range(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         start: Bound,
         end: Bound,
     ) -> Result<Vec<(Vec<u8>, Rid)>> {
@@ -372,7 +372,7 @@ impl BTree {
         }
     }
 
-    pub fn delete(&self, bp: &mut BufferPool, key: &[u8], rid: Rid) -> Result<()> {
+    pub fn delete(&self, bp: &BufferPool, key: &[u8], rid: Rid) -> Result<()> {
         let root = self.root(bp)?;
         if root == 0 {
             return Ok(());
@@ -397,7 +397,7 @@ impl BTree {
 
     fn delete_rec(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         page_no: PageNo,
         key: &[u8],
         rid: Rid,
@@ -438,7 +438,7 @@ impl BTree {
     }
 
     /// Child of `parent` underflowed after a delete: borrow from siblings or merge.
-    fn fix_child(&self, bp: &mut BufferPool, parent: PageNo, child: PageNo) -> Result<()> {
+    fn fix_child(&self, bp: &BufferPool, parent: PageNo, child: PageNo) -> Result<()> {
         let (child_ty, idx, keys, children) = self.locate_child(bp, parent, child)?;
         let sep_left = if idx >= 1 { Some(keys[idx - 1].clone()) } else { None };
         let sep_right = if idx < keys.len() { Some(keys[idx].clone()) } else { None };
@@ -453,7 +453,7 @@ impl BTree {
     #[allow(clippy::type_complexity)]
     fn locate_child(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         parent: PageNo,
         child: PageNo,
     ) -> Result<(u8, usize, Vec<Vec<u8>>, Vec<PageNo>)> {
@@ -476,7 +476,7 @@ impl BTree {
     #[allow(clippy::too_many_arguments)]
     fn fix_leaf_child(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         parent: PageNo,
         child: PageNo,
         idx: usize,
@@ -555,7 +555,7 @@ impl BTree {
     #[allow(clippy::too_many_arguments)]
     fn fix_internal_child(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         parent: PageNo,
         child: PageNo,
         idx: usize,
@@ -652,7 +652,7 @@ impl BTree {
 
     fn read_internal(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         page: PageNo,
     ) -> Result<(PageNo, InternalEntries)> {
         bp.read_page(self.file, page, |p| {
@@ -660,7 +660,7 @@ impl BTree {
         })
     }
 
-    fn pop_last_separator(&self, bp: &mut BufferPool, page: PageNo) -> Result<(Vec<u8>, PageNo)> {
+    fn pop_last_separator(&self, bp: &BufferPool, page: PageNo) -> Result<(Vec<u8>, PageNo)> {
         let (n, entry) = bp.read_page(self.file, page, |p| {
             Ok((internal_num(p), internal_entry_at(p, internal_num(p) - 1)))
         })?;
@@ -670,7 +670,7 @@ impl BTree {
 
     fn take_first_separator(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         page: PageNo,
     ) -> Result<(Vec<u8>, PageNo)> {
         let entry = bp.read_page(self.file, page, |p| Ok(internal_entry_at(p, 0)))?;
@@ -681,7 +681,7 @@ impl BTree {
         Ok(entry)
     }
 
-    fn set_internal_first_child(&self, bp: &mut BufferPool, page: PageNo, child: PageNo) -> Result<()> {
+    fn set_internal_first_child(&self, bp: &BufferPool, page: PageNo, child: PageNo) -> Result<()> {
         bp.with_page(self.file, page, |p| {
             internal_set_first_child(p, child);
             Ok(())
@@ -690,7 +690,7 @@ impl BTree {
 
     fn set_separator_key(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         parent: PageNo,
         sep_idx: usize,
         new_key: Vec<u8>,
@@ -704,7 +704,7 @@ impl BTree {
         })
     }
 
-    fn pop_last_leaf_entry(&self, bp: &mut BufferPool, page: PageNo) -> Result<(Vec<u8>, Rid)> {
+    fn pop_last_leaf_entry(&self, bp: &BufferPool, page: PageNo) -> Result<(Vec<u8>, Rid)> {
         let (n, entry) = bp.read_page(self.file, page, |p| {
             Ok((leaf_num(p), leaf_entry_at(p, leaf_num(p) - 1)))
         })?;
@@ -712,28 +712,28 @@ impl BTree {
         Ok(entry)
     }
 
-    fn take_first_leaf_entry(&self, bp: &mut BufferPool, page: PageNo) -> Result<(Vec<u8>, Rid)> {
+    fn take_first_leaf_entry(&self, bp: &BufferPool, page: PageNo) -> Result<(Vec<u8>, Rid)> {
         let entry = bp.read_page(self.file, page, |p| Ok(leaf_entry_at(p, 0)))?;
         bp.with_page(self.file, page, |p| leaf_remove_at(p, 0))?;
         Ok(entry)
     }
 
-    fn first_leaf_entry(&self, bp: &mut BufferPool, page: PageNo) -> Result<(Vec<u8>, Rid)> {
+    fn first_leaf_entry(&self, bp: &BufferPool, page: PageNo) -> Result<(Vec<u8>, Rid)> {
         bp.read_page(self.file, page, |p| Ok(leaf_entry_at(p, 0)))
     }
 
-    fn prepend_leaf_entry(&self, bp: &mut BufferPool, page: PageNo, key: &[u8], rid: Rid) -> Result<()> {
+    fn prepend_leaf_entry(&self, bp: &BufferPool, page: PageNo, key: &[u8], rid: Rid) -> Result<()> {
         bp.with_page(self.file, page, |p| leaf_insert_at(p, 0, key, rid))
     }
 
-    fn append_leaf_entry(&self, bp: &mut BufferPool, page: PageNo, key: &[u8], rid: Rid) -> Result<()> {
+    fn append_leaf_entry(&self, bp: &BufferPool, page: PageNo, key: &[u8], rid: Rid) -> Result<()> {
         bp.with_page(self.file, page, |p| {
             let n = leaf_num(p);
             leaf_insert_at(p, n, key, rid)
         })
     }
 
-    fn append_leaf_entries(&self, bp: &mut BufferPool, target: PageNo, source: PageNo) -> Result<()> {
+    fn append_leaf_entries(&self, bp: &BufferPool, target: PageNo, source: PageNo) -> Result<()> {
         let entries: Vec<(Vec<u8>, Rid)> =
             bp.read_page(self.file, source, |p| Ok(leaf_entries(p).collect()))?;
         bp.with_page(self.file, target, |p| {
@@ -745,40 +745,40 @@ impl BTree {
         })
     }
 
-    fn leaf_chain_next(&self, bp: &mut BufferPool, page: PageNo) -> Result<Option<PageNo>> {
+    fn leaf_chain_next(&self, bp: &BufferPool, page: PageNo) -> Result<Option<PageNo>> {
         bp.read_page(self.file, page, |p| {
             let next = leaf_next(p);
             Ok(if next == 0 { None } else { Some(next) })
         })
     }
 
-    fn set_leaf_next(&self, bp: &mut BufferPool, page: PageNo, next: Option<PageNo>) -> Result<()> {
+    fn set_leaf_next(&self, bp: &BufferPool, page: PageNo, next: Option<PageNo>) -> Result<()> {
         bp.with_page(self.file, page, |p| {
             leaf_set_next(p, next.unwrap_or(0));
             Ok(())
         })
     }
 
-    fn set_leaf_prev(&self, bp: &mut BufferPool, page: PageNo, prev: PageNo) -> Result<()> {
+    fn set_leaf_prev(&self, bp: &BufferPool, page: PageNo, prev: PageNo) -> Result<()> {
         bp.with_page(self.file, page, |p| {
             leaf_set_prev(p, prev);
             Ok(())
         })
     }
 
-    fn can_merge_leaves(&self, bp: &mut BufferPool, a: PageNo, b: PageNo) -> Result<bool> {
+    fn can_merge_leaves(&self, bp: &BufferPool, a: PageNo, b: PageNo) -> Result<bool> {
         let ua = bp.read_page(self.file, a, |p| Ok(leaf_bytes_used(p)))?;
         let ub = bp.read_page(self.file, b, |p| Ok(leaf_bytes_used(p)))?;
         Ok(ua + ub < PAGE_SIZE - 32)
     }
 
-    fn can_merge_internals(&self, bp: &mut BufferPool, a: PageNo, b: PageNo) -> Result<bool> {
+    fn can_merge_internals(&self, bp: &BufferPool, a: PageNo, b: PageNo) -> Result<bool> {
         let ua = bp.read_page(self.file, a, |p| Ok(internal_bytes_used(p)))?;
         let ub = bp.read_page(self.file, b, |p| Ok(internal_bytes_used(p)))?;
         Ok(ua + ub < PAGE_SIZE - 32)
     }
 
-    pub fn search(&self, bp: &mut BufferPool, key: &[u8]) -> Result<Vec<Rid>> {
+    pub fn search(&self, bp: &BufferPool, key: &[u8]) -> Result<Vec<Rid>> {
         let root = self.root(bp)?;
         if root == 0 {
             return Ok(vec![]);
@@ -824,7 +824,7 @@ impl BTree {
         }
     }
 
-    fn descend(&self, bp: &mut BufferPool, mut page_no: PageNo, key: &[u8]) -> Result<PageNo> {
+    fn descend(&self, bp: &BufferPool, mut page_no: PageNo, key: &[u8]) -> Result<PageNo> {
         loop {
             let ty = bp.read_page(self.file, page_no, |page| Ok(node_type(page)))?;
             if ty == LEAF {
@@ -851,7 +851,7 @@ fn leaf_entry(page: &[u8], i: usize) -> (Vec<u8>, Rid) {
 }
 
 fn internal_sep_remove(
-    bp: &mut BufferPool,
+    bp: &BufferPool,
     file: FileId,
     page: PageNo,
     idx: usize,

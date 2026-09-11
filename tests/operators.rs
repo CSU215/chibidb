@@ -3,15 +3,15 @@ use chibidb::exec::operator::{build_select, build_statement, Filter, Limit, Proj
 use chibidb::value::Value;
 use chibidb::{Database, Session};
 
-fn seed(db: &mut Database) {
+fn seed(db: &Database) {
     db.execute_sql("create table t (id int);").unwrap();
     db.execute_sql("insert into t values (1),(2),(3),(4);").unwrap();
 }
 
 #[test]
 fn scan_filter_project_and_limit() {
-    let mut db = Database::open_in_memory().unwrap();
-    seed(&mut db);
+    let db = Database::open_in_memory().unwrap();
+    seed(&db);
     let mut session = Session::new();
 
     let scan = TableScan::new(&db, "t").unwrap();
@@ -34,8 +34,8 @@ fn scan_filter_project_and_limit() {
 
 #[test]
 fn scan_respects_mvcc_visibility() {
-    let mut db = Database::open_in_memory().unwrap();
-    seed(&mut db);
+    let db = Database::open_in_memory().unwrap();
+    seed(&db);
     db.execute_sql("delete from t where id = 1;").unwrap();
     let mut session = Session::new();
 
@@ -49,8 +49,8 @@ fn scan_respects_mvcc_visibility() {
 
 #[test]
 fn limit_offset_skips_rows() {
-    let mut db = Database::open_in_memory().unwrap();
-    seed(&mut db);
+    let db = Database::open_in_memory().unwrap();
+    seed(&db);
     let mut session = Session::new();
 
     let scan = TableScan::new(&db, "t").unwrap();
@@ -61,8 +61,8 @@ fn limit_offset_skips_rows() {
 
 #[test]
 fn project_evaluates_expressions() {
-    let mut db = Database::open_in_memory().unwrap();
-    seed(&mut db);
+    let db = Database::open_in_memory().unwrap();
+    seed(&db);
     let mut session = Session::new();
 
     let scan = TableScan::new(&db, "t").unwrap();
@@ -93,17 +93,17 @@ fn parse_select(sql: &str) -> Box<chibidb::ast::SelectStmt> {
 
 #[test]
 fn simple_select_builds_an_operator_plan() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int, tag int);").unwrap();
     db.execute_sql("create index idx on t (id);").unwrap();
 
     let select = parse_select("select id from t where id = 1 limit 1;");
-    assert!(build_select(&mut db, &select).unwrap().is_some());
+    assert!(build_select(&db, &select).unwrap().is_some());
 }
 
 #[test]
 fn constant_and_distinct_selects_build_plans() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int);").unwrap();
 
     for sql in [
@@ -114,13 +114,13 @@ fn constant_and_distinct_selects_build_plans() {
         "select id, count(*) from t group by id;",
     ] {
         let select = parse_select(sql);
-        assert!(build_select(&mut db, &select).unwrap().is_some(), "{sql}");
+        assert!(build_select(&db, &select).unwrap().is_some(), "{sql}");
     }
 }
 
 #[test]
 fn joins_build_an_operator_plan() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table a (id int);").unwrap();
     db.execute_sql("create table b (id int);").unwrap();
 
@@ -131,13 +131,13 @@ fn joins_build_an_operator_plan() {
         "select * from a right join b on a.id = b.id;",
     ] {
         let select = parse_select(sql);
-        assert!(build_select(&mut db, &select).unwrap().is_some(), "{sql}");
+        assert!(build_select(&db, &select).unwrap().is_some(), "{sql}");
     }
 }
 
 #[test]
 fn representative_selects_all_build_plans() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int, tag int);").unwrap();
     db.execute_sql("create index idx on t (id);").unwrap();
 
@@ -156,13 +156,13 @@ fn representative_selects_all_build_plans() {
         "select (select max(id) from t) as m from t;",
     ] {
         let select = parse_select(sql);
-        assert!(build_select(&mut db, &select).unwrap().is_some(), "{sql}");
+        assert!(build_select(&db, &select).unwrap().is_some(), "{sql}");
     }
 }
 
 #[test]
 fn hash_join_handles_duplicate_keys() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table a (k int, x int);").unwrap();
     db.execute_sql("create table b (k int, y int);").unwrap();
     db.execute_sql("insert into a values (1, 10), (2, 20), (2, 21);").unwrap();
@@ -187,7 +187,7 @@ fn hash_join_handles_duplicate_keys() {
 
 #[test]
 fn hash_join_left_keeps_unmatched_rows() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table a (k int);").unwrap();
     db.execute_sql("create table b (k int, y int);").unwrap();
     db.execute_sql("insert into a values (1), (2);").unwrap();
@@ -210,7 +210,7 @@ fn hash_join_left_keeps_unmatched_rows() {
 
 #[test]
 fn views_build_an_operator_plan() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int, tag int);").unwrap();
     db.execute_sql("create view v as select id from t where id > 0;").unwrap();
 
@@ -220,13 +220,13 @@ fn views_build_an_operator_plan() {
         "select a.id from t a, v b where a.id = b.id;",
     ] {
         let select = parse_select(sql);
-        assert!(build_select(&mut db, &select).unwrap().is_some(), "{sql}");
+        assert!(build_select(&db, &select).unwrap().is_some(), "{sql}");
     }
 }
 
 #[test]
 fn dml_builds_operator_plans() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int);").unwrap();
 
     for sql in [
@@ -235,17 +235,17 @@ fn dml_builds_operator_plans() {
         "delete from t where id = 2;",
     ] {
         let stmt = chibidb::parser::parse(sql).unwrap().remove(0);
-        assert!(build_statement(&mut db, &stmt).unwrap().is_some(), "{sql}");
+        assert!(build_statement(&db, &stmt).unwrap().is_some(), "{sql}");
     }
 
     // DDL is not an operator statement
     let ddl = chibidb::parser::parse("create table u (id int);").unwrap().remove(0);
-    assert!(build_statement(&mut db, &ddl).unwrap().is_none());
+    assert!(build_statement(&db, &ddl).unwrap().is_none());
 }
 
 #[test]
 fn unions_build_an_operator_plan() {
-    let mut db = Database::open_in_memory().unwrap();
+    let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int);").unwrap();
 
     for sql in [
@@ -254,6 +254,6 @@ fn unions_build_an_operator_plan() {
         "select id from t union select id from t order by id limit 1;",
     ] {
         let select = parse_select(sql);
-        assert!(build_select(&mut db, &select).unwrap().is_some(), "{sql}");
+        assert!(build_select(&db, &select).unwrap().is_some(), "{sql}");
     }
 }

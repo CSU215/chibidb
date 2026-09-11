@@ -23,7 +23,7 @@ use eval::EvalCtx;
 use plan::execute_explain;
 use subquery::{eval_bound, eval_predicate_bound};
 
-pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Result<ResultSet> {
+pub(crate) fn execute(db: &Database, trx: &mut TrxState, stmt: &Stmt) -> Result<ResultSet> {
     // Schema changes are not isolated from other sessions' open transactions
     // (their undo log points at tables that could vanish), so refuse them.
     if matches!(
@@ -78,7 +78,7 @@ fn ddl_in_trx(_trx: &TrxState) -> Result<ResultSet> {
     Err(Error::Runtime("DDL inside a transaction is not supported".into()))
 }
 
-fn execute_create_index(db: &mut Database, trx: &mut TrxState, c: &CreateIndexStmt) -> Result<ResultSet> {
+fn execute_create_index(db: &Database, trx: &mut TrxState, c: &CreateIndexStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&c.table)?.schema.clone();
     let col_idx = schema
         .index_of(&c.column)
@@ -92,7 +92,7 @@ fn execute_create_index(db: &mut Database, trx: &mut TrxState, c: &CreateIndexSt
             continue;
         }
         let key = crate::index::encode_key(&row[col_idx])?;
-        btree.insert(&mut db.pool, &key, rid)?;
+        btree.insert(&db.pool, &key, rid)?;
     }
     db.catalog_mut().create_index(
         &c.name,
@@ -105,7 +105,7 @@ fn execute_create_index(db: &mut Database, trx: &mut TrxState, c: &CreateIndexSt
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
-fn execute_drop_index(db: &mut Database, d: &DropIndexStmt) -> Result<ResultSet> {
+fn execute_drop_index(db: &Database, d: &DropIndexStmt) -> Result<ResultSet> {
     if db.catalog().index(&d.name).is_some_and(|ix| ix.unique) {
         return Err(Error::Runtime(format!(
             "cannot drop index backing a constraint: {}",
@@ -117,13 +117,13 @@ fn execute_drop_index(db: &mut Database, d: &DropIndexStmt) -> Result<ResultSet>
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
-fn execute_drop_table(db: &mut Database, d: &DropTableStmt) -> Result<ResultSet> {
+fn execute_drop_table(db: &Database, d: &DropTableStmt) -> Result<ResultSet> {
     db.drop_table(&d.name)?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
 fn execute_create_view(
-    db: &mut Database,
+    db: &Database,
     trx: &mut TrxState,
     c: &CreateViewStmt,
 ) -> Result<ResultSet> {
@@ -146,13 +146,13 @@ fn execute_create_view(
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
-fn execute_drop_view(db: &mut Database, d: &DropViewStmt) -> Result<ResultSet> {
+fn execute_drop_view(db: &Database, d: &DropViewStmt) -> Result<ResultSet> {
     db.catalog_mut().drop_view(&d.name)?;
     db.save_catalog()?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
-fn execute_checkpoint(db: &mut Database, trx: &TrxState) -> Result<ResultSet> {
+fn execute_checkpoint(db: &Database, trx: &TrxState) -> Result<ResultSet> {
     // the statement's own autocommit transaction does not count, but an
     // explicit one does (truncating the log would drop its future COMMIT)
     if trx.explicit || db.has_open_trxs_excluding(trx.id) {
@@ -166,7 +166,7 @@ fn execute_checkpoint(db: &mut Database, trx: &TrxState) -> Result<ResultSet> {
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
-fn execute_vacuum(db: &mut Database, trx: &TrxState) -> Result<ResultSet> {
+fn execute_vacuum(db: &Database, trx: &TrxState) -> Result<ResultSet> {
     // same guard as checkpoint: no transaction may depend on physical state
     if trx.explicit || db.has_open_trxs_excluding(trx.id) {
         return Err(Error::Runtime(
@@ -177,7 +177,7 @@ fn execute_vacuum(db: &mut Database, trx: &TrxState) -> Result<ResultSet> {
     Ok(ResultSet::Message(format!("VACUUM COMPLETE: {purged} rows purged")))
 }
 
-pub(crate) fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<ResultSet> {
+pub(crate) fn execute_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&u.table)?.schema.clone();
     let mut assigns = Vec::new();
     for (col, expr) in &u.assignments {
@@ -223,7 +223,7 @@ pub(crate) fn execute_update(db: &mut Database, trx: &mut TrxState, u: &UpdateSt
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
-pub(crate) fn execute_delete(db: &mut Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<ResultSet> {
+pub(crate) fn execute_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&d.table)?.schema.clone();
     let records = db.store_scan_raw(&d.table)?;
     let mut victims = Vec::new();
@@ -277,7 +277,7 @@ fn check_not_null(schema: &Schema, row: &[Value]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn execute_insert(db: &mut Database, trx: &mut TrxState, i: &InsertStmt) -> Result<ResultSet> {
+pub(crate) fn execute_insert(db: &Database, trx: &mut TrxState, i: &InsertStmt) -> Result<ResultSet> {
     let schema = db.catalog().table(&i.table)?.schema.clone();
     let targets = insert_targets(&schema, &i.columns)?;
     for values in &i.rows {
@@ -343,7 +343,7 @@ pub(crate) fn coerce(v: Value, dtype: DataType, col: &str) -> Result<Value> {
     }
 }
 
-fn execute_create_table(db: &mut Database, c: &CreateTableStmt) -> Result<ResultSet> {
+fn execute_create_table(db: &Database, c: &CreateTableStmt) -> Result<ResultSet> {
     let mut columns = Vec::with_capacity(c.columns.len());
     for cd in &c.columns {
         let default = match &cd.default {
@@ -389,7 +389,7 @@ fn unique_index_name(table: &str, column: &str) -> String {
 /// ORDER BY over an already-projected result set: column references resolve
 /// against the output column names.
 pub(crate) fn sort_projected(
-    db: &mut Database,
+    db: &Database,
     trx: &mut TrxState,
     outer: Option<&EvalCtx>,
     columns: &[String],

@@ -27,7 +27,7 @@ impl HeapFile {
         Self { file }
     }
 
-    pub fn init(bp: &mut BufferPool, file: FileId) -> Result<Self> {
+    pub fn init(bp: &BufferPool, file: FileId) -> Result<Self> {
         if bp.page_count(file)? != 0 {
             return Err(Error::Runtime("cannot init heap file: file not empty".into()));
         }
@@ -39,7 +39,7 @@ impl HeapFile {
         Ok(Self { file })
     }
 
-    pub fn open(bp: &mut BufferPool, file: FileId) -> Result<Self> {
+    pub fn open(bp: &BufferPool, file: FileId) -> Result<Self> {
         if bp.page_count(file)? == 0 {
             return Err(Error::Runtime("cannot open heap file: file is empty".into()));
         }
@@ -49,7 +49,7 @@ impl HeapFile {
 
     /// Opens the file, re-initializing a header that a crash lost before it
     /// reached the disk. Returns true when the file was re-initialized.
-    pub fn open_or_repair(bp: &mut BufferPool, file: FileId) -> Result<bool> {
+    pub fn open_or_repair(bp: &BufferPool, file: FileId) -> Result<bool> {
         if bp.page_count(file)? == 0 {
             Self::init(bp, file)?;
             return Ok(true);
@@ -72,7 +72,7 @@ impl HeapFile {
         self.file
     }
 
-    pub fn insert(&self, bp: &mut BufferPool, record: &[u8]) -> Result<Rid> {
+    pub fn insert(&self, bp: &BufferPool, record: &[u8]) -> Result<Rid> {
         let pages = bp.page_count(self.file)?;
         for no in 1..pages {
             match bp.with_page(self.file, no, |page| page_insert(page, record)) {
@@ -96,7 +96,7 @@ impl HeapFile {
         Ok(Rid::new(no, slot))
     }
 
-    pub fn get(&self, bp: &mut BufferPool, rid: Rid) -> Result<Vec<u8>> {
+    pub fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>> {
         bp.read_page(self.file, rid.page_no, |page| {
             page_get(page, rid.slot)?
                 .map(|r| r.to_vec())
@@ -104,12 +104,12 @@ impl HeapFile {
         })
     }
 
-    pub fn delete(&self, bp: &mut BufferPool, rid: Rid) -> Result<()> {
+    pub fn delete(&self, bp: &BufferPool, rid: Rid) -> Result<()> {
         bp.with_page(self.file, rid.page_no, |page| page_delete(page, rid.slot))
     }
 
     /// MVCC delete-mark: rewrites the record in place, setting its deleter id.
-    pub fn delete_mark(&self, bp: &mut BufferPool, rid: Rid, deleter: u32) -> Result<()> {
+    pub fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u32) -> Result<()> {
         bp.with_page(self.file, rid.page_no, |page| {
             let rec = page_get(page, rid.slot)?
                 .ok_or_else(|| Error::Runtime(format!("no record at {rid:?}")))?;
@@ -124,7 +124,7 @@ impl HeapFile {
 
     pub fn for_each(
         &self,
-        bp: &mut BufferPool,
+        bp: &BufferPool,
         mut f: impl FnMut(Rid, &[u8]) -> Result<()>,
     ) -> Result<()> {
         let pages = bp.page_count(self.file)?;

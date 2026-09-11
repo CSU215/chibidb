@@ -20,7 +20,7 @@ use super::subquery::{eval_bound, eval_predicate_bound};
 /// transaction, and the outer row/group context when this plan runs as a
 /// correlated subquery.
 pub struct ExecContext<'a> {
-    pub(crate) db: &'a mut Database,
+    pub(crate) db: &'a Database,
     pub(crate) trx: &'a mut crate::trx::TrxState,
     pub(crate) outer: Option<&'a EvalCtx<'a>>,
 }
@@ -79,7 +79,7 @@ impl PhysicalOperator for TableScan {
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         let file = ctx.db.catalog().table(&self.table)?.heap.file;
-        self.scanner = Some(HeapEngine::new(file).scan(&mut ctx.db.pool)?);
+        self.scanner = Some(HeapEngine::new(file).scan(&ctx.db.pool)?);
         Ok(())
     }
 
@@ -87,7 +87,7 @@ impl PhysicalOperator for TableScan {
         loop {
             let (creator, deleter, row) = {
                 let scanner = self.scanner.as_mut().expect("table scan not opened");
-                match scanner.next(&mut ctx.db.pool)? {
+                match scanner.next(&ctx.db.pool)? {
                     Some((_, record)) => decode_record(&record)?,
                     None => return Ok(None),
                 }
@@ -115,7 +115,7 @@ pub struct ViewScan {
 }
 
 impl ViewScan {
-    pub fn new(db: &mut Database, view_sql: &str, owner: &str) -> Result<Option<Self>> {
+    pub fn new(db: &Database, view_sql: &str, owner: &str) -> Result<Option<Self>> {
         let stmts = crate::parser::parse(view_sql)?;
         let Some(crate::ast::Stmt::Select(select)) = stmts.into_iter().next() else {
             return Ok(None);
@@ -744,7 +744,7 @@ fn encode_join_key(
     keys: &[Expr],
     schema: &Schema,
     row: &[Value],
-    db: &mut Database,
+    db: &Database,
     trx: &mut crate::trx::TrxState,
 ) -> Result<Option<Vec<Vec<u8>>>> {
     let ctx = EvalCtx::row(schema, row);
@@ -1008,13 +1008,13 @@ pub struct IndexScan {
 
 impl IndexScan {
     /// Returns `None` when the selection is not sargable (use a `TableScan`).
-    pub fn new(db: &mut Database, table: &str, selection: Option<&Expr>) -> Result<Option<Self>> {
+    pub fn new(db: &Database, table: &str, selection: Option<&Expr>) -> Result<Option<Self>> {
         Self::with_owner(db, table, table, selection)
     }
 
     /// `owner` is the alias (or table name) that qualifies this scan's columns.
     pub fn with_owner(
-        db: &mut Database,
+        db: &Database,
         table: &str,
         owner: &str,
         selection: Option<&Expr>,
@@ -1059,7 +1059,7 @@ impl PhysicalOperator for IndexScan {
         while self.pos < self.rids.len() {
             let rid = self.rids[self.pos];
             self.pos += 1;
-            let record = HeapFile::at(self.heap_file).get(&mut ctx.db.pool, rid)?;
+            let record = HeapFile::at(self.heap_file).get(&ctx.db.pool, rid)?;
             let (creator, deleter, row) = decode_record(&record)?;
             if ctx.trx.visible(creator, deleter) {
                 return Ok(Some(row));
@@ -1077,7 +1077,7 @@ impl PhysicalOperator for IndexScan {
 /// Builds a plan for statements the operator layer covers: SELECT and DML.
 /// Other statements (DDL, EXPLAIN, transaction control) return `None`.
 pub fn build_statement(
-    db: &mut Database,
+    db: &Database,
     stmt: &Stmt,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
     match stmt {
@@ -1097,7 +1097,7 @@ pub fn build_statement(
 
 /// Builds a scan for one FROM entry: a table scan or a view sub-plan.
 fn build_from_source(
-    db: &mut Database,
+    db: &Database,
     tref: &TableRef,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
     let owner = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
@@ -1112,7 +1112,7 @@ fn build_from_source(
 /// Builds a physical plan for a SELECT. Returns `None` for any shape the
 /// operators do not cover yet, leaving the materialized executor as fallback.
 pub fn build_select(
-    db: &mut Database,
+    db: &Database,
     select: &SelectStmt,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
     // set operations: build each operand, then apply the trailing order/limit
@@ -1212,7 +1212,7 @@ pub fn build_select(
 /// Builds the plan for a UNION [ALL] chain: each operand is planned, then the
 /// trailing ORDER BY / LIMIT apply to the whole result.
 fn build_set_op(
-    db: &mut Database,
+    db: &Database,
     select: &SelectStmt,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
     let mut base = select.clone();

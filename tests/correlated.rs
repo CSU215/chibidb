@@ -3,7 +3,7 @@
 use chibidb::value::Value;
 use chibidb::{Database, ResultSet};
 
-fn q(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     let rs = db.execute_sql(sql).unwrap();
     assert_eq!(rs.len(), 1, "sql: {sql}");
     match &rs[0] {
@@ -12,7 +12,7 @@ fn q(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
     }
 }
 
-fn setup(db: &mut Database) {
+fn setup(db: &Database) {
     db.execute_sql("create table student (sno int, sname char(20), sage int);").unwrap();
     db.execute_sql(
         "insert into student values (1,'alice',20),(2,'bob',21),(3,'carol',22),(4,'dave',23);",
@@ -23,10 +23,10 @@ fn setup(db: &mut Database) {
         .unwrap();
 }
 
-fn with_db(f: impl Fn(&mut Database)) {
-    let mut db = Database::open_in_memory().unwrap();
-    setup(&mut db);
-    f(&mut db);
+fn with_db(f: impl Fn(&Database)) {
+    let db = Database::open_in_memory().unwrap();
+    setup(&db);
+    f(&db);
 }
 
 #[test]

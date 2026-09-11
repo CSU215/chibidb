@@ -134,7 +134,7 @@ fn load_rejects_invalid_file() {
 fn database_applies_config_buffer_pool_frames() {
     let cfg = Config::from_toml_str("[storage]\nbuffer_pool_frames = 2\n").unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Database::open_with_config(dir.path(), &cfg).unwrap();
+    let db = Database::open_with_config(dir.path(), &cfg).unwrap();
     assert_eq!(db.config().storage.buffer_pool_frames, 2);
 
     db.execute_sql("create table t (id int);").unwrap();

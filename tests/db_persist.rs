@@ -3,7 +3,7 @@ use chibidb::Database;
 #[test]
 fn file_backend_writes_data_files() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Database::open(dir.path()).unwrap();
+    let db = Database::open(dir.path()).unwrap();
     db.execute_sql("create table t (id int, name char(10));").unwrap();
     db.execute_sql("insert into t values (1, 'a'), (2, 'b');").unwrap();
 
@@ -17,7 +17,7 @@ fn file_backend_writes_data_files() {
 #[test]
 fn file_backend_creates_one_file_per_table() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Database::open(dir.path()).unwrap();
+    let db = Database::open(dir.path()).unwrap();
     db.execute_sql("create table a (id int);").unwrap();
     db.execute_sql("create table b (id int);").unwrap();
     db.execute_sql("create table C (id int);").unwrap();
@@ -31,14 +31,14 @@ fn file_backend_creates_one_file_per_table() {
 fn reopen_restores_schema_and_data() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut db = Database::open(dir.path()).unwrap();
+        let db = Database::open(dir.path()).unwrap();
         db.execute_sql("create table student (id int, name char(10), score float);")
             .unwrap();
         db.execute_sql("insert into student values (1, 'alice', 95.5), (2, 'bob', 80);")
             .unwrap();
     }
 
-    let mut db = Database::open(dir.path()).unwrap();
+    let db = Database::open(dir.path()).unwrap();
     let rs = db.execute_sql("select * from student;").unwrap();
     match &rs[0] {
         chibidb::ResultSet::Rows { columns, rows } => {
@@ -65,11 +65,11 @@ fn reopen_restores_schema_and_data() {
 fn file_counter_continues_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut db = Database::open(dir.path()).unwrap();
+        let db = Database::open(dir.path()).unwrap();
         db.execute_sql("create table a (id int);").unwrap();
         db.execute_sql("create table b (id int);").unwrap();
     }
-    let mut db = Database::open(dir.path()).unwrap();
+    let db = Database::open(dir.path()).unwrap();
     db.execute_sql("create table c (id int);").unwrap();
     db.execute_sql("insert into c values (42);").unwrap();
 
@@ -84,7 +84,7 @@ fn file_counter_continues_after_reopen() {
 fn reopen_rejects_corrupt_catalog() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut db = Database::open(dir.path()).unwrap();
+        let db = Database::open(dir.path()).unwrap();
         db.execute_sql("create table t (id int);").unwrap();
     }
     std::fs::write(dir.path().join("catalog.bin"), b"garbage!!!").unwrap();

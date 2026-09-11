@@ -7,14 +7,14 @@ use crate::{Database, Error, Result};
 use super::coerce;
 use super::eval::{eval_const, expr_has_column, expr_has_subquery};
 
-pub(crate) fn execute_explain(db: &mut Database, e: &ExplainStmt) -> Result<ResultSet> {
+pub(crate) fn execute_explain(db: &Database, e: &ExplainStmt) -> Result<ResultSet> {
     match &*e.stmt {
         Stmt::Select(s) => Ok(ResultSet::Message(plan_select(db, s)?)),
         _ => Err(Error::Runtime("explain supports select only".into())),
     }
 }
 
-pub(crate) fn plan_select(db: &mut Database, s: &SelectStmt) -> Result<String> {
+pub(crate) fn plan_select(db: &Database, s: &SelectStmt) -> Result<String> {
     if s.from.is_empty() {
         return Ok("ConstantSelect -> Project".into());
     }
@@ -113,7 +113,7 @@ fn flip_cmp(op: BinOp) -> Option<BinOp> {
 /// wins outright; otherwise all `>`/`>=`/`<`/`<=` conjuncts on one indexed
 /// column are combined into a single bounded range scan.
 fn find_sargable(
-    db: &mut Database,
+    db: &Database,
     table: &str,
     selection: Option<&Expr>,
 ) -> Result<Option<Sargable>> {
@@ -220,7 +220,7 @@ pub(crate) struct IndexScanRids {
 }
 
 pub(crate) fn plan_index_scan(
-    db: &mut Database,
+    db: &Database,
     table: &str,
     selection: Option<&Expr>,
 ) -> Result<Option<IndexScanRids>> {
@@ -238,7 +238,7 @@ pub(crate) fn plan_index_scan(
     let rids: Vec<Rid> = match &sarg.kind {
         SargKind::Eq(lit) => {
             let key = literal_key(lit, sarg.dtype, &sarg.column)?;
-            btree.search(&mut db.pool, &key)?
+            btree.search(&db.pool, &key)?
         }
         SargKind::Range { lower, upper } => {
             let lower_key = lower
@@ -251,7 +251,7 @@ pub(crate) fn plan_index_scan(
                 .transpose()?;
             let start = bound(lower_key.as_ref(), lower.as_ref().is_some_and(|(i, _)| *i));
             let end = bound(upper_key.as_ref(), upper.as_ref().is_some_and(|(i, _)| *i));
-            scan_rids(&btree, &mut db.pool, start, end)?
+            scan_rids(&btree, &db.pool, start, end)?
         }
     };
     let heap_file = db.catalog().table(table)?.heap.file;
@@ -260,7 +260,7 @@ pub(crate) fn plan_index_scan(
 
 fn scan_rids(
     btree: &BTree,
-    pool: &mut crate::storage::BufferPool,
+    pool: &crate::storage::BufferPool,
     start: Bound,
     end: Bound,
 ) -> Result<Vec<Rid>> {

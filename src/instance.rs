@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use crate::ast::{Privilege, Stmt};
 use crate::config::Config;
@@ -25,8 +25,8 @@ pub const DEFAULT_DB: &str = "main";
 pub struct Instance {
     config: Config,
     root: PathBuf,
-    databases: RwLock<HashMap<String, Arc<Mutex<Database>>>>,
-    meta: Arc<Mutex<Database>>,
+    databases: RwLock<HashMap<String, Arc<RwLock<Database>>>>,
+    meta: Arc<RwLock<Database>>,
     _temp: Option<tempfile::TempDir>,
 }
 
@@ -39,7 +39,7 @@ impl Instance {
         let meta_path = root.join(META_DIR);
         std::fs::create_dir_all(&meta_path)
             .map_err(|e| Error::Runtime(format!("cannot create {}: {e}", meta_path.display())))?;
-        let meta = Arc::new(Mutex::new(Database::open_with_config(&meta_path, config)?));
+        let meta = Arc::new(RwLock::new(Database::open_with_config(&meta_path, config)?));
         let instance = Self {
             config: config.clone(),
             root: root.to_path_buf(),
@@ -65,7 +65,7 @@ impl Instance {
     }
 
     fn bootstrap_meta(&self) -> Result<()> {
-        let mut meta = self.meta.lock();
+        let meta = self.meta.read();
         if !meta.table_exists("databases") {
             meta.execute_sql("create table databases (name char(64) primary key);")?;
         }
@@ -85,7 +85,7 @@ impl Instance {
     /// Names of registered databases, sorted. The `databases` system table is
     /// the source of truth, so a stray directory is not a database.
     pub fn databases(&self) -> Result<Vec<String>> {
-        let mut meta = self.meta.lock();
+        let meta = self.meta.read();
         let result = meta.execute_sql("select name from databases;")?;
         let mut names = Vec::new();
         if let Some(ResultSet::Rows { rows, .. }) = result.into_iter().next() {
@@ -113,7 +113,7 @@ impl Instance {
         std::fs::create_dir_all(&path)
             .map_err(|e| Error::Runtime(format!("cannot create {}: {e}", path.display())))?;
         self.meta
-            .lock()
+            .write()
             .execute_sql(&format!("insert into databases values ('{name}');"))?;
         Ok(())
     }
@@ -130,13 +130,13 @@ impl Instance {
         std::fs::remove_dir_all(&path)
             .map_err(|e| Error::Runtime(format!("cannot remove {}: {e}", path.display())))?;
         self.meta
-            .lock()
+            .write()
             .execute_sql(&format!("delete from databases where name = '{name}';"))?;
         Ok(())
     }
 
     /// Returns a handle to the database, opening and caching it on first use.
-    pub fn database(&self, name: &str) -> Result<Arc<Mutex<Database>>> {
+    pub fn database(&self, name: &str) -> Result<Arc<RwLock<Database>>> {
         validate_name(name)?;
         if let Some(db) = self.databases.read().get(name) {
             return Ok(db.clone());
@@ -149,19 +149,19 @@ impl Instance {
         if let Some(db) = map.get(name) {
             return Ok(db.clone());
         }
-        let db = Arc::new(Mutex::new(Database::open_with_config(&path, &self.config)?));
+        let db = Arc::new(RwLock::new(Database::open_with_config(&path, &self.config)?));
         map.insert(name.to_string(), db.clone());
         Ok(db)
     }
 
-    /// Locks one database and runs `f` against it.
+    /// Takes the database's write lock and runs `f` against it.
     pub fn with_database_mut<R>(
         &self,
         name: &str,
         f: impl FnOnce(&mut Database) -> R,
     ) -> Result<R> {
         let db = self.database(name)?;
-        let mut guard = db.lock();
+        let mut guard = db.write();
         Ok(f(&mut guard))
     }
 
@@ -215,8 +215,14 @@ impl Instance {
                 other => {
                     let db_name = self.ensure_current_db(session)?;
                     let db = self.database(&db_name)?;
-                    let mut guard = db.lock();
-                    if let Some(rs) = guard.execute_stmt_with(session, other)? {
+                    // read-only statements share the database; anything that
+                    // may write takes it exclusively for the statement
+                    let result = if crate::is_read_only(other) {
+                        db.read().execute_stmt_with(session, other)?
+                    } else {
+                        db.write().execute_stmt_with(session, other)?
+                    };
+                    if let Some(rs) = result {
                         out.push(rs);
                     }
                 }
@@ -240,11 +246,11 @@ impl Instance {
 
     /// Flushes (checkpoints) the system database and every open database.
     pub fn flush(&self) -> Result<()> {
-        self.meta.lock().flush()?;
-        let dbs: Vec<Arc<Mutex<Database>>> =
+        self.meta.read().flush()?;
+        let dbs: Vec<Arc<RwLock<Database>>> =
             self.databases.read().values().cloned().collect();
         for db in dbs {
-            db.lock().flush()?;
+            db.read().flush()?;
         }
         Ok(())
     }
@@ -255,7 +261,7 @@ impl Instance {
             return Ok(());
         };
         if self.root.join(&name).is_dir() {
-            self.database(&name)?.lock().rollback_session(session)?;
+            self.database(&name)?.write().rollback_session(session)?;
         } else {
             // the database was dropped out from under the session; its undo
             // log references gone tables, so just drop the handle
@@ -285,8 +291,8 @@ impl Instance {
 
     pub fn create_user(&self, name: &str, password: &str) -> Result<()> {
         validate_ident(name, "user name")?;
-        let mut meta = self.meta.lock();
-        if user_exists(&mut meta, name)? {
+        let meta = self.meta.write();
+        if user_exists(&meta, name)? {
             return Err(Error::Runtime(format!("user already exists: {name}")));
         }
         let hash = hash_password(password);
@@ -296,8 +302,8 @@ impl Instance {
 
     pub fn drop_user(&self, name: &str) -> Result<()> {
         validate_ident(name, "user name")?;
-        let mut meta = self.meta.lock();
-        if !user_exists(&mut meta, name)? {
+        let meta = self.meta.write();
+        if !user_exists(&meta, name)? {
             return Err(Error::Runtime(format!("no such user: {name}")));
         }
         meta.execute_sql(&format!("delete from users where name = '{name}';"))?;
@@ -306,7 +312,7 @@ impl Instance {
 
     /// True when `password` matches the stored hash for `name`.
     pub fn authenticate(&self, name: &str, password: &str) -> Result<bool> {
-        let mut meta = self.meta.lock();
+        let meta = self.meta.read();
         let result =
             meta.execute_sql(&format!("select password from users where name = '{name}';"))?;
         let stored = match result.into_iter().next() {
@@ -327,12 +333,12 @@ impl Instance {
     pub fn grant(&self, user: &str, database: &str, privilege: Privilege) -> Result<()> {
         validate_ident(user, "user name")?;
         validate_scope(database)?;
-        let mut meta = self.meta.lock();
-        if !user_exists(&mut meta, user)? {
+        let meta = self.meta.write();
+        if !user_exists(&meta, user)? {
             return Err(Error::Runtime(format!("no such user: {user}")));
         }
         let kind = privilege.as_str();
-        revoke(&mut meta, user, database, kind)?;
+        revoke(&meta, user, database, kind)?;
         meta.execute_sql(&format!(
             "insert into privileges values ('{user}', '{database}', '{kind}');"
         ))?;
@@ -342,7 +348,7 @@ impl Instance {
     pub fn revoke(&self, user: &str, database: &str, privilege: Privilege) -> Result<()> {
         validate_ident(user, "user name")?;
         validate_scope(database)?;
-        revoke(&mut self.meta.lock(), user, database, privilege.as_str())
+        revoke(&self.meta.write(), user, database, privilege.as_str())
     }
 
     /// True when `user` holds `privilege` on `database` or on all databases.
@@ -355,7 +361,7 @@ impl Instance {
         validate_ident(user, "user name")?;
         validate_scope(database)?;
         let kind = privilege.as_str();
-        let mut meta = self.meta.lock();
+        let meta = self.meta.read();
         let result = meta.execute_sql(&format!(
             "select kind from privileges where username = '{user}' and kind = '{kind}' and (dbname = '{database}' or dbname = '*');"
         ))?;
@@ -363,12 +369,12 @@ impl Instance {
     }
 }
 
-fn user_exists(meta: &mut Database, name: &str) -> Result<bool> {
+fn user_exists(meta: &Database, name: &str) -> Result<bool> {
     let result = meta.execute_sql(&format!("select name from users where name = '{name}';"))?;
     Ok(matches!(result.into_iter().next(), Some(ResultSet::Rows { rows, .. }) if !rows.is_empty()))
 }
 
-fn revoke(meta: &mut Database, user: &str, database: &str, kind: &str) -> Result<()> {
+fn revoke(meta: &Database, user: &str, database: &str, kind: &str) -> Result<()> {
     meta.execute_sql(&format!(
         "delete from privileges where username = '{user}' and dbname = '{database}' and kind = '{kind}';"
     ))?;

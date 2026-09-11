@@ -103,7 +103,7 @@ impl Database {
             crate::storage::dwb::recover(&dwb_path, crate::storage::dwb::write_page_at)?;
             disk.enable_double_write(&dwb_path)?;
         }
-        let mut pool = BufferPool::new(disk, config.storage.buffer_pool_frames);
+        let pool = BufferPool::new(disk, config.storage.buffer_pool_frames);
         let mut catalog = Catalog::default();
         let mut next_table_file = 0;
         let mut next_index_file = 0;
@@ -121,7 +121,7 @@ impl Database {
             for meta in &snap.tables {
                 let fpath = tables_dir.join(format!("{:06}.dbf", meta.file_no));
                 let file = pool.open_file(&fpath)?;
-                HeapFile::open_or_repair(&mut pool, file)?;
+                HeapFile::open_or_repair(&pool, file)?;
                 let schema = Schema {
                     columns: meta
                         .columns
@@ -146,7 +146,7 @@ impl Database {
             for ix in &snap.indexes {
                 let fpath = indexes_dir.join(format!("{:06}.idxf", ix.file_no));
                 let file = pool.open_file(&fpath)?;
-                if BTree::open_or_repair(&mut pool, file)? {
+                if BTree::open_or_repair(&pool, file)? {
                     repaired_index_tables.push(ix.table.clone());
                 }
                 let schema = &catalog.table(&ix.table)?.schema;
@@ -188,7 +188,7 @@ impl Database {
             touched.insert(catalog.table(table)?.heap.file_no);
         }
 
-        let mut db = Self {
+        let db = Self {
             config: config.clone(),
             catalog: RwLock::new(catalog),
             pool,
@@ -227,7 +227,7 @@ impl Database {
         &self.config
     }
 
-    pub fn flush(&mut self) -> Result<()> {
+    pub fn flush(&self) -> Result<()> {
         if !self.open_trxs.read().is_empty() {
             // truncating the log now would drop the open transaction's redo
             // records, so its later COMMIT could not be recovered
@@ -238,7 +238,7 @@ impl Database {
         self.flush_inner()
     }
 
-    pub(crate) fn flush_inner(&mut self) -> Result<()> {
+    pub(crate) fn flush_inner(&self) -> Result<()> {
         self.pool.flush_all()?;
         self.save_catalog()?;
         // checkpoint: every page is on disk, so the log has nothing left to redo
@@ -250,7 +250,7 @@ impl Database {
     /// creator never committed (left behind by a crashed transaction).
     /// Stale index entries of purged rows are removed too. Must run with no
     /// open transactions (the VACUUM statement enforces this).
-    pub(crate) fn vacuum(&mut self) -> Result<usize> {
+    pub(crate) fn vacuum(&self) -> Result<usize> {
         let mut purged = 0;
         let committed = self.committed_trxs.read().clone();
         let metas = self.catalog().table_metas();
@@ -265,10 +265,10 @@ impl Database {
                 }
                 for (ci, ix_file) in &ops {
                     let key = encode_key(&row[*ci])?;
-                    BTree::at(*ix_file).delete(&mut self.pool, &key, rid)?;
+                    BTree::at(*ix_file).delete(&self.pool, &key, rid)?;
                 }
                 let file = self.catalog().table(&meta.name)?.heap.file;
-                HeapFile::at(file).delete(&mut self.pool, rid)?;
+                HeapFile::at(file).delete(&self.pool, rid)?;
                 purged += 1;
             }
         }
@@ -279,7 +279,7 @@ impl Database {
     /// disk with the next flush) and rebuilds indexes of touched tables.
     /// `touched` accumulates heap file numbers that must have their indexes
     /// rebuilt; it may arrive pre-seeded with repaired index files.
-    fn recover_from_wal(&mut self, plan: &wal::RecoveryPlan, touched: &mut HashSet<u32>) -> Result<()> {
+    fn recover_from_wal(&self, plan: &wal::RecoveryPlan, touched: &mut HashSet<u32>) -> Result<()> {
         let file_map: std::collections::HashMap<u32, FileId> =
             self.catalog().heap_files().into_iter().collect();
         for (_, _, records) in &plan.committed {
@@ -318,7 +318,7 @@ impl Database {
                             }
                         })?;
                         if unmarked {
-                            HeapFile::at(file).delete_mark(&mut self.pool, *rid, *deleter)?;
+                            HeapFile::at(file).delete_mark(&self.pool, *rid, *deleter)?;
                             touched.insert(*file_no);
                         }
                     }
@@ -335,7 +335,7 @@ impl Database {
     /// Rebuilds every index of the table owning heap file `file_no` from the
     /// heap contents. Index pages are derived data and a crash may have lost
     /// unflushed ones.
-    fn rebuild_indexes(&mut self, file_no: u32) -> Result<()> {
+    fn rebuild_indexes(&self, file_no: u32) -> Result<()> {
         let table = self
             .catalog()
             .table_metas()
@@ -347,20 +347,20 @@ impl Database {
         for (_, ix_file) in &ops {
             self.pool.discard_file(*ix_file);
             self.pool.truncate_file(*ix_file)?;
-            BTree::init(&mut self.pool, *ix_file)?;
+            BTree::init(&self.pool, *ix_file)?;
         }
         for (rid, rec) in self.store_scan_raw(&table)? {
             let (_, _, row) = crate::storage::codec::decode_record(&rec)?;
             for (ci, ix_file) in &ops {
                 let key = encode_key(&row[*ci])?;
-                BTree::at(*ix_file).insert(&mut self.pool, &key, rid)?;
+                BTree::at(*ix_file).insert(&self.pool, &key, rid)?;
             }
         }
         Ok(())
     }
 
     /// Commit bookkeeping shared by explicit COMMIT and autocommit.
-    fn commit_trx(&mut self, trx_id: u32, wrote: bool) -> Result<()> {
+    fn commit_trx(&self, trx_id: u32, wrote: bool) -> Result<()> {
         self.committed_trxs.write().insert(trx_id);
         self.open_trxs.write().remove(&trx_id);
         if !wrote {
@@ -393,7 +393,7 @@ impl Database {
         std::mem::forget(_temp);
     }
 
-    pub fn execute_sql(&mut self, sql: &str) -> Result<Vec<ResultSet>> {
+    pub fn execute_sql(&self, sql: &str) -> Result<Vec<ResultSet>> {
         let mut session = Session::new();
         self.execute_sql_with(&mut session, sql)
     }
@@ -402,7 +402,7 @@ impl Database {
     /// read transaction, returning the produced rows. Used by tests and the
     /// future operator-based executor.
     pub fn collect_plan(
-        &mut self,
+        &self,
         session: &mut Session,
         plan: &mut dyn crate::exec::operator::PhysicalOperator,
     ) -> Result<Vec<Vec<Value>>> {
@@ -439,7 +439,7 @@ impl Database {
 
     /// Executes statements within the session's transaction context.
     pub fn execute_sql_with(
-        &mut self,
+        &self,
         session: &mut Session,
         sql: &str,
     ) -> Result<Vec<ResultSet>> {
@@ -456,7 +456,7 @@ impl Database {
     /// Executes one parsed statement. Transaction-control statements produce
     /// no result set (`None`).
     pub(crate) fn execute_stmt_with(
-        &mut self,
+        &self,
         session: &mut Session,
         stmt: &crate::ast::Stmt,
     ) -> Result<Option<ResultSet>> {
@@ -544,7 +544,7 @@ impl Database {
     }
 
     /// Rolls back any open transaction when a session goes away.
-    pub fn rollback_session(&mut self, session: &mut Session) -> Result<()> {
+    pub fn rollback_session(&self, session: &mut Session) -> Result<()> {
         if let Some(mut trx) = session.trx.take() {
             self.rollback_trx(&mut trx)?;
             self.open_trxs.write().remove(&trx.id);
@@ -558,7 +558,7 @@ impl Database {
     }
 
     /// Overrides the auto-checkpoint log budget in bytes; mainly for tests.
-    pub fn set_wal_checkpoint_threshold(&mut self, bytes: u64) {
+    pub fn set_wal_checkpoint_threshold(&self, bytes: u64) {
         self.wal_checkpoint_threshold.store(bytes, Ordering::Relaxed);
     }
 
@@ -572,29 +572,29 @@ impl Database {
         self.committed_trxs.read().clone()
     }
 
-    fn rollback_trx(&mut self, trx: &mut TrxState) -> Result<()> {
+    fn rollback_trx(&self, trx: &mut TrxState) -> Result<()> {
         while let Some(undo) = trx.undo.pop() {
             match undo {
                 Undo::Insert { table, rid, row } => {
                     let file = self.catalog().table(&table)?.heap.file;
-                    HeapFile::at(file).delete(&mut self.pool, rid)?;
+                    HeapFile::at(file).delete(&self.pool, rid)?;
                     for (ci, ix_file) in self.index_ops(&table)? {
                         let key = encode_key(&row[ci])?;
-                        BTree::at(ix_file).delete(&mut self.pool, &key, rid)?;
+                        BTree::at(ix_file).delete(&self.pool, &key, rid)?;
                     }
                 }
                 Undo::DeleteMark { table, rid } => {
                     let file = self.catalog().table(&table)?.heap.file;
-                    HeapFile::at(file).delete_mark(&mut self.pool, rid, 0)?;
+                    HeapFile::at(file).delete_mark(&self.pool, rid, 0)?;
                 }
                 Undo::Update { table, old_rid, new_rid, new_row } => {
                     let file = self.catalog().table(&table)?.heap.file;
-                    HeapFile::at(file).delete(&mut self.pool, new_rid)?;
+                    HeapFile::at(file).delete(&self.pool, new_rid)?;
                     for (ci, ix_file) in self.index_ops(&table)? {
                         let key = encode_key(&new_row[ci])?;
-                        BTree::at(ix_file).delete(&mut self.pool, &key, new_rid)?;
+                        BTree::at(ix_file).delete(&self.pool, &key, new_rid)?;
                     }
-                    HeapFile::at(file).delete_mark(&mut self.pool, old_rid, 0)?;
+                    HeapFile::at(file).delete_mark(&self.pool, old_rid, 0)?;
                 }
             }
         }
@@ -614,19 +614,19 @@ impl Database {
         self.catalog.write()
     }
 
-    pub(crate) fn new_table_heap(&mut self, _name: &str) -> Result<HeapStore> {
+    pub(crate) fn new_table_heap(&self, _name: &str) -> Result<HeapStore> {
         let file_no = self.next_table_file.fetch_add(1, Ordering::SeqCst);
         let path = self.data_dir.join("tables").join(format!("{file_no:06}.dbf"));
         let file = self.pool.create_file(&path)?;
-        HeapFile::init(&mut self.pool, file)?;
+        HeapFile::init(&self.pool, file)?;
         Ok(HeapStore { file, file_no })
     }
 
-    pub(crate) fn new_index_heap(&mut self, _name: &str) -> Result<IndexStore> {
+    pub(crate) fn new_index_heap(&self, _name: &str) -> Result<IndexStore> {
         let file_no = self.next_index_file.fetch_add(1, Ordering::SeqCst);
         let path = self.data_dir.join("indexes").join(format!("{file_no:06}.idxf"));
         let file = self.pool.create_file(&path)?;
-        BTree::init(&mut self.pool, file)?;
+        BTree::init(&self.pool, file)?;
         Ok(IndexStore { file, file_no })
     }
 
@@ -647,7 +647,7 @@ impl Database {
 
     /// Drops a table: catalog first (durability), then its heap and index
     /// files. A crash in between leaves harmless orphan files behind.
-    pub(crate) fn drop_table(&mut self, name: &str) -> Result<()> {
+    pub(crate) fn drop_table(&self, name: &str) -> Result<()> {
         let dropped = self.catalog_mut().drop_table(name)?;
         self.save_catalog()?;
         for file in std::iter::once(dropped.heap_file).chain(dropped.index_files) {
@@ -684,12 +684,12 @@ impl Database {
     }
 
     /// Raw versioned records; callers decode and apply visibility.
-    pub(crate) fn store_scan_raw(&mut self, name: &str) -> Result<Vec<(Rid, Vec<u8>)>> {
+    pub(crate) fn store_scan_raw(&self, name: &str) -> Result<Vec<(Rid, Vec<u8>)>> {
         let file = self.catalog().table(name)?.heap.file;
         let engine = HeapEngine::new(file);
-        let mut scanner = engine.scan(&mut self.pool)?;
+        let mut scanner = engine.scan(&self.pool)?;
         let mut out = Vec::new();
-        while let Some(row) = scanner.next(&mut self.pool)? {
+        while let Some(row) = scanner.next(&self.pool)? {
             out.push(row);
         }
         Ok(out)
@@ -702,7 +702,7 @@ impl Database {
     /// column index so equal values in different constraint columns do not
     /// collide.
     pub(crate) fn check_unique(
-        &mut self,
+        &self,
         table: &str,
         row: &[Value],
         exclude: Option<Rid>,
@@ -735,11 +735,11 @@ impl Database {
                 return Err(Error::Runtime(format!("duplicate key: {table}({column})")));
             }
             claimed.push((ci, key.clone()));
-            for rid in BTree::at(ix_file).search(&mut self.pool, &key)? {
+            for rid in BTree::at(ix_file).search(&self.pool, &key)? {
                 if Some(rid) == exclude {
                     continue;
                 }
-                let rec = heap.get(&mut self.pool, rid)?;
+                let rec = heap.get(&self.pool, rid)?;
                 let (creator, deleter, _) = decode_record(&rec)?;
                 if trx.visible(creator, deleter) {
                     return Err(Error::Runtime(format!("duplicate key: {table}({column})")));
@@ -750,7 +750,7 @@ impl Database {
     }
 
     pub(crate) fn store_insert(
-        &mut self,
+        &self,
         name: &str,
         row: Vec<Value>,
         creator: u32,
@@ -762,11 +762,11 @@ impl Database {
         };
         let heap = HeapFile::at(file);
         let data = encode_record(creator, 0, &row);
-        let rid = heap.insert(&mut self.pool, &data)?;
+        let rid = heap.insert(&self.pool, &data)?;
         self.wal.append(creator, &Record::Insert { file_no, rid, record: data.clone() })?;
         for (ci, ix_file) in self.index_ops(name)? {
             let key = encode_key(&row[ci])?;
-            BTree::at(ix_file).insert(&mut self.pool, &key, rid)?;
+            BTree::at(ix_file).insert(&self.pool, &key, rid)?;
         }
         Ok(rid)
     }
@@ -774,7 +774,7 @@ impl Database {
     /// MVCC delete: mark records with the deleter's trx id (index untouched,
     /// stale entries are filtered by visibility on read).
     pub(crate) fn store_delete_mark(
-        &mut self,
+        &self,
         name: &str,
         rids: &[Rid],
         deleter: u32,
@@ -786,7 +786,7 @@ impl Database {
         };
         let heap = HeapFile::at(file);
         for rid in rids {
-            heap.delete_mark(&mut self.pool, *rid, deleter)?;
+            heap.delete_mark(&self.pool, *rid, deleter)?;
             self.wal.append(deleter, &Record::DeleteMark { file_no, rid: *rid, deleter })?;
         }
         Ok(())
@@ -796,7 +796,7 @@ impl Database {
     /// entries for the new version are added; old entries stay so older
     /// snapshots can still find them (filtered by visibility on read).
     pub(crate) fn store_update_versions(
-        &mut self,
+        &self,
         name: &str,
         updates: &[(Rid, Vec<Value>)],
         trx_id: u32,
@@ -810,18 +810,18 @@ impl Database {
         let ops = self.index_ops(name)?;
         let mut new_rids = Vec::with_capacity(updates.len());
         for (rid, new_row) in updates {
-            heap.delete_mark(&mut self.pool, *rid, trx_id)?;
+            heap.delete_mark(&self.pool, *rid, trx_id)?;
             self.wal
                 .append(trx_id, &Record::DeleteMark { file_no, rid: *rid, deleter: trx_id })?;
             let data = encode_record(trx_id, 0, new_row);
-            let new_rid = heap.insert(&mut self.pool, &data)?;
+            let new_rid = heap.insert(&self.pool, &data)?;
             self.wal.append(
                 trx_id,
                 &Record::Insert { file_no, rid: new_rid, record: data.clone() },
             )?;
             for (ci, ix_file) in &ops {
                 let key = encode_key(&new_row[*ci])?;
-                BTree::at(*ix_file).insert(&mut self.pool, &key, new_rid)?;
+                BTree::at(*ix_file).insert(&self.pool, &key, new_rid)?;
             }
             new_rids.push(new_rid);
         }
@@ -832,7 +832,7 @@ impl Database {
 /// Whether a statement only reads, so its autocommit needs no transaction
 /// bookkeeping. Everything else (DML, DDL, CHECKPOINT, VACUUM) may mutate
 /// state and takes the normal round trip.
-fn is_read_only(stmt: &crate::ast::Stmt) -> bool {
+pub(crate) fn is_read_only(stmt: &crate::ast::Stmt) -> bool {
     matches!(
         stmt,
         crate::ast::Stmt::Select(_) | crate::ast::Stmt::Explain(_)
@@ -841,7 +841,7 @@ fn is_read_only(stmt: &crate::ast::Stmt) -> bool {
 
 /// Drives one operator tree to completion, appending rows to `out`.
 fn run_plan(
-    db: &mut Database,
+    db: &Database,
     session: &mut Session,
     plan: &mut dyn crate::exec::operator::PhysicalOperator,
     out: &mut Vec<Vec<Value>>,
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn read_only_autocommit_does_not_touch_bookkeeping() {
-        let mut db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().unwrap();
         let before = db.next_trx_id.load(Ordering::SeqCst);
 
         db.execute_sql("select 1;").unwrap();
@@ -884,7 +884,7 @@ mod tests {
 
     #[test]
     fn write_autocommit_registers_its_transaction() {
-        let mut db = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().unwrap();
         db.execute_sql("create table t (id int);").unwrap();
         let before = db.next_trx_id.load(Ordering::SeqCst);
 

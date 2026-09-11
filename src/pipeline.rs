@@ -28,7 +28,7 @@ impl<'a> SqlEvent<'a> {
 pub trait Stage {
     fn handle(
         &self,
-        db: &mut Database,
+        db: &Database,
         session: &mut Session,
         event: &mut SqlEvent<'_>,
     ) -> Result<()>;
@@ -46,7 +46,7 @@ impl Pipeline {
 
     pub fn run(
         &self,
-        db: &mut Database,
+        db: &Database,
         session: &mut Session,
         event: &mut SqlEvent<'_>,
     ) -> Result<()> {
@@ -63,7 +63,7 @@ pub struct ExecuteStage;
 impl Stage for ExecuteStage {
     fn handle(
         &self,
-        db: &mut Database,
+        db: &Database,
         session: &mut Session,
         event: &mut SqlEvent<'_>,
     ) -> Result<()> {
@@ -93,7 +93,7 @@ pub struct ResolveStage;
 impl Stage for ResolveStage {
     fn handle(
         &self,
-        db: &mut Database,
+        db: &Database,
         _session: &mut Session,
         event: &mut SqlEvent<'_>,
     ) -> Result<()> {
@@ -115,7 +115,7 @@ pub struct OptimizeStage;
 impl Stage for OptimizeStage {
     fn handle(
         &self,
-        db: &mut Database,
+        db: &Database,
         _session: &mut Session,
         event: &mut SqlEvent<'_>,
     ) -> Result<()> {

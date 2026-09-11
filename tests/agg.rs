@@ -1,7 +1,7 @@
 use chibidb::value::Value;
 use chibidb::Database;
 
-fn with_dbs(f: impl Fn(&mut Database)) {
+fn with_dbs(f: impl Fn(&Database)) {
     let mut mem = Database::open_in_memory().unwrap();
     f(&mut mem);
 
@@ -10,7 +10,7 @@ fn with_dbs(f: impl Fn(&mut Database)) {
     f(&mut file_db);
 }
 
-fn seeded(db: &mut Database) {
+fn seeded(db: &Database) {
     db.execute_sql("create table t (id int, name char(10), score float);").unwrap();
     db.execute_sql(
         "insert into t values (1, 'a', 80.0), (2, null, 90.5), (3, 'c', 90.5);",
@@ -18,7 +18,7 @@ fn seeded(db: &mut Database) {
     .unwrap();
 }
 
-fn one_row(db: &mut Database, sql: &str) -> Vec<Value> {
+fn one_row(db: &Database, sql: &str) -> Vec<Value> {
     let rs = db.execute_sql(sql).unwrap();
     match &rs[0] {
         chibidb::ResultSet::Rows { rows, .. } => rows[0].clone(),
@@ -26,7 +26,7 @@ fn one_row(db: &mut Database, sql: &str) -> Vec<Value> {
     }
 }
 
-fn err(db: &mut Database, sql: &str) {
+fn err(db: &Database, sql: &str) {
     assert!(db.execute_sql(sql).is_err(), "expected error for: {sql}");
 }
 
@@ -230,7 +230,7 @@ fn order_by_sorts_rows() {
         )
         .unwrap();
 
-        let col = |sql: &str, db: &mut Database| -> Vec<Value> {
+        let col = |sql: &str, db: &Database| -> Vec<Value> {
             let rs = db.execute_sql(sql).unwrap();
             match &rs[0] {
                 chibidb::ResultSet::Rows { rows, .. } => rows.iter().map(|r| r[0].clone()).collect(),
@@ -307,7 +307,7 @@ fn limit_and_offset() {
         for i in 0..5 {
             db.execute_sql(&format!("insert into t values ({i});")).unwrap();
         }
-        let ids = |sql: &str, db: &mut Database| -> Vec<i64> {
+        let ids = |sql: &str, db: &Database| -> Vec<i64> {
             let rs = db.execute_sql(sql).unwrap();
             match &rs[0] {
                 chibidb::ResultSet::Rows { rows, .. } => rows

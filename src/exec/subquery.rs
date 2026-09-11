@@ -10,7 +10,7 @@ use super::eval::{eval, expr_has_subquery, EvalCtx};
 /// executing it against `outer` so correlated references resolve. The
 /// result contains no subquery nodes and can be evaluated purely.
 pub(crate) fn bind_expr(
-    db: &mut Database,
+    db: &Database,
     trx: &mut TrxState,
     e: &Expr,
     outer: Option<&EvalCtx>,
@@ -107,7 +107,7 @@ pub(crate) fn bind_expr(
 
 /// Evaluates `e`, first materializing any subqueries against `ctx`.
 pub(crate) fn eval_bound(
-    db: &mut Database,
+    db: &Database,
     trx: &mut TrxState,
     e: &Expr,
     ctx: Option<&EvalCtx>,
@@ -120,7 +120,7 @@ pub(crate) fn eval_bound(
 }
 
 pub(crate) fn eval_predicate_bound(
-    db: &mut Database,
+    db: &Database,
     trx: &mut TrxState,
     e: &Expr,
     schema: &Schema,
@@ -139,7 +139,7 @@ pub(crate) fn eval_predicate_bound(
 }
 
 fn run_subquery(
-    db: &mut Database,
+    db: &Database,
     trx: &mut TrxState,
     sub: &crate::ast::SelectStmt,
     outer: Option<&EvalCtx>,

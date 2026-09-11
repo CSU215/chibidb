@@ -11,16 +11,16 @@ use crate::Result;
 /// nested-loop join) without aliasing the pool.
 pub trait RowScanner: Send {
     /// Returns the next `(Rid, encoded record)` pair, or `None` at EOF.
-    fn next(&mut self, bp: &mut BufferPool) -> Result<Option<(Rid, Vec<u8>)>>;
+    fn next(&mut self, bp: &BufferPool) -> Result<Option<(Rid, Vec<u8>)>>;
 }
 
 /// Read seam over a table's storage. The executor depends on this, not on the
 /// concrete engine (heap today, LSM later).
 pub trait TableEngine: Send + Sync {
-    fn scan(&self, bp: &mut BufferPool) -> Result<Box<dyn RowScanner>>;
+    fn scan(&self, bp: &BufferPool) -> Result<Box<dyn RowScanner>>;
 
     /// Point fetch of one encoded record by row id.
-    fn get(&self, bp: &mut BufferPool, rid: Rid) -> Result<Vec<u8>>;
+    fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>>;
 }
 
 /// Engine backed by the current on-disk heap layout. `new` is an unvalidated
@@ -36,11 +36,11 @@ impl HeapEngine {
 }
 
 impl TableEngine for HeapEngine {
-    fn scan(&self, bp: &mut BufferPool) -> Result<Box<dyn RowScanner>> {
+    fn scan(&self, bp: &BufferPool) -> Result<Box<dyn RowScanner>> {
         Ok(Box::new(HeapScanner::new(bp, self.file)?))
     }
 
-    fn get(&self, bp: &mut BufferPool, rid: Rid) -> Result<Vec<u8>> {
+    fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>> {
         HeapFile::at(self.file).get(bp, rid)
     }
 }
@@ -53,14 +53,14 @@ struct HeapScanner {
 }
 
 impl HeapScanner {
-    fn new(bp: &mut BufferPool, file: FileId) -> Result<Self> {
+    fn new(bp: &BufferPool, file: FileId) -> Result<Self> {
         let pages = bp.page_count(file)?;
         Ok(Self { file, next_page: 1, last_page: pages, buffer: Vec::new().into_iter() })
     }
 }
 
 impl RowScanner for HeapScanner {
-    fn next(&mut self, bp: &mut BufferPool) -> Result<Option<(Rid, Vec<u8>)>> {
+    fn next(&mut self, bp: &BufferPool) -> Result<Option<(Rid, Vec<u8>)>> {
         loop {
             if let Some(row) = self.buffer.next() {
                 return Ok(Some(row));
