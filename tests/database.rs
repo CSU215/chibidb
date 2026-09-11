@@ -55,7 +55,7 @@ fn rejects_malformed_database_statements() {
 #[test]
 fn create_use_and_query_across_databases() {
     let dir = tempfile::tempdir().unwrap();
-    let mut inst = instance(&dir);
+    let inst = instance(&dir);
     let mut s = Session::new();
 
     inst.execute_with(&mut s, "create database shop;").unwrap();
@@ -73,7 +73,7 @@ fn create_use_and_query_across_databases() {
 #[test]
 fn table_statements_auto_select_a_default_database() {
     let dir = tempfile::tempdir().unwrap();
-    let mut inst = instance(&dir);
+    let inst = instance(&dir);
     let mut s = Session::new();
 
     // no USE needed: the first table statement lands in `main`
@@ -95,7 +95,7 @@ fn table_statements_auto_select_a_default_database() {
 #[test]
 fn use_unknown_database_errors() {
     let dir = tempfile::tempdir().unwrap();
-    let mut inst = instance(&dir);
+    let inst = instance(&dir);
     let mut s = Session::new();
     assert!(inst.execute_with(&mut s, "use nope;").is_err());
     assert_eq!(s.current_db(), None);
@@ -104,7 +104,7 @@ fn use_unknown_database_errors() {
 #[test]
 fn dropped_database_cannot_be_queried() {
     let dir = tempfile::tempdir().unwrap();
-    let mut inst = instance(&dir);
+    let inst = instance(&dir);
     let mut s = Session::new();
     inst.execute_with(&mut s, "create database shop;").unwrap();
     inst.execute_with(&mut s, "use shop;").unwrap();
@@ -115,7 +115,7 @@ fn dropped_database_cannot_be_queried() {
 #[test]
 fn database_statements_are_rejected_inside_a_transaction() {
     let dir = tempfile::tempdir().unwrap();
-    let mut inst = instance(&dir);
+    let inst = instance(&dir);
     let mut s = Session::new();
     inst.execute_with(&mut s, "create database shop;").unwrap();
     inst.execute_with(&mut s, "use shop;").unwrap();

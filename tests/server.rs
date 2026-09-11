@@ -8,12 +8,11 @@ use chibidb::value::Value;
 use chibidb::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 
 async fn start_server() -> (SharedInstance, std::net::SocketAddr, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let instance = Instance::open(dir.path(), &Config::default()).unwrap();
-    let shared: SharedInstance = Arc::new(Mutex::new(instance));
+    let shared: SharedInstance = Arc::new(instance);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(serve(shared.clone(), listener));

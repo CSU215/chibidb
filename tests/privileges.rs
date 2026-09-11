@@ -7,7 +7,7 @@ fn instance(dir: &tempfile::TempDir) -> Instance {
     Instance::open(dir.path(), &Config::default()).unwrap()
 }
 
-fn setup(inst: &mut Instance, s: &mut Session) {
+fn setup(inst: &Instance, s: &mut Session) {
     inst.execute_with(s, "create user alice identified by 'x';").unwrap();
     inst.execute_with(s, "create database shop;").unwrap();
 }
@@ -15,9 +15,9 @@ fn setup(inst: &mut Instance, s: &mut Session) {
 #[test]
 fn grant_and_check_read_privilege() {
     let dir = tempfile::tempdir().unwrap();
-    let mut inst = instance(&dir);
+    let inst = instance(&dir);
     let mut s = Session::new();
-    setup(&mut inst, &mut s);
+    setup(&inst, &mut s);
 
     assert!(!inst.has_privilege("alice", "shop", Privilege::Read).unwrap());
     inst.execute_with(&mut s, "grant read on shop to alice;").unwrap();
@@ -28,9 +28,9 @@ fn grant_and_check_read_privilege() {
 #[test]
 fn grant_all_on_all_databases() {
     let dir = tempfile::tempdir().unwrap();
-    let mut inst = instance(&dir);
+    let inst = instance(&dir);
     let mut s = Session::new();
-    setup(&mut inst, &mut s);
+    setup(&inst, &mut s);
 
     inst.execute_with(&mut s, "grant all on * to alice;").unwrap();
     assert!(inst.has_privilege("alice", "shop", Privilege::Read).unwrap());
@@ -41,9 +41,9 @@ fn grant_all_on_all_databases() {
 #[test]
 fn revoke_removes_the_privilege() {
     let dir = tempfile::tempdir().unwrap();
-    let mut inst = instance(&dir);
+    let inst = instance(&dir);
     let mut s = Session::new();
-    setup(&mut inst, &mut s);
+    setup(&inst, &mut s);
 
     inst.execute_with(&mut s, "grant write on shop to alice;").unwrap();
     assert!(inst.has_privilege("alice", "shop", Privilege::Write).unwrap());
@@ -54,9 +54,9 @@ fn revoke_removes_the_privilege() {
 #[test]
 fn granting_to_unknown_user_errors() {
     let dir = tempfile::tempdir().unwrap();
-    let mut inst = instance(&dir);
+    let inst = instance(&dir);
     let mut s = Session::new();
-    setup(&mut inst, &mut s);
+    setup(&inst, &mut s);
     assert!(inst.execute_with(&mut s, "grant read on shop to bob;").is_err());
 }
 

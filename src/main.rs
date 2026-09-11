@@ -41,7 +41,7 @@ async fn main() -> std::io::Result<()> {
         // server
         3 | 4 if args[1] == "serve" => {
             let addr = args.get(3).cloned().unwrap_or_else(|| default_addr.clone());
-            let instance = Arc::new(tokio::sync::Mutex::new(open(&args[2], &config)));
+            let instance = Arc::new(open(&args[2], &config));
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("chibidb server listening on {addr}");
             server::serve(instance, listener).await
@@ -53,10 +53,10 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
-async fn repl(mut instance: Instance) -> std::io::Result<()> {
+async fn repl(instance: Instance) -> std::io::Result<()> {
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
-    run_repl(&mut instance, stdin, &mut stdout).await?;
+    run_repl(&instance, stdin, &mut stdout).await?;
     if let Err(e) = instance.flush() {
         eprintln!("error: flush failed: {e}");
     }

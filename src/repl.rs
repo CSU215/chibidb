@@ -7,7 +7,7 @@ use crate::render::write_result;
 use crate::trx::Session;
 
 pub async fn run_repl(
-    instance: &mut Instance,
+    instance: &Instance,
     mut input: impl AsyncBufRead + Unpin,
     output: &mut (impl AsyncWrite + Unpin),
 ) -> io::Result<()> {

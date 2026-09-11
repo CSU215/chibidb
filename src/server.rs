@@ -3,18 +3,18 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 
 use crate::instance::Instance;
 use crate::protocol::{Protocol, TextProtocol};
 use crate::trx::Session;
 
-pub type SharedInstance = Arc<Mutex<Instance>>;
+pub type SharedInstance = Arc<Instance>;
 
 /// Accepts connections until the listener is closed.
 ///
-/// Statement execution happens under the instance lock; concurrent sessions
-/// are serialized on writes and reads alike (single-writer model).
+/// Each connection runs on its own tokio task; statement execution takes the
+/// target database's lock inside `Instance` (different databases run in
+/// parallel, the same database serializes).
 pub async fn serve(instance: SharedInstance, listener: TcpListener) -> io::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -33,14 +33,14 @@ async fn handle_conn(instance: SharedInstance, stream: TcpStream) -> io::Result<
     let mut session = Session::new();
     let result = serve_session(&instance, stream, &mut session).await;
     // roll back any open transaction when the session goes away
-    if let Err(e) = instance.lock().await.rollback_session(&mut session) {
+    if let Err(e) = instance.rollback_session(&mut session) {
         eprintln!("connection cleanup error: {e}");
     }
     result
 }
 
 async fn serve_session(
-    instance: &SharedInstance,
+    instance: &Instance,
     stream: TcpStream,
     session: &mut Session,
 ) -> io::Result<()> {
@@ -60,7 +60,7 @@ async fn serve_session(
                     break;
                 }
                 let mut out = Vec::new();
-                match instance.lock().await.execute_with(session, sql) {
+                match instance.execute_with(session, sql) {
                     Ok(results) => protocol.encode_success(&results, &mut out),
                     Err(e) => protocol.encode_failure(&e.to_string(), &mut out),
                 }
