@@ -809,7 +809,7 @@ fn run_plan(
     plan: &mut dyn crate::exec::operator::PhysicalOperator,
     out: &mut Vec<Vec<Value>>,
 ) -> Result<()> {
-    let mut ctx = crate::exec::operator::ExecContext { db, session };
+    let mut ctx = crate::exec::operator::ExecContext { db, trx: session.trx(), outer: None };
     plan.open(&mut ctx)?;
     while let Some(row) = plan.next(&mut ctx)? {
         out.push(row);

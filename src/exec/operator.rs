@@ -7,7 +7,6 @@ use crate::storage::codec::decode_record;
 use crate::storage::engine::{HeapEngine, RowScanner, TableEngine};
 use crate::storage::heap::HeapFile;
 use crate::storage::Rid;
-use crate::trx::Session;
 use crate::value::Value;
 use crate::{Database, Error, Result};
 
@@ -15,11 +14,13 @@ use super::aggregate::{expr_has_aggregate, sort_rows};
 use super::eval::{eval_const, EvalCtx};
 use super::subquery::{eval_bound, eval_predicate_bound};
 
-/// Context threaded through operators: the database plus the session whose
-/// active transaction supplies MVCC visibility.
+/// Context threaded through operators: the database, the session's active
+/// transaction, and the outer row/group context when this plan runs as a
+/// correlated subquery.
 pub struct ExecContext<'a> {
-    pub db: &'a mut Database,
-    pub session: &'a mut Session,
+    pub(crate) db: &'a mut Database,
+    pub(crate) trx: &'a mut crate::trx::TrxState,
+    pub(crate) outer: Option<&'a EvalCtx<'a>>,
 }
 
 /// Volcano-style physical operator: `open`, repeated `next`, `close`.
@@ -77,7 +78,7 @@ impl PhysicalOperator for TableScan {
                     None => return Ok(None),
                 }
             };
-            if ctx.session.trx().visible(creator, deleter) {
+            if ctx.trx.visible(creator, deleter) {
                 return Ok(Some(row));
             }
         }
@@ -153,11 +154,11 @@ impl PhysicalOperator for Filter {
             };
             if eval_predicate_bound(
                 ctx.db,
-                ctx.session.trx(),
+                ctx.trx,
                 &self.predicate,
                 self.child.schema(),
                 &row,
-                None,
+                ctx.outer,
             )? {
                 return Ok(Some(row));
             }
@@ -201,10 +202,11 @@ impl PhysicalOperator for Project {
         let Some(row) = self.child.next(ctx)? else {
             return Ok(None);
         };
-        let eval_ctx = EvalCtx::row(self.child.schema(), &row);
+        let mut eval_ctx = EvalCtx::row(self.child.schema(), &row);
+        eval_ctx.parent = ctx.outer;
         let mut out = Vec::with_capacity(self.exprs.len());
         for expr in &self.exprs {
-            out.push(eval_bound(ctx.db, ctx.session.trx(), expr, Some(&eval_ctx))?);
+            out.push(eval_bound(ctx.db, ctx.trx, expr, Some(&eval_ctx))?);
         }
         Ok(Some(out))
     }
@@ -339,8 +341,8 @@ impl PhysicalOperator for Sort {
         let schema = self.child.schema().clone();
         sort_rows(
             ctx.db,
-            ctx.session.trx(),
-            None,
+            ctx.trx,
+            ctx.outer,
             &schema,
             &mut rows,
             &self.order_by,
@@ -411,8 +413,8 @@ impl PhysicalOperator for GroupBy {
         let schema = self.child.schema().clone();
         let rows = super::aggregate::grouped_select_rows(
             ctx.db,
-            ctx.session.trx(),
-            None,
+            ctx.trx,
+            ctx.outer,
             &schema,
             &self.select,
             filtered,
@@ -470,7 +472,7 @@ impl NestedLoopJoin {
         match &self.condition {
             None => Ok(true),
             Some(condition) => {
-                eval_predicate_bound(ctx.db, ctx.session.trx(), condition, &self.schema, row, None)
+                eval_predicate_bound(ctx.db, ctx.trx, condition, &self.schema, row, ctx.outer)
             }
         }
     }
@@ -720,7 +722,7 @@ impl HashJoin {
         match &self.residual {
             None => Ok(true),
             Some(predicate) => {
-                eval_predicate_bound(ctx.db, ctx.session.trx(), predicate, &self.schema, row, None)
+                eval_predicate_bound(ctx.db, ctx.trx, predicate, &self.schema, row, ctx.outer)
             }
         }
     }
@@ -744,7 +746,7 @@ impl PhysicalOperator for HashJoin {
             let mut table: HashMap<Vec<Vec<u8>>, Vec<usize>> = HashMap::new();
             for (i, left) in left_rows.iter().enumerate() {
                 let key =
-                    encode_join_key(&self.left_keys, &left_schema, left, ctx.db, ctx.session.trx())?;
+                    encode_join_key(&self.left_keys, &left_schema, left, ctx.db, ctx.trx)?;
                 if let Some(key) = key {
                     table.entry(key).or_default().push(i);
                 }
@@ -755,7 +757,7 @@ impl PhysicalOperator for HashJoin {
                     &right_schema,
                     right,
                     ctx.db,
-                    ctx.session.trx(),
+                    ctx.trx,
                 )?;
                 let mut matched = false;
                 if let Some(indices) = key.as_ref().and_then(|k| table.get(k)) {
@@ -782,7 +784,7 @@ impl PhysicalOperator for HashJoin {
                     &right_schema,
                     right,
                     ctx.db,
-                    ctx.session.trx(),
+                    ctx.trx,
                 )?;
                 if let Some(key) = key {
                     table.entry(key).or_default().push(i);
@@ -790,7 +792,7 @@ impl PhysicalOperator for HashJoin {
             }
             for left in &left_rows {
                 let key =
-                    encode_join_key(&self.left_keys, &left_schema, left, ctx.db, ctx.session.trx())?;
+                    encode_join_key(&self.left_keys, &left_schema, left, ctx.db, ctx.trx)?;
                 let mut matched = false;
                 if let Some(indices) = key.as_ref().and_then(|k| table.get(k)) {
                     for &i in indices {
@@ -889,8 +891,8 @@ impl PhysicalOperator for Union {
         if !self.order_by.is_empty() {
             super::sort_projected(
                 ctx.db,
-                ctx.session.trx(),
-                None,
+                ctx.trx,
+                ctx.outer,
                 &columns,
                 &mut rows,
                 &self.order_by,
@@ -982,7 +984,7 @@ impl PhysicalOperator for IndexScan {
             self.pos += 1;
             let record = HeapFile::at(self.heap_file).get(&mut ctx.db.pool, rid)?;
             let (creator, deleter, row) = decode_record(&record)?;
-            if ctx.session.trx().visible(creator, deleter) {
+            if ctx.trx.visible(creator, deleter) {
                 return Ok(Some(row));
             }
         }
