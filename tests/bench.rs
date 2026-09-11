@@ -87,3 +87,24 @@ fn index_vs_full_scan() {
         20,
     );
 }
+
+/// Baseline throughput of the current materialized executor. The volcano/chunk
+/// operators added in P5 must be measured against these numbers.
+#[test]
+#[ignore = "micro-benchmark; run with --ignored --nocapture"]
+fn materialized_execution_baseline() {
+    let mut db = build();
+    println!("rows: {N}");
+    let cases: [(&str, &str, u32); 4] = [
+        ("scan+project", "select id, tag from t;", 3),
+        ("filter tag = 3", "select id from t where tag = 3;", 10),
+        ("count(*)", "select count(*) from t;", 5),
+        ("group by tag", "select tag, count(*) from t group by tag;", 5),
+    ];
+    for (label, sql, iterations) in cases {
+        let elapsed = per_op(iterations, || {
+            db.execute_sql(sql).unwrap();
+        });
+        println!("{label:<18} {elapsed:>12?}");
+    }
+}
