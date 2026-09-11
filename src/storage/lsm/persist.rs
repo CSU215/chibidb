@@ -23,6 +23,9 @@ const MANIFEST_TMP: &str = "MANIFEST.tmp";
 const MANIFEST_MAGIC: [u8; 8] = *b"LSMMF001";
 const SSTABLE_SUFFIX: &str = ".sst";
 
+/// Default number of live SSTables that triggers an automatic compaction.
+pub const DEFAULT_COMPACTION_TRIGGER: usize = 4;
+
 /// A durable LSM store rooted at one directory.
 pub struct PersistentLsm {
     dir: PathBuf,
@@ -30,12 +33,23 @@ pub struct PersistentLsm {
     /// Live table file numbers, oldest first.
     sstable_files: Vec<u32>,
     next_file_no: u32,
+    /// Compact once this many tables are live (a small tiered-0 policy).
+    compaction_trigger: usize,
 }
 
 impl PersistentLsm {
     /// Opens (or creates) the store, restoring the tables named by the
     /// manifest. Any extra files on disk are ignored.
     pub fn open(dir: &Path, block_size: usize) -> Result<Self> {
+        Self::open_with_trigger(dir, block_size, DEFAULT_COMPACTION_TRIGGER)
+    }
+
+    /// Like [`PersistentLsm::open`] but with an explicit compaction trigger.
+    pub fn open_with_trigger(
+        dir: &Path,
+        block_size: usize,
+        compaction_trigger: usize,
+    ) -> Result<Self> {
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::Runtime(format!("cannot create {}: {e}", dir.display())))?;
         let sstable_files = read_manifest(dir)?;
@@ -46,7 +60,13 @@ impl PersistentLsm {
             store.add_sstable(SSTable::parse(bytes)?);
         }
         let next_file_no = sstable_files.iter().copied().max().unwrap_or(0) + 1;
-        Ok(Self { dir: dir.to_path_buf(), store, sstable_files, next_file_no })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            store,
+            sstable_files,
+            next_file_no,
+            compaction_trigger: compaction_trigger.max(2),
+        })
     }
 
     pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
@@ -90,6 +110,10 @@ impl PersistentLsm {
         self.next_file_no += 1;
         self.store.add_sstable(SSTable::parse(image)?);
         self.store.reset_memtable();
+        // bound read amplification by merging once too many tables pile up
+        if self.sstable_files.len() >= self.compaction_trigger {
+            self.compact()?;
+        }
         Ok(())
     }
 

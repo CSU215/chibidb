@@ -67,6 +67,8 @@ pub struct StorageConfig {
     pub buffer_pool_frames: usize,
     pub double_write: bool,
     pub inline_lob_limit: usize,
+    /// Live SSTable count that triggers an automatic LSM compaction.
+    pub lsm_compaction_trigger: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -120,6 +122,7 @@ impl Default for StorageConfig {
             buffer_pool_frames: 64,
             double_write: false,
             inline_lob_limit: 4096,
+            lsm_compaction_trigger: 4,
         }
     }
 }

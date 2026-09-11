@@ -56,7 +56,8 @@ fn newest_value_wins_after_reopen() {
 fn compaction_merges_files_and_removes_old_ones() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut lsm = PersistentLsm::open(dir.path(), 128).unwrap();
+        // a high trigger keeps auto-compaction out of the way of this test
+        let mut lsm = PersistentLsm::open_with_trigger(dir.path(), 128, 100).unwrap();
         for round in 0..4u32 {
             for i in 0..20 {
                 lsm.put(

@@ -29,7 +29,20 @@ impl LsmEngine {
     /// Opens (or creates) the LSM directory and resumes the row-id counter
     /// after the largest key already stored.
     pub fn open(dir: &Path, block_size: usize) -> Result<Self> {
-        let lsm = PersistentLsm::open(dir, block_size)?;
+        Self::open_with_trigger(
+            dir,
+            block_size,
+            crate::storage::lsm::persist::DEFAULT_COMPACTION_TRIGGER,
+        )
+    }
+
+    /// Like [`LsmEngine::open`] but with an explicit compaction trigger.
+    pub fn open_with_trigger(
+        dir: &Path,
+        block_size: usize,
+        compaction_trigger: usize,
+    ) -> Result<Self> {
+        let lsm = PersistentLsm::open_with_trigger(dir, block_size, compaction_trigger)?;
         let mut max_id = 0u64;
         for (key, _) in lsm.iter()? {
             if let Ok(bytes) = <[u8; 8]>::try_from(key.as_slice()) {

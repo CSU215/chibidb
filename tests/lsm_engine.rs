@@ -70,10 +70,38 @@ fn lsm_engine_flushed_data_survives_a_reopen() {
 }
 
 #[test]
+fn lsm_auto_compaction_bounds_the_table_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let bp = pool();
+    let engine = LsmEngine::open_with_trigger(dir.path(), 128, 3).unwrap();
+
+    for round in 0..6u32 {
+        for i in 0..10 {
+            let data = encode_record_inline(round, 0, &[Value::Int(i)]);
+            engine.insert(&bp, &data).unwrap();
+        }
+        engine.flush().unwrap();
+        assert!(
+            engine.num_sstables() < 3,
+            "live tables {} exceeded the trigger",
+            engine.num_sstables()
+        );
+    }
+
+    let mut scanner = engine.scan(&bp).unwrap();
+    let mut count = 0;
+    while scanner.next(&bp).unwrap().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 60);
+}
+
+#[test]
 fn lsm_engine_compaction_preserves_values() {
     let dir = tempfile::tempdir().unwrap();
     let bp = pool();
-    let engine = LsmEngine::open(dir.path(), 128).unwrap();
+    // a high trigger keeps auto-compaction out of the way of this test
+    let engine = LsmEngine::open_with_trigger(dir.path(), 128, 100).unwrap();
 
     let mut rows = Vec::new();
     for round in 0..4u32 {

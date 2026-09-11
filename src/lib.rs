@@ -201,7 +201,7 @@ impl Database {
                     }
                     EngineKind::Lsm => {
                         let dir = tables_dir.join(format!("{:06}.lsm", meta.file_no));
-                        let engine = LsmEngine::open(&dir, LSM_BLOCK_SIZE)?;
+                        let engine = LsmEngine::open_with_trigger(&dir, LSM_BLOCK_SIZE, config.storage.lsm_compaction_trigger)?;
                         (HeapStore { file: LSM_FILE_ID, file_no: meta.file_no }, Arc::new(engine))
                     }
                 };
@@ -854,7 +854,11 @@ impl Database {
             }
             EngineKind::Lsm => {
                 let dir = self.data_dir.join("tables").join(format!("{file_no:06}.lsm"));
-                let engine = LsmEngine::open(&dir, LSM_BLOCK_SIZE)?;
+                let engine = LsmEngine::open_with_trigger(
+                    &dir,
+                    LSM_BLOCK_SIZE,
+                    self.config.storage.lsm_compaction_trigger,
+                )?;
                 Ok((HeapStore { file: LSM_FILE_ID, file_no }, Arc::new(engine)))
             }
         }
