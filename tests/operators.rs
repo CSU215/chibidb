@@ -136,6 +136,31 @@ fn joins_build_an_operator_plan() {
 }
 
 #[test]
+fn representative_selects_all_build_plans() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int, tag int);").unwrap();
+    db.execute_sql("create index idx on t (id);").unwrap();
+
+    for sql in [
+        "select 1;",
+        "select id from t;",
+        "select id, tag from t where id = 1;",
+        "select distinct tag from t;",
+        "select id from t order by id desc;",
+        "select count(*), sum(id) from t;",
+        "select tag, count(*) from t group by tag having count(*) > 1;",
+        "select id from t order by id limit 2 offset 1;",
+        "select a.id from t a, t b where a.id = b.id;",
+        "select id from t union select id from t;",
+        "select id from t where id in (select id from t);",
+        "select (select max(id) from t) as m from t;",
+    ] {
+        let select = parse_select(sql);
+        assert!(build_select(&mut db, &select).unwrap().is_some(), "{sql}");
+    }
+}
+
+#[test]
 fn unions_build_an_operator_plan() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int);").unwrap();
