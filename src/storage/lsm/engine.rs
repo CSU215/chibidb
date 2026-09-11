@@ -1,0 +1,137 @@
+//! An LSM-backed [`TableStorage`].
+//!
+//! Rows are keyed by an internal, monotonically increasing id that maps to a
+//! [`Rid`], so the versioned-record format (`creator`, `deleter`, row bytes)
+//! and every caller of the storage seam stay exactly as for the heap. The LSM
+//! store is only a different physical layout for the same records.
+
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use parking_lot::Mutex;
+
+use crate::storage::buffer::BufferPool;
+use crate::storage::engine::{RowScanner, TableEngine, TableStorage};
+use crate::storage::heap::Rid;
+use crate::storage::lsm::persist::PersistentLsm;
+use crate::storage::page::FileId;
+use crate::{Error, Result};
+
+/// Reserved file id reported for LSM tables (they have no heap file).
+pub const LSM_FILE_ID: FileId = u32::MAX;
+
+pub struct LsmEngine {
+    inner: Mutex<PersistentLsm>,
+    next_rid: AtomicU64,
+}
+
+impl LsmEngine {
+    /// Opens (or creates) the LSM directory and resumes the row-id counter
+    /// after the largest key already stored.
+    pub fn open(dir: &Path, block_size: usize) -> Result<Self> {
+        let lsm = PersistentLsm::open(dir, block_size)?;
+        let mut max_id = 0u64;
+        for (key, _) in lsm.iter()? {
+            if let Ok(bytes) = <[u8; 8]>::try_from(key.as_slice()) {
+                max_id = max_id.max(u64::from_be_bytes(bytes));
+            }
+        }
+        Ok(Self { inner: Mutex::new(lsm), next_rid: AtomicU64::new(max_id + 1) })
+    }
+
+    /// Flushes the memtable to a new SSTable.
+    pub fn flush(&self) -> Result<()> {
+        self.inner.lock().flush()
+    }
+
+    /// Merges every SSTable into one.
+    pub fn compact(&self) -> Result<()> {
+        self.inner.lock().compact()
+    }
+
+    pub fn num_sstables(&self) -> usize {
+        self.inner.lock().num_sstables()
+    }
+}
+
+impl std::fmt::Debug for LsmEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LsmEngine").finish_non_exhaustive()
+    }
+}
+
+impl TableEngine for LsmEngine {
+    fn scan(&self, _bp: &BufferPool) -> Result<Box<dyn RowScanner>> {
+        let lsm = self.inner.lock();
+        let mut rows = Vec::new();
+        for (key, value) in lsm.iter()? {
+            let Ok(bytes) = <[u8; 8]>::try_from(key.as_slice()) else {
+                continue;
+            };
+            rows.push((id_to_rid(u64::from_be_bytes(bytes)), value));
+        }
+        Ok(Box::new(VecScanner { rows: rows.into_iter() }))
+    }
+
+    fn get(&self, _bp: &BufferPool, rid: Rid) -> Result<Vec<u8>> {
+        self.inner
+            .lock()
+            .get(&rid_key(rid))?
+            .ok_or_else(|| Error::Runtime(format!("no record at {rid:?}")))
+    }
+}
+
+impl TableStorage for LsmEngine {
+    fn insert(&self, _bp: &BufferPool, record: &[u8]) -> Result<Rid> {
+        let id = self.next_rid.fetch_add(1, Ordering::SeqCst);
+        let rid = id_to_rid(id);
+        self.inner.lock().put(rid_key(rid), record.to_vec());
+        Ok(rid)
+    }
+
+    fn delete(&self, _bp: &BufferPool, rid: Rid) -> Result<()> {
+        self.inner.lock().delete(rid_key(rid));
+        Ok(())
+    }
+
+    fn delete_mark(&self, _bp: &BufferPool, rid: Rid, deleter: u32) -> Result<u32> {
+        let mut lsm = self.inner.lock();
+        let key = rid_key(rid);
+        let mut record = lsm
+            .get(&key)?
+            .ok_or_else(|| Error::Runtime(format!("no record at {rid:?}")))?;
+        if record.len() < 8 {
+            return Err(Error::Runtime("record lacks mvcc fields".into()));
+        }
+        let previous = u32::from_le_bytes(record[4..8].try_into().unwrap());
+        record[4..8].copy_from_slice(&deleter.to_le_bytes());
+        lsm.put(key, record);
+        Ok(previous)
+    }
+
+    fn file_id(&self) -> FileId {
+        LSM_FILE_ID
+    }
+}
+
+/// A scanner over an already-materialized set of rows.
+struct VecScanner {
+    rows: std::vec::IntoIter<(Rid, Vec<u8>)>,
+}
+
+impl RowScanner for VecScanner {
+    fn next(&mut self, _bp: &BufferPool) -> Result<Option<(Rid, Vec<u8>)>> {
+        Ok(self.rows.next())
+    }
+}
+
+/// Packs a row id into a `Rid` (16 bits of slot per page number).
+fn id_to_rid(id: u64) -> Rid {
+    Rid { page_no: (id >> 16) as u32, slot: (id & 0xffff) as u16 }
+}
+
+/// The LSM key for a row: big-endian so lexicographic order follows the id.
+fn rid_key(rid: Rid) -> Vec<u8> {
+    let id = ((rid.page_no as u64) << 16) | rid.slot as u64;
+    id.to_be_bytes().to_vec()
+}
