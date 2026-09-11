@@ -115,7 +115,7 @@ impl Stage for OptimizeStage {
     ) -> Result<()> {
         if let Stmt::Select(select) = event.stmt {
             event.plan = Some(crate::exec::plan::plan_select(db, select)?);
-            event.physical = crate::exec::operator::build_simple_select(db, select)?;
+            event.physical = crate::exec::operator::build_select(db, select)?;
         }
         Ok(())
     }

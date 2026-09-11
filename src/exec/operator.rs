@@ -80,6 +80,42 @@ impl PhysicalOperator for TableScan {
     }
 }
 
+/// Produces exactly one empty tuple, for SELECTs without a FROM clause.
+#[derive(Default)]
+pub struct ConstantScan {
+    schema: Schema,
+    done: bool,
+}
+
+impl ConstantScan {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl PhysicalOperator for ConstantScan {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn open(&mut self, _ctx: &mut ExecContext<'_>) -> Result<()> {
+        self.done = false;
+        Ok(())
+    }
+
+    fn next(&mut self, _ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        Ok(Some(Vec::new()))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Drops rows whose predicate does not evaluate to true.
 pub struct Filter {
     child: Box<dyn PhysicalOperator>,
@@ -221,6 +257,44 @@ impl PhysicalOperator for Limit {
     }
 }
 
+/// Keeps the first occurrence of each row; NULLs compare equal, matching the
+/// materialized `distinct` semantics.
+pub struct Distinct {
+    child: Box<dyn PhysicalOperator>,
+    seen: Vec<Vec<Value>>,
+}
+
+impl Distinct {
+    pub fn new(child: Box<dyn PhysicalOperator>) -> Self {
+        Self { child, seen: Vec::new() }
+    }
+}
+
+impl PhysicalOperator for Distinct {
+    fn schema(&self) -> &Schema {
+        self.child.schema()
+    }
+
+    fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
+        self.seen.clear();
+        self.child.open(ctx)
+    }
+
+    fn next(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
+        while let Some(row) = self.child.next(ctx)? {
+            if !self.seen.iter().any(|seen| seen == &row) {
+                self.seen.push(row.clone());
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.child.close()
+    }
+}
+
 /// Index scan: fetches exactly the row ids the access path selected.
 pub struct IndexScan {
     schema: Schema,
@@ -276,20 +350,48 @@ impl PhysicalOperator for IndexScan {
     }
 }
 
-/// Builds a physical plan for a single-table SELECT covering selection,
-/// projection and limit. Returns `None` for shapes the operators do not
-/// handle yet (joins, aggregates, ordering, distinct, set ops, views).
-pub fn build_simple_select(
+/// Builds a physical plan for a SELECT. Returns `None` for any shape the
+/// operators do not cover yet, leaving the materialized executor as fallback.
+pub fn build_select(
     db: &mut Database,
     select: &SelectStmt,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
-    if !simple_select_shape(select) {
+    // set operations, grouping and ordering are not covered yet
+    if !select.set_ops.is_empty()
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || !select.order_by.is_empty()
+    {
+        return Ok(None);
+    }
+
+    // no FROM: a single projected tuple (distinct/order/limit are ignored by
+    // the materialized path here, so we match that)
+    if select.from.is_empty() {
+        if select.items.iter().any(|it| matches!(it, SelectItem::Star)) {
+            return Ok(None);
+        }
+        let (exprs, headers) = projection_exprs(&select.items);
+        let plan = Project::new(Box::new(ConstantScan::new()), exprs, headers);
+        return Ok(Some(Box::new(plan)));
+    }
+
+    // joins are not covered yet
+    if select.from.len() != 1 {
         return Ok(None);
     }
     let table = &select.from[0].name;
     if db.catalog().view(table).is_some() {
         return Ok(None);
     }
+    // aggregation is not covered yet
+    if select.items.iter().any(|item| match item {
+        SelectItem::Expr(e) | SelectItem::Aliased(e, _) => expr_has_aggregate(e),
+        SelectItem::Star => false,
+    }) {
+        return Ok(None);
+    }
+
     let mut op: Box<dyn PhysicalOperator> =
         match IndexScan::new(db, table, select.selection.as_ref())? {
             Some(scan) => Box::new(scan),
@@ -300,6 +402,9 @@ pub fn build_simple_select(
     }
     let (exprs, headers) = projection(db, table, &select.items)?;
     op = Box::new(Project::new(op, exprs, headers));
+    if select.distinct {
+        op = Box::new(Distinct::new(op));
+    }
     if let Some(limit) = &select.limit {
         let offset = limit_bound(limit.offset.as_ref())?;
         let count = limit_bound(Some(&limit.count))?;
@@ -308,20 +413,23 @@ pub fn build_simple_select(
     Ok(Some(op))
 }
 
-fn simple_select_shape(select: &SelectStmt) -> bool {
-    if !select.set_ops.is_empty()
-        || select.from.len() != 1
-        || !select.group_by.is_empty()
-        || select.having.is_some()
-        || select.distinct
-        || !select.order_by.is_empty()
-    {
-        return false;
+fn projection_exprs(items: &[SelectItem]) -> (Vec<Expr>, Vec<String>) {
+    let mut exprs = Vec::new();
+    let mut headers = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Expr(e) => {
+                headers.push(e.to_string());
+                exprs.push(e.clone());
+            }
+            SelectItem::Aliased(e, alias) => {
+                headers.push(alias.clone());
+                exprs.push(e.clone());
+            }
+            SelectItem::Star => unreachable!("star is rejected before projection"),
+        }
     }
-    !select.items.iter().any(|item| match item {
-        SelectItem::Expr(e) | SelectItem::Aliased(e, _) => expr_has_aggregate(e),
-        SelectItem::Star => false,
-    })
+    (exprs, headers)
 }
 
 fn projection(db: &Database, table: &str, items: &[SelectItem]) -> Result<(Vec<Expr>, Vec<String>)> {
