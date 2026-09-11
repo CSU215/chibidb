@@ -1,12 +1,10 @@
 use crate::ast::{BinOp, Expr, UnOp};
 use crate::catalog::Schema;
-use crate::result::ResultSet;
 use crate::trx::TrxState;
 use crate::value::Value;
 use crate::{Database, Error, Result};
 
 use super::eval::{eval, expr_has_subquery, EvalCtx};
-use super::execute_select;
 
 /// Replaces every subquery in `e` with the literal value it evaluates to,
 /// executing it against `outer` so correlated references resolve. The
@@ -146,8 +144,20 @@ fn run_subquery(
     sub: &crate::ast::SelectStmt,
     outer: Option<&EvalCtx>,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-    match execute_select(db, trx, sub, outer)? {
-        ResultSet::Rows { columns, rows } => Ok((columns, rows)),
-        ResultSet::Message(_) => Err(Error::Runtime("subquery must be a select".into())),
+    let Some(mut plan) = crate::exec::operator::build_select(db, sub)? else {
+        return Err(Error::Runtime(
+            "subquery shape is not supported by the operators".into(),
+        ));
+    };
+    let columns: Vec<String> = plan.schema().columns.iter().map(|c| c.name.clone()).collect();
+    let mut rows = Vec::new();
+    {
+        let mut ctx = crate::exec::operator::ExecContext { db, trx, outer };
+        plan.open(&mut ctx)?;
+        while let Some(row) = plan.next(&mut ctx)? {
+            rows.push(row);
+        }
+        plan.close()?;
     }
+    Ok((columns, rows))
 }
