@@ -70,7 +70,58 @@ impl Instance {
         if !meta.table_exists("databases") {
             meta.execute_sql("create table databases (name char(64) primary key);")?;
         }
+        if !meta.table_exists("users") {
+            meta.execute_sql(
+                "create table users (name char(64) primary key, password char(128) not null);",
+            )?;
+        }
         Ok(())
+    }
+
+    /// Creates a user, storing only a salted hash of the password.
+    pub fn create_user(&mut self, name: &str, password: &str) -> Result<()> {
+        validate_ident(name, "user name")?;
+        if self.user_exists(name)? {
+            return Err(Error::Runtime(format!("user already exists: {name}")));
+        }
+        let hash = hash_password(password);
+        self.meta_mut()?
+            .execute_sql(&format!("insert into users values ('{name}', '{hash}');"))?;
+        Ok(())
+    }
+
+    pub fn drop_user(&mut self, name: &str) -> Result<()> {
+        validate_ident(name, "user name")?;
+        if !self.user_exists(name)? {
+            return Err(Error::Runtime(format!("no such user: {name}")));
+        }
+        self.meta_mut()?
+            .execute_sql(&format!("delete from users where name = '{name}';"))?;
+        Ok(())
+    }
+
+    /// True when `password` matches the stored hash for `name`.
+    pub fn authenticate(&mut self, name: &str, password: &str) -> Result<bool> {
+        let result = self
+            .meta_mut()?
+            .execute_sql(&format!("select password from users where name = '{name}';"))?;
+        let stored = match result.into_iter().next() {
+            Some(ResultSet::Rows { mut rows, .. }) if !rows.is_empty() => {
+                match rows.remove(0).into_iter().next() {
+                    Some(Value::Str(hash)) => hash,
+                    _ => return Ok(false),
+                }
+            }
+            _ => return Ok(false),
+        };
+        Ok(verify_password(password, &stored))
+    }
+
+    fn user_exists(&mut self, name: &str) -> Result<bool> {
+        let result = self
+            .meta_mut()?
+            .execute_sql(&format!("select name from users where name = '{name}';"))?;
+        Ok(matches!(result.into_iter().next(), Some(ResultSet::Rows { rows, .. }) if !rows.is_empty()))
     }
 
     /// Names of registered databases, sorted. The `databases` system table is
@@ -231,10 +282,41 @@ fn validate_name(name: &str) -> Result<()> {
     if name == META_DIR {
         return Err(Error::Runtime(format!("database name is reserved: {name}")));
     }
+    validate_ident(name, "database name")
+}
+
+fn validate_ident(name: &str, what: &str) -> Result<()> {
     let valid = !name.is_empty()
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if !valid {
-        return Err(Error::Runtime(format!("invalid database name: {name}")));
+        return Err(Error::Runtime(format!("invalid {what}: {name}")));
     }
     Ok(())
+}
+
+/// Hashes `password` with a random 64-bit salt; stored as `salt$sha256`.
+fn hash_password(password: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::hash::{BuildHasher, Hasher};
+
+    let salt = std::hash::RandomState::new().build_hasher().finish();
+    let mut hasher = Sha256::new();
+    hasher.update(salt.to_le_bytes());
+    hasher.update(password.as_bytes());
+    format!("{salt:016x}${:x}", hasher.finalize())
+}
+
+fn verify_password(password: &str, stored: &str) -> bool {
+    use sha2::{Digest, Sha256};
+
+    let Some((salt_hex, expected)) = stored.split_once('$') else {
+        return false;
+    };
+    let Ok(salt) = u64::from_str_radix(salt_hex, 16) else {
+        return false;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(salt.to_le_bytes());
+    hasher.update(password.as_bytes());
+    format!("{:x}", hasher.finalize()) == expected
 }
