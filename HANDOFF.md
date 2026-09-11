@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：P5 收官（SELECT 全走算子）；P10 并发/事务设计定稿；下一步 P5.5 DML 算子化；377 tests 全绿、clippy 零警告。
+> 最后更新：P5.5 DML 算子化完成（执行层全算子化）；P10.0 并发/事务设计定稿；下一步 P10.1；378 tests 全绿、clippy 零警告。
 
 ---
 
@@ -72,11 +72,12 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `lexer.rs` | 分词：整数/浮点/字符串/标识符/标点/`--` 注释 | `lex(src) -> Result<Vec<Token>>` |
 | `parser.rs` | 递归下降解析全部 SQL（文法见 §5） | `parse(sql) -> Result<Vec<Stmt>>` |
 | `ast.rs` | AST：`Stmt` / `Expr` / `SelectStmt` / DDL / `TrxCtl` 等 | |
-| `exec/mod.rs` | 执行器入口：语句分发、DDL/DML（`SELECT` 必须走算子计划，此处报错）、`coerce` | `execute(db, trx, stmt)` |
+| `exec/mod.rs` | 执行器入口：语句分发、DDL（`SELECT`/DML 必须走算子计划，此处报错）、`coerce` | `execute(db, trx, stmt)` |
+| `exec/dml.rs` | DML 命令算子：`InsertOp`/`UpdateOp`/`DeleteOp`（`open` 执行写入、`next` 无行、`output_kind = Command`） | |
 | `exec/eval.rs` | 表达式双上下文求值（`EvalCtx` 带父链的 Row/Group 作用域，`resolve_column` 逐层向外）、算子、三值逻辑、LIKE、标量函数、`eval_const` | `eval` / `eval_const` |
 | `exec/aggregate.rs` | 聚合求值、GROUP BY/HAVING、ORDER BY、DISTINCT、LIMIT 的共享逻辑 | `grouped_select_rows` / `sort_rows` / `eval_aggregate` |
 | `exec/plan.rs` | EXPLAIN 计划、规则式索引访问路径（sargable）、同列上下界合并为范围扫、**有序索引扫描判定**（`order_by_matches`）、`plan_index_scan` | `execute_explain` / `plan_index_scan` |
-| `exec/operator.rs` | 火山算子：`PhysicalOperator` + `ExecContext{db,trx,outer}` + `TableScan`/`IndexScan`/`ViewScan`/`ConstantScan`/`Filter`/`Project`/`Distinct`/`Sort`/`GroupBy`/`NestedLoopJoin`/`HashJoin`/`Union`/`Limit`；`build_select`/`build_set_op` 递归建树；`Database::collect_plan` 驱动 | |
+| `exec/operator.rs` | 火山算子：`PhysicalOperator`（`output_kind`）+ `ExecContext{db,trx,outer}` + `TableScan`/`IndexScan`/`ViewScan`/`ConstantScan`/`Filter`/`Project`/`Distinct`/`Sort`/`GroupBy`/`NestedLoopJoin`/`HashJoin`/`Union`/`Limit`；`build_select`/`build_statement` 递归建树；`Database::collect_plan` 驱动 | |
 | `exec/subquery.rs` | 子查询（IN/EXISTS/标量）：按当前外层行构建并运行算子子计划，改写为字面量；`eval_bound`/`eval_predicate_bound` 是接入点 | `bind_expr` |
 | `value.rs` | `Value`：Null/Bool/Int(i64)/Float(f64)/Str/Date(i32 纪元天数)/Text | Display 决定 REPL 输出 |
 | `datetime.rs` | 日期校验：civil-date 算法（Hinnant），`'YYYY-MM-DD'` 比较时隐式转日期 | `parse_date` |
@@ -355,7 +356,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 验收记录（M20–M25 评审）：296 tests 全绿 + clippy 零警告；人工边界复验（跨列同值、DROP TABLE 清约束索引、链式 RIGHT JOIN、ESCAPE 角例、OrderedIndexScan 含 DESC、DML 子查询、恢复路径 `rebuild_indexes` 覆盖约束索引）均通过。**发现并修复 1 处阻断性缺陷**：`check_unique` 的 `claimed` 查重表跨唯一索引共享，同一行两个不同约束列取同值（如 PK 列与 UNIQUE 列同为 1）会被误判 `duplicate key`——红测试复现后按列下标区分修复，见 `abd0dbb`。已知边界（如实记档）：UNION 各臂不做类型统一，混型结果集上比较会报 type mismatch。
 
-提交基线：`c74f157 refactor: remove the materialized SELECT backbone`（HEAD）。
+提交基线：`e620154 feat: execute DML through command operators`（HEAD）。
 
 ---
 
@@ -391,7 +392,7 @@ DML 先算子化（P5.5），使执行层统一走算子。
 | P3 | 单实例多库 + 系统元数据库 + 用户/权限 | 🟡 多库 + 前端接入 + 系统库 `chibi_meta`（`databases`/`users`/`privileges`）+ `CREATE/DROP USER` + `GRANT/REVOKE`（`e99c5ef`…`7d8a85f`）；认证/权限尚未在协议层强制、系统表未以 `information_schema` 暴露 |
 | P4 | Stage 流水线（Parse/Resolve/Optimize/Execute/Result） | 🟡 `ResolveStage`/`OptimizeStage` 落地（`dc312de`）；Parse 仍在 pipeline 外、Execute 尚未消费 `plan`、Result 写出仍在前端 |
 | P5 | 执行模型：基准 → 火山算子 → Chunk | ✅ SELECT 全走算子（单/多表、`HashJoin`、分组聚合、DISTINCT、ORDER、LIMIT、UNION、视图、相关/不相关子查询）；物化 SELECT 主干已删除；Chunk 按评估暂缓 |
-| P5.5 | DML 算子化：`Insert`/`Update`/`Delete` 算子 + 计划构造 | ⬜ |
+| P5.5 | DML 算子化：`Insert`/`Update`/`Delete` 命令算子 | ✅ `InsertOp`/`UpdateOp`/`DeleteOp`（`e620154`） |
 | P6 | 存储引擎抽象落地：Heap + Double-Write Buffer | 🟡 统一文件头（`63ede97`）+ 可配置 DWB（`3daa90b`）；`StorageEngine` trait 待 LSM 阶段再扩（`TableEngine` 读接缝已在 P2 落地） |
 | P7 | LSM 引擎（下一阶段） | ⬜ |
 | P8 | LOB（外存 + `LobReader` 流式） | ⬜ |
