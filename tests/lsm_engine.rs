@@ -70,6 +70,26 @@ fn lsm_engine_flushed_data_survives_a_reopen() {
 }
 
 #[test]
+fn scan_prefers_the_newest_version_across_a_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let bp = pool();
+    // a high trigger keeps the two versions in separate level-0 tables
+    let engine = LsmEngine::open_with_trigger(dir.path(), 256, 100).unwrap();
+
+    let rid = engine.insert(&bp, &encode_record_inline(1, 0, &[Value::Int(10)])).unwrap();
+    engine.flush().unwrap(); // the original version now lives in a table
+
+    // a newer version of the same row lands in the memtable
+    engine.delete_mark(&bp, rid, 9).unwrap();
+
+    let mut scanner = engine.scan(&bp).unwrap();
+    let (seen, rec) = scanner.next(&bp).unwrap().unwrap();
+    assert_eq!(seen, rid, "the same row id must appear only once");
+    assert_eq!(rec, encode_record_inline(1, 9, &[Value::Int(10)]));
+    assert!(scanner.next(&bp).unwrap().is_none());
+}
+
+#[test]
 fn lsm_auto_compaction_bounds_the_table_count() {
     let dir = tempfile::tempdir().unwrap();
     let bp = pool();

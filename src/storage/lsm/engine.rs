@@ -96,12 +96,12 @@ impl std::fmt::Debug for LsmEngine {
 
 impl TableEngine for LsmEngine {
     fn scan(&self, _bp: &BufferPool) -> Result<Box<dyn RowScanner>> {
-        // snapshot under the lock, then stream without holding it
-        let (mem, mut sstables) = {
+        // snapshot under the lock, then stream without holding it; `snapshot`
+        // already yields the tables newest first
+        let (mem, sstables) = {
             let lsm = self.inner.lock();
             lsm.snapshot()
         };
-        sstables.reverse(); // newest first
         let merge = MergeScanner::new(mem, sstables)?;
         Ok(Box::new(LsmScanner { merge }))
     }
