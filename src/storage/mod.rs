@@ -10,7 +10,7 @@ pub mod lsm;
 pub mod page;
 pub mod slotted;
 
-pub use buffer::BufferPool;
+pub use buffer::{BufferPool, PoolStats};
 pub use disk::DiskManager;
 pub use heap::{HeapFile, Rid};
 pub use lob::{LobId, LobReader, LobStore};

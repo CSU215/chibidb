@@ -291,6 +291,11 @@ impl Database {
         &self.config
     }
 
+    /// Buffer-pool lookup counters, for observability and cache-behavior tests.
+    pub fn buffer_pool_stats(&self) -> crate::storage::PoolStats {
+        self.pool.stats()
+    }
+
     pub fn flush(&self) -> Result<()> {
         if !self.trx.no_open_transactions() {
             // truncating the log now would drop the open transaction's redo

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -28,12 +28,27 @@ struct PoolState {
     lru: VecDeque<(FileId, PageNo)>,
 }
 
+/// A snapshot of the buffer pool's lookup counters, for observability and
+/// cache-behavior tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolStats {
+    /// Lookups served from a resident frame.
+    pub hits: u64,
+    /// Lookups that had to load a page from disk.
+    pub misses: u64,
+    /// Frames written back to make room for a miss.
+    pub evictions: u64,
+}
+
 /// Thread-safe buffer pool: `&self` methods let readers share the pool while
 /// per-frame latches keep different pages independent.
 pub struct BufferPool {
     disk: Mutex<DiskManager>,
     state: Mutex<PoolState>,
     capacity: usize,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
 }
 
 impl BufferPool {
@@ -42,6 +57,18 @@ impl BufferPool {
             disk: Mutex::new(disk),
             state: Mutex::new(PoolState::default()),
             capacity: capacity.max(1),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        }
+    }
+
+    /// A consistent-enough snapshot of the lookup counters.
+    pub fn stats(&self) -> PoolStats {
+        PoolStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
         }
     }
 
@@ -77,6 +104,7 @@ impl BufferPool {
         let mut state = self.state.lock();
         if let Some(frame) = state.frames.get(&key).cloned() {
             touch(&mut state.lru, key);
+            self.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(frame);
         }
         while state.frames.len() >= self.capacity {
@@ -84,6 +112,7 @@ impl BufferPool {
                 .lru
                 .pop_front()
                 .ok_or_else(|| Error::Runtime("buffer pool exhausted".into()))?;
+            self.evictions.fetch_add(1, Ordering::Relaxed);
             let victim = state
                 .frames
                 .remove(&victim_key)
@@ -98,6 +127,7 @@ impl BufferPool {
         }
         let mut data = zeroed_page();
         self.disk.lock().read_page(file, no, &mut data)?;
+        self.misses.fetch_add(1, Ordering::Relaxed);
         let frame = Arc::new(Frame {
             file,
             no,
