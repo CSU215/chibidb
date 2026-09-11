@@ -27,6 +27,7 @@ pub use result::ResultSet;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -51,15 +52,15 @@ pub struct Database {
     pool: BufferPool,
     wal: Wal,
     data_dir: PathBuf,
-    next_table_file: u32,
-    next_index_file: u32,
-    next_trx_id: u32,
-    committed_trxs: HashSet<u32>,
+    next_table_file: AtomicU32,
+    next_index_file: AtomicU32,
+    next_trx_id: AtomicU32,
+    committed_trxs: RwLock<HashSet<u32>>,
     /// Transactions that have begun but not committed/rolled back yet. The
     /// log must not be truncated while this is non-empty, or a later COMMIT
     /// would lose its redo records.
-    open_trxs: HashSet<u32>,
-    wal_checkpoint_threshold: u64,
+    open_trxs: RwLock<HashSet<u32>>,
+    wal_checkpoint_threshold: AtomicU64,
     _temp: Option<tempfile::TempDir>,
 }
 
@@ -193,24 +194,26 @@ impl Database {
             pool,
             wal: Wal::open(&wal_path)?,
             data_dir: path.to_path_buf(),
-            next_table_file,
-            next_index_file,
-            next_trx_id,
-            committed_trxs,
-            open_trxs: HashSet::new(),
-            wal_checkpoint_threshold: config.wal.checkpoint_threshold,
+            next_table_file: AtomicU32::new(next_table_file),
+            next_index_file: AtomicU32::new(next_index_file),
+            next_trx_id: AtomicU32::new(next_trx_id),
+            committed_trxs: RwLock::new(committed_trxs),
+            open_trxs: RwLock::new(HashSet::new()),
+            wal_checkpoint_threshold: AtomicU64::new(config.wal.checkpoint_threshold),
             _temp: None,
         };
         db.recover_from_wal(&plan, &mut touched)?;
 
         // never hand a crashed transaction's id to a new transaction
-        if plan.max_trx_id >= db.next_trx_id {
-            db.next_trx_id = plan.max_trx_id.saturating_add(1);
+        if plan.max_trx_id >= db.next_trx_id.load(Ordering::SeqCst) {
+            db.next_trx_id.store(plan.max_trx_id.saturating_add(1), Ordering::SeqCst);
         }
-        let committed_repaired =
-            plan.committed_ids.iter().any(|id| !db.committed_trxs.contains(id));
+        let committed_repaired = {
+            let committed = db.committed_trxs.read();
+            plan.committed_ids.iter().any(|id| !committed.contains(id))
+        };
         if committed_repaired {
-            db.committed_trxs.extend(plan.committed_ids);
+            db.committed_trxs.write().extend(plan.committed_ids);
         }
         // persist the repaired committed set so it survives a second crash
         // even if nothing else is written in this session
@@ -225,7 +228,7 @@ impl Database {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        if !self.open_trxs.is_empty() {
+        if !self.open_trxs.read().is_empty() {
             // truncating the log now would drop the open transaction's redo
             // records, so its later COMMIT could not be recovered
             return Err(Error::Runtime(
@@ -249,13 +252,14 @@ impl Database {
     /// open transactions (the VACUUM statement enforces this).
     pub(crate) fn vacuum(&mut self) -> Result<usize> {
         let mut purged = 0;
+        let committed = self.committed_trxs.read().clone();
         let metas = self.catalog().table_metas();
         for meta in metas {
             let ops = self.index_ops(&meta.name)?;
             for (rid, rec) in self.store_scan_raw(&meta.name)? {
                 let (creator, deleter, row) = crate::storage::codec::decode_record(&rec)?;
-                let dead = !self.committed_trxs.contains(&creator)
-                    || (deleter != 0 && self.committed_trxs.contains(&deleter));
+                let dead = !committed.contains(&creator)
+                    || (deleter != 0 && committed.contains(&deleter));
                 if !dead {
                     continue;
                 }
@@ -357,8 +361,8 @@ impl Database {
 
     /// Commit bookkeeping shared by explicit COMMIT and autocommit.
     fn commit_trx(&mut self, trx_id: u32, wrote: bool) -> Result<()> {
-        self.committed_trxs.insert(trx_id);
-        self.open_trxs.remove(&trx_id);
+        self.committed_trxs.write().insert(trx_id);
+        self.open_trxs.write().remove(&trx_id);
         if !wrote {
             // A read-only transaction created no versioned rows, so no future
             // snapshot needs its id and its bookkeeping need not hit disk.
@@ -372,7 +376,9 @@ impl Database {
         self.save_catalog()?;
         // opportunistic checkpoint once the log outgrew its budget and no
         // open transaction is counting on its contents
-        if self.wal.len()? > self.wal_checkpoint_threshold && self.open_trxs.is_empty() {
+        if self.wal.len()? > self.wal_checkpoint_threshold.load(Ordering::Relaxed)
+            && self.open_trxs.read().is_empty()
+        {
             self.flush()?;
         }
         Ok(())
@@ -405,12 +411,13 @@ impl Database {
             && plan.output_kind() == crate::exec::operator::OutputKind::Rows;
         if autocommit {
             if read_only {
-                session.begin_readonly(&self.committed_trxs);
+                let committed = self.committed_snapshot();
+                session.begin_readonly(&committed);
             } else {
-                let id = self.next_trx_id;
-                self.next_trx_id += 1;
-                session.begin(id, &self.committed_trxs, false);
-                self.open_trxs.insert(id);
+                let id = self.alloc_trx_id();
+                let committed = self.committed_snapshot();
+                session.begin(id, &committed, false);
+                self.open_trxs.write().insert(id);
             }
         }
         let mut out = Vec::new();
@@ -423,7 +430,7 @@ impl Database {
             } else {
                 self.rollback_trx(&mut trx)?;
                 if !read_only {
-                    self.open_trxs.remove(&trx.id);
+                    self.open_trxs.write().remove(&trx.id);
                 }
             }
         }
@@ -463,10 +470,10 @@ impl Database {
                 if session.trx.is_some() {
                     return Err(Error::Runtime("transaction already begun".into()));
                 }
-                let id = self.next_trx_id;
-                self.next_trx_id += 1;
-                session.begin(id, &self.committed_trxs, true);
-                self.open_trxs.insert(id);
+                let id = self.alloc_trx_id();
+                let committed = self.committed_snapshot();
+                session.begin(id, &committed, true);
+                self.open_trxs.write().insert(id);
                 Ok(None)
             }
             crate::ast::Stmt::Trx(crate::ast::TrxCtl::Commit) => {
@@ -485,7 +492,7 @@ impl Database {
                 }
                 if let Some(mut trx) = session.trx.take() {
                     self.rollback_trx(&mut trx)?;
-                    self.open_trxs.remove(&trx.id);
+                    self.open_trxs.write().remove(&trx.id);
                 }
                 Ok(None)
             }
@@ -494,12 +501,13 @@ impl Database {
                 let autocommit = session.trx.is_none();
                 if autocommit {
                     if read_only {
-                        session.begin_readonly(&self.committed_trxs);
+                        let committed = self.committed_snapshot();
+                        session.begin_readonly(&committed);
                     } else {
-                        let id = self.next_trx_id;
-                        self.next_trx_id += 1;
-                        session.begin(id, &self.committed_trxs, false);
-                        self.open_trxs.insert(id);
+                        let id = self.alloc_trx_id();
+                        let committed = self.committed_snapshot();
+                        session.begin(id, &committed, false);
+                        self.open_trxs.write().insert(id);
                     }
                 }
                 let mut event = SqlEvent::new(other);
@@ -525,7 +533,7 @@ impl Database {
                             if !autocommit {
                                 session.trx = Some(trx);
                             } else {
-                                self.open_trxs.remove(&trx.id);
+                                self.open_trxs.write().remove(&trx.id);
                             }
                         }
                         Err(e)
@@ -539,19 +547,29 @@ impl Database {
     pub fn rollback_session(&mut self, session: &mut Session) -> Result<()> {
         if let Some(mut trx) = session.trx.take() {
             self.rollback_trx(&mut trx)?;
-            self.open_trxs.remove(&trx.id);
+            self.open_trxs.write().remove(&trx.id);
         }
         Ok(())
     }
 
     /// Whether any session other than `trx_id` has a transaction open.
     pub(crate) fn has_open_trxs_excluding(&self, trx_id: u32) -> bool {
-        self.open_trxs.iter().any(|&id| id != trx_id)
+        self.open_trxs.read().iter().any(|&id| id != trx_id)
     }
 
     /// Overrides the auto-checkpoint log budget in bytes; mainly for tests.
     pub fn set_wal_checkpoint_threshold(&mut self, bytes: u64) {
-        self.wal_checkpoint_threshold = bytes;
+        self.wal_checkpoint_threshold.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Reserves the next transaction id.
+    fn alloc_trx_id(&self) -> u32 {
+        self.next_trx_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// A copy of the committed set, the snapshot a new transaction sees.
+    fn committed_snapshot(&self) -> HashSet<u32> {
+        self.committed_trxs.read().clone()
     }
 
     fn rollback_trx(&mut self, trx: &mut TrxState) -> Result<()> {
@@ -597,8 +615,7 @@ impl Database {
     }
 
     pub(crate) fn new_table_heap(&mut self, _name: &str) -> Result<HeapStore> {
-        let file_no = self.next_table_file;
-        self.next_table_file += 1;
+        let file_no = self.next_table_file.fetch_add(1, Ordering::SeqCst);
         let path = self.data_dir.join("tables").join(format!("{file_no:06}.dbf"));
         let file = self.pool.create_file(&path)?;
         HeapFile::init(&mut self.pool, file)?;
@@ -606,8 +623,7 @@ impl Database {
     }
 
     pub(crate) fn new_index_heap(&mut self, _name: &str) -> Result<IndexStore> {
-        let file_no = self.next_index_file;
-        self.next_index_file += 1;
+        let file_no = self.next_index_file.fetch_add(1, Ordering::SeqCst);
         let path = self.data_dir.join("indexes").join(format!("{file_no:06}.idxf"));
         let file = self.pool.create_file(&path)?;
         BTree::init(&mut self.pool, file)?;
@@ -616,10 +632,10 @@ impl Database {
 
     pub(crate) fn save_catalog(&self) -> Result<()> {
         let snap = CatalogSnapshot {
-            next_table_file: self.next_table_file,
-            next_index_file: self.next_index_file,
-            next_trx_id: self.next_trx_id,
-            committed_trxs: self.committed_trxs.iter().copied().collect(),
+            next_table_file: self.next_table_file.load(Ordering::SeqCst),
+            next_index_file: self.next_index_file.load(Ordering::SeqCst),
+            next_trx_id: self.next_trx_id.load(Ordering::SeqCst),
+            committed_trxs: self.committed_trxs.read().iter().copied().collect(),
             tables: self.catalog().table_metas(),
             indexes: self.catalog().index_metas(),
             views: self.catalog().view_metas(),
@@ -850,25 +866,38 @@ mod tests {
     #[test]
     fn read_only_autocommit_does_not_touch_bookkeeping() {
         let mut db = Database::open_in_memory().unwrap();
-        let before = db.next_trx_id;
+        let before = db.next_trx_id.load(Ordering::SeqCst);
 
         db.execute_sql("select 1;").unwrap();
 
-        assert_eq!(db.next_trx_id, before, "read-only must not allocate a trx id");
-        assert!(db.committed_trxs.is_empty(), "read-only must not join committed");
-        assert!(db.open_trxs.is_empty(), "read-only must not stay open");
+        assert_eq!(
+            db.next_trx_id.load(Ordering::SeqCst),
+            before,
+            "read-only must not allocate a trx id"
+        );
+        assert!(
+            db.committed_trxs.read().is_empty(),
+            "read-only must not join committed"
+        );
+        assert!(db.open_trxs.read().is_empty(), "read-only must not stay open");
     }
 
     #[test]
     fn write_autocommit_registers_its_transaction() {
         let mut db = Database::open_in_memory().unwrap();
         db.execute_sql("create table t (id int);").unwrap();
-        let before = db.next_trx_id;
+        let before = db.next_trx_id.load(Ordering::SeqCst);
 
         db.execute_sql("insert into t values (1);").unwrap();
 
-        assert!(db.next_trx_id > before, "write must allocate a trx id");
-        assert!(db.committed_trxs.contains(&before), "write must be committed");
-        assert!(db.open_trxs.is_empty(), "write must not stay open");
+        assert!(
+            db.next_trx_id.load(Ordering::SeqCst) > before,
+            "write must allocate a trx id"
+        );
+        assert!(
+            db.committed_trxs.read().contains(&before),
+            "write must be committed"
+        );
+        assert!(db.open_trxs.read().is_empty(), "write must not stay open");
     }
 }
