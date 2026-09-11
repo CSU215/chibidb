@@ -108,3 +108,36 @@ fn materialized_execution_baseline() {
         println!("{label:<18} {elapsed:>12?}");
     }
 }
+
+/// Hash join throughput on two 50k-row tables.
+#[test]
+#[ignore = "micro-benchmark; run with --ignored --nocapture"]
+fn hash_join_throughput() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table a (id int, v int);").unwrap();
+    db.execute_sql("create table b (id int, w int);").unwrap();
+    let chunk = 500i64;
+    let mut i = 0i64;
+    while i < N {
+        let mut sa = String::from("insert into a values ");
+        let mut sb = String::from("insert into b values ");
+        for j in i..(i + chunk).min(N) {
+            if j > i {
+                sa.push(',');
+                sb.push(',');
+            }
+            sa.push_str(&format!("({j},{})", j % 10));
+            sb.push_str(&format!("({j},{})", j % 7));
+        }
+        sa.push(';');
+        sb.push(';');
+        db.execute_sql(&sa).unwrap();
+        db.execute_sql(&sb).unwrap();
+        i += chunk;
+    }
+    let elapsed = per_op(5, || {
+        db.execute_sql("select count(*) from a join b on a.id = b.id;")
+            .unwrap();
+    });
+    println!("hash join count(*)  50k x 50k   {elapsed:?}");
+}
