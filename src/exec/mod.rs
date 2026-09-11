@@ -1,31 +1,25 @@
 use crate::ast::{
     CreateIndexStmt, CreateTableStmt, CreateViewStmt, DataType, DeleteStmt, DropIndexStmt,
-    DropTableStmt, DropViewStmt, Expr, InsertStmt, SelectItem, SelectStmt, Stmt, TableRef,
-    UpdateStmt,
+    DropTableStmt, DropViewStmt, Expr, InsertStmt, Stmt, UpdateStmt,
 };
 use crate::catalog::Schema;
 use crate::result::ResultSet;
 use crate::storage::codec::decode_record;
-use crate::storage::Rid;
 use crate::trx::{TrxState, Undo};
 use crate::value::Value;
 use crate::{Database, Error, Result};
 
 mod aggregate;
 mod eval;
-mod join;
 pub mod operator;
 pub(crate) mod plan;
 mod subquery;
 
 pub use eval::eval_const;
 
-use aggregate::{
-    apply_limit, cmp_sort_keys, dedup_rows, execute_grouped_select, expr_has_aggregate, sort_rows,
-};
+use aggregate::cmp_sort_keys;
 use eval::EvalCtx;
-use join::nested_loop;
-use plan::{execute_explain, index_scan_source};
+use plan::execute_explain;
 use subquery::{eval_bound, eval_predicate_bound};
 
 pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Result<ResultSet> {
@@ -60,7 +54,9 @@ pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Res
         Stmt::Checkpoint => execute_checkpoint(db, trx),
         Stmt::Vacuum => execute_vacuum(db, trx),
         Stmt::Insert(i) => execute_insert(db, trx, i),
-        Stmt::Select(s) => execute_select(db, trx, s, None),
+        Stmt::Select(_) => {
+            Err(Error::Runtime("select must be executed through the operator plan".into()))
+        }
         Stmt::Delete(d) => execute_delete(db, trx, d),
         Stmt::Update(u) => execute_update(db, trx, u),
         Stmt::Explain(e) => execute_explain(db, e),
@@ -79,21 +75,6 @@ pub(crate) fn execute(db: &mut Database, trx: &mut TrxState, stmt: &Stmt) -> Res
 
 fn ddl_in_trx(_trx: &TrxState) -> Result<ResultSet> {
     Err(Error::Runtime("DDL inside a transaction is not supported".into()))
-}
-
-/// Decodes versioned records and keeps only rows visible to `trx`.
-pub(crate) fn decode_visible(
-    records: Vec<(Rid, Vec<u8>)>,
-    trx: &TrxState,
-) -> Result<Vec<Vec<Value>>> {
-    let mut out = Vec::new();
-    for (_, rec) in records {
-        let (creator, deleter, row) = decode_record(&rec)?;
-        if trx.visible(creator, deleter) {
-            out.push(row);
-        }
-    }
-    Ok(out)
 }
 
 fn execute_create_index(db: &mut Database, trx: &mut TrxState, c: &CreateIndexStmt) -> Result<ResultSet> {
@@ -145,12 +126,20 @@ fn execute_create_view(
     trx: &mut TrxState,
     c: &CreateViewStmt,
 ) -> Result<ResultSet> {
-    // validate the definition by executing its select once (read-only)
+    // validate the definition by planning and running its select once
     let stmts = crate::parser::parse(&c.sql)?;
     let Some(Stmt::Select(sel)) = stmts.into_iter().next() else {
         return Err(Error::Runtime("view must be defined by a select".into()));
     };
-    execute_select(db, trx, &sel, None)?;
+    let Some(mut plan) = operator::build_select(db, &sel)? else {
+        return Err(Error::Runtime("view must be defined by a supported select".into()));
+    };
+    {
+        let mut ctx = operator::ExecContext { db, trx, outer: None };
+        plan.open(&mut ctx)?;
+        while plan.next(&mut ctx)?.is_some() {}
+        plan.close()?;
+    }
     db.catalog_mut().create_view(&c.name, c.sql.clone())?;
     db.save_catalog()?;
     Ok(ResultSet::Message("SUCCESS".into()))
@@ -396,59 +385,6 @@ fn unique_index_name(table: &str, column: &str) -> String {
     format!("__unique_{table}_{column}")
 }
 
-/// Schema of a single real table (owner-qualified), without scanning rows.
-fn single_table_schema(db: &Database, tref: &TableRef) -> Result<Schema> {
-    let owner = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
-    let columns = db.catalog().table(&tref.name)?.schema.columns.clone();
-    Ok(Schema {
-        columns: columns
-            .into_iter()
-            .map(|c| crate::catalog::ColumnDesc::plain(Some(owner.clone()), c.name, c.dtype))
-            .collect(),
-    })
-}
-
-/// Evaluates a UNION [ALL] chain left-to-right, then applies the trailing
-/// ORDER BY / LIMIT to the whole result set.
-fn execute_set_op(
-    db: &mut Database,
-    trx: &mut TrxState,
-    s: &SelectStmt,
-    outer: Option<&EvalCtx>,
-) -> Result<ResultSet> {
-    let mut base = s.clone();
-    base.set_ops = Vec::new();
-    let order_by = std::mem::take(&mut base.order_by);
-    let limit = base.limit.take();
-    let (columns, mut rows) = rows_of(execute_select(db, trx, &base, outer)?)?;
-    for (all, op) in &s.set_ops {
-        let (cols2, rows2) = rows_of(execute_select(db, trx, op, outer)?)?;
-        if cols2.len() != columns.len() {
-            return Err(Error::Runtime(format!(
-                "union column count mismatch: {} vs {}",
-                columns.len(),
-                cols2.len()
-            )));
-        }
-        rows.extend(rows2);
-        if !*all {
-            dedup_rows(&mut rows);
-        }
-    }
-    if !order_by.is_empty() {
-        sort_projected(db, trx, outer, &columns, &mut rows, &order_by)?;
-    }
-    apply_limit(&mut rows, &limit)?;
-    Ok(ResultSet::Rows { columns, rows })
-}
-
-fn rows_of(rs: ResultSet) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-    match rs {
-        ResultSet::Rows { columns, rows } => Ok((columns, rows)),
-        ResultSet::Message(_) => Err(Error::Runtime("set operation requires selects".into())),
-    }
-}
-
 /// ORDER BY over an already-projected result set: column references resolve
 /// against the output column names.
 pub(crate) fn sort_projected(
@@ -480,112 +416,4 @@ pub(crate) fn sort_projected(
     Ok(())
 }
 
-pub(crate) fn execute_select(
-    db: &mut Database,
-    trx: &mut TrxState,
-    s: &SelectStmt,
-    outer: Option<&EvalCtx>,
-) -> Result<ResultSet> {
-    if !s.set_ops.is_empty() {
-        return execute_set_op(db, trx, s, outer);
-    }
-    if s.from.is_empty() {
-        let mut columns = Vec::new();
-        let mut row = Vec::new();
-        for item in &s.items {
-            match item {
-                SelectItem::Expr(e) => {
-                    columns.push(e.to_string());
-                    row.push(eval_bound(db, trx, e, outer)?);
-                }
-                SelectItem::Aliased(e, alias) => {
-                    columns.push(alias.clone());
-                    row.push(eval_bound(db, trx, e, outer)?);
-                }
-                SelectItem::Star => {
-                    return Err(Error::Runtime("select * requires from".into()))
-                }
-            }
-        }
-        return Ok(ResultSet::Rows { columns, rows: vec![row] });
-    }
-    // For a single table, resolve the access path before scanning: when an
-    // index applies we never touch the rest of the heap.
-    let (schema, source_rows, ordered_by) = if s.from.len() == 1 {
-        match index_scan_source(db, trx, &s.from[0].name, s.selection.as_ref())? {
-            Some((scanned, column)) => {
-                (single_table_schema(db, &s.from[0])?, scanned, Some(column))
-            }
-            None => {
-                let (schema, rows) = nested_loop(db, trx, s, outer)?;
-                (schema, rows, None)
-            }
-        }
-    } else {
-        let (schema, rows) = nested_loop(db, trx, s, outer)?;
-        (schema, rows, None)
-    };
-    let mut headers = Vec::new();
-    let mut exprs = Vec::new();
-    for item in &s.items {
-        match item {
-            SelectItem::Star => {
-                for col in &schema.columns {
-                    headers.push(col.name.clone());
-                    // qualified reference avoids ambiguity when column names repeat
-                    match &col.owner {
-                        Some(owner) => exprs.push(Expr::QualifiedColumn(owner.clone(), col.name.clone())),
-                        None => exprs.push(Expr::Column(col.name.clone())),
-                    }
-                }
-            }
-            SelectItem::Expr(e) => {
-                headers.push(e.to_string());
-                exprs.push(e.clone());
-            }
-            SelectItem::Aliased(e, alias) => {
-                headers.push(alias.clone());
-                exprs.push(e.clone());
-            }
-        }
-    }
-    let mut filtered: Vec<Vec<Value>> = Vec::new();
-    for row in source_rows {
-        if let Some(sel) = &s.selection
-            && !eval_predicate_bound(db, trx, sel, &schema, &row, outer)? {
-                continue;
-            }
-        filtered.push(row);
-    }
-    let has_aggregate = s
-        .items
-        .iter()
-        .any(|it| matches!(it, SelectItem::Expr(e) | SelectItem::Aliased(e, _) if expr_has_aggregate(e)))
-        || s.having.as_ref().is_some_and(expr_has_aggregate);
 
-    if !s.group_by.is_empty() || has_aggregate {
-        return execute_grouped_select(db, trx, outer, &schema, s, filtered, headers, exprs);
-    }
-    // An index scan already yields ascending order on its column.
-    let skip_sort = ordered_by
-        .as_deref()
-        .is_some_and(|c| plan::order_by_matches(c, &s.order_by));
-    if !s.order_by.is_empty() && !skip_sort {
-        sort_rows(db, trx, outer, &schema, &mut filtered, &s.order_by, &s.items)?;
-    }
-    let mut out_rows = Vec::new();
-    for row in filtered {
-        let mut ctx = EvalCtx::row(&schema, &row);
-        ctx.parent = outer;
-        let mut out_row = Vec::with_capacity(exprs.len());
-        for e in &exprs {
-            out_row.push(eval_bound(db, trx, e, Some(&ctx))?);
-        }
-        out_rows.push(out_row);
-    }
-    if s.distinct {
-        dedup_rows(&mut out_rows);
-    }
-    apply_limit(&mut out_rows, &s.limit)?;
-    Ok(ResultSet::Rows { columns: headers, rows: out_rows })
-}

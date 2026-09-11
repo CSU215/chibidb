@@ -2,12 +2,9 @@ use crate::ast::{BinOp, DataType, Expr, ExplainStmt, SelectStmt, Stmt};
 use crate::index::{encode_key, BTree, Bound};
 use crate::result::ResultSet;
 use crate::storage::Rid;
-use crate::trx::TrxState;
-use crate::value::Value;
 use crate::{Database, Error, Result};
 
 use super::coerce;
-use super::decode_visible;
 use super::eval::{eval_const, expr_has_column, expr_has_subquery};
 
 pub(crate) fn execute_explain(db: &mut Database, e: &ExplainStmt) -> Result<ResultSet> {
@@ -217,25 +214,8 @@ fn bound<'a>(key: Option<&'a Vec<u8>>, inclusive: bool) -> Bound<'a> {
     }
 }
 
-/// If the selection is sargable, scans the index and returns the visible
-/// rows for the referenced table; otherwise returns `None`.
-/// Returns the visible rows plus the indexed column they are ordered by.
-pub(crate) fn index_scan_source(
-    db: &mut Database,
-    trx: &mut TrxState,
-    table: &str,
-    selection: Option<&Expr>,
-) -> Result<Option<(Vec<Vec<Value>>, String)>> {
-    let Some(plan) = plan_index_scan(db, table, selection)? else {
-        return Ok(None);
-    };
-    let rows = decode_visible(db.store_get_records(table, &plan.rids)?, trx)?;
-    Ok(Some((rows, plan.column)))
-}
-
 /// Index-derived row ids for a sargable selection, if one applies. The
-/// executor's materialized path consumes this, as does the `IndexScan`
-/// operator.
+/// `IndexScan` operator consumes this.
 pub(crate) struct IndexScanRids {
     pub heap_file: crate::storage::FileId,
     pub column: String,

@@ -657,20 +657,6 @@ impl Database {
         Ok(out)
     }
 
-    pub(crate) fn store_get_records(
-        &mut self,
-        name: &str,
-        rids: &[Rid],
-    ) -> Result<Vec<(Rid, Vec<u8>)>> {
-        let file = self.catalog.table(name)?.heap.file;
-        let engine = HeapEngine::new(file);
-        let mut out = Vec::with_capacity(rids.len());
-        for rid in rids {
-            out.push((*rid, engine.get(&mut self.pool, *rid)?));
-        }
-        Ok(out)
-    }
-
     /// Enforces UNIQUE / PRIMARY KEY constraints for `row` using the
     /// constraint-backed indexes and MVCC visibility. `exclude` skips the
     /// row being updated; `claimed` catches duplicates among rows touched by

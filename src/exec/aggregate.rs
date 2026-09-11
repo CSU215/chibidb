@@ -1,6 +1,5 @@
 use crate::ast::{AggFunc, BinOp, Expr, Limit, SelectItem, SelectStmt};
 use crate::catalog::Schema;
-use crate::result::ResultSet;
 use crate::trx::TrxState;
 use crate::value::Value;
 use crate::{Database, Error, Result};
@@ -108,24 +107,8 @@ pub(crate) fn eval_aggregate(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_grouped_select(
-    db: &mut Database,
-    trx: &mut TrxState,
-    outer: Option<&EvalCtx>,
-    schema: &Schema,
-    s: &SelectStmt,
-    filtered: Vec<Vec<Value>>,
-    headers: Vec<String>,
-    exprs: Vec<Expr>,
-) -> Result<ResultSet> {
-    let rows = grouped_select_rows(db, trx, outer, schema, s, filtered, exprs)?;
-    Ok(ResultSet::Rows { columns: headers, rows })
-}
-
 /// Core of grouped/aggregate execution: group, having, order groups, project
-/// (with group context), distinct and limit. Shared by the materialized path
-/// and the `GroupBy` operator.
+/// (with group context), distinct and limit. Used by the `GroupBy` operator.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn grouped_select_rows(
     db: &mut Database,
