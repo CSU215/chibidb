@@ -14,6 +14,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::storage::lsm::memtable::MemEntry;
 use crate::storage::lsm::sstable::SSTable;
 use crate::storage::lsm::store::LsmStore;
 use crate::{Error, Result};
@@ -91,6 +92,11 @@ impl PersistentLsm {
 
     pub fn sstable_file_numbers(&self) -> &[u32] {
         &self.sstable_files
+    }
+
+    /// A cheap snapshot for streaming scans (memtable entries + table clones).
+    pub fn snapshot(&self) -> (Vec<(Vec<u8>, MemEntry)>, Vec<SSTable>) {
+        self.store.snapshot()
     }
 
     /// Writes the memtable out as one new SSTable and commits it via the

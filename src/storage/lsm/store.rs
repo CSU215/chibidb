@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::storage::lsm::block::DEFAULT_RESTART_INTERVAL;
 use crate::storage::lsm::memtable::{MemEntry, MemTable};
-use crate::storage::lsm::sstable::{SSTable, SSTableBuilder};
+use crate::storage::lsm::sstable::{SSTable, SSTableBuilder, SstableScanner};
 use crate::Result;
 
 const TAG_TOMBSTONE: u8 = 0;
@@ -46,6 +46,10 @@ impl LsmStore {
             return Ok(entry.value().map(<[u8]>::to_vec));
         }
         for sstable in self.sstables.iter().rev() {
+            // skip tables whose key range cannot contain the key
+            if !sstable.may_contain(key) {
+                continue;
+            }
             if let Some(encoded) = sstable.get(key)? {
                 return Ok(decode_entry(&encoded).value().map(<[u8]>::to_vec));
             }
@@ -72,6 +76,12 @@ impl LsmStore {
 
     pub fn num_sstables(&self) -> usize {
         self.sstables.len()
+    }
+
+    /// A cheap snapshot for streaming scans: the memtable entries and clones
+    /// of the SSTables (their contents are shared behind `Arc`).
+    pub fn snapshot(&self) -> (Vec<(Vec<u8>, MemEntry)>, Vec<SSTable>) {
+        (self.memtable.iter(), self.sstables.clone())
     }
 
     /// The memtable as an SSTable image, or `None` when it is empty. Does not
@@ -153,5 +163,76 @@ fn decode_entry(data: &[u8]) -> MemEntry {
     match data.first() {
         Some(&TAG_VALUE) => MemEntry::Value(data[1..].to_vec()),
         _ => MemEntry::Tombstone,
+    }
+}
+
+/// Streams the newest visible value per key across a memtable and a list of
+/// SSTables, without materializing the whole store. Sources are ordered newest
+/// first; on a key collision the newest source wins, and a winning tombstone
+/// suppresses the key.
+pub struct MergeScanner {
+    sources: Vec<MergeSource>,
+    heads: Vec<Option<(Vec<u8>, MemEntry)>>,
+}
+
+enum MergeSource {
+    Mem(std::vec::IntoIter<(Vec<u8>, MemEntry)>),
+    Sst(SstableScanner),
+}
+
+impl MergeScanner {
+    /// `sstables` must be newest first.
+    pub fn new(mem: Vec<(Vec<u8>, MemEntry)>, sstables: Vec<SSTable>) -> Result<Self> {
+        let mut sources = vec![MergeSource::Mem(mem.into_iter())];
+        for table in sstables {
+            sources.push(MergeSource::Sst(table.scanner()));
+        }
+        let mut heads = Vec::with_capacity(sources.len());
+        for source in &mut sources {
+            heads.push(advance_one(source)?);
+        }
+        Ok(Self { sources, heads })
+    }
+
+    pub fn next_entry(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        loop {
+            let mut best: Option<Vec<u8>> = None;
+            for head in &self.heads {
+                if let Some((key, _)) = head
+                    && best.as_ref().is_none_or(|current| key < current)
+                {
+                    best = Some(key.clone());
+                }
+            }
+            let Some(key) = best else {
+                return Ok(None);
+            };
+
+            let mut winner: Option<MemEntry> = None;
+            for i in 0..self.sources.len() {
+                let matches = matches!(&self.heads[i], Some((k, _)) if k.as_slice() == key.as_slice());
+                if matches {
+                    let (_, entry) = self.heads[i].take().expect("head matched");
+                    if winner.is_none() {
+                        winner = Some(entry);
+                    }
+                    self.heads[i] = advance_one(&mut self.sources[i])?;
+                }
+            }
+
+            match winner.expect("at least one source matched") {
+                MemEntry::Value(value) => return Ok(Some((key, value))),
+                MemEntry::Tombstone => continue,
+            }
+        }
+    }
+}
+
+fn advance_one(source: &mut MergeSource) -> Result<Option<(Vec<u8>, MemEntry)>> {
+    match source {
+        MergeSource::Mem(iter) => Ok(iter.next()),
+        MergeSource::Sst(scanner) => Ok(scanner
+            .next_entry()?
+            .map(|(key, encoded)| (key, decode_entry(&encoded)))),
     }
 }

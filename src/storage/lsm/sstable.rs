@@ -8,6 +8,8 @@
 //! `(offset, size)`. A reader consults the bloom filter first, then
 //! binary-searches the index and reads the chosen block.
 
+use std::sync::Arc;
+
 use crate::storage::lsm::bloom::{BloomBuilder, BloomFilter};
 use crate::storage::lsm::block::{Block, BlockBuilder, DEFAULT_RESTART_INTERVAL};
 use crate::storage::lsm::coding::{get_varint64, put_varint64};
@@ -133,11 +135,15 @@ impl SSTableBuilder {
 }
 
 /// A parsed, immutable SSTable held in memory.
+#[derive(Clone)]
 pub struct SSTable {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     /// (last key of a data block, where the block lives), ascending.
-    index: Vec<(Vec<u8>, BlockHandle)>,
-    bloom: BloomFilter,
+    index: Arc<Vec<(Vec<u8>, BlockHandle)>>,
+    bloom: Arc<BloomFilter>,
+    /// Smallest and largest keys, for range pruning.
+    first_key: Arc<Vec<u8>>,
+    last_key: Arc<Vec<u8>>,
 }
 
 impl SSTable {
@@ -167,7 +173,20 @@ impl SSTable {
         for (key, encoded) in index_block.entries()? {
             index.push((key, BlockHandle::decode(&encoded)?));
         }
-        Ok(Self { data, index, bloom })
+        let first_key = match index.first() {
+            Some((_, handle)) => {
+                Block::parse(slice(&data, *handle)?.to_vec())?.first_key()?.unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+        let last_key = index.last().map(|(key, _)| key.clone()).unwrap_or_default();
+        Ok(Self {
+            data: Arc::new(data),
+            index: Arc::new(index),
+            bloom: Arc::new(bloom),
+            first_key: Arc::new(first_key),
+            last_key: Arc::new(last_key),
+        })
     }
 
     pub fn num_blocks(&self) -> usize {
@@ -176,10 +195,20 @@ impl SSTable {
 
     /// The first key in the table, if any.
     pub fn first_key(&self) -> Result<Option<Vec<u8>>> {
-        match self.index.first() {
-            None => Ok(None),
-            Some((_, handle)) => self.block(*handle)?.first_key(),
-        }
+        Ok((!self.first_key.is_empty()).then(|| (*self.first_key).clone()))
+    }
+
+    /// The last key in the table, if any.
+    pub fn last_key(&self) -> Option<Vec<u8>> {
+        (!self.last_key.is_empty()).then(|| (*self.last_key).clone())
+    }
+
+    /// Whether `key` could be in this table, by key range. Empty tables never
+    /// contain anything.
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        !self.index.is_empty()
+            && key >= self.first_key.as_slice()
+            && key <= self.last_key.as_slice()
     }
 
     /// The table's bloom filter, exposed for tests and diagnostics.
@@ -202,7 +231,7 @@ impl SSTable {
     /// All entries in ascending order.
     pub fn iter(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut out = Vec::new();
-        for (_, handle) in &self.index {
+        for (_, handle) in self.index.iter() {
             out.extend(self.block(*handle)?.entries()?);
         }
         Ok(out)
@@ -210,6 +239,34 @@ impl SSTable {
 
     fn block(&self, handle: BlockHandle) -> Result<Block> {
         Block::parse(slice(&self.data, handle)?.to_vec())
+    }
+
+    /// A lazy scanner over the table, holding one data block at a time.
+    pub fn scanner(&self) -> SstableScanner {
+        SstableScanner { table: self.clone(), next_block: 0, current: Vec::new().into_iter() }
+    }
+}
+
+/// Lazily walks an SSTable's data blocks, materializing only the current one.
+pub struct SstableScanner {
+    table: SSTable,
+    next_block: usize,
+    current: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+}
+
+impl SstableScanner {
+    pub fn next_entry(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        loop {
+            if let Some(entry) = self.current.next() {
+                return Ok(Some(entry));
+            }
+            if self.next_block >= self.table.index.len() {
+                return Ok(None);
+            }
+            let handle = self.table.index[self.next_block].1;
+            self.next_block += 1;
+            self.current = self.table.block(handle)?.entries()?.into_iter();
+        }
     }
 }
 

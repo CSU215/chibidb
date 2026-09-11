@@ -1,4 +1,4 @@
-use chibidb::storage::lsm::LsmStore;
+use chibidb::storage::lsm::{LsmStore, MergeScanner};
 
 fn small() -> LsmStore {
     LsmStore::new(128)
@@ -79,6 +79,27 @@ fn iter_merges_memtable_and_sstables_in_order() {
         .collect();
     assert_eq!(keys, ["a", "b", "c", "d"]);
     assert_eq!(store.get(b"d").unwrap(), Some(b"2".to_vec()));
+}
+
+#[test]
+fn streaming_merge_yields_newest_visible_values() {
+    let mut store = small();
+    store.put(b"a".to_vec(), b"1".to_vec());
+    store.put(b"b".to_vec(), b"1".to_vec());
+    store.flush().unwrap();
+    // newer memtable overrides `a` and deletes `b`
+    store.put(b"a".to_vec(), b"2".to_vec());
+    store.delete(b"b".to_vec());
+    store.put(b"c".to_vec(), b"2".to_vec());
+
+    let (mem, mut sstables) = store.snapshot();
+    sstables.reverse(); // newest first
+    let mut scanner = MergeScanner::new(mem, sstables).unwrap();
+    let mut rows = Vec::new();
+    while let Some(row) = scanner.next_entry().unwrap() {
+        rows.push(row);
+    }
+    assert_eq!(rows, [(b"a".to_vec(), b"2".to_vec()), (b"c".to_vec(), b"2".to_vec())]);
 }
 
 #[test]

@@ -54,6 +54,21 @@ fn empty_table_is_readable() {
 }
 
 #[test]
+fn sstable_reports_its_key_range() {
+    let table = SSTable::parse(build(128, 100)).unwrap();
+    assert_eq!(table.first_key().unwrap(), Some(b"key0000".to_vec()));
+    assert_eq!(table.last_key(), Some(b"key0099".to_vec()));
+    assert!(table.may_contain(b"key0050"));
+    assert!(!table.may_contain(b"aaa"));
+    assert!(!table.may_contain(b"zzz"));
+
+    let mut builder = SSTableBuilder::new(64, 4);
+    let empty = SSTable::parse(builder.finish()).unwrap();
+    assert_eq!(empty.last_key(), None);
+    assert!(!empty.may_contain(b"x"));
+}
+
+#[test]
 fn sstable_bloom_filter_is_wired() {
     let table = SSTable::parse(build(128, 500)).unwrap();
     for i in 0..500 {

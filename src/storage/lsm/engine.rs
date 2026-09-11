@@ -14,6 +14,7 @@ use crate::storage::buffer::BufferPool;
 use crate::storage::engine::{RowScanner, TableEngine, TableStorage};
 use crate::storage::heap::Rid;
 use crate::storage::lsm::persist::PersistentLsm;
+use crate::storage::lsm::store::MergeScanner;
 use crate::storage::page::FileId;
 use crate::{Error, Result};
 
@@ -95,15 +96,14 @@ impl std::fmt::Debug for LsmEngine {
 
 impl TableEngine for LsmEngine {
     fn scan(&self, _bp: &BufferPool) -> Result<Box<dyn RowScanner>> {
-        let lsm = self.inner.lock();
-        let mut rows = Vec::new();
-        for (key, value) in lsm.iter()? {
-            let Ok(bytes) = <[u8; 8]>::try_from(key.as_slice()) else {
-                continue;
-            };
-            rows.push((id_to_rid(u64::from_be_bytes(bytes)), value));
-        }
-        Ok(Box::new(VecScanner { rows: rows.into_iter() }))
+        // snapshot under the lock, then stream without holding it
+        let (mem, mut sstables) = {
+            let lsm = self.inner.lock();
+            lsm.snapshot()
+        };
+        sstables.reverse(); // newest first
+        let merge = MergeScanner::new(mem, sstables)?;
+        Ok(Box::new(LsmScanner { merge }))
     }
 
     fn get(&self, _bp: &BufferPool, rid: Rid) -> Result<Vec<u8>> {
@@ -155,14 +155,19 @@ impl TableStorage for LsmEngine {
     }
 }
 
-/// A scanner over an already-materialized set of rows.
-struct VecScanner {
-    rows: std::vec::IntoIter<(Rid, Vec<u8>)>,
+/// Streams merged key/value pairs as `(Rid, record)` rows.
+struct LsmScanner {
+    merge: MergeScanner,
 }
 
-impl RowScanner for VecScanner {
+impl RowScanner for LsmScanner {
     fn next(&mut self, _bp: &BufferPool) -> Result<Option<(Rid, Vec<u8>)>> {
-        Ok(self.rows.next())
+        while let Some((key, value)) = self.merge.next_entry()? {
+            if let Ok(bytes) = <[u8; 8]>::try_from(key.as_slice()) {
+                return Ok(Some((id_to_rid(u64::from_be_bytes(bytes)), value)));
+            }
+        }
+        Ok(None)
     }
 }
 

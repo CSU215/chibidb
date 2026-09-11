@@ -16,4 +16,4 @@ pub use engine::LsmEngine;
 pub use memtable::{MemEntry, MemTable};
 pub use persist::PersistentLsm;
 pub use sstable::{BlockHandle, SSTable, SSTableBuilder};
-pub use store::LsmStore;
+pub use store::{LsmStore, MergeScanner};
