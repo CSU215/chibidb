@@ -242,6 +242,38 @@ pub struct DropUserStmt {
     pub name: String,
 }
 
+/// A table-level privilege kind; `ALL` expands to read + write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Privilege {
+    Read,
+    Write,
+}
+
+impl Privilege {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Privilege::Read => "read",
+            Privilege::Write => "write",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrantStmt {
+    pub privileges: Vec<Privilege>,
+    /// `*` means every database.
+    pub database: String,
+    pub user: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevokeStmt {
+    pub privileges: Vec<Privilege>,
+    /// `*` means every database.
+    pub database: String,
+    pub user: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplainStmt {
     pub stmt: Box<Stmt>,
@@ -318,7 +350,9 @@ pub enum Stmt {
     DropUser(DropUserStmt),
     DropView(DropViewStmt),
     Explain(ExplainStmt),
+    Grant(GrantStmt),
     Insert(InsertStmt),
+    Revoke(RevokeStmt),
     Select(Box<SelectStmt>),
     Update(UpdateStmt),
     Use(UseStmt),

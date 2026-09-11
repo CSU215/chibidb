@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::ast::Stmt;
+use crate::ast::{Privilege, Stmt};
 use crate::config::Config;
 use crate::parser;
 use crate::result::ResultSet;
@@ -75,6 +75,11 @@ impl Instance {
                 "create table users (name char(64) primary key, password char(128) not null);",
             )?;
         }
+        if !meta.table_exists("privileges") {
+            meta.execute_sql(
+                "create table privileges (username char(64), dbname char(64), kind char(16));",
+            )?;
+        }
         Ok(())
     }
 
@@ -121,6 +126,48 @@ impl Instance {
         let result = self
             .meta_mut()?
             .execute_sql(&format!("select name from users where name = '{name}';"))?;
+        Ok(matches!(result.into_iter().next(), Some(ResultSet::Rows { rows, .. }) if !rows.is_empty()))
+    }
+
+    /// Grants one privilege to `user` on `database` (`*` = all databases).
+    /// Idempotent: an existing matching grant is replaced.
+    pub fn grant(&mut self, user: &str, database: &str, privilege: Privilege) -> Result<()> {
+        validate_ident(user, "user name")?;
+        validate_scope(database)?;
+        if !self.user_exists(user)? {
+            return Err(Error::Runtime(format!("no such user: {user}")));
+        }
+        let kind = privilege.as_str();
+        self.revoke(user, database, privilege)?;
+        self.meta_mut()?.execute_sql(&format!(
+            "insert into privileges values ('{user}', '{database}', '{kind}');"
+        ))?;
+        Ok(())
+    }
+
+    pub fn revoke(&mut self, user: &str, database: &str, privilege: Privilege) -> Result<()> {
+        validate_ident(user, "user name")?;
+        validate_scope(database)?;
+        let kind = privilege.as_str();
+        self.meta_mut()?.execute_sql(&format!(
+            "delete from privileges where username = '{user}' and dbname = '{database}' and kind = '{kind}';"
+        ))?;
+        Ok(())
+    }
+
+    /// True when `user` holds `privilege` on `database` or on all databases.
+    pub fn has_privilege(
+        &mut self,
+        user: &str,
+        database: &str,
+        privilege: Privilege,
+    ) -> Result<bool> {
+        validate_ident(user, "user name")?;
+        validate_scope(database)?;
+        let kind = privilege.as_str();
+        let result = self.meta_mut()?.execute_sql(&format!(
+            "select kind from privileges where username = '{user}' and kind = '{kind}' and (dbname = '{database}' or dbname = '*');"
+        ))?;
         Ok(matches!(result.into_iter().next(), Some(ResultSet::Rows { rows, .. }) if !rows.is_empty()))
     }
 
@@ -221,6 +268,20 @@ impl Instance {
                     self.drop_user(&d.name)?;
                     out.push(ResultSet::Message("SUCCESS".into()));
                 }
+                Stmt::Grant(g) => {
+                    self.reject_in_trx(session)?;
+                    for privilege in &g.privileges {
+                        self.grant(&g.user, &g.database, *privilege)?;
+                    }
+                    out.push(ResultSet::Message("SUCCESS".into()));
+                }
+                Stmt::Revoke(r) => {
+                    self.reject_in_trx(session)?;
+                    for privilege in &r.privileges {
+                        self.revoke(&r.user, &r.database, *privilege)?;
+                    }
+                    out.push(ResultSet::Message("SUCCESS".into()));
+                }
                 other => {
                     let db_name = self.ensure_current_db(session)?;
                     let db = self.database_mut(&db_name)?;
@@ -302,6 +363,14 @@ fn validate_ident(name: &str, what: &str) -> Result<()> {
         return Err(Error::Runtime(format!("invalid {what}: {name}")));
     }
     Ok(())
+}
+
+/// A privilege scope is a database name or `*` (all databases).
+fn validate_scope(database: &str) -> Result<()> {
+    if database == "*" {
+        return Ok(());
+    }
+    validate_ident(database, "database name")
 }
 
 /// Hashes `password` with a random 64-bit salt; stored as `salt$sha256`.

@@ -1,8 +1,9 @@
 use crate::ast::{
     AggFunc, BinOp, ColumnDef, CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt,
     CreateUserStmt, CreateViewStmt, DataType, DeleteStmt, DropDatabaseStmt, DropIndexStmt,
-    DropTableStmt, DropUserStmt, DropViewStmt, ExplainStmt, Expr, InsertStmt, JoinKind, Limit,
-    SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp, UpdateStmt, UseStmt,
+    DropTableStmt, DropUserStmt, DropViewStmt, ExplainStmt, Expr, GrantStmt, InsertStmt, JoinKind,
+    Limit, Privilege, RevokeStmt, SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp, UpdateStmt,
+    UseStmt,
 };
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
@@ -197,6 +198,30 @@ impl<'a> Parser<'a> {
             let name = self.parse_ident("database name")?;
             return Ok(Stmt::Use(UseStmt { name }));
         }
+        if self.eat_keyword("grant") {
+            let privileges = self.parse_privileges()?;
+            if !self.eat_keyword("on") {
+                return Err(self.unexpected("on"));
+            }
+            let database = self.parse_scope()?;
+            if !self.eat_keyword("to") {
+                return Err(self.unexpected("to"));
+            }
+            let user = self.parse_name_literal("user name")?;
+            return Ok(Stmt::Grant(GrantStmt { privileges, database, user }));
+        }
+        if self.eat_keyword("revoke") {
+            let privileges = self.parse_privileges()?;
+            if !self.eat_keyword("on") {
+                return Err(self.unexpected("on"));
+            }
+            let database = self.parse_scope()?;
+            if !self.eat_keyword("from") {
+                return Err(self.unexpected("from"));
+            }
+            let user = self.parse_name_literal("user name")?;
+            return Ok(Stmt::Revoke(RevokeStmt { privileges, database, user }));
+        }
         if self.eat_keyword("insert") {
             if !self.eat_keyword("into") {
                 return Err(self.unexpected("into"));
@@ -287,6 +312,33 @@ impl<'a> Parser<'a> {
             Some(Token { kind: TokenKind::Str(s), .. }) => Ok(s.clone()),
             _ => Err(self.unexpected(want)),
         }
+    }
+
+    fn parse_privileges(&mut self) -> Result<Vec<Privilege>> {
+        let mut out = Vec::new();
+        loop {
+            if self.eat_keyword("all") {
+                out.push(Privilege::Read);
+                out.push(Privilege::Write);
+            } else if self.eat_keyword("read") {
+                out.push(Privilege::Read);
+            } else if self.eat_keyword("write") {
+                out.push(Privilege::Write);
+            } else {
+                return Err(self.unexpected("privilege (read/write/all)"));
+            }
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn parse_scope(&mut self) -> Result<String> {
+        if self.eat_punct(Punct::Star) {
+            return Ok("*".to_string());
+        }
+        self.parse_ident("database name")
     }
 
     fn parse_select(&mut self) -> Result<Stmt> {
