@@ -28,6 +28,8 @@ pub use result::ResultSet;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
 use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
 use crate::config::Config;
@@ -45,7 +47,7 @@ pub use crate::trx::Session;
 
 pub struct Database {
     config: Config,
-    catalog: Catalog,
+    catalog: RwLock<Catalog>,
     pool: BufferPool,
     wal: Wal,
     data_dir: PathBuf,
@@ -187,7 +189,7 @@ impl Database {
 
         let mut db = Self {
             config: config.clone(),
-            catalog,
+            catalog: RwLock::new(catalog),
             pool,
             wal: Wal::open(&wal_path)?,
             data_dir: path.to_path_buf(),
@@ -247,7 +249,8 @@ impl Database {
     /// open transactions (the VACUUM statement enforces this).
     pub(crate) fn vacuum(&mut self) -> Result<usize> {
         let mut purged = 0;
-        for meta in self.catalog.table_metas() {
+        let metas = self.catalog().table_metas();
+        for meta in metas {
             let ops = self.index_ops(&meta.name)?;
             for (rid, rec) in self.store_scan_raw(&meta.name)? {
                 let (creator, deleter, row) = crate::storage::codec::decode_record(&rec)?;
@@ -260,7 +263,7 @@ impl Database {
                     let key = encode_key(&row[*ci])?;
                     BTree::at(*ix_file).delete(&mut self.pool, &key, rid)?;
                 }
-                let file = self.catalog.table(&meta.name)?.heap.file;
+                let file = self.catalog().table(&meta.name)?.heap.file;
                 HeapFile::at(file).delete(&mut self.pool, rid)?;
                 purged += 1;
             }
@@ -274,7 +277,7 @@ impl Database {
     /// rebuilt; it may arrive pre-seeded with repaired index files.
     fn recover_from_wal(&mut self, plan: &wal::RecoveryPlan, touched: &mut HashSet<u32>) -> Result<()> {
         let file_map: std::collections::HashMap<u32, FileId> =
-            self.catalog.heap_files().into_iter().collect();
+            self.catalog().heap_files().into_iter().collect();
         for (_, _, records) in &plan.committed {
             for rec in records {
                 match rec {
@@ -330,7 +333,7 @@ impl Database {
     /// unflushed ones.
     fn rebuild_indexes(&mut self, file_no: u32) -> Result<()> {
         let table = self
-            .catalog
+            .catalog()
             .table_metas()
             .into_iter()
             .find(|m| m.file_no == file_no)
@@ -555,7 +558,7 @@ impl Database {
         while let Some(undo) = trx.undo.pop() {
             match undo {
                 Undo::Insert { table, rid, row } => {
-                    let file = self.catalog.table(&table)?.heap.file;
+                    let file = self.catalog().table(&table)?.heap.file;
                     HeapFile::at(file).delete(&mut self.pool, rid)?;
                     for (ci, ix_file) in self.index_ops(&table)? {
                         let key = encode_key(&row[ci])?;
@@ -563,11 +566,11 @@ impl Database {
                     }
                 }
                 Undo::DeleteMark { table, rid } => {
-                    let file = self.catalog.table(&table)?.heap.file;
+                    let file = self.catalog().table(&table)?.heap.file;
                     HeapFile::at(file).delete_mark(&mut self.pool, rid, 0)?;
                 }
                 Undo::Update { table, old_rid, new_rid, new_row } => {
-                    let file = self.catalog.table(&table)?.heap.file;
+                    let file = self.catalog().table(&table)?.heap.file;
                     HeapFile::at(file).delete(&mut self.pool, new_rid)?;
                     for (ci, ix_file) in self.index_ops(&table)? {
                         let key = encode_key(&new_row[ci])?;
@@ -580,17 +583,17 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn catalog(&self) -> &Catalog {
-        &self.catalog
+    pub(crate) fn catalog(&self) -> RwLockReadGuard<'_, Catalog> {
+        self.catalog.read()
     }
 
     /// Whether a table with `name` exists in this database.
     pub(crate) fn table_exists(&self, name: &str) -> bool {
-        self.catalog.table(name).is_ok()
+        self.catalog().table(name).is_ok()
     }
 
-    pub(crate) fn catalog_mut(&mut self) -> &mut Catalog {
-        &mut self.catalog
+    pub(crate) fn catalog_mut(&self) -> RwLockWriteGuard<'_, Catalog> {
+        self.catalog.write()
     }
 
     pub(crate) fn new_table_heap(&mut self, _name: &str) -> Result<HeapStore> {
@@ -617,9 +620,9 @@ impl Database {
             next_index_file: self.next_index_file,
             next_trx_id: self.next_trx_id,
             committed_trxs: self.committed_trxs.iter().copied().collect(),
-            tables: self.catalog.table_metas(),
-            indexes: self.catalog.index_metas(),
-            views: self.catalog.view_metas(),
+            tables: self.catalog().table_metas(),
+            indexes: self.catalog().index_metas(),
+            views: self.catalog().view_metas(),
         };
         let bytes = encode_catalog(&snap);
         std::fs::write(self.data_dir.join("catalog.bin"), bytes)
@@ -629,7 +632,7 @@ impl Database {
     /// Drops a table: catalog first (durability), then its heap and index
     /// files. A crash in between leaves harmless orphan files behind.
     pub(crate) fn drop_table(&mut self, name: &str) -> Result<()> {
-        let dropped = self.catalog.drop_table(name)?;
+        let dropped = self.catalog_mut().drop_table(name)?;
         self.save_catalog()?;
         for file in std::iter::once(dropped.heap_file).chain(dropped.index_files) {
             let path = self.pool.close_file(file)?;
@@ -650,9 +653,9 @@ impl Database {
 
     /// (column index, index file) pairs for every index on `table`.
     pub(crate) fn index_ops(&self, table: &str) -> Result<Vec<(usize, FileId)>> {
-        let schema = &self.catalog.table(table)?.schema;
-        Ok(self
-            .catalog
+        let catalog = self.catalog();
+        let schema = &catalog.table(table)?.schema;
+        Ok(catalog
             .indexes_for(table)
             .into_iter()
             .map(|ix| {
@@ -666,7 +669,7 @@ impl Database {
 
     /// Raw versioned records; callers decode and apply visibility.
     pub(crate) fn store_scan_raw(&mut self, name: &str) -> Result<Vec<(Rid, Vec<u8>)>> {
-        let file = self.catalog.table(name)?.heap.file;
+        let file = self.catalog().table(name)?.heap.file;
         let engine = HeapEngine::new(file);
         let mut scanner = engine.scan(&mut self.pool)?;
         let mut out = Vec::new();
@@ -691,9 +694,9 @@ impl Database {
         claimed: &mut Vec<(usize, Vec<u8>)>,
     ) -> Result<()> {
         let (checks, heap_file) = {
-            let schema = &self.catalog.table(table)?.schema;
-            let checks: Vec<(usize, FileId, String)> = self
-                .catalog
+            let catalog = self.catalog();
+            let schema = &catalog.table(table)?.schema;
+            let checks: Vec<(usize, FileId, String)> = catalog
                 .unique_indexes_for(table)
                 .into_iter()
                 .map(|ix| {
@@ -701,7 +704,7 @@ impl Database {
                     (ci, ix.store.file, ix.column.clone())
                 })
                 .collect();
-            (checks, self.catalog.table(table)?.heap.file)
+            (checks, catalog.table(table)?.heap.file)
         };
         if checks.is_empty() {
             return Ok(());
@@ -737,7 +740,8 @@ impl Database {
         creator: u32,
     ) -> Result<Rid> {
         let (file, file_no) = {
-            let t = self.catalog.table(name)?;
+            let catalog = self.catalog();
+            let t = catalog.table(name)?;
             (t.heap.file, t.heap.file_no)
         };
         let heap = HeapFile::at(file);
@@ -760,7 +764,8 @@ impl Database {
         deleter: u32,
     ) -> Result<()> {
         let (file, file_no) = {
-            let t = self.catalog.table(name)?;
+            let catalog = self.catalog();
+            let t = catalog.table(name)?;
             (t.heap.file, t.heap.file_no)
         };
         let heap = HeapFile::at(file);
@@ -781,7 +786,8 @@ impl Database {
         trx_id: u32,
     ) -> Result<Vec<Rid>> {
         let (file, file_no) = {
-            let t = self.catalog.table(name)?;
+            let catalog = self.catalog();
+            let t = catalog.table(name)?;
             (t.heap.file, t.heap.file_no)
         };
         let heap = HeapFile::at(file);

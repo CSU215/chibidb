@@ -99,7 +99,7 @@ impl Stage for ResolveStage {
     ) -> Result<()> {
         event.tables = referenced_tables(event.stmt);
         for table in &event.tables {
-            let known = db.catalog().table(table).is_ok() || db.catalog().view(table).is_some();
+            let known = db.table_exists(table) || db.catalog().view(table).is_some();
             if !known {
                 return Err(Error::Runtime(format!("no such table: {table}")));
             }

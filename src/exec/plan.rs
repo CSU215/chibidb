@@ -131,7 +131,8 @@ fn find_sargable(
         op: BinOp,
         lit: Expr,
     }
-    let schema = &db.catalog().table(table)?.schema;
+    let catalog = db.catalog();
+    let schema = &catalog.table(table)?.schema;
     let mut cands: Vec<Cand> = Vec::new();
     for conj in split_conjuncts(sel) {
         let (col_expr, op, lit) = match conj {
@@ -158,11 +159,7 @@ fn find_sargable(
         let Some(col_idx) = schema.index_of(&cname) else {
             continue;
         };
-        let Some(ix) = db
-            .catalog()
-            .indexes_for(table)
-            .into_iter()
-            .find(|ix| ix.column == cname)
+        let Some(ix) = catalog.indexes_for(table).into_iter().find(|ix| ix.column == cname)
         else {
             continue;
         };

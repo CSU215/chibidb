@@ -1101,7 +1101,8 @@ fn build_from_source(
     tref: &TableRef,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
     let owner = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
-    if let Some(sql) = db.catalog().view(&tref.name).cloned() {
+    let view_sql = db.catalog().view(&tref.name).cloned();
+    if let Some(sql) = view_sql {
         return Ok(ViewScan::new(db, &sql, &owner)?
             .map(|scan| Box::new(scan) as Box<dyn PhysicalOperator>));
     }
