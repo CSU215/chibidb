@@ -87,7 +87,7 @@ fn execute_create_index(db: &Database, trx: &mut TrxState, c: &CreateIndexStmt) 
     let records = db.store_scan_raw(&c.table)?;
     let btree = crate::index::BTree::at(store.file);
     for (rid, rec) in records {
-        let (creator, deleter, row) = decode_record(&rec)?;
+        let (creator, deleter, row) = decode_record(&rec, db.lobs())?;
         if !trx.visible(creator, deleter) {
             continue;
         }
@@ -190,7 +190,7 @@ pub(crate) fn execute_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) 
     let mut updates = Vec::new();
     let mut claimed: Vec<(usize, Vec<u8>)> = Vec::new();
     for (rid, rec) in records {
-        let (creator, deleter, row) = decode_record(&rec)?;
+        let (creator, deleter, row) = decode_record(&rec, db.lobs())?;
         if !trx.visible(creator, deleter) {
             continue;
         }
@@ -229,7 +229,7 @@ pub(crate) fn execute_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) 
     let records = db.store_scan_raw(&d.table)?;
     let mut victims = Vec::new();
     for (rid, rec) in records {
-        let (creator, deleter, row) = decode_record(&rec)?;
+        let (creator, deleter, row) = decode_record(&rec, db.lobs())?;
         if !trx.visible(creator, deleter) {
             continue;
         }
@@ -305,11 +305,12 @@ pub(crate) fn execute_insert(db: &Database, trx: &mut TrxState, i: &InsertStmt) 
         }
         check_not_null(&schema, &row)?;
         db.check_unique(&i.table, &row, None, trx, &mut claimed)?;
-        let encoded = crate::storage::codec::encode_row(&row);
-        if encoded.len() + 16 > crate::storage::PAGE_SIZE {
+        // the check is on the externalized size: long strings live in the lob
+        // store, so only the fixed-size reference stays in the row
+        let size = crate::storage::codec::encoded_row_size(&row, db.inline_lob_limit()) + 8;
+        if size + 16 > crate::storage::PAGE_SIZE {
             return Err(Error::Runtime(format!(
-                "record too large ({} bytes does not fit in a page)",
-                encoded.len()
+                "record too large ({size} bytes does not fit in a page)"
             )));
         }
         let rid = db.store_insert(&i.table, row.clone(), trx.id)?;

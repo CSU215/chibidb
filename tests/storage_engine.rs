@@ -1,4 +1,4 @@
-use chibidb::storage::codec::encode_record;
+use chibidb::storage::codec::encode_record_inline;
 use chibidb::storage::engine::{HeapEngine, TableEngine, TableStorage};
 use chibidb::storage::{BufferPool, DiskManager, HeapFile, Rid};
 use chibidb::value::Value;
@@ -77,7 +77,7 @@ fn table_storage_supports_the_mvcc_version_lifecycle() {
     assert_eq!(engine.file_id(), f);
 
     // insert a version (creator, deleter, row) and read it back
-    let data = encode_record(1, 0, &[Value::Int(42)]);
+    let data = encode_record_inline(1, 0, &[Value::Int(42)]);
     let rid = engine.insert(&bp, &data).unwrap();
     assert_eq!(engine.get(&bp, rid).unwrap(), data);
 

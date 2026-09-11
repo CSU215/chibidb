@@ -87,7 +87,7 @@ impl PhysicalOperator for TableScan {
             let (creator, deleter, row) = {
                 let scanner = self.scanner.as_mut().expect("table scan not opened");
                 match scanner.next(&ctx.db.pool)? {
-                    Some((_, record)) => decode_record(&record)?,
+                    Some((_, record)) => decode_record(&record, ctx.db.lobs())?,
                     None => return Ok(None),
                 }
             };
@@ -1063,7 +1063,7 @@ impl PhysicalOperator for IndexScan {
             let rid = self.rids[self.pos];
             self.pos += 1;
             let record = self.engine.get(&ctx.db.pool, rid)?;
-            let (creator, deleter, row) = decode_record(&record)?;
+            let (creator, deleter, row) = decode_record(&record, ctx.db.lobs())?;
             if ctx.trx.visible(creator, deleter) {
                 return Ok(Some(row));
             }

@@ -390,10 +390,12 @@ fn text_type() {
         let (_, r) = rows(&rs);
         assert_eq!(r[0][0], Value::Str(long.clone()));
 
-        // text longer than a page cannot be stored
+        // text longer than a page is now stored out of line (LOB) and read back
         let huge = "y".repeat(20000);
-        let err = db.execute_sql(&format!("insert into t values (3, '{huge}');")).unwrap_err();
-        assert!(err.to_string().contains("too large"), "{err}");
+        db.execute_sql(&format!("insert into t values (3, '{huge}');")).unwrap();
+        let rs = db.execute_sql("select body from t where id = 3;").unwrap();
+        let (_, r) = rows(&rs);
+        assert_eq!(r[0][0], Value::Str(huge));
 
         // numbers do not fit into text columns
         let err = db.execute_sql("insert into t values (4, 123);").unwrap_err();

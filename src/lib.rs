@@ -86,7 +86,7 @@ use crate::storage::codec::{decode_record, encode_record};
 use crate::storage::engine::{HeapEngine, TableStorage};
 use crate::storage::lsm::engine::{LsmEngine, LSM_FILE_ID};
 use crate::storage::slotted::{page_get, page_put_at};
-use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, Rid};
+use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, LobStore, Rid};
 use crate::trx::{TrxState, Undo};
 use crate::value::Value;
 use crate::wal::{Record, Wal};
@@ -103,6 +103,8 @@ pub struct Database {
     config: Config,
     catalog: RwLock<Catalog>,
     pool: BufferPool,
+    /// Out-of-line storage for long string values.
+    lobs: LobStore,
     wal: Wal,
     data_dir: PathBuf,
     next_table_file: AtomicU32,
@@ -255,6 +257,7 @@ impl Database {
             config: config.clone(),
             catalog: RwLock::new(catalog),
             pool,
+            lobs: LobStore::open(&path.join("lobs"))?,
             wal: Wal::open(&wal_path)?,
             data_dir: path.to_path_buf(),
             next_table_file: AtomicU32::new(next_table_file),
@@ -328,7 +331,7 @@ impl Database {
             let ops = self.index_ops(&meta.name)?;
             let engine = self.catalog().table(&meta.name)?.engine();
             for (rid, rec) in self.store_scan_raw(&meta.name)? {
-                let (creator, deleter, row) = crate::storage::codec::decode_record(&rec)?;
+                let (creator, deleter, row) = crate::storage::codec::decode_record(&rec, &self.lobs)?;
                 let dead = !committed.contains(&creator)
                     || (deleter != 0 && committed.contains(&deleter));
                 if !dead {
@@ -453,7 +456,7 @@ impl Database {
             BTree::init(&self.pool, *ix_file)?;
         }
         for (rid, rec) in self.store_scan_raw(&table)? {
-            let (_, _, row) = crate::storage::codec::decode_record(&rec)?;
+            let (_, _, row) = crate::storage::codec::decode_record(&rec, &self.lobs)?;
             for (ci, ix_file) in &ops {
                 let key = encode_key(&row[*ci])?;
                 BTree::at(*ix_file).insert(&self.pool, &key, rid)?;
@@ -515,7 +518,7 @@ impl Database {
             }
             let engine = self.catalog().table(table)?.engine();
             let rec = engine.get(&self.pool, rid)?;
-            let (_, current, _) = decode_record(&rec)?;
+            let (_, current, _) = decode_record(&rec, &self.lobs)?;
             if self.conflicting_committer(trx, current) {
                 return Err(conflict_error(table));
             }
@@ -812,6 +815,16 @@ impl Database {
         self.catalog.read()
     }
 
+    /// Out-of-line storage for large string values.
+    pub(crate) fn lobs(&self) -> &LobStore {
+        &self.lobs
+    }
+
+    /// Strings longer than this are stored out-of-line.
+    pub(crate) fn inline_lob_limit(&self) -> usize {
+        self.config.storage.inline_lob_limit
+    }
+
     /// Whether a table with `name` exists in this database.
     pub(crate) fn table_exists(&self, name: &str) -> bool {
         self.catalog().table(name).is_ok()
@@ -969,7 +982,7 @@ impl Database {
                     continue;
                 }
                 let rec = engine.get(&self.pool, rid)?;
-                let (creator, deleter, _) = decode_record(&rec)?;
+                let (creator, deleter, _) = decode_record(&rec, &self.lobs)?;
                 if trx.visible(creator, deleter) {
                     return Err(Error::Runtime(format!("duplicate key: {table}({column})")));
                 }
@@ -989,7 +1002,7 @@ impl Database {
             let t = catalog.table(name)?;
             (t.heap.file_no, t.engine())
         };
-        let data = encode_record(creator, 0, &row);
+        let data = encode_record(creator, 0, &row, &self.lobs, self.inline_lob_limit())?;
         let rid = engine.insert(&self.pool, &data)?;
         self.wal.append(creator, &Record::Insert { file_no, rid, record: data.clone() })?;
         for (ci, ix_file) in self.index_ops(name)? {
@@ -1040,7 +1053,7 @@ impl Database {
             let prev_deleter = engine.delete_mark(&self.pool, *rid, trx_id)?;
             self.wal
                 .append(trx_id, &Record::DeleteMark { file_no, rid: *rid, deleter: trx_id })?;
-            let data = encode_record(trx_id, 0, new_row);
+            let data = encode_record(trx_id, 0, new_row, &self.lobs, self.inline_lob_limit())?;
             let new_rid = engine.insert(&self.pool, &data)?;
             self.wal.append(
                 trx_id,
