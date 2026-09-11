@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：P10.1 完成（分库锁 + 去全局锁 + `ThreadHandler` 双线程后端）；382 tests 全绿、clippy 零警告。
+> 最后更新：P10.2a 完成（只读 autocommit 不再写共享事务簿记）；384 tests 全绿、clippy 零警告。
 
 ---
 
@@ -357,7 +357,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 验收记录（M20–M25 评审）：296 tests 全绿 + clippy 零警告；人工边界复验（跨列同值、DROP TABLE 清约束索引、链式 RIGHT JOIN、ESCAPE 角例、OrderedIndexScan 含 DESC、DML 子查询、恢复路径 `rebuild_indexes` 覆盖约束索引）均通过。**发现并修复 1 处阻断性缺陷**：`check_unique` 的 `claimed` 查重表跨唯一索引共享，同一行两个不同约束列取同值（如 PK 列与 UNIQUE 列同为 1）会被误判 `duplicate key`——红测试复现后按列下标区分修复，见 `abd0dbb`。已知边界（如实记档）：UNION 各臂不做类型统一，混型结果集上比较会报 type mismatch。
 
-提交基线：`a1acc25 feat: add ThreadHandler with per-connection and thread-pool backends`（HEAD）。
+提交基线：`879c39e feat: skip shared transaction bookkeeping for read-only autocommit`（HEAD）。
 
 ---
 
@@ -398,7 +398,7 @@ DML 先算子化（P5.5），使执行层统一走算子。
 | P7 | LSM 引擎（下一阶段） | ⬜ |
 | P8 | LOB（外存 + `LobReader` 流式） | ⬜ |
 | P9 | 多前端（MySQL/HTTP/Text TCP） | ⬜ |
-| P10 | 并发：`ThreadHandler`（per-connection/thread-pool）+ 去全局锁 + 可配置冲突策略（FCW/2PL） | 🟡 P10.1 完成：分库锁 + 去全局锁（`4984822`）+ `ThreadHandler` 双后端（`a1acc25`）；P10.2 库内读并发、P10.3 FCW/2PL 待做 |
+| P10 | 并发：`ThreadHandler`（per-connection/thread-pool）+ 去全局锁 + 可配置冲突策略（FCW/2PL） | 🟡 P10.1 完成：分库锁 + 去全局锁（`4984822`）+ `ThreadHandler` 双后端（`a1acc25`）；P10.2a 完成：只读 autocommit 走本地快照事务，不写 `next_trx_id`/`open_trxs`/`committed_trxs`（`879c39e`）；P10.2b/c/d 与 P10.3 FCW/2PL 待做 |
 
 工作纪律：每步先写失败测试（红）再最小实现（绿），提交粒度对齐 chibicc（一次一件事），
 提交前全量 `cargo test` + clippy 零警告，并同步本文档与 README。
