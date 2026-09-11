@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：P10 + P7（双引擎，含 `ENGINE=` 语法）+ P8（外存 LOB）完成；448 tests 全绿、clippy 零警告。
+> 最后更新：P10 + P7 + P8 完成，P3 认证/权限强制落地；451 tests 全绿、clippy 零警告。
 
 ---
 
@@ -357,7 +357,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 验收记录（M20–M25 评审）：296 tests 全绿 + clippy 零警告；人工边界复验（跨列同值、DROP TABLE 清约束索引、链式 RIGHT JOIN、ESCAPE 角例、OrderedIndexScan 含 DESC、DML 子查询、恢复路径 `rebuild_indexes` 覆盖约束索引）均通过。**发现并修复 1 处阻断性缺陷**：`check_unique` 的 `claimed` 查重表跨唯一索引共享，同一行两个不同约束列取同值（如 PK 列与 UNIQUE 列同为 1）会被误判 `duplicate key`——红测试复现后按列下标区分修复，见 `abd0dbb`。已知边界（如实记档）：UNION 各臂不做类型统一，混型结果集上比较会报 type mismatch。
 
-提交基线：`178db10 feat: support CREATE TABLE ... ENGINE = heap|lsm`（HEAD）。
+提交基线：`d773d5e feat: authenticate sessions and enforce privileges at the instance layer`（HEAD）。
 
 ---
 
@@ -391,7 +391,7 @@ DML 先算子化（P5.5），使执行层统一走算子。
 | P1.3 | 文件头 `format_version/page_size/engine` 元数据 | ⏩ 延到 P6（`PAGE_SIZE` 现为编译期常量，动态化随存储抽象做） |
 | P2 | 抽象接缝：存储读接口 `RowScanner`/`TableEngine` + `HeapEngine`；`Protocol`/`TextProtocol` 编解码；`Stage`/`Pipeline` + `ExecuteStage` | 🟡 三个接缝落地（`d220fcb`、`7b351d6`、`9c5199a`） |
 | P2+ | 其余接缝：`TransactionManager`、`PhysicalOperator` | ⬜ |
-| P3 | 单实例多库 + 系统元数据库 + 用户/权限 | 🟡 多库 + 前端接入 + 系统库 `chibi_meta`（`databases`/`users`/`privileges`）+ `CREATE/DROP USER` + `GRANT/REVOKE`（`e99c5ef`…`7d8a85f`）；认证/权限尚未在协议层强制、系统表未以 `information_schema` 暴露 |
+| P3 | 单实例多库 + 系统元数据库 + 用户/权限 | 🟡 多库 + 前端接入 + 系统库 `chibi_meta`（`databases`/`users`/`privileges`）+ `CREATE/DROP USER` + `GRANT/REVOKE`（`e99c5ef`…`7d8a85f`）；认证/权限已强制（`d773d5e`）：`auth.enabled = true` 时，`LOGIN u IDENTIFIED BY 'p'` 认证并绑定会话；未登录报 `not logged in`，越权报 `permission denied`（SELECT/EXPLAIN 需 Read；DML/DDL 需 Write；用户/库管理仅需登录）；无用户时允许免登录 `CREATE USER` 作为引导。`information_schema` 暴露仍待做 |
 | P4 | Stage 流水线（Parse/Resolve/Optimize/Execute/Result） | 🟡 `ResolveStage`/`OptimizeStage` 落地（`dc312de`）；Parse 仍在 pipeline 外、Execute 尚未消费 `plan`、Result 写出仍在前端 |
 | P5 | 执行模型：基准 → 火山算子 → Chunk | ✅ SELECT 全走算子（单/多表、`HashJoin`、分组聚合、DISTINCT、ORDER、LIMIT、UNION、视图、相关/不相关子查询）；物化 SELECT 主干已删除；Chunk 按评估暂缓 |
 | P5.5 | DML 算子化：`Insert`/`Update`/`Delete` 命令算子 | ✅ `InsertOp`/`UpdateOp`/`DeleteOp`（`e620154`） |
