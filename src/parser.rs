@@ -5,6 +5,7 @@ use crate::ast::{
     Limit, Privilege, RevokeStmt, SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp, UpdateStmt,
     UseStmt,
 };
+use crate::config::EngineKind;
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
 
@@ -569,7 +570,22 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(Punct::RParen)?;
-        Ok(Stmt::CreateTable(CreateTableStmt { name, columns }))
+        let engine = if self.eat_keyword("engine") {
+            self.expect_punct(Punct::Eq)?;
+            let kind = match self.bump() {
+                Some(Token { kind: TokenKind::Ident(s), .. }) if s.eq_ignore_ascii_case("heap") => {
+                    EngineKind::Heap
+                }
+                Some(Token { kind: TokenKind::Ident(s), .. }) if s.eq_ignore_ascii_case("lsm") => {
+                    EngineKind::Lsm
+                }
+                _ => return Err(self.unexpected("engine name (heap or lsm)")),
+            };
+            Some(kind)
+        } else {
+            None
+        };
+        Ok(Stmt::CreateTable(CreateTableStmt { name, columns, engine }))
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef> {

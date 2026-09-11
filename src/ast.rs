@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::config::EngineKind;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOp {
     Add,
@@ -164,6 +166,8 @@ pub struct ColumnDef {
 pub struct CreateTableStmt {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    /// `ENGINE = heap|lsm`; `None` uses `storage.default_engine`.
+    pub engine: Option<EngineKind>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

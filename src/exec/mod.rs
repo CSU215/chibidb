@@ -369,7 +369,7 @@ fn execute_create_table(db: &Database, c: &CreateTableStmt) -> Result<ResultSet>
         });
     }
     let schema = Schema { columns };
-    let kind = db.default_engine();
+    let kind = c.engine.unwrap_or_else(|| db.default_engine());
     let (heap, engine) = db.new_table_storage(kind)?;
     db.catalog_mut().create_table(&c.name, schema, heap, kind, engine)?;
     // PRIMARY KEY / UNIQUE get a constraint-backed unique index; the table is
