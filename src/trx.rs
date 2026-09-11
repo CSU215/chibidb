@@ -20,6 +20,8 @@ pub struct Session {
     id: u64,
     /// Whether this session currently holds the database's 2PL write lock.
     holds_writer: bool,
+    /// Authenticated user, once the session has logged in.
+    user: Option<String>,
 }
 
 impl Session {
@@ -29,11 +31,21 @@ impl Session {
             current_db: None,
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             holds_writer: false,
+            user: None,
         }
     }
 
     pub fn current_db(&self) -> Option<&str> {
         self.current_db.as_deref()
+    }
+
+    /// The authenticated user, if the session has logged in.
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+
+    pub(crate) fn set_user(&mut self, user: Option<String>) {
+        self.user = user;
     }
 
     pub(crate) fn set_current_db(&mut self, name: Option<String>) {

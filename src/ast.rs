@@ -242,6 +242,12 @@ pub struct CreateUserStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct LoginStmt {
+    pub name: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct DropUserStmt {
     pub name: String,
 }
@@ -356,6 +362,7 @@ pub enum Stmt {
     Explain(ExplainStmt),
     Grant(GrantStmt),
     Insert(InsertStmt),
+    Login(LoginStmt),
     Revoke(RevokeStmt),
     Select(Box<SelectStmt>),
     Update(UpdateStmt),

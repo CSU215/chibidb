@@ -67,7 +67,8 @@ pub(crate) fn execute(db: &Database, trx: &mut TrxState, stmt: &Stmt) -> Result<
         | Stmt::CreateUser(_)
         | Stmt::DropUser(_)
         | Stmt::Grant(_)
-        | Stmt::Revoke(_) => {
+        | Stmt::Revoke(_)
+        | Stmt::Login(_) => {
             Err(Error::Runtime("database statements must be run on an instance".into()))
         }
         Stmt::Trx(_) => Err(Error::Runtime("transaction control handled elsewhere".into())),

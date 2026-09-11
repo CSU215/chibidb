@@ -172,7 +172,13 @@ impl Instance {
         let stmts = parser::parse(sql)?;
         let mut out = Vec::new();
         for stmt in &stmts {
+            self.authorize(session, stmt)?;
             match stmt {
+                Stmt::Login(l) => {
+                    self.reject_in_trx(session)?;
+                    self.login(session, &l.name, &l.password)?;
+                    out.push(ResultSet::Message("SUCCESS".into()));
+                }
                 Stmt::CreateDatabase(c) => {
                     self.reject_in_trx(session)?;
                     self.create_database(&c.name)?;
@@ -311,6 +317,66 @@ impl Instance {
         Ok(())
     }
 
+    /// Authenticates `user` and binds it to the session.
+    pub fn login(&self, session: &mut Session, user: &str, password: &str) -> Result<()> {
+        if !self.authenticate(user, password)? {
+            return Err(Error::Runtime("authentication failed".into()));
+        }
+        session.set_user(Some(user.to_string()));
+        Ok(())
+    }
+
+    /// Enforces authentication and per-database privileges when
+    /// `auth.enabled`. Without it every statement is allowed (as before).
+    fn authorize(&self, session: &Session, stmt: &Stmt) -> Result<()> {
+        if !self.config.auth.enabled || matches!(stmt, Stmt::Login(_)) {
+            return Ok(());
+        }
+        // bootstrap: the first account may be created before anyone logs in
+        if session.user().is_none()
+            && matches!(stmt, Stmt::CreateUser(_))
+            && !self.any_users()?
+        {
+            return Ok(());
+        }
+        let Some(user) = session.user() else {
+            return Err(Error::Runtime("not logged in".into()));
+        };
+        // account administration only needs a login (there is no role model)
+        if matches!(
+            stmt,
+            Stmt::CreateUser(_)
+                | Stmt::DropUser(_)
+                | Stmt::Grant(_)
+                | Stmt::Revoke(_)
+                | Stmt::CreateDatabase(_)
+                | Stmt::DropDatabase(_)
+        ) {
+            return Ok(());
+        }
+        let Some(privilege) = statement_privilege(stmt) else {
+            return Ok(());
+        };
+        let db = session.current_db().unwrap_or(DEFAULT_DB);
+        if !self.has_privilege(user, db, privilege)? {
+            return Err(Error::Runtime(format!(
+                "permission denied for {user} on {db}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn any_users(&self) -> Result<bool> {
+        let meta = self.meta.read();
+        let result = meta.execute_sql("select count(*) from users;")?;
+        Ok(match result.into_iter().next() {
+            Some(ResultSet::Rows { rows, .. }) if !rows.is_empty() => {
+                matches!(rows[0].first(), Some(Value::Int(n)) if *n > 0)
+            }
+            _ => false,
+        })
+    }
+
     // ---- users -----------------------------------------------------------
 
     pub fn create_user(&self, name: &str, password: &str) -> Result<()> {
@@ -390,6 +456,21 @@ impl Instance {
             "select kind from privileges where username = '{user}' and kind = '{kind}' and (dbname = '{database}' or dbname = '*');"
         ))?;
         Ok(matches!(result.into_iter().next(), Some(ResultSet::Rows { rows, .. }) if !rows.is_empty()))
+    }
+}
+
+/// The privilege a statement needs on its current database, if any.
+fn statement_privilege(stmt: &Stmt) -> Option<Privilege> {
+    match stmt {
+        Stmt::Select(_) | Stmt::Explain(_) => Some(Privilege::Read),
+        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Some(Privilege::Write),
+        Stmt::CreateTable(_)
+        | Stmt::CreateIndex(_)
+        | Stmt::CreateView(_)
+        | Stmt::DropTable(_)
+        | Stmt::DropIndex(_)
+        | Stmt::DropView(_) => Some(Privilege::Write),
+        _ => None,
     }
 }
 

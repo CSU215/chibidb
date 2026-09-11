@@ -2,7 +2,8 @@ use crate::ast::{
     AggFunc, BinOp, ColumnDef, CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt,
     CreateUserStmt, CreateViewStmt, DataType, DeleteStmt, DropDatabaseStmt, DropIndexStmt,
     DropTableStmt, DropUserStmt, DropViewStmt, ExplainStmt, Expr, GrantStmt, InsertStmt, JoinKind,
-    Limit, Privilege, RevokeStmt, SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp, UpdateStmt,
+    Limit, LoginStmt, Privilege, RevokeStmt, SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp,
+    UpdateStmt,
     UseStmt,
 };
 use crate::config::EngineKind;
@@ -111,6 +112,17 @@ impl<'a> Parser<'a> {
             }
             let inner = self.parse_statement()?;
             return Ok(Stmt::Explain(ExplainStmt { stmt: Box::new(inner) }));
+        }
+        if self.eat_keyword("login") {
+            let name = self.parse_name_literal("user name")?;
+            if !self.eat_keyword("identified") {
+                return Err(self.unexpected("identified"));
+            }
+            if !self.eat_keyword("by") {
+                return Err(self.unexpected("by"));
+            }
+            let password = self.parse_string("password")?;
+            return Ok(Stmt::Login(LoginStmt { name, password }));
         }
         if self.eat_keyword("select") {
             return self.parse_select();
