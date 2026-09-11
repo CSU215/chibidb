@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：P10 完成 + P7.1 接缝 + P7.2 MemTable + P7.3a/b 块与 SSTable；410 tests 全绿、clippy 零警告。
+> 最后更新：P10 完成 + P7.1 接缝 + P7.2 MemTable + P7.3a/b/c 块/SSTable/bloom；414 tests 全绿、clippy 零警告。
 
 ---
 
@@ -357,7 +357,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 验收记录（M20–M25 评审）：296 tests 全绿 + clippy 零警告；人工边界复验（跨列同值、DROP TABLE 清约束索引、链式 RIGHT JOIN、ESCAPE 角例、OrderedIndexScan 含 DESC、DML 子查询、恢复路径 `rebuild_indexes` 覆盖约束索引）均通过。**发现并修复 1 处阻断性缺陷**：`check_unique` 的 `claimed` 查重表跨唯一索引共享，同一行两个不同约束列取同值（如 PK 列与 UNIQUE 列同为 1）会被误判 `duplicate key`——红测试复现后按列下标区分修复，见 `abd0dbb`。已知边界（如实记档）：UNION 各臂不做类型统一，混型结果集上比较会报 type mismatch。
 
-提交基线：`4bb82fc feat: add the LSM sstable writer and reader`（HEAD）。
+提交基线：`dae2532 feat: add a bloom filter and wire it into sstable lookups`（HEAD）。
 
 ---
 
@@ -396,7 +396,7 @@ DML 先算子化（P5.5），使执行层统一走算子。
 | P5 | 执行模型：基准 → 火山算子 → Chunk | ✅ SELECT 全走算子（单/多表、`HashJoin`、分组聚合、DISTINCT、ORDER、LIMIT、UNION、视图、相关/不相关子查询）；物化 SELECT 主干已删除；Chunk 按评估暂缓 |
 | P5.5 | DML 算子化：`Insert`/`Update`/`Delete` 命令算子 | ✅ `InsertOp`/`UpdateOp`/`DeleteOp`（`e620154`） |
 | P6 | 存储引擎抽象落地：Heap + Double-Write Buffer | 🟡 统一文件头（`63ede97`）+ 可配置 DWB（`3daa90b`）；`StorageEngine` trait 待 LSM 阶段再扩（`TableEngine` 读接缝已在 P2 落地） |
-| P7 | LSM 引擎 | 🟡 P7.1 存储引擎接缝完成：`TableStorage`（`TableEngine` + `insert/delete/delete_mark/file_id`，MVCC 语义）与 `HeapEngine` 实现；`Table` 持 `Arc<dyn TableStorage>`，`Database` 的 `store_*`/回滚/vacuum/唯一性检查、`TableScan`/`IndexScan` 均经该接缝（`da4299f`）。P7.2 完成：`src/storage/lsm/memtable.rs` 有序写缓冲 `MemTable`（`RwLock<BTreeMap>` + `AtomicUsize` 字节计数；`put/delete`（墓碑）/`get`/`iter`/`range`；`MemEntry` 区分值/墓碑），`tests/lsm_memtable.rs` 覆盖覆盖写、墓碑、排序/范围、字节计数、并发写（`b336985`）。P7.3a 完成：`src/storage/lsm/coding.rs`（varint/fixed32）与 `block.rs`（LevelDB 式前缀压缩块 + restart 数组，`BlockBuilder`/`Block` 支持 `get` 二分 + 块内扫描、`first_key`、空块），`tests/lsm_block.rs` 覆盖往返/查找/边界/空块/编码截断（`45d1c6f`）。P7.3b 完成：`src/storage/lsm/sstable.rs`——`SSTableBuilder`（按块大小切分数据块，索引块记「块末 key → `BlockHandle`」，footer `index_offset/index_size/magic`）与 `SSTable`（解析索引、`get` 依索引二分选块、`iter` 顺序遍历、`first_key`），`tests/lsm_sstable.rs` 覆盖多块往返/命中未命中/单块/空表/损坏校验（`4bb82fc`）。P7.3c bloom、P7.4 compaction/manifest、P7.5 LSM 引擎与 `ENGINE=` 待做 |
+| P7 | LSM 引擎 | 🟡 P7.1 存储引擎接缝完成：`TableStorage`（`TableEngine` + `insert/delete/delete_mark/file_id`，MVCC 语义）与 `HeapEngine` 实现；`Table` 持 `Arc<dyn TableStorage>`，`Database` 的 `store_*`/回滚/vacuum/唯一性检查、`TableScan`/`IndexScan` 均经该接缝（`da4299f`）。P7.2 完成：`src/storage/lsm/memtable.rs` 有序写缓冲 `MemTable`（`RwLock<BTreeMap>` + `AtomicUsize` 字节计数；`put/delete`（墓碑）/`get`/`iter`/`range`；`MemEntry` 区分值/墓碑），`tests/lsm_memtable.rs` 覆盖覆盖写、墓碑、排序/范围、字节计数、并发写（`b336985`）。P7.3a 完成：`src/storage/lsm/coding.rs`（varint/fixed32）与 `block.rs`（LevelDB 式前缀压缩块 + restart 数组，`BlockBuilder`/`Block` 支持 `get` 二分 + 块内扫描、`first_key`、空块），`tests/lsm_block.rs` 覆盖往返/查找/边界/空块/编码截断（`45d1c6f`）。P7.3b 完成：`src/storage/lsm/sstable.rs`——`SSTableBuilder`（按块大小切分数据块，索引块记「块末 key → `BlockHandle`」，footer `index_offset/index_size/magic`）与 `SSTable`（解析索引、`get` 依索引二分选块、`iter` 顺序遍历、`first_key`），`tests/lsm_sstable.rs` 覆盖多块往返/命中未命中/单块/空表/损坏校验（`4bb82fc`）。P7.3c 完成：`src/storage/lsm/bloom.rs`（FNV-1a 双哈希，编码 `bit array + k`；空过滤器保守返回「可能」）并接入 SSTable footer（filter/index 两个 handle），`SSTable::get` 先过 bloom；`tests/lsm_bloom.rs` 覆盖无假阴性/假阳性率/空过滤器，`tests/lsm_sstable.rs` 加 bloom 接线用例（`dae2532`）。P7.4 compaction/manifest、P7.5 LSM 引擎与 `ENGINE=` 待做 |
 | P8 | LOB（外存 + `LobReader` 流式） | ⬜ |
 | P9 | 多前端（MySQL/HTTP/Text TCP） | ⬜ |
 | P10 | 并发：`ThreadHandler`（per-connection/thread-pool）+ 去全局锁 + 可配置冲突策略（FCW/2PL） | 🟡 P10.1：分库锁 + 去全局锁（`4984822`）+ `ThreadHandler` 双后端（`a1acc25`）。P10.2a：只读 autocommit 走本地快照事务，不写 `next_trx_id`/`open_trxs`/`committed_trxs`（`879c39e`）。P10.2b：`BufferPool` 元数据锁 + 每帧 `Mutex<PageData>`/`AtomicBool` 脏位，方法 `&self`（`f56694b`）。P10.2c：WAL 内部 `Mutex`（`f56c78d`）、Catalog `RwLock`（`9f8e801`）、事务簿记 `Atomic*`/`RwLock`（`64b52c1`）。P10.2d：`Database` 方法全 `&self`、读路径 `&Database`、`Instance` 每库 `RwLock<Database>`（读并发、写独占）（`2c70856`）。P10.3：`transaction.conflict = "fcw" | "2pl"`（`e068598`）。FCW：提交时按 `prev_deleter`/当前标记检测写写冲突并回滚失败方。2PL：每库悲观写锁（`Arc<DatabaseWriteLock>`，`Condvar` 等待 + `lock_timeout_ms`），显式事务在 `BEGIN`（取快照前）持锁至 `COMMIT/ROLLBACK`，自动提交写在语句内持锁；`Instance` 在取库锁前先取写锁，避免与 COMMIT 形成锁序死锁（`80596c1`）；`rollback_session` 释放。**P10 阶段完成** |
