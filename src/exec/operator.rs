@@ -8,7 +8,7 @@ use crate::trx::Session;
 use crate::value::Value;
 use crate::{Database, Error, Result};
 
-use super::aggregate::expr_has_aggregate;
+use super::aggregate::{expr_has_aggregate, sort_rows};
 use super::eval::{eval_const, EvalCtx};
 use super::subquery::{eval_bound, eval_predicate_bound};
 
@@ -36,15 +36,21 @@ pub struct TableScan {
 
 impl TableScan {
     pub fn new(db: &Database, table: &str) -> Result<Self> {
+        Self::with_owner(db, table, table)
+    }
+
+    /// `owner` is the alias (or table name) that qualifies this scan's
+    /// columns, so qualified references resolve correctly.
+    pub fn with_owner(db: &Database, table: &str, owner: &str) -> Result<Self> {
         let columns = db.catalog().table(table)?.schema.columns.clone();
-        let owner = table.to_string();
+        let owner = owner.to_string();
         let schema = Schema {
             columns: columns
                 .into_iter()
                 .map(|c| ColumnDesc::plain(Some(owner.clone()), c.name, c.dtype))
                 .collect(),
         };
-        Ok(Self { table: owner, schema, scanner: None })
+        Ok(Self { table: table.to_string(), schema, scanner: None })
     }
 }
 
@@ -295,10 +301,74 @@ impl PhysicalOperator for Distinct {
     }
 }
 
+/// Blocking sort operator: materializes its child, orders by `order_by`
+/// (resolving SELECT aliases against `items`), then streams the result.
+pub struct Sort {
+    child: Box<dyn PhysicalOperator>,
+    order_by: Vec<(Expr, bool)>,
+    items: Vec<SelectItem>,
+    rows: Vec<Vec<Value>>,
+    pos: usize,
+}
+
+impl Sort {
+    pub fn new(
+        child: Box<dyn PhysicalOperator>,
+        order_by: Vec<(Expr, bool)>,
+        items: Vec<SelectItem>,
+    ) -> Self {
+        Self { child, order_by, items, rows: Vec::new(), pos: 0 }
+    }
+}
+
+impl PhysicalOperator for Sort {
+    fn schema(&self) -> &Schema {
+        self.child.schema()
+    }
+
+    fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
+        self.child.open(ctx)?;
+        let mut rows = Vec::new();
+        while let Some(row) = self.child.next(ctx)? {
+            rows.push(row);
+        }
+        self.child.close()?;
+        let schema = self.child.schema().clone();
+        sort_rows(
+            ctx.db,
+            ctx.session.trx(),
+            None,
+            &schema,
+            &mut rows,
+            &self.order_by,
+            &self.items,
+        )?;
+        self.rows = rows;
+        self.pos = 0;
+        Ok(())
+    }
+
+    fn next(&mut self, _ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
+        if self.pos >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.pos].clone();
+        self.pos += 1;
+        Ok(Some(row))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.rows.clear();
+        self.pos = 0;
+        Ok(())
+    }
+}
+
 /// Index scan: fetches exactly the row ids the access path selected.
 pub struct IndexScan {
     schema: Schema,
     heap_file: crate::storage::FileId,
+    column: String,
     rids: Vec<Rid>,
     pos: usize,
 }
@@ -306,18 +376,39 @@ pub struct IndexScan {
 impl IndexScan {
     /// Returns `None` when the selection is not sargable (use a `TableScan`).
     pub fn new(db: &mut Database, table: &str, selection: Option<&Expr>) -> Result<Option<Self>> {
+        Self::with_owner(db, table, table, selection)
+    }
+
+    /// `owner` is the alias (or table name) that qualifies this scan's columns.
+    pub fn with_owner(
+        db: &mut Database,
+        table: &str,
+        owner: &str,
+        selection: Option<&Expr>,
+    ) -> Result<Option<Self>> {
         let Some(plan) = crate::exec::plan::plan_index_scan(db, table, selection)? else {
             return Ok(None);
         };
         let columns = db.catalog().table(table)?.schema.columns.clone();
-        let owner = table.to_string();
+        let owner = owner.to_string();
         let schema = Schema {
             columns: columns
                 .into_iter()
                 .map(|c| ColumnDesc::plain(Some(owner.clone()), c.name, c.dtype))
                 .collect(),
         };
-        Ok(Some(Self { schema, heap_file: plan.heap_file, rids: plan.rids, pos: 0 }))
+        Ok(Some(Self {
+            schema,
+            heap_file: plan.heap_file,
+            column: plan.column,
+            rids: plan.rids,
+            pos: 0,
+        }))
+    }
+
+    /// The indexed column, which the scan yields in ascending order.
+    pub fn ordered_column(&self) -> &str {
+        &self.column
     }
 }
 
@@ -356,12 +447,8 @@ pub fn build_select(
     db: &mut Database,
     select: &SelectStmt,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
-    // set operations, grouping and ordering are not covered yet
-    if !select.set_ops.is_empty()
-        || !select.group_by.is_empty()
-        || select.having.is_some()
-        || !select.order_by.is_empty()
-    {
+    // set operations, grouping and having are not covered yet
+    if !select.set_ops.is_empty() || !select.group_by.is_empty() || select.having.is_some() {
         return Ok(None);
     }
 
@@ -384,6 +471,7 @@ pub fn build_select(
     if db.catalog().view(table).is_some() {
         return Ok(None);
     }
+    let owner = select.from[0].alias.as_deref().unwrap_or(table);
     // aggregation is not covered yet
     if select.items.iter().any(|item| match item {
         SelectItem::Expr(e) | SelectItem::Aliased(e, _) => expr_has_aggregate(e),
@@ -392,13 +480,25 @@ pub fn build_select(
         return Ok(None);
     }
 
-    let mut op: Box<dyn PhysicalOperator> =
-        match IndexScan::new(db, table, select.selection.as_ref())? {
-            Some(scan) => Box::new(scan),
-            None => Box::new(TableScan::new(db, table)?),
+    let (mut op, ordered_by): (Box<dyn PhysicalOperator>, Option<String>) =
+        match IndexScan::with_owner(db, table, owner, select.selection.as_ref())? {
+            Some(scan) => {
+                let column = scan.ordered_column().to_string();
+                (Box::new(scan), Some(column))
+            }
+            None => (Box::new(TableScan::with_owner(db, table, owner)?), None),
         };
     if let Some(selection) = &select.selection {
         op = Box::new(Filter::new(op, selection.clone()));
+    }
+    if !select.order_by.is_empty() {
+        // an ascending scan on the ordering column already yields the order
+        let skip = ordered_by
+            .as_deref()
+            .is_some_and(|column| crate::exec::plan::order_by_matches(column, &select.order_by));
+        if !skip {
+            op = Box::new(Sort::new(op, select.order_by.clone(), select.items.clone()));
+        }
     }
     let (exprs, headers) = projection(db, table, &select.items)?;
     op = Box::new(Project::new(op, exprs, headers));
