@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use chibidb::config::{Config, EngineKind, ExecutionMode};
+use chibidb::config::{Config, EngineKind, ExecutionMode, ThreadModel};
 use chibidb::value::Value;
 use chibidb::{Database, ResultSet};
 
@@ -85,6 +85,24 @@ fn rejects_zero_page_size() {
 fn rejects_zero_buffer_pool_frames() {
     let c = Config::from_toml_str("[storage]\nbuffer_pool_frames = 0\n").unwrap();
     assert!(c.validate().is_err());
+}
+
+#[test]
+fn parses_thread_model() {
+    let per = Config::from_toml_str("[server]\nthread_model = \"per-connection\"\n").unwrap();
+    assert_eq!(per.server.thread_model, ThreadModel::PerConnection);
+
+    let pool =
+        Config::from_toml_str("[server]\nthread_model = \"thread-pool\"\nworker_threads = 8\n")
+            .unwrap();
+    assert_eq!(pool.server.thread_model, ThreadModel::ThreadPool);
+    assert_eq!(pool.server.worker_threads, 8);
+
+    let zero = Config::from_toml_str(
+        "[server]\nthread_model = \"thread-pool\"\nworker_threads = 0\n",
+    )
+    .unwrap();
+    assert!(zero.validate().is_err());
 }
 
 #[test]

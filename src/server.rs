@@ -1,50 +1,106 @@
-use std::io;
-use std::sync::Arc;
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpStream as StdTcpStream};
+use std::sync::{mpsc, Arc};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
+use crate::config::{Config, ThreadModel};
 use crate::instance::Instance;
 use crate::protocol::{Protocol, TextProtocol};
 use crate::trx::Session;
 
 pub type SharedInstance = Arc<Instance>;
 
-/// Accepts connections until the listener is closed.
-///
-/// Each connection runs on its own tokio task; statement execution takes the
-/// target database's lock inside `Instance` (different databases run in
-/// parallel, the same database serializes).
+/// Dispatches accepted connections to blocking execution threads.
+pub trait ThreadHandler: Send + Sync {
+    fn dispatch(&self, instance: SharedInstance, stream: StdTcpStream, peer: SocketAddr);
+}
+
+/// Accepts connections until the listener is closed, handing each to the
+/// configured thread model. Statement execution is synchronous and runs on the
+/// handler's threads; only accept and socket transfer use the async runtime.
 pub async fn serve(instance: SharedInstance, listener: TcpListener) -> io::Result<()> {
+    let handler = build_handler(instance.config());
     loop {
         let (stream, peer) = listener.accept().await?;
-        let instance = instance.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_conn(instance, stream).await {
-                eprintln!("connection {peer} error: {e}");
-            }
-        });
+        let stream = stream.into_std()?;
+        stream.set_nonblocking(false)?;
+        handler.dispatch(instance.clone(), stream, peer);
     }
 }
 
-/// Request protocol: `[u32 len][sql utf8]`; response: a sequence of wire frames.
-async fn handle_conn(instance: SharedInstance, stream: TcpStream) -> io::Result<()> {
+fn build_handler(config: &Config) -> Box<dyn ThreadHandler> {
+    match config.server.thread_model {
+        ThreadModel::PerConnection => Box::new(PerConnectionHandler),
+        ThreadModel::ThreadPool => Box::new(ThreadPoolHandler::new(config.server.worker_threads)),
+    }
+}
+
+/// One dedicated thread per connection.
+struct PerConnectionHandler;
+
+impl ThreadHandler for PerConnectionHandler {
+    fn dispatch(&self, instance: SharedInstance, stream: StdTcpStream, peer: SocketAddr) {
+        std::thread::spawn(move || run_connection(instance, stream, peer));
+    }
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// A fixed pool of worker threads shared by all connections.
+struct ThreadPoolHandler {
+    sender: mpsc::Sender<Job>,
+    _workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ThreadPoolHandler {
+    fn new(size: usize) -> Self {
+        let (sender, receiver) = mpsc::channel::<Job>();
+        let receiver = Arc::new(parking_lot::Mutex::new(receiver));
+        let mut workers = Vec::new();
+        for _ in 0..size.max(1) {
+            let receiver = Arc::clone(&receiver);
+            workers.push(std::thread::spawn(move || loop {
+                let job = {
+                    let guard = receiver.lock();
+                    guard.recv()
+                };
+                match job {
+                    Ok(job) => job(),
+                    Err(_) => break,
+                }
+            }));
+        }
+        Self { sender, _workers: workers }
+    }
+}
+
+impl ThreadHandler for ThreadPoolHandler {
+    fn dispatch(&self, instance: SharedInstance, stream: StdTcpStream, peer: SocketAddr) {
+        let job: Job = Box::new(move || run_connection(instance, stream, peer));
+        let _ = self.sender.send(job);
+    }
+}
+
+fn run_connection(instance: SharedInstance, mut stream: StdTcpStream, peer: SocketAddr) {
     // one session per connection so transactions span statements
     let mut session = Session::new();
-    let result = serve_session(&instance, stream, &mut session).await;
+    let result = serve_connection(&instance, &mut stream, &mut session);
     // roll back any open transaction when the session goes away
     if let Err(e) = instance.rollback_session(&mut session) {
         eprintln!("connection cleanup error: {e}");
     }
-    result
+    if let Err(e) = result {
+        eprintln!("connection {peer} error: {e}");
+    }
 }
 
-async fn serve_session(
+/// Request protocol: `[u32 len][sql utf8]`; response: a sequence of wire frames.
+fn serve_connection(
     instance: &Instance,
-    stream: TcpStream,
+    stream: &mut StdTcpStream,
     session: &mut Session,
 ) -> io::Result<()> {
-    let (mut rd, mut wr) = stream.into_split();
     let mut protocol = TextProtocol;
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -64,10 +120,11 @@ async fn serve_session(
                     Ok(results) => protocol.encode_success(&results, &mut out),
                     Err(e) => protocol.encode_failure(&e.to_string(), &mut out),
                 }
-                wr.write_all(&out).await?;
+                stream.write_all(&out)?;
+                stream.flush()?;
             }
             Ok(None) => {
-                let n = rd.read(&mut chunk).await?;
+                let n = stream.read(&mut chunk)?;
                 if n == 0 {
                     break;
                 }

@@ -59,6 +59,11 @@ impl Instance {
         Ok(Self { _temp: Some(temp), ..inst })
     }
 
+    /// The instance configuration (used by the server to pick a thread model).
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     fn bootstrap_meta(&self) -> Result<()> {
         let mut meta = self.meta.lock();
         if !meta.table_exists("databases") {

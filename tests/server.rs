@@ -9,14 +9,20 @@ use chibidb::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-async fn start_server() -> (SharedInstance, std::net::SocketAddr, tempfile::TempDir) {
+async fn start_server_with(
+    config: Config,
+) -> (SharedInstance, std::net::SocketAddr, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let instance = Instance::open(dir.path(), &Config::default()).unwrap();
+    let instance = Instance::open(dir.path(), &config).unwrap();
     let shared: SharedInstance = Arc::new(instance);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(serve(shared.clone(), listener));
     (shared, addr, dir)
+}
+
+async fn start_server() -> (SharedInstance, std::net::SocketAddr, tempfile::TempDir) {
+    start_server_with(Config::default()).await
 }
 
 /// Sends one statement and collects frames until Done.
@@ -176,6 +182,23 @@ async fn databases_are_selectable_over_tcp() {
     // a different connection still sees the default main database
     let mut b = TcpStream::connect(addr).await.unwrap();
     let rs = exec_remote(&mut b, "select id from t;").await.unwrap();
+    match &rs[0] {
+        ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(1)),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn thread_pool_model_serves_queries() {
+    let config =
+        Config::from_toml_str("[server]\nthread_model = \"thread-pool\"\nworker_threads = 2\n")
+            .unwrap();
+    let (_shared, addr, _dir) = start_server_with(config).await;
+
+    let mut c = TcpStream::connect(addr).await.unwrap();
+    exec_remote(&mut c, "create table t (id int);").await.unwrap();
+    exec_remote(&mut c, "insert into t values (1);").await.unwrap();
+    let rs = exec_remote(&mut c, "select count(*) from t;").await.unwrap();
     match &rs[0] {
         ResultSet::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(1)),
         other => panic!("expected rows, got {other:?}"),

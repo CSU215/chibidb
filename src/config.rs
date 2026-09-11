@@ -24,6 +24,17 @@ pub enum ExecutionMode {
     Chunk,
 }
 
+/// How accepted connections are mapped to execution threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThreadModel {
+    /// One dedicated blocking thread per connection.
+    #[default]
+    PerConnection,
+    /// A fixed pool of worker threads shared by all connections.
+    ThreadPool,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -56,6 +67,8 @@ pub struct WalConfig {
 pub struct ServerConfig {
     pub addr: String,
     pub protocols: Vec<String>,
+    pub thread_model: ThreadModel,
+    pub worker_threads: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -90,7 +103,12 @@ impl Default for WalConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { addr: "127.0.0.1:5678".into(), protocols: vec!["text".into()] }
+        Self {
+            addr: "127.0.0.1:5678".into(),
+            protocols: vec!["text".into()],
+            thread_model: ThreadModel::PerConnection,
+            worker_threads: 4,
+        }
     }
 }
 
@@ -127,6 +145,11 @@ impl Config {
         if self.storage.buffer_pool_frames == 0 {
             return Err(Error::Runtime(
                 "storage.buffer_pool_frames must be greater than zero".into(),
+            ));
+        }
+        if self.server.thread_model == ThreadModel::ThreadPool && self.server.worker_threads == 0 {
+            return Err(Error::Runtime(
+                "server.worker_threads must be greater than zero for the thread-pool model".into(),
             ));
         }
         Ok(())
