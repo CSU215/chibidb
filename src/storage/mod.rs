@@ -1,6 +1,7 @@
 pub mod buffer;
 pub mod codec;
 pub mod disk;
+pub mod dwb;
 pub mod engine;
 pub mod header;
 pub mod heap;

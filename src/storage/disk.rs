@@ -3,12 +3,14 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::storage::dwb::DoubleWrite;
 use crate::storage::page::{FileId, PageNo, PAGE_SIZE};
 use crate::{Error, Result};
 
 pub struct DiskManager {
     files: BTreeMap<FileId, (PathBuf, File)>,
     next_file_id: FileId,
+    dwb: Option<DoubleWrite>,
 }
 
 impl Default for DiskManager {
@@ -19,7 +21,42 @@ impl Default for DiskManager {
 
 impl DiskManager {
     pub fn new() -> Self {
-        Self { files: BTreeMap::new(), next_file_id: 0 }
+        Self { files: BTreeMap::new(), next_file_id: 0, dwb: None }
+    }
+
+    /// Enables a double-write buffer: dirty pages are staged there and synced
+    /// before reaching their final location, so a torn final write can be
+    /// repaired on the next open.
+    pub fn enable_double_write(&mut self, path: &Path) -> Result<()> {
+        self.dwb = Some(DoubleWrite::open(path)?);
+        Ok(())
+    }
+
+    /// Stages a page into the double-write buffer (no-op when disabled).
+    pub fn stage_page(&mut self, file: FileId, no: PageNo, buf: &[u8; PAGE_SIZE]) -> Result<()> {
+        if let Some(dwb) = self.dwb.as_mut() {
+            let target = self
+                .files
+                .get(&file)
+                .map(|(p, _)| p.clone())
+                .ok_or_else(|| Error::Runtime(format!("unknown file id {file}")))?;
+            dwb.stage(&target, no, buf)?;
+        }
+        Ok(())
+    }
+
+    pub fn sync_double_write(&mut self) -> Result<()> {
+        if let Some(dwb) = self.dwb.as_mut() {
+            dwb.sync()?;
+        }
+        Ok(())
+    }
+
+    pub fn reset_double_write(&mut self) -> Result<()> {
+        if let Some(dwb) = self.dwb.as_mut() {
+            dwb.reset()?;
+        }
+        Ok(())
     }
 
     pub fn create_file(&mut self, path: &Path) -> Result<FileId> {

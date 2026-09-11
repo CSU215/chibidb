@@ -158,13 +158,24 @@ impl BufferPool {
     }
 
     pub fn flush_all(&mut self) -> Result<()> {
-        for i in 0..self.frames.len() {
-            if self.frames[i].dirty {
-                let (file, no) = self.frames[i].key;
-                self.disk.write_page(file, no, &self.frames[i].data)?;
-                self.frames[i].dirty = false;
-            }
+        let dirty: Vec<usize> =
+            (0..self.frames.len()).filter(|&i| self.frames[i].dirty).collect();
+        if dirty.is_empty() {
+            return Ok(());
         }
+        // double-write: stage every page and sync before touching the final
+        // files, so a crash mid-write can be repaired on the next open
+        for &i in &dirty {
+            let (file, no) = self.frames[i].key;
+            self.disk.stage_page(file, no, &self.frames[i].data)?;
+        }
+        self.disk.sync_double_write()?;
+        for &i in &dirty {
+            let (file, no) = self.frames[i].key;
+            self.disk.write_page(file, no, &self.frames[i].data)?;
+            self.frames[i].dirty = false;
+        }
+        self.disk.reset_double_write()?;
         Ok(())
     }
 }
