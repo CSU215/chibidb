@@ -1,183 +1,214 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use parking_lot::Mutex;
 
 use crate::storage::disk::DiskManager;
 use crate::storage::page::{zeroed_page, FileId, PageData, PageNo, PAGE_SIZE};
 use crate::{Error, Result};
 
+/// One cached page. Its key is fixed for the frame's lifetime, so a reader
+/// holding an `Arc` keeps reading the page it loaded even if the frame is
+/// later evicted. `data` is the page latch; `dirty` is set by writers.
 struct Frame {
-    key: (FileId, PageNo),
-    data: PageData,
-    dirty: bool,
+    file: FileId,
+    no: PageNo,
+    data: Mutex<PageData>,
+    dirty: AtomicBool,
 }
 
+/// The page table and LRU order, guarded by one lock. Frame *contents* have
+/// their own latches, so this lock is held only while resolving a page to a
+/// frame, never while a closure runs.
+#[derive(Default)]
+struct PoolState {
+    frames: HashMap<(FileId, PageNo), Arc<Frame>>,
+    lru: VecDeque<(FileId, PageNo)>,
+}
+
+/// Thread-safe buffer pool: `&self` methods let readers share the pool while
+/// per-frame latches keep different pages independent.
 pub struct BufferPool {
-    disk: DiskManager,
-    frames: Vec<Frame>,
-    page_table: HashMap<(FileId, PageNo), usize>,
-    lru: VecDeque<usize>,
+    disk: Mutex<DiskManager>,
+    state: Mutex<PoolState>,
     capacity: usize,
 }
 
 impl BufferPool {
     pub fn new(disk: DiskManager, capacity: usize) -> Self {
         Self {
-            disk,
-            frames: Vec::new(),
-            page_table: HashMap::new(),
-            lru: VecDeque::new(),
+            disk: Mutex::new(disk),
+            state: Mutex::new(PoolState::default()),
             capacity: capacity.max(1),
         }
     }
 
     pub fn with_page<T>(
-        &mut self,
+        &self,
         file: FileId,
         no: PageNo,
         f: impl FnOnce(&mut [u8; PAGE_SIZE]) -> Result<T>,
     ) -> Result<T> {
-        let idx = self.frame_for(file, no)?;
-        let out = f(&mut self.frames[idx].data);
-        self.frames[idx].dirty = true;
+        let frame = self.frame_for(file, no)?;
+        let mut data = frame.data.lock();
+        let out = f(&mut data);
+        frame.dirty.store(true, Ordering::Release);
         out
     }
 
     pub fn read_page<T>(
-        &mut self,
+        &self,
         file: FileId,
         no: PageNo,
         f: impl FnOnce(&[u8; PAGE_SIZE]) -> Result<T>,
     ) -> Result<T> {
-        let idx = self.frame_for(file, no)?;
-        f(&self.frames[idx].data)
+        let frame = self.frame_for(file, no)?;
+        let data = frame.data.lock();
+        f(&data)
     }
 
-    fn frame_for(&mut self, file: FileId, no: PageNo) -> Result<usize> {
+    /// Resolves a page to its frame, loading and evicting as needed. The state
+    /// lock is released before the caller latches the frame, so a page latch is
+    /// never held together with the metadata lock.
+    fn frame_for(&self, file: FileId, no: PageNo) -> Result<Arc<Frame>> {
         let key = (file, no);
-        if let Some(&idx) = self.page_table.get(&key) {
-            self.touch(idx);
-            return Ok(idx);
+        let mut state = self.state.lock();
+        if let Some(frame) = state.frames.get(&key).cloned() {
+            touch(&mut state.lru, key);
+            return Ok(frame);
         }
-        let idx = self.victim()?;
-        let frame = &mut self.frames[idx];
-        self.disk.read_page(file, no, &mut frame.data)?;
-        frame.key = key;
-        frame.dirty = false;
-        self.page_table.insert(key, idx);
-        self.touch(idx);
-        Ok(idx)
+        while state.frames.len() >= self.capacity {
+            let victim_key = state
+                .lru
+                .pop_front()
+                .ok_or_else(|| Error::Runtime("buffer pool exhausted".into()))?;
+            let victim = state
+                .frames
+                .remove(&victim_key)
+                .expect("lru and page table stay in sync");
+            if victim.dirty.load(Ordering::Acquire) {
+                // lock order disk -> frame latch, matching flush_all
+                let mut disk = self.disk.lock();
+                let data = victim.data.lock();
+                disk.write_page(victim.file, victim.no, &data)?;
+                victim.dirty.store(false, Ordering::Release);
+            }
+        }
+        let mut data = zeroed_page();
+        self.disk.lock().read_page(file, no, &mut data)?;
+        let frame = Arc::new(Frame {
+            file,
+            no,
+            data: Mutex::new(data),
+            dirty: AtomicBool::new(false),
+        });
+        state.frames.insert(key, frame.clone());
+        state.lru.push_back(key);
+        Ok(frame)
     }
 
-    fn victim(&mut self) -> Result<usize> {
-        if self.frames.len() < self.capacity {
-            self.frames.push(Frame { key: (0, 0), data: zeroed_page(), dirty: false });
-            return Ok(self.frames.len() - 1);
-        }
-        let idx =
-            self.lru.pop_front().ok_or_else(|| Error::Runtime("buffer pool exhausted".into()))?;
-        let frame = &mut self.frames[idx];
-        if frame.dirty {
-            let (file, no) = frame.key;
-            self.disk.write_page(file, no, &frame.data)?;
-        }
-        self.page_table.remove(&frame.key);
-        Ok(idx)
-    }
-
-    fn touch(&mut self, idx: usize) {
-        if let Some(pos) = self.lru.iter().position(|&x| x == idx) {
-            self.lru.remove(pos);
-        }
-        self.lru.push_back(idx);
-    }
-
-    pub fn alloc_page(&mut self, file: FileId) -> Result<PageNo> {
-        let no = self.disk.page_count(file)?;
+    pub fn alloc_page(&self, file: FileId) -> Result<PageNo> {
+        let mut disk = self.disk.lock();
+        let no = disk.page_count(file)?;
         let empty = zeroed_page();
-        self.disk.write_page(file, no, &empty)?;
+        disk.write_page(file, no, &empty)?;
         Ok(no)
     }
 
-    pub fn create_file(&mut self, path: &Path) -> Result<FileId> {
-        self.disk.create_file(path)
+    pub fn create_file(&self, path: &Path) -> Result<FileId> {
+        self.disk.lock().create_file(path)
     }
 
-    pub fn open_file(&mut self, path: &Path) -> Result<FileId> {
-        self.disk.open_file(path)
+    pub fn open_file(&self, path: &Path) -> Result<FileId> {
+        self.disk.lock().open_file(path)
     }
 
-    pub fn page_count(&mut self, file: FileId) -> Result<PageNo> {
-        self.disk.page_count(file)
+    pub fn page_count(&self, file: FileId) -> Result<PageNo> {
+        self.disk.lock().page_count(file)
     }
 
     /// Empties a file in place. Cached frames of the file must be dropped
     /// first (see `discard_file`).
-    pub fn truncate_file(&mut self, file: FileId) -> Result<()> {
-        self.disk.truncate_file(file)
+    pub fn truncate_file(&self, file: FileId) -> Result<()> {
+        self.disk.lock().truncate_file(file)
     }
 
     /// Drops all cached frames of a file without writing them back, closes
     /// its handle and returns the path for deletion.
-    pub fn close_file(&mut self, file: FileId) -> Result<std::path::PathBuf> {
+    pub fn close_file(&self, file: FileId) -> Result<PathBuf> {
         self.discard_file(file);
-        self.disk.close_file(file)
+        self.disk.lock().close_file(file)
     }
 
-    /// Drops all cached frames of a file without writing them back.
-    pub fn discard_file(&mut self, file: FileId) {
-        // every live frame is referenced exactly once by the lru list
-        let lru_order: Vec<usize> = self.lru.drain(..).collect();
-        let mut old_frames: Vec<Option<Frame>> =
-            std::mem::take(&mut self.frames).into_iter().map(Some).collect();
-        let mut remap: HashMap<usize, usize> = HashMap::new();
-        let mut new_frames = Vec::with_capacity(old_frames.len());
-        for old_idx in lru_order {
-            if let Some(frame) = old_frames[old_idx].take()
-                && frame.key.0 != file {
-                    remap.insert(old_idx, new_frames.len());
-                    new_frames.push(frame);
-                }
-        }
-        self.page_table.retain(|k, _| k.0 != file);
-        for v in self.page_table.values_mut() {
-            *v = remap[v];
-        }
-        self.frames = new_frames;
-        self.lru = (0..self.frames.len()).collect();
+    /// Drops all cached frames of a file without writing them back. A reader
+    /// that already resolved a frame keeps its own `Arc`, so it is unaffected.
+    pub fn discard_file(&self, file: FileId) {
+        let mut state = self.state.lock();
+        state.frames.retain(|k, _| k.0 != file);
+        state.lru.retain(|k| k.0 != file);
     }
 
-    pub fn flush_file(&mut self, file: FileId) -> Result<()> {
-        for i in 0..self.frames.len() {
-            if self.frames[i].dirty && self.frames[i].key.0 == file {
-                let (f, no) = self.frames[i].key;
-                self.disk.write_page(f, no, &self.frames[i].data)?;
-                self.frames[i].dirty = false;
+    pub fn flush_file(&self, file: FileId) -> Result<()> {
+        let frames = self.dirty_frames(Some(file));
+        if frames.is_empty() {
+            return Ok(());
+        }
+        let mut disk = self.disk.lock();
+        for frame in frames {
+            if frame.dirty.load(Ordering::Acquire) {
+                let data = frame.data.lock();
+                disk.write_page(frame.file, frame.no, &data)?;
+                frame.dirty.store(false, Ordering::Release);
             }
         }
         Ok(())
     }
 
-    pub fn flush_all(&mut self) -> Result<()> {
-        let dirty: Vec<usize> =
-            (0..self.frames.len()).filter(|&i| self.frames[i].dirty).collect();
-        if dirty.is_empty() {
+    pub fn flush_all(&self) -> Result<()> {
+        let frames = self.dirty_frames(None);
+        if frames.is_empty() {
             return Ok(());
         }
+        let mut disk = self.disk.lock();
         // double-write: stage every page and sync before touching the final
         // files, so a crash mid-write can be repaired on the next open
-        for &i in &dirty {
-            let (file, no) = self.frames[i].key;
-            self.disk.stage_page(file, no, &self.frames[i].data)?;
+        for frame in &frames {
+            let data = frame.data.lock();
+            disk.stage_page(frame.file, frame.no, &data)?;
         }
-        self.disk.sync_double_write()?;
-        for &i in &dirty {
-            let (file, no) = self.frames[i].key;
-            self.disk.write_page(file, no, &self.frames[i].data)?;
-            self.frames[i].dirty = false;
+        disk.sync_double_write()?;
+        for frame in &frames {
+            let data = frame.data.lock();
+            disk.write_page(frame.file, frame.no, &data)?;
+            frame.dirty.store(false, Ordering::Release);
         }
-        self.disk.reset_double_write()?;
+        disk.reset_double_write()?;
         Ok(())
     }
+
+    /// Snapshots the frames that need writing back, optionally only those of
+    /// one file. `flush_*` then writes them without holding the state lock.
+    fn dirty_frames(&self, only: Option<FileId>) -> Vec<Arc<Frame>> {
+        let state = self.state.lock();
+        state
+            .frames
+            .iter()
+            .filter(|(k, f)| {
+                only.is_none_or(|file| k.0 == file) && f.dirty.load(Ordering::Acquire)
+            })
+            .map(|(_, f)| f.clone())
+            .collect()
+    }
+}
+
+/// Moves `key` to the back of the LRU deque.
+fn touch(lru: &mut VecDeque<(FileId, PageNo)>, key: (FileId, PageNo)) {
+    if let Some(pos) = lru.iter().position(|&k| k == key) {
+        lru.remove(pos);
+    }
+    lru.push_back(key);
 }
 
 impl Drop for BufferPool {
