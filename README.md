@@ -11,7 +11,7 @@ cargo run -q                    # 内存实例 REPL（临时目录后端，自�
 cargo run -q -- <dir>           # 文件实例 REPL（数据根目录，多库落盘）
 cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（361 tests）
+cargo test                      # 全量回归（367 tests）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
