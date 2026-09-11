@@ -2,7 +2,7 @@ use crate::storage::buffer::BufferPool;
 use crate::storage::heap::{HeapFile, Rid};
 use crate::storage::page::{FileId, PageNo};
 use crate::storage::slotted::page_iter;
-use crate::Result;
+use crate::{Error, Result};
 /// A forward-only cursor over a table's rows, decoupled from the concrete
 /// storage engine.
 ///
@@ -39,6 +39,21 @@ pub trait TableStorage: TableEngine + std::fmt::Debug {
 
     /// The file backing this table, for WAL replay and index mapping.
     fn file_id(&self) -> FileId;
+
+    /// Places an already-encoded version at an exact row id during WAL replay.
+    /// Engines without page-addressed storage (LSM) override this; the heap
+    /// replays by writing pages directly.
+    fn insert_at(&self, bp: &BufferPool, rid: Rid, record: &[u8]) -> Result<()> {
+        let _ = (bp, rid, record);
+        Err(Error::Runtime("insert_at is not supported by this engine".into()))
+    }
+
+    /// Makes pending writes durable. The heap's pages reach disk through the
+    /// buffer pool, so its default is a no-op; the LSM engine flushes its
+    /// memtable to an SSTable.
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Engine backed by the current on-disk heap layout. `new` is an unvalidated

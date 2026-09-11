@@ -79,10 +79,12 @@ impl DatabaseWriteLock {
 
 use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
-use crate::config::{Config, ConflictStrategy};
+use crate::config::{Config, ConflictStrategy, EngineKind};
 use crate::index::{encode_key, BTree};
 use crate::pipeline::{ExecuteStage, OptimizeStage, Pipeline, ResolveStage, SqlEvent};
 use crate::storage::codec::{decode_record, encode_record};
+use crate::storage::engine::{HeapEngine, TableStorage};
+use crate::storage::lsm::engine::{LsmEngine, LSM_FILE_ID};
 use crate::storage::slotted::{page_get, page_put_at};
 use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, Rid};
 use crate::trx::{TrxState, Undo};
@@ -90,6 +92,12 @@ use crate::value::Value;
 use crate::wal::{Record, Wal};
 
 pub use crate::trx::Session;
+
+/// SSTable block size for LSM-backed tables.
+const LSM_BLOCK_SIZE: usize = 4096;
+
+/// WAL-replay routing: file number to its engine kind and handle.
+type StorageMap = std::collections::HashMap<u32, (EngineKind, Arc<dyn TableStorage>)>;
 
 pub struct Database {
     config: Config,
@@ -168,9 +176,6 @@ impl Database {
                 .map_err(|e| Error::Runtime(format!("cannot read catalog: {e}")))?;
             let snap = decode_catalog(&bytes)?;
             for meta in &snap.tables {
-                let fpath = tables_dir.join(format!("{:06}.dbf", meta.file_no));
-                let file = pool.open_file(&fpath)?;
-                HeapFile::open_or_repair(&pool, file)?;
                 let schema = Schema {
                     columns: meta
                         .columns
@@ -186,11 +191,20 @@ impl Database {
                         })
                         .collect(),
                 };
-                catalog.create_table(
-                    &meta.name,
-                    schema,
-                    HeapStore { file, file_no: meta.file_no },
-                )?;
+                let (heap, engine): (HeapStore, Arc<dyn TableStorage>) = match meta.engine {
+                    EngineKind::Heap => {
+                        let fpath = tables_dir.join(format!("{:06}.dbf", meta.file_no));
+                        let file = pool.open_file(&fpath)?;
+                        HeapFile::open_or_repair(&pool, file)?;
+                        (HeapStore { file, file_no: meta.file_no }, Arc::new(HeapEngine::new(file)))
+                    }
+                    EngineKind::Lsm => {
+                        let dir = tables_dir.join(format!("{:06}.lsm", meta.file_no));
+                        let engine = LsmEngine::open(&dir, LSM_BLOCK_SIZE)?;
+                        (HeapStore { file: LSM_FILE_ID, file_no: meta.file_no }, Arc::new(engine))
+                    }
+                };
+                catalog.create_table(&meta.name, schema, heap, meta.engine, engine)?;
             }
             for ix in &snap.indexes {
                 let fpath = indexes_dir.join(format!("{:06}.idxf", ix.file_no));
@@ -291,6 +305,11 @@ impl Database {
 
     pub(crate) fn flush_inner(&self) -> Result<()> {
         self.pool.flush_all()?;
+        // LSM tables flush their memtable to a durable SSTable; heap tables
+        // are covered by the buffer-pool flush above.
+        for meta in self.catalog().table_metas() {
+            self.catalog().table(&meta.name)?.engine().flush()?;
+        }
         self.save_catalog()?;
         // checkpoint: every page is on disk, so the log has nothing left to redo
         self.wal.truncate()
@@ -331,46 +350,79 @@ impl Database {
     /// `touched` accumulates heap file numbers that must have their indexes
     /// rebuilt; it may arrive pre-seeded with repaired index files.
     fn recover_from_wal(&self, plan: &wal::RecoveryPlan, touched: &mut HashSet<u32>) -> Result<()> {
-        let file_map: std::collections::HashMap<u32, FileId> =
-            self.catalog().heap_files().into_iter().collect();
+        // Route each redo record to the engine that owns its table: the heap
+        // replays into pages, the LSM engine replays into its store.
+        let (storage, file_map): (StorageMap, std::collections::HashMap<u32, FileId>) = {
+            let catalog = self.catalog();
+            let file_map: std::collections::HashMap<u32, FileId> =
+                catalog.heap_files().into_iter().collect();
+            let mut storage = StorageMap::new();
+            for (file_no, _) in catalog.heap_files() {
+                if let Some(entry) = catalog.storage_for_file_no(file_no) {
+                    storage.insert(file_no, entry);
+                }
+            }
+            (storage, file_map)
+        };
         for (_, _, records) in &plan.committed {
             for rec in records {
                 match rec {
                     Record::Insert { file_no, rid, record } => {
                         // records of dropped tables (file no longer in the
                         // catalog) are stale and skipped
-                        let Some(file) = file_map.get(file_no) else { continue };
-                        let file = *file;
-                        while self.pool.page_count(file)? <= rid.page_no {
-                            self.pool.alloc_page(file)?;
-                        }
-                        let occupied = self.pool.read_page(file, rid.page_no, |page| {
-                            Ok(page_get(page, rid.slot)?.is_some())
-                        })?;
-                        if !occupied {
-                            self.pool.with_page(file, rid.page_no, |page| {
-                                page_put_at(page, rid.slot, record)
-                            })?;
-                            touched.insert(*file_no);
+                        let Some((kind, engine)) = storage.get(file_no) else { continue };
+                        match kind {
+                            EngineKind::Lsm => {
+                                engine.insert_at(&self.pool, *rid, record)?;
+                                touched.insert(*file_no);
+                            }
+                            EngineKind::Heap => {
+                                let file = file_map[file_no];
+                                while self.pool.page_count(file)? <= rid.page_no {
+                                    self.pool.alloc_page(file)?;
+                                }
+                                let occupied = self.pool.read_page(file, rid.page_no, |page| {
+                                    Ok(page_get(page, rid.slot)?.is_some())
+                                })?;
+                                if !occupied {
+                                    self.pool.with_page(file, rid.page_no, |page| {
+                                        page_put_at(page, rid.slot, record)
+                                    })?;
+                                    touched.insert(*file_no);
+                                }
+                            }
                         }
                     }
                     Record::DeleteMark { file_no, rid, deleter } => {
-                        let Some(file) = file_map.get(file_no) else { continue };
-                        let file = *file;
-                        if self.pool.page_count(file)? <= rid.page_no {
-                            continue;
-                        }
-                        let unmarked = self.pool.read_page(file, rid.page_no, |page| {
-                            match page_get(page, rid.slot)? {
-                                Some(rec) if rec.len() >= 8 => {
-                                    Ok(u32::from_le_bytes(rec[4..8].try_into().unwrap()) == 0)
+                        let Some((kind, engine)) = storage.get(file_no) else { continue };
+                        match kind {
+                            EngineKind::Lsm => {
+                                if let Ok(bytes) = engine.get(&self.pool, *rid)
+                                    && bytes.len() >= 8
+                                    && u32::from_le_bytes(bytes[4..8].try_into().unwrap()) == 0
+                                {
+                                    engine.delete_mark(&self.pool, *rid, *deleter)?;
+                                    touched.insert(*file_no);
                                 }
-                                _ => Ok(false),
                             }
-                        })?;
-                        if unmarked {
-                            HeapFile::at(file).delete_mark(&self.pool, *rid, *deleter)?;
-                            touched.insert(*file_no);
+                            EngineKind::Heap => {
+                                let file = file_map[file_no];
+                                if self.pool.page_count(file)? <= rid.page_no {
+                                    continue;
+                                }
+                                let unmarked = self.pool.read_page(file, rid.page_no, |page| {
+                                    match page_get(page, rid.slot)? {
+                                        Some(rec) if rec.len() >= 8 => {
+                                            Ok(u32::from_le_bytes(rec[4..8].try_into().unwrap()) == 0)
+                                        }
+                                        _ => Ok(false),
+                                    }
+                                })?;
+                                if unmarked {
+                                    HeapFile::at(file).delete_mark(&self.pool, *rid, *deleter)?;
+                                    touched.insert(*file_no);
+                                }
+                            }
                         }
                     }
                     Record::Commit => {}
@@ -769,12 +821,30 @@ impl Database {
         self.catalog.write()
     }
 
-    pub(crate) fn new_table_heap(&self, _name: &str) -> Result<HeapStore> {
+    /// The configured engine for newly created tables.
+    pub(crate) fn default_engine(&self) -> EngineKind {
+        self.config.storage.default_engine
+    }
+
+    /// Creates the physical storage for a new table of the given engine kind.
+    pub(crate) fn new_table_storage(
+        &self,
+        kind: EngineKind,
+    ) -> Result<(HeapStore, Arc<dyn TableStorage>)> {
         let file_no = self.next_table_file.fetch_add(1, Ordering::SeqCst);
-        let path = self.data_dir.join("tables").join(format!("{file_no:06}.dbf"));
-        let file = self.pool.create_file(&path)?;
-        HeapFile::init(&self.pool, file)?;
-        Ok(HeapStore { file, file_no })
+        match kind {
+            EngineKind::Heap => {
+                let path = self.data_dir.join("tables").join(format!("{file_no:06}.dbf"));
+                let file = self.pool.create_file(&path)?;
+                HeapFile::init(&self.pool, file)?;
+                Ok((HeapStore { file, file_no }, Arc::new(HeapEngine::new(file))))
+            }
+            EngineKind::Lsm => {
+                let dir = self.data_dir.join("tables").join(format!("{file_no:06}.lsm"));
+                let engine = LsmEngine::open(&dir, LSM_BLOCK_SIZE)?;
+                Ok((HeapStore { file: LSM_FILE_ID, file_no }, Arc::new(engine)))
+            }
+        }
     }
 
     pub(crate) fn new_index_heap(&self, _name: &str) -> Result<IndexStore> {
@@ -805,19 +875,25 @@ impl Database {
     pub(crate) fn drop_table(&self, name: &str) -> Result<()> {
         let dropped = self.catalog_mut().drop_table(name)?;
         self.save_catalog()?;
-        for file in std::iter::once(dropped.heap_file).chain(dropped.index_files) {
-            let path = self.pool.close_file(file)?;
-            match std::fs::remove_file(&path) {
+        if dropped.engine == EngineKind::Lsm {
+            let dir = self.data_dir.join("tables").join(format!("{:06}.lsm", dropped.file_no));
+            match std::fs::remove_dir_all(&dir) {
                 Ok(()) => {}
-                // another DROP in the same statement batch may already have it
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     return Err(Error::Runtime(format!(
-                        "cannot delete file {}: {e}",
-                        path.display()
+                        "cannot delete {}: {e}",
+                        dir.display()
                     )))
                 }
             }
+        } else {
+            let path = self.pool.close_file(dropped.heap_file)?;
+            remove_if_exists(&path)?;
+        }
+        for file in dropped.index_files {
+            let path = self.pool.close_file(file)?;
+            remove_if_exists(&path)?;
         }
         Ok(())
     }
@@ -1013,6 +1089,14 @@ fn run_plan(
 
 fn dir_err(dir: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
     move |e| Error::Runtime(format!("cannot create dir {}: {e}", dir.display()))
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::Runtime(format!("cannot delete file {}: {e}", path.display()))),
+    }
 }
 
 #[cfg(test)]

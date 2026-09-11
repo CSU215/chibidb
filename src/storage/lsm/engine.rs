@@ -49,6 +49,26 @@ impl LsmEngine {
         self.inner.lock().compact()
     }
 
+    /// Writes a version at an exact row id during WAL replay, keeping the id
+    /// counter ahead of replayed ids so later inserts do not collide.
+    pub fn insert_at(&self, rid: Rid, record: &[u8]) -> Result<()> {
+        let id = ((rid.page_no as u64) << 16) | rid.slot as u64;
+        let mut current = self.next_rid.load(Ordering::SeqCst);
+        while current <= id {
+            match self.next_rid.compare_exchange(
+                current,
+                id + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        self.inner.lock().put(rid_key(rid), record.to_vec());
+        Ok(())
+    }
+
     pub fn num_sstables(&self) -> usize {
         self.inner.lock().num_sstables()
     }
@@ -111,6 +131,14 @@ impl TableStorage for LsmEngine {
 
     fn file_id(&self) -> FileId {
         LSM_FILE_ID
+    }
+
+    fn insert_at(&self, _bp: &BufferPool, rid: Rid, record: &[u8]) -> Result<()> {
+        LsmEngine::insert_at(self, rid, record)
+    }
+
+    fn flush(&self) -> Result<()> {
+        LsmEngine::flush(self)
     }
 }
 

@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::ast::DataType;
-use crate::storage::engine::{HeapEngine, TableStorage};
+use crate::config::EngineKind;
+use crate::storage::engine::TableStorage;
 use crate::storage::FileId;
 use crate::value::Value;
 use crate::{Error, Result};
@@ -88,6 +89,8 @@ pub(crate) struct IndexStore {
 /// Files to remove from disk after DROP TABLE.
 pub(crate) struct DroppedTable {
     pub heap_file: FileId,
+    pub file_no: u32,
+    pub engine: EngineKind,
     pub index_files: Vec<FileId>,
 }
 
@@ -106,8 +109,9 @@ pub(crate) struct IndexEntry {
 pub struct Table {
     pub schema: Schema,
     pub(crate) heap: HeapStore,
-    /// The storage engine backing this table (heap today, LSM later).
+    /// The storage engine backing this table (heap or LSM).
     pub(crate) engine: Arc<dyn TableStorage>,
+    pub(crate) engine_kind: EngineKind,
 }
 
 impl Table {
@@ -130,12 +134,13 @@ impl Catalog {
         name: &str,
         schema: Schema,
         heap: HeapStore,
+        engine_kind: EngineKind,
+        engine: Arc<dyn TableStorage>,
     ) -> Result<()> {
         if self.tables.contains_key(name) || self.views.contains_key(name) {
             return Err(Error::Runtime(format!("table already exists: {name}")));
         }
-        let engine: Arc<dyn TableStorage> = Arc::new(HeapEngine::new(heap.file));
-        self.tables.insert(name.to_string(), Table { schema, heap, engine });
+        self.tables.insert(name.to_string(), Table { schema, heap, engine, engine_kind });
         Ok(())
     }
 
@@ -168,7 +173,12 @@ impl Catalog {
                         default: c.default.clone(),
                     })
                     .collect();
-                TableMeta { name: name.clone(), columns, file_no: t.heap.file_no }
+                TableMeta {
+                    name: name.clone(),
+                    columns,
+                    file_no: t.heap.file_no,
+                    engine: t.engine_kind,
+                }
             })
             .collect()
     }
@@ -215,7 +225,12 @@ impl Catalog {
             let ix = self.indexes.remove(&ix_name).expect("name collected above");
             index_files.push(ix.store.file);
         }
-        Ok(DroppedTable { heap_file: table.heap.file, index_files })
+        Ok(DroppedTable {
+            heap_file: table.heap.file,
+            file_no: table.heap.file_no,
+            engine: table.engine_kind,
+            index_files,
+        })
     }
 
     pub(crate) fn index_metas(&self) -> Vec<IndexMeta> {
@@ -250,6 +265,18 @@ impl Catalog {
     /// (heap file_no, FileId) for every table, for WAL replay mapping.
     pub(crate) fn heap_files(&self) -> Vec<(u32, FileId)> {
         self.tables.values().map(|t| (t.heap.file_no, t.heap.file)).collect()
+    }
+
+    /// The engine kind and handle for the table owning `file_no`, used to
+    /// route WAL replay by storage type.
+    pub(crate) fn storage_for_file_no(
+        &self,
+        file_no: u32,
+    ) -> Option<(EngineKind, Arc<dyn TableStorage>)> {
+        self.tables
+            .values()
+            .find(|t| t.heap.file_no == file_no)
+            .map(|t| (t.engine_kind, t.engine()))
     }
 
     pub(crate) fn create_view(&mut self, name: &str, sql: String) -> Result<()> {

@@ -1,10 +1,11 @@
 ﻿use crate::ast::DataType;
+use crate::config::EngineKind;
 use crate::storage::codec::{decode_row, encode_row};
 use crate::storage::header::{self, FileKind};
 use crate::value::Value;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"CHIDCAT6";
+const MAGIC: [u8; 8] = *b"CHIDCAT7";
 
 const DTYPE_INT: u8 = 0x00;
 const DTYPE_FLOAT: u8 = 0x01;
@@ -27,6 +28,7 @@ pub struct TableMeta {
     pub name: String,
     pub columns: Vec<ColumnMeta>,
     pub file_no: u32,
+    pub engine: EngineKind,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +89,7 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
             put_value(&mut buf, c.default.as_ref());
         }
         put_u32(&mut buf, t.file_no);
+        buf.push(engine_tag(t.engine));
     }
     put_u32(&mut buf, snap.indexes.len() as u32);
     for ix in &snap.indexes {
@@ -139,7 +142,12 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
             columns.push(ColumnMeta { name: cname, dtype, not_null, primary_key, unique, default });
         }
         let file_no = take_u32(data, &mut pos)?;
-        tables.push(TableMeta { name, columns, file_no });
+        let engine = match take(data, &mut pos, 1)?[0] {
+            0 => EngineKind::Heap,
+            1 => EngineKind::Lsm,
+            other => return Err(Error::Runtime(format!("unknown engine tag 0x{other:02x}"))),
+        };
+        tables.push(TableMeta { name, columns, file_no, engine });
     }
     let n_indexes = take_u32(data, &mut pos)?;
     let mut indexes = Vec::new();
@@ -192,6 +200,13 @@ fn take_value(data: &[u8], pos: &mut usize) -> Result<Option<Value>> {
     let bytes = take(data, pos, len)?;
     let (row, _) = decode_row(bytes)?;
     Ok(row.into_iter().next())
+}
+
+fn engine_tag(engine: EngineKind) -> u8 {
+    match engine {
+        EngineKind::Heap => 0,
+        EngineKind::Lsm => 1,
+    }
 }
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
