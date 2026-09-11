@@ -106,23 +106,23 @@ fn constant_and_distinct_selects_build_plans() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int);").unwrap();
 
-    let constant = parse_select("select 1 + 2;");
-    assert!(build_select(&mut db, &constant).unwrap().is_some());
-
-    let distinct = parse_select("select distinct id from t;");
-    assert!(build_select(&mut db, &distinct).unwrap().is_some());
-
-    let ordered = parse_select("select id from t order by id;");
-    assert!(build_select(&mut db, &ordered).unwrap().is_some());
+    for sql in [
+        "select 1 + 2;",
+        "select distinct id from t;",
+        "select id from t order by id;",
+        "select count(*) from t;",
+        "select id, count(*) from t group by id;",
+    ] {
+        let select = parse_select(sql);
+        assert!(build_select(&mut db, &select).unwrap().is_some(), "{sql}");
+    }
 }
 
 #[test]
-fn complex_selects_fall_back_to_the_materialized_path() {
+fn set_operations_fall_back_to_the_materialized_path() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int);").unwrap();
 
-    for sql in ["select count(*) from t;", "select id from t union select id from t;"] {
-        let select = parse_select(sql);
-        assert!(build_select(&mut db, &select).unwrap().is_none(), "{sql}");
-    }
+    let select = parse_select("select id from t union select id from t;");
+    assert!(build_select(&mut db, &select).unwrap().is_none());
 }

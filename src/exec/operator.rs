@@ -364,6 +364,78 @@ impl PhysicalOperator for Sort {
     }
 }
 
+/// Grouped/aggregate execution packaged as an operator. Materializes its
+/// child, then delegates to the shared `grouped_select_rows` (group, having,
+/// order groups, project, distinct, limit).
+pub struct GroupBy {
+    child: Box<dyn PhysicalOperator>,
+    select: SelectStmt,
+    exprs: Vec<Expr>,
+    schema: Schema,
+    rows: Vec<Vec<Value>>,
+    pos: usize,
+}
+
+impl GroupBy {
+    pub fn new(
+        child: Box<dyn PhysicalOperator>,
+        select: SelectStmt,
+        exprs: Vec<Expr>,
+        headers: Vec<String>,
+    ) -> Self {
+        let schema = Schema {
+            columns: headers
+                .into_iter()
+                .map(|h| ColumnDesc::plain(None, h, DataType::Text))
+                .collect(),
+        };
+        Self { child, select, exprs, schema, rows: Vec::new(), pos: 0 }
+    }
+}
+
+impl PhysicalOperator for GroupBy {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
+        self.child.open(ctx)?;
+        let mut filtered = Vec::new();
+        while let Some(row) = self.child.next(ctx)? {
+            filtered.push(row);
+        }
+        self.child.close()?;
+        let schema = self.child.schema().clone();
+        let rows = super::aggregate::grouped_select_rows(
+            ctx.db,
+            ctx.session.trx(),
+            None,
+            &schema,
+            &self.select,
+            filtered,
+            self.exprs.clone(),
+        )?;
+        self.rows = rows;
+        self.pos = 0;
+        Ok(())
+    }
+
+    fn next(&mut self, _ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
+        if self.pos >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.pos].clone();
+        self.pos += 1;
+        Ok(Some(row))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.rows.clear();
+        self.pos = 0;
+        Ok(())
+    }
+}
+
 /// Index scan: fetches exactly the row ids the access path selected.
 pub struct IndexScan {
     schema: Schema,
@@ -447,15 +519,17 @@ pub fn build_select(
     db: &mut Database,
     select: &SelectStmt,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
-    // set operations, grouping and having are not covered yet
-    if !select.set_ops.is_empty() || !select.group_by.is_empty() || select.having.is_some() {
+    // set operations are not covered yet
+    if !select.set_ops.is_empty() {
         return Ok(None);
     }
 
     // no FROM: a single projected tuple (distinct/order/limit are ignored by
     // the materialized path here, so we match that)
     if select.from.is_empty() {
-        if select.items.iter().any(|it| matches!(it, SelectItem::Star)) {
+        if select.items.iter().any(|it| matches!(it, SelectItem::Star))
+            || items_have_aggregate(&select.items)
+        {
             return Ok(None);
         }
         let (exprs, headers) = projection_exprs(&select.items);
@@ -472,13 +546,6 @@ pub fn build_select(
         return Ok(None);
     }
     let owner = select.from[0].alias.as_deref().unwrap_or(table);
-    // aggregation is not covered yet
-    if select.items.iter().any(|item| match item {
-        SelectItem::Expr(e) | SelectItem::Aliased(e, _) => expr_has_aggregate(e),
-        SelectItem::Star => false,
-    }) {
-        return Ok(None);
-    }
 
     let (mut op, ordered_by): (Box<dyn PhysicalOperator>, Option<String>) =
         match IndexScan::with_owner(db, table, owner, select.selection.as_ref())? {
@@ -491,6 +558,17 @@ pub fn build_select(
     if let Some(selection) = &select.selection {
         op = Box::new(Filter::new(op, selection.clone()));
     }
+
+    // grouped / aggregate: grouping, having, ordering, projection, distinct
+    // and limit are all handled inside GroupBy (matching the materialized path)
+    if !select.group_by.is_empty()
+        || select.having.is_some()
+        || items_have_aggregate(&select.items)
+    {
+        let (exprs, headers) = build_projection(op.schema(), &select.items);
+        return Ok(Some(Box::new(GroupBy::new(op, select.clone(), exprs, headers))));
+    }
+
     if !select.order_by.is_empty() {
         // an ascending scan on the ordering column already yields the order
         let skip = ordered_by
@@ -500,7 +578,7 @@ pub fn build_select(
             op = Box::new(Sort::new(op, select.order_by.clone(), select.items.clone()));
         }
     }
-    let (exprs, headers) = projection(db, table, &select.items)?;
+    let (exprs, headers) = build_projection(op.schema(), &select.items);
     op = Box::new(Project::new(op, exprs, headers));
     if select.distinct {
         op = Box::new(Distinct::new(op));
@@ -532,15 +610,20 @@ fn projection_exprs(items: &[SelectItem]) -> (Vec<Expr>, Vec<String>) {
     (exprs, headers)
 }
 
-fn projection(db: &Database, table: &str, items: &[SelectItem]) -> Result<(Vec<Expr>, Vec<String>)> {
+/// Expands SELECT items against `schema`: `*` becomes owner-qualified column
+/// references so joins stay unambiguous.
+fn build_projection(schema: &Schema, items: &[SelectItem]) -> (Vec<Expr>, Vec<String>) {
     let mut exprs = Vec::new();
     let mut headers = Vec::new();
     for item in items {
         match item {
             SelectItem::Star => {
-                for column in &db.catalog().table(table)?.schema.columns {
+                for column in &schema.columns {
                     headers.push(column.name.clone());
-                    exprs.push(Expr::Column(column.name.clone()));
+                    exprs.push(match &column.owner {
+                        Some(owner) => Expr::QualifiedColumn(owner.clone(), column.name.clone()),
+                        None => Expr::Column(column.name.clone()),
+                    });
                 }
             }
             SelectItem::Expr(e) => {
@@ -553,7 +636,14 @@ fn projection(db: &Database, table: &str, items: &[SelectItem]) -> Result<(Vec<E
             }
         }
     }
-    Ok((exprs, headers))
+    (exprs, headers)
+}
+
+fn items_have_aggregate(items: &[SelectItem]) -> bool {
+    items.iter().any(|item| match item {
+        SelectItem::Expr(e) | SelectItem::Aliased(e, _) => expr_has_aggregate(e),
+        SelectItem::Star => false,
+    })
 }
 
 fn limit_bound(expr: Option<&Expr>) -> Result<u64> {

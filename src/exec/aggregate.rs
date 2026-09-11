@@ -119,6 +119,23 @@ pub(crate) fn execute_grouped_select(
     headers: Vec<String>,
     exprs: Vec<Expr>,
 ) -> Result<ResultSet> {
+    let rows = grouped_select_rows(db, trx, outer, schema, s, filtered, exprs)?;
+    Ok(ResultSet::Rows { columns: headers, rows })
+}
+
+/// Core of grouped/aggregate execution: group, having, order groups, project
+/// (with group context), distinct and limit. Shared by the materialized path
+/// and the `GroupBy` operator.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grouped_select_rows(
+    db: &mut Database,
+    trx: &mut TrxState,
+    outer: Option<&EvalCtx>,
+    schema: &Schema,
+    s: &SelectStmt,
+    filtered: Vec<Vec<Value>>,
+    exprs: Vec<Expr>,
+) -> Result<Vec<Vec<Value>>> {
     for g in &s.group_by {
         if expr_has_aggregate(g) {
             return Err(Error::Runtime("aggregate functions are not allowed in group by".into()));
@@ -185,7 +202,7 @@ pub(crate) fn execute_grouped_select(
         dedup_rows(&mut out_rows);
     }
     apply_limit(&mut out_rows, &s.limit)?;
-    Ok(ResultSet::Rows { columns: headers, rows: out_rows })
+    Ok(out_rows)
 }
 
 /// DISTINCT: keep the first occurrence of every projected row; NULLs are
