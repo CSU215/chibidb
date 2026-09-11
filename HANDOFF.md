@@ -352,7 +352,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 验收记录（M20–M25 评审）：296 tests 全绿 + clippy 零警告；人工边界复验（跨列同值、DROP TABLE 清约束索引、链式 RIGHT JOIN、ESCAPE 角例、OrderedIndexScan 含 DESC、DML 子查询、恢复路径 `rebuild_indexes` 覆盖约束索引）均通过。**发现并修复 1 处阻断性缺陷**：`check_unique` 的 `claimed` 查重表跨唯一索引共享，同一行两个不同约束列取同值（如 PK 列与 UNIQUE 列同为 1）会被误判 `duplicate key`——红测试复现后按列下标区分修复，见 `abd0dbb`。已知边界（如实记档）：UNION 各臂不做类型统一，混型结果集上比较会报 type mismatch。
 
-提交基线：`dc312de feat: add ResolveStage and OptimizeStage to the pipeline`（HEAD）。
+提交基线：`6585676 test: add materialized execution baseline benchmark`（HEAD）。
 
 ---
 
@@ -367,6 +367,9 @@ Double-Write Buffer；多前端（MySQL/HTTP/Text TCP）；单实例多库 + 系
 最后收口移除全局锁；旧数据文件不兼容（可丢弃）；依赖放宽（toml+serde/parking_lot/crossbeam 等）；
 MySQL 认证先做 `mysql_native_password`、暂不做 TLS。
 
+物化执行基准（release，5 万行，`cargo test --release --test bench materialized_execution_baseline -- --ignored --nocapture`）：
+scan+project 31.1ms、filter tag=3 23.8ms、count(*) 18.9ms、group by tag 27.2ms。火山/Chunk 实现需与此对比。
+
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | P0 | 基线：297 tests + clippy + bench 记录 | ✅ |
@@ -376,7 +379,7 @@ MySQL 认证先做 `mysql_native_password`、暂不做 TLS。
 | P2+ | 其余接缝：`TransactionManager`、`PhysicalOperator` | ⬜ |
 | P3 | 单实例多库 + 系统元数据库 + 用户/权限 | 🟡 多库 + 前端接入 + 系统库 `chibi_meta`（`databases`/`users`/`privileges`）+ `CREATE/DROP USER` + `GRANT/REVOKE`（`e99c5ef`…`7d8a85f`）；认证/权限尚未在协议层强制、系统表未以 `information_schema` 暴露 |
 | P4 | Stage 流水线（Parse/Resolve/Optimize/Execute/Result） | 🟡 `ResolveStage`/`OptimizeStage` 落地（`dc312de`）；Parse 仍在 pipeline 外、Execute 尚未消费 `plan`、Result 写出仍在前端 |
-| P5 | 执行模型：基准 → 火山算子 → Chunk | ⬜ |
+| P5 | 执行模型：基准 → 火山算子 → Chunk | 🟡 物化执行基准已记录（`6585676`）；`PhysicalOperator` 接口与算子待做 |
 | P6 | 存储引擎抽象落地：Heap + Double-Write Buffer | ⬜ |
 | P7 | LSM 引擎（下一阶段） | ⬜ |
 | P8 | LOB（外存 + `LobReader` 流式） | ⬜ |
