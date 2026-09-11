@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：P5 执行算子化完成度：单/多表 SELECT、分组聚合、UNION、子查询谓词全走算子；等值连接用 `HashJoin`；367 tests 全绿、clippy 零警告。
+> 最后更新：P6 存储加固：统一文件头（版本/类型/页大小）+ 可配置 Double-Write Buffer；376 tests 全绿、clippy 零警告。
 
 ---
 
@@ -54,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 ```
 
 启动时会在**当前工作目录**读取 `config.toml`（缺失即全用默认值）。已生效条目：
-`storage.buffer_pool_frames`、`wal.checkpoint_threshold`、`server.addr`。其余条目
+`storage.buffer_pool_frames`、`storage.double_write`、`wal.checkpoint_threshold`、`server.addr`。其余条目
 （`storage.page_size/default_engine/double_write/inline_lob_limit`、`execution.mode`、
 `auth.enabled`、`server.protocols`）是后续阶段的预留位；其中 `page_size` 当前必须等于编译期
 `PAGE_SIZE`，否则打开数据库时报错（动态页大小属 P6 存储抽象）。
@@ -93,13 +93,15 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `instance.rs` | 单实例多库：数据根 `<db>/` + 系统库 `chibi_meta/`（真实 Database，`databases`/`users`/`privileges` 表；口令加盐 SHA-256）；`execute_with` 顶层入口（拦截库/用户/权限语句，其余路由到 current_db） | `Instance::open` / `execute_with` / `create_user` / `authenticate` / `grant` / `has_privilege` |
 | `config.rs` | 全局配置中心：`Config`（storage/wal/server/execution/auth），`config.toml` 加载、默认值、校验 | `Config::load` / `from_toml_str` / `validate` |
 | `catalog/mod.rs` | `Catalog`：`Table`/`HeapStore`/`IndexEntry`、`Schema`/`ColumnDesc`（带 `owner`）、`resolve()` 歧义检测 | |
-| `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT5**（v5：事务簿记 + 视图定义 + 列约束 + 唯一索引标记） | `CatalogSnapshot` |
+| `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT6** + 统一文件头（事务簿记 + 视图定义 + 列约束 + 唯一索引标记） | `CatalogSnapshot` |
 | `storage/page.rs` | 页常量：`PAGE_SIZE=8192`、`FileId=u32`、`PageNo=u32`、`zeroed_page` | |
-| `storage/disk.rs` | `DiskManager`：分页文件读写、建文件、魔数校验 | |
-| `storage/buffer.rs` | `BufferPool`：帧数来自 config、LRU `VecDeque`、脏页写回、Drop flush；`with_page(file,no,f)` 闭包式访问（访问即脏）、`read_page`（只读不脏） | |
+| `storage/disk.rs` | `DiskManager`：分页文件读写、建文件、可选 Double-Write Buffer 的 stage/sync/reset | |
+| `storage/header.rs` | 统一文件头 `[magic8][version u16][kind u8][page_size u32]`；`write_header`/`read_header` 校验版本/类型/页大小 | `FORMAT_VERSION` |
+| `storage/dwb.rs` | Double-Write Buffer：flush 前 stage + sync，崩溃后 `recover` 按路径回写再截断 | `DoubleWrite` / `recover` |
+| `storage/buffer.rs` | `BufferPool`：帧数来自 config、LRU `VecDeque`、脏页写回（`flush_all` 走 DWB）、Drop flush；`with_page(file,no,f)` 闭包式访问（访问即脏）、`read_page`（只读不脏） | |
 | `storage/slotted.rs` | slotted 页纯函数：槽目录、变长条目、`page_insert`（空槽复用+压实）、`page_get/iter/delete/write` | |
 | `storage/engine.rs` | 存储读接缝：`TableEngine`/`RowScanner` trait + `HeapEngine`（流式逐页扫描） | `HeapEngine::scan` |
-| `storage/heap.rs` | `HeapFile`：page 0 文件头（魔数 **CHD2** v2 行带 MVCC 字段）、first-fit 多页、`insert/get/delete(物理)/delete_mark(MVCC)/for_each` | `Rid{page_no,slot}` |
+| `storage/heap.rs` | `HeapFile`：page 0 文件头（魔数 **CHIDHEAP** + 统一头；行带 MVCC 字段）、first-fit 多页、`insert/get/delete(物理)/delete_mark(MVCC)/for_each` | `Rid{page_no,slot}` |
 | `storage/codec.rs` | 行/记录编码：自描述 tag（Null=00/Int=01/Float=02/Str=03/Bool=04/Date=05/Text）、值计数前缀；`encode_row/decode_row`；**版本化记录** `encode_record(creator,deleter,row)`（前 8 字节两个隐藏 u32） | |
 | `index/key.rs` | 索引保序键编码：int 符号翻转大端、float 保序变换、str+NUL 结尾、date 符号翻转、null=0x00 | `encode_key` |
 | `index/node.rs` | B+ 树节点页：叶/内部条目、lower/upper bound、bytes 占用阈值 25%、`page_write` 原位重写 | |
@@ -230,11 +232,12 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ```
 <data_dir>/
-  catalog.bin            # 魔数 CHIDCAT5 + next_table_file/next_index_file/next_trx_id/committed[]
+  catalog.bin            # 魔数 CHIDCAT6 + 统一文件头 + next_table_file/next_index_file/next_trx_id/committed[]
                           # + 表元数据（列定义+file_no）+ 索引元数据（name/table/column/file_no）
   wal.bin                # 预写日志（见 §6.3）；干净关闭/flush 后为 0 字节
-  tables/000000.dbf ...  # 每表一个 HeapFile；page 0 头魔数 CHD2，数据页从 1 起，first-fit
-  indexes/000000.idxf ...# 每索引一个 B+ 树文件；page 0 头魔数 CHIDBTX1
+  tables/000000.dbf ...  # 每表一个 HeapFile；page 0 头魔数 CHIDHEAP + 统一头，数据页从 1 起，first-fit
+  indexes/000000.idxf ...# 每索引一个 B+ 树文件；page 0 头魔数 CHIDBITX + 统一头
+  dwb.bin                # Double-Write Buffer（config.storage.double_write 开启时）
 ```
 
 ### 6.2 MVCC 现状（M12.1）
@@ -353,7 +356,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 验收记录（M20–M25 评审）：296 tests 全绿 + clippy 零警告；人工边界复验（跨列同值、DROP TABLE 清约束索引、链式 RIGHT JOIN、ESCAPE 角例、OrderedIndexScan 含 DESC、DML 子查询、恢复路径 `rebuild_indexes` 覆盖约束索引）均通过。**发现并修复 1 处阻断性缺陷**：`check_unique` 的 `claimed` 查重表跨唯一索引共享，同一行两个不同约束列取同值（如 PK 列与 UNIQUE 列同为 1）会被误判 `duplicate key`——红测试复现后按列下标区分修复，见 `abd0dbb`。已知边界（如实记档）：UNION 各臂不做类型统一，混型结果集上比较会报 type mismatch。
 
-提交基线：`a77de0c test: add hash join throughput benchmark`（HEAD）。
+提交基线：`3daa90b feat: add a configurable double-write buffer`（HEAD）。
 
 ---
 
@@ -382,7 +385,7 @@ MySQL 认证先做 `mysql_native_password`、暂不做 TLS。
 | P3 | 单实例多库 + 系统元数据库 + 用户/权限 | 🟡 多库 + 前端接入 + 系统库 `chibi_meta`（`databases`/`users`/`privileges`）+ `CREATE/DROP USER` + `GRANT/REVOKE`（`e99c5ef`…`7d8a85f`）；认证/权限尚未在协议层强制、系统表未以 `information_schema` 暴露 |
 | P4 | Stage 流水线（Parse/Resolve/Optimize/Execute/Result） | 🟡 `ResolveStage`/`OptimizeStage` 落地（`dc312de`）；Parse 仍在 pipeline 外、Execute 尚未消费 `plan`、Result 写出仍在前端 |
 | P5 | 执行模型：基准 → 火山算子 → Chunk | 🟡 顶层 SELECT 全走算子（单/多表、等值 `HashJoin`、分组聚合、UNION、子查询谓词）；视图 FROM 与子查询内部仍物化；Chunk 暂缓 |
-| P6 | 存储引擎抽象落地：Heap + Double-Write Buffer | ⬜ |
+| P6 | 存储引擎抽象落地：Heap + Double-Write Buffer | 🟡 统一文件头（`63ede97`）+ 可配置 DWB（`3daa90b`）；`StorageEngine` trait 待 LSM 阶段再扩（`TableEngine` 读接缝已在 P2 落地） |
 | P7 | LSM 引擎（下一阶段） | ⬜ |
 | P8 | LOB（外存 + `LobReader` 流式） | ⬜ |
 | P9 | 多前端（MySQL/HTTP/Text TCP） | ⬜ |
