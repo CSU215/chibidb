@@ -13,7 +13,7 @@ cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
 # HTTP/JSON 前端：配置 server.http_addr 后，POST /query {"sql":"..."} → {"results":[...]}
 # MySQL 前端：配置 server.mysql_addr 后，可用 mysql 客户端连接（mysql_native_password、文本结果集）
-cargo test                      # 全量回归（470 tests）
+cargo test                      # 全量回归（472 tests）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -131,7 +131,7 @@ SQL 字符串
 - **Heap**（默认）：`HeapEngine` + slotted page + B+ 树索引
 - **LSM**：`MemTable`（有序 + 墓碑）→ `SSTable`（数据块 + 索引块 + bloom + footer，varint/前缀压缩）
   → `LsmStore`（flush/compaction）→ `PersistentLsm`（`MANIFEST` 原子提交、重开恢复、活跃表达阈值自动合并）；
-  `LsmEngine` 以内部行号键接入 `TableStorage`，版本化记录与堆一致
+  `LsmEngine` 以内部行号键接入 `TableStorage`，版本化记录与堆一致；查询按 key 范围跳表 + 逐块流式归并
 
 新建表的引擎由 `CREATE TABLE ... ENGINE = heap|lsm` 指定，未写时取 `storage.default_engine`；
 catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派。
@@ -164,7 +164,7 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
 
 ## 测试
 
-`cargo test` 跑 470 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
+`cargo test` 跑 472 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
 表约束（PK/UNIQUE/NOT NULL/DEFAULT）/索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等，
 另有 `tests/miniob_compat.rs` 用经典 student/course/sc 场景做端到端回归。集成测试的 `with_dbs` 模式让同一用例在内存后端
 与文件后端各跑一遍；WAL 测试用 `Database::simulate_crash()` 模拟进程被杀。
