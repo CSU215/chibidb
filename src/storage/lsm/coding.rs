@@ -34,6 +34,19 @@ pub fn get_varint32(data: &[u8], pos: &mut usize) -> Result<u32> {
     Err(Error::Runtime("varint32 overflows 32 bits".into()))
 }
 
+/// Reads a varint64, advancing `pos`.
+pub fn get_varint64(data: &[u8], pos: &mut usize) -> Result<u64> {
+    let mut result: u64 = 0;
+    for shift in (0..70).step_by(7) {
+        let byte = take_byte(data, pos)?;
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+    }
+    Err(Error::Runtime("varint64 overflows 64 bits".into()))
+}
+
 pub fn put_fixed32(buf: &mut Vec<u8>, value: u32) {
     buf.extend_from_slice(&value.to_le_bytes());
 }

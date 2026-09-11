@@ -4,6 +4,8 @@
 pub mod block;
 pub mod coding;
 pub mod memtable;
+pub mod sstable;
 
 pub use block::{Block, BlockBuilder, DEFAULT_RESTART_INTERVAL};
 pub use memtable::{MemEntry, MemTable};
+pub use sstable::{BlockHandle, SSTable, SSTableBuilder};
