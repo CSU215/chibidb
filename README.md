@@ -11,7 +11,7 @@ cargo run -q                    # 内存实例 REPL（临时目录后端，自�
 cargo run -q -- <dir>           # 文件实例 REPL（数据根目录，多库落盘）
 cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（451 tests）
+cargo test                      # 全量回归（454 tests）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -111,6 +111,7 @@ SQL 字符串
   → 子查询物化      按外层行求值 IN/EXISTS/标量子查询并改写为字面量（支持相关子查询）
   → B+ 树索引      保序字节键、分裂/借用/合并、范围扫描
   → MVCC           快照隔离、undo 回滚、BEGIN/COMMIT/ROLLBACK
+  → TransactionManager 事务 id 分配 + committed/open 集合 + 快照
   → WAL            提交时 fsync；崩溃后重放已提交事务
   → slotted page   8KB、槽目录、变长条目
   → TableStorage   表存储接缝（`insert/delete/delete_mark/scan/get`，带 MVCC 语义）
@@ -156,7 +157,7 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
 
 ## 测试
 
-`cargo test` 跑 451 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
+`cargo test` 跑 454 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
 表约束（PK/UNIQUE/NOT NULL/DEFAULT）/索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等，
 另有 `tests/miniob_compat.rs` 用经典 student/course/sc 场景做端到端回归。集成测试的 `with_dbs` 模式让同一用例在内存后端
 与文件后端各跑一遍；WAL 测试用 `Database::simulate_crash()` 模拟进程被杀。
