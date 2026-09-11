@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：P5 收官——SELECT 全走火山算子（含视图、子查询），物化 SELECT 主干已删除；377 tests 全绿、clippy 零警告。
+> 最后更新：P5 收官（SELECT 全走算子）；P10 并发/事务设计定稿；下一步 P5.5 DML 算子化；377 tests 全绿、clippy 零警告。
 
 ---
 
@@ -370,6 +370,13 @@ Double-Write Buffer；多前端（MySQL/HTTP/Text TCP）；单实例多库 + 系
 最后收口移除全局锁；旧数据文件不兼容（可丢弃）；依赖放宽（toml+serde/parking_lot/crossbeam 等）；
 MySQL 认证先做 `mysql_native_password`、暂不做 TLS。
 
+并发/事务设计（P10.0 定稿）：保持**快照隔离**；线程模型抽象 `ThreadHandler`，提供
+`per-connection` 与 `thread-pool` 两种后端（config `server.thread_model` / `worker_threads`）；
+分期 P10.1 per-DB `Mutex` 去全局锁 → P10.2 库内 `RwLock` + Catalog `arc-swap` 快照 +
+BufferPool 页闩 + WAL 组提交 → P10.3 库内多写者，冲突策略**可配置**
+（`transaction.conflict = "fcw" | "2pl"`，先 FCW 后 2PL + 死锁检测）。锁库 `parking_lot`/`arc-swap`。
+DML 先算子化（P5.5），使执行层统一走算子。
+
 物化执行基准（release，5 万行，`cargo test --release --test bench -- --ignored --nocapture`）：
 算子路径下 scan+project 19.0ms、filter tag=3 13.7ms、count(*) 9.9ms、group by tag 20.8ms
 （P5 前物化基线分别为 31.1/23.8/18.9/27.2ms）；等值 `HashJoin` 50k×50k + count(*) 93.7ms。
@@ -384,11 +391,12 @@ MySQL 认证先做 `mysql_native_password`、暂不做 TLS。
 | P3 | 单实例多库 + 系统元数据库 + 用户/权限 | 🟡 多库 + 前端接入 + 系统库 `chibi_meta`（`databases`/`users`/`privileges`）+ `CREATE/DROP USER` + `GRANT/REVOKE`（`e99c5ef`…`7d8a85f`）；认证/权限尚未在协议层强制、系统表未以 `information_schema` 暴露 |
 | P4 | Stage 流水线（Parse/Resolve/Optimize/Execute/Result） | 🟡 `ResolveStage`/`OptimizeStage` 落地（`dc312de`）；Parse 仍在 pipeline 外、Execute 尚未消费 `plan`、Result 写出仍在前端 |
 | P5 | 执行模型：基准 → 火山算子 → Chunk | ✅ SELECT 全走算子（单/多表、`HashJoin`、分组聚合、DISTINCT、ORDER、LIMIT、UNION、视图、相关/不相关子查询）；物化 SELECT 主干已删除；Chunk 按评估暂缓 |
+| P5.5 | DML 算子化：`Insert`/`Update`/`Delete` 算子 + 计划构造 | ⬜ |
 | P6 | 存储引擎抽象落地：Heap + Double-Write Buffer | 🟡 统一文件头（`63ede97`）+ 可配置 DWB（`3daa90b`）；`StorageEngine` trait 待 LSM 阶段再扩（`TableEngine` 读接缝已在 P2 落地） |
 | P7 | LSM 引擎（下一阶段） | ⬜ |
 | P8 | LOB（外存 + `LobReader` 流式） | ⬜ |
 | P9 | 多前端（MySQL/HTTP/Text TCP） | ⬜ |
-| P10 | 并发收口：移除全局锁 + 锁管理器/死锁检测 | ⬜ |
+| P10 | 并发：`ThreadHandler`（per-connection/thread-pool）+ 去全局锁 + 可配置冲突策略（FCW/2PL） | ⬜ |
 
 工作纪律：每步先写失败测试（红）再最小实现（绿），提交粒度对齐 chibicc（一次一件事），
 提交前全量 `cargo test` + clippy 零警告，并同步本文档与 README。
