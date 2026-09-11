@@ -83,6 +83,35 @@ fn compaction_merges_files_and_removes_old_ones() {
 }
 
 #[test]
+fn leveled_compaction_preserves_data_and_tombstones() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut lsm = PersistentLsm::open_with_trigger(dir.path(), 128, 3).unwrap();
+        for round in 0..12u32 {
+            for i in 0..10u32 {
+                if round >= 5 && i == 0 {
+                    continue; // keep k000 deleted
+                }
+                lsm.put(format!("k{i:03}").into_bytes(), format!("r{round}-{i}").into_bytes());
+            }
+            if round == 5 {
+                lsm.delete(b"k000".to_vec());
+            }
+            lsm.flush().unwrap();
+        }
+        // 12 flushes but the leveled layout keeps the table count logarithmic
+        assert!(lsm.num_sstables() <= 6, "live tables {}", lsm.num_sstables());
+        assert_eq!(lsm.get(b"k005").unwrap(), Some(b"r11-5".to_vec()));
+        assert_eq!(lsm.get(b"k000").unwrap(), None);
+    }
+
+    let lsm = PersistentLsm::open_with_trigger(dir.path(), 128, 3).unwrap();
+    assert_eq!(lsm.get(b"k005").unwrap(), Some(b"r11-5".to_vec()));
+    assert_eq!(lsm.get(b"k000").unwrap(), None);
+    assert_eq!(lsm.iter().unwrap().len(), 9);
+}
+
+#[test]
 fn orphan_sstable_file_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
     {

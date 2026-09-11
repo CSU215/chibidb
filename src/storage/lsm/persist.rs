@@ -1,14 +1,13 @@
-//! On-disk LSM store: SSTable files plus a manifest listing the live set.
+//! On-disk LSM store: SSTable files plus a manifest describing the levels.
 //!
 //! Directory layout:
 //! ```text
-//! <dir>/MANIFEST          number-encoded list of live SSTable files
+//! <dir>/MANIFEST          levels of live SSTable file numbers + next id
 //! <dir>/sst-000001.sst    one immutable table per file
 //! ```
-//! Flush writes a new table file and then rewrites the manifest (write to a
-//! temp file, fsync, rename) before adopting it, so a crash leaves either the
-//! old manifest or the new one. An orphaned table file is ignored on open
-//! because the manifest never named it.
+//! Flush and each compaction step write a new table file before the manifest
+//! is rewritten (write to a temp file, fsync, rename), so a crash leaves the
+//! old manifest or the new one. Orphaned files are ignored on open.
 
 use std::fs::File;
 use std::io::Write;
@@ -19,27 +18,22 @@ use crate::storage::lsm::sstable::SSTable;
 use crate::storage::lsm::store::LsmStore;
 use crate::{Error, Result};
 
+pub use crate::storage::lsm::store::DEFAULT_COMPACTION_TRIGGER;
+
 const MANIFEST: &str = "MANIFEST";
 const MANIFEST_TMP: &str = "MANIFEST.tmp";
-const MANIFEST_MAGIC: [u8; 8] = *b"LSMMF001";
+const MANIFEST_MAGIC: [u8; 8] = *b"LSMMF002";
 const SSTABLE_SUFFIX: &str = ".sst";
-
-/// Default number of live SSTables that triggers an automatic compaction.
-pub const DEFAULT_COMPACTION_TRIGGER: usize = 4;
 
 /// A durable LSM store rooted at one directory.
 pub struct PersistentLsm {
     dir: PathBuf,
     store: LsmStore,
-    /// Live table file numbers, oldest first.
-    sstable_files: Vec<u32>,
     next_file_no: u32,
-    /// Compact once this many tables are live (a small tiered-0 policy).
-    compaction_trigger: usize,
 }
 
 impl PersistentLsm {
-    /// Opens (or creates) the store, restoring the tables named by the
+    /// Opens (or creates) the store, restoring the levels named by the
     /// manifest. Any extra files on disk are ignored.
     pub fn open(dir: &Path, block_size: usize) -> Result<Self> {
         Self::open_with_trigger(dir, block_size, DEFAULT_COMPACTION_TRIGGER)
@@ -53,21 +47,23 @@ impl PersistentLsm {
     ) -> Result<Self> {
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::Runtime(format!("cannot create {}: {e}", dir.display())))?;
-        let sstable_files = read_manifest(dir)?;
-        let mut store = LsmStore::new(block_size);
-        for &no in &sstable_files {
-            let bytes = std::fs::read(sstable_path(dir, no))
-                .map_err(|e| Error::Runtime(format!("cannot read sstable {no}: {e}")))?;
-            store.add_sstable(SSTable::parse(bytes)?);
+        let (stored_next, manifest_levels) = read_manifest(dir)?;
+        let mut store = LsmStore::new_with_trigger(block_size, compaction_trigger);
+        let mut max_file = 0u32;
+        let mut levels = Vec::with_capacity(manifest_levels.len());
+        for level in &manifest_levels {
+            let mut tables = Vec::with_capacity(level.len());
+            for &no in level {
+                let bytes = std::fs::read(sstable_path(dir, no))
+                    .map_err(|e| Error::Runtime(format!("cannot read sstable {no}: {e}")))?;
+                tables.push(SSTable::parse(bytes)?.with_file_no(no));
+                max_file = max_file.max(no);
+            }
+            levels.push(tables);
         }
-        let next_file_no = sstable_files.iter().copied().max().unwrap_or(0) + 1;
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            store,
-            sstable_files,
-            next_file_no,
-            compaction_trigger: compaction_trigger.max(2),
-        })
+        store.set_levels(levels);
+        let next_file_no = stored_next.max(max_file + 1).max(1);
+        Ok(Self { dir: dir.to_path_buf(), store, next_file_no })
     }
 
     pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
@@ -90,8 +86,14 @@ impl PersistentLsm {
         self.store.num_sstables()
     }
 
-    pub fn sstable_file_numbers(&self) -> &[u32] {
-        &self.sstable_files
+    /// File numbers of every live table, newest first.
+    pub fn sstable_file_numbers(&self) -> Vec<u32> {
+        self.store
+            .levels()
+            .iter()
+            .flatten()
+            .filter_map(SSTable::file_no)
+            .collect()
     }
 
     /// A cheap snapshot for streaming scans (memtable entries + table clones).
@@ -99,49 +101,65 @@ impl PersistentLsm {
         self.store.snapshot()
     }
 
-    /// Writes the memtable out as one new SSTable and commits it via the
-    /// manifest.
+    /// Writes the memtable to a new level-0 table, cascades compaction, then
+    /// commits the new level layout via the manifest.
     pub fn flush(&mut self) -> Result<()> {
         let Some(image) = self.store.memtable_image() else {
             return Ok(());
         };
         let no = self.next_file_no;
         write_sstable(&self.dir, no, &image)?;
-        self.sstable_files.push(no);
-        if let Err(e) = write_manifest(&self.dir, &self.sstable_files) {
-            // roll back the in-memory manifest so disk and memory agree
-            self.sstable_files.pop();
-            return Err(e);
-        }
         self.next_file_no += 1;
-        self.store.add_sstable(SSTable::parse(image)?);
+        self.store.insert_level0(SSTable::parse(image)?.with_file_no(no));
         self.store.reset_memtable();
-        // bound read amplification by merging once too many tables pile up
-        if self.sstable_files.len() >= self.compaction_trigger {
-            self.compact()?;
-        }
-        Ok(())
+        self.cascade()?;
+        self.write_manifest()
     }
 
-    /// Merges every SSTable into one new file and removes the old ones.
+    /// Merges every level into one table, dropping tombstones (major
+    /// compaction).
     pub fn compact(&mut self) -> Result<()> {
         let Some(image) = self.store.compacted_image()? else {
             return Ok(());
         };
-        let old = std::mem::take(&mut self.sstable_files);
+        let old = self.sstable_file_numbers();
         let no = self.next_file_no;
         write_sstable(&self.dir, no, &image)?;
-        if let Err(e) = write_manifest(&self.dir, &[no]) {
-            self.sstable_files = old;
-            return Err(e);
-        }
         self.next_file_no += 1;
-        self.store.replace_sstables(vec![SSTable::parse(image)?]);
-        self.sstable_files = vec![no];
+        self.store.set_levels(vec![vec![SSTable::parse(image)?.with_file_no(no)]]);
         for file in old {
             let _ = std::fs::remove_file(sstable_path(&self.dir, file));
         }
+        self.write_manifest()
+    }
+
+    /// Merges every level that reached the trigger into the next level.
+    fn cascade(&mut self) -> Result<()> {
+        while let Some(level) = self.store.level_needing_compaction() {
+            let tables: Vec<SSTable> = self.store.level_tables(level).to_vec();
+            let image = self.store.merge_tables(&tables)?;
+            let no = self.next_file_no;
+            write_sstable(&self.dir, no, &image)?;
+            self.next_file_no += 1;
+            let merged = SSTable::parse(image)?.with_file_no(no);
+            for table in &tables {
+                if let Some(file) = table.file_no() {
+                    let _ = std::fs::remove_file(sstable_path(&self.dir, file));
+                }
+            }
+            self.store.apply_merge(level, merged);
+        }
         Ok(())
+    }
+
+    fn write_manifest(&self) -> Result<()> {
+        let levels: Vec<Vec<u32>> = self
+            .store
+            .levels()
+            .iter()
+            .map(|level| level.iter().filter_map(SSTable::file_no).collect())
+            .collect();
+        write_manifest(&self.dir, self.next_file_no, &levels)
     }
 }
 
@@ -157,12 +175,16 @@ fn write_sstable(dir: &Path, file_no: u32, image: &[u8]) -> Result<()> {
     file.sync_all().map_err(|e| Error::Runtime(format!("cannot sync sstable: {e}")))
 }
 
-fn write_manifest(dir: &Path, file_numbers: &[u32]) -> Result<()> {
-    let mut buf = Vec::with_capacity(12 + file_numbers.len() * 4);
+fn write_manifest(dir: &Path, next_file_no: u32, levels: &[Vec<u32>]) -> Result<()> {
+    let mut buf = Vec::new();
     buf.extend_from_slice(&MANIFEST_MAGIC);
-    buf.extend_from_slice(&(file_numbers.len() as u32).to_le_bytes());
-    for &no in file_numbers {
-        buf.extend_from_slice(&no.to_le_bytes());
+    buf.extend_from_slice(&next_file_no.to_le_bytes());
+    buf.extend_from_slice(&(levels.len() as u32).to_le_bytes());
+    for level in levels {
+        buf.extend_from_slice(&(level.len() as u32).to_le_bytes());
+        for &no in level {
+            buf.extend_from_slice(&no.to_le_bytes());
+        }
     }
     let tmp = dir.join(MANIFEST_TMP);
     {
@@ -175,25 +197,38 @@ fn write_manifest(dir: &Path, file_numbers: &[u32]) -> Result<()> {
         .map_err(|e| Error::Runtime(format!("cannot replace manifest: {e}")))
 }
 
-fn read_manifest(dir: &Path) -> Result<Vec<u32>> {
+fn read_manifest(dir: &Path) -> Result<(u32, Vec<Vec<u32>>)> {
     let path = dir.join(MANIFEST);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((1, Vec::new())),
         Err(e) => return Err(Error::Runtime(format!("cannot read manifest: {e}"))),
     };
-    if bytes.len() < 12 || bytes[0..8] != MANIFEST_MAGIC {
+    if bytes.len() < 16 || bytes[0..8] != MANIFEST_MAGIC {
         return Err(Error::Runtime("manifest is corrupt".into()));
     }
-    let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    if bytes.len() < 12 + count * 4 {
-        return Err(Error::Runtime("manifest is truncated".into()));
+    let next_file_no = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let num_levels = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let mut pos = 16;
+    let mut levels = Vec::with_capacity(num_levels);
+    for _ in 0..num_levels {
+        let count = take_u32(&bytes, &mut pos)? as usize;
+        if bytes.len() < pos + count * 4 {
+            return Err(Error::Runtime("manifest is truncated".into()));
+        }
+        let mut level = Vec::with_capacity(count);
+        for _ in 0..count {
+            level.push(take_u32(&bytes, &mut pos)?);
+        }
+        levels.push(level);
     }
-    let mut files = Vec::with_capacity(count);
-    let mut pos = 12;
-    for _ in 0..count {
-        files.push(u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()));
-        pos += 4;
-    }
-    Ok(files)
+    Ok((next_file_no, levels))
+}
+
+fn take_u32(data: &[u8], pos: &mut usize) -> Result<u32> {
+    let bytes = data
+        .get(*pos..*pos + 4)
+        .ok_or_else(|| Error::Runtime("manifest is truncated".into()))?;
+    *pos += 4;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }

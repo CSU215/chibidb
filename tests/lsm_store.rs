@@ -104,7 +104,8 @@ fn streaming_merge_yields_newest_visible_values() {
 
 #[test]
 fn compaction_preserves_latest_values() {
-    let mut store = small();
+    // a high trigger keeps auto-cascade out of the way of this test
+    let mut store = LsmStore::new_with_trigger(128, 100);
     for round in 0..5 {
         for i in 0..20 {
             store.put(format!("key{i:03}").into_bytes(), format!("r{round}-{i}").into_bytes());

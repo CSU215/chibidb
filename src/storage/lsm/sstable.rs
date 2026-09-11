@@ -144,6 +144,8 @@ pub struct SSTable {
     /// Smallest and largest keys, for range pruning.
     first_key: Arc<Vec<u8>>,
     last_key: Arc<Vec<u8>>,
+    /// File number when this table is backed by a file (persistence only).
+    file_no: Option<u32>,
 }
 
 impl SSTable {
@@ -186,7 +188,18 @@ impl SSTable {
             bloom: Arc::new(bloom),
             first_key: Arc::new(first_key),
             last_key: Arc::new(last_key),
+            file_no: None,
         })
+    }
+
+    /// Records the file this table was loaded from / written to.
+    pub fn with_file_no(mut self, file_no: u32) -> Self {
+        self.file_no = Some(file_no);
+        self
+    }
+
+    pub fn file_no(&self) -> Option<u32> {
+        self.file_no
     }
 
     pub fn num_blocks(&self) -> usize {

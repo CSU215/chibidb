@@ -81,9 +81,11 @@ fn lsm_auto_compaction_bounds_the_table_count() {
             engine.insert(&bp, &data).unwrap();
         }
         engine.flush().unwrap();
+        // with levels, the live count is bounded by about (trigger-1)*log(N),
+        // well below the number of flushes
         assert!(
-            engine.num_sstables() < 3,
-            "live tables {} exceeded the trigger",
+            engine.num_sstables() <= 4,
+            "live tables {} exceeded the leveled bound",
             engine.num_sstables()
         );
     }

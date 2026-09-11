@@ -1,8 +1,12 @@
-//! An in-memory LSM store: one mutable memtable on top of immutable SSTables.
+//! An in-memory LSM store: one mutable memtable on top of immutable SSTables
+//! organized into levels.
 //!
-//! A flush turns the memtable into a new SSTable; compaction merges every
-//! SSTable into one. Values carry a one-byte tag so tombstones survive a flush
-//! and keep shadowing older tables until compaction drops them.
+//! A flush appends a table to level 0. When a level reaches the compaction
+//! trigger it is merged into a single table placed at the front of the next
+//! level (a logarithmic, binary-counter structure). Because newer levels are
+//! always placed first, scanning levels in order preserves newest-wins while
+//! bounding write amplification to O(N log N). Values carry a one-byte tag so
+//! tombstones survive merges and keep shadowing older levels.
 
 use std::collections::BTreeMap;
 
@@ -14,11 +18,16 @@ use crate::Result;
 const TAG_TOMBSTONE: u8 = 0;
 const TAG_VALUE: u8 = 1;
 
-/// Newest table last, oldest first.
+/// Default tables per level that triggers a merge into the next level.
+pub const DEFAULT_COMPACTION_TRIGGER: usize = 4;
+
+/// Levels of immutable tables. `levels[0]` is newest; within a level the front
+/// is newest. Flattening in order yields a globally newest-first sequence.
 pub struct LsmStore {
     memtable: MemTable,
-    sstables: Vec<SSTable>,
+    levels: Vec<Vec<SSTable>>,
     block_size: usize,
+    compaction_trigger: usize,
 }
 
 impl Default for LsmStore {
@@ -29,7 +38,16 @@ impl Default for LsmStore {
 
 impl LsmStore {
     pub fn new(block_size: usize) -> Self {
-        Self { memtable: MemTable::new(), sstables: Vec::new(), block_size }
+        Self::new_with_trigger(block_size, DEFAULT_COMPACTION_TRIGGER)
+    }
+
+    pub fn new_with_trigger(block_size: usize, compaction_trigger: usize) -> Self {
+        Self {
+            memtable: MemTable::new(),
+            levels: Vec::new(),
+            block_size,
+            compaction_trigger: compaction_trigger.max(2),
+        }
     }
 
     pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
@@ -40,29 +58,36 @@ impl LsmStore {
         self.memtable.delete(key);
     }
 
-    /// Newest-wins lookup across the memtable and every SSTable.
+    /// Newest-wins lookup across the memtable and every level.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(entry) = self.memtable.get(key) {
             return Ok(entry.value().map(<[u8]>::to_vec));
         }
-        for sstable in self.sstables.iter().rev() {
-            // skip tables whose key range cannot contain the key
-            if !sstable.may_contain(key) {
-                continue;
-            }
-            if let Some(encoded) = sstable.get(key)? {
-                return Ok(decode_entry(&encoded).value().map(<[u8]>::to_vec));
+        for level in &self.levels {
+            for table in level {
+                // skip tables whose key range cannot contain the key
+                if !table.may_contain(key) {
+                    continue;
+                }
+                if let Some(encoded) = table.get(key)? {
+                    return Ok(decode_entry(&encoded).value().map(<[u8]>::to_vec));
+                }
             }
         }
         Ok(None)
     }
 
+    /// Tables newest first across all levels.
+    fn tables_newest_first(&self) -> impl Iterator<Item = &SSTable> {
+        self.levels.iter().flatten()
+    }
+
     /// The merged, visible contents in ascending key order.
     pub fn iter(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut merged: BTreeMap<Vec<u8>, MemEntry> = BTreeMap::new();
-        for sstable in &self.sstables {
-            for (key, encoded) in sstable.iter()? {
-                merged.insert(key, decode_entry(&encoded));
+        for table in self.tables_newest_first() {
+            for (key, encoded) in table.iter()? {
+                merged.entry(key).or_insert_with(|| decode_entry(&encoded));
             }
         }
         for (key, entry) in self.memtable.iter() {
@@ -75,17 +100,28 @@ impl LsmStore {
     }
 
     pub fn num_sstables(&self) -> usize {
-        self.sstables.len()
+        self.levels.iter().map(Vec::len).sum()
+    }
+
+    pub fn levels(&self) -> &[Vec<SSTable>] {
+        &self.levels
+    }
+
+    pub fn set_levels(&mut self, levels: Vec<Vec<SSTable>>) {
+        self.levels = levels;
+    }
+
+    pub fn compaction_trigger(&self) -> usize {
+        self.compaction_trigger
     }
 
     /// A cheap snapshot for streaming scans: the memtable entries and clones
-    /// of the SSTables (their contents are shared behind `Arc`).
+    /// of the SSTables (their contents are shared behind `Arc`), newest first.
     pub fn snapshot(&self) -> (Vec<(Vec<u8>, MemEntry)>, Vec<SSTable>) {
-        (self.memtable.iter(), self.sstables.clone())
+        (self.memtable.iter(), self.tables_newest_first().cloned().collect())
     }
 
-    /// The memtable as an SSTable image, or `None` when it is empty. Does not
-    /// mutate the store, so a caller can persist the image first.
+    /// The memtable as an SSTable image, or `None` when it is empty.
     pub fn memtable_image(&self) -> Option<Vec<u8>> {
         if self.memtable.is_empty() {
             return None;
@@ -93,47 +129,92 @@ impl LsmStore {
         Some(self.build_from(self.memtable.iter()))
     }
 
-    /// The major-compaction image of all SSTables (tombstones dropped), or
+    /// The major-compaction image of every table (tombstones dropped), or
     /// `None` when there is nothing to merge.
     pub fn compacted_image(&self) -> Result<Option<Vec<u8>>> {
-        if self.sstables.len() < 2 {
+        if self.num_sstables() < 2 {
             return Ok(None);
         }
         let mut merged: BTreeMap<Vec<u8>, MemEntry> = BTreeMap::new();
-        for sstable in &self.sstables {
-            for (key, encoded) in sstable.iter()? {
-                merged.insert(key, decode_entry(&encoded));
+        for table in self.tables_newest_first() {
+            for (key, encoded) in table.iter()? {
+                merged.entry(key).or_insert_with(|| decode_entry(&encoded));
             }
         }
-        Ok(Some(self.build_from(merged.into_iter().collect::<Vec<_>>())))
-    }
-
-    pub fn add_sstable(&mut self, sstable: SSTable) {
-        self.sstables.push(sstable);
-    }
-
-    pub fn replace_sstables(&mut self, sstables: Vec<SSTable>) {
-        self.sstables = sstables;
+        let entries: Vec<(Vec<u8>, MemEntry)> = merged
+            .into_iter()
+            .filter(|(_, entry)| entry.value().is_some())
+            .collect();
+        Ok(Some(self.build_from(entries)))
     }
 
     pub fn reset_memtable(&mut self) {
         self.memtable = MemTable::new();
     }
 
-    /// Turns the memtable into a new SSTable (minor compaction).
+    /// Inserts a freshly flushed table at the front of level 0.
+    pub fn insert_level0(&mut self, table: SSTable) {
+        if self.levels.is_empty() {
+            self.levels.push(Vec::new());
+        }
+        self.levels[0].insert(0, table);
+    }
+
+    /// The lowest level holding at least `compaction_trigger` tables.
+    pub fn level_needing_compaction(&self) -> Option<usize> {
+        self.levels.iter().position(|level| level.len() >= self.compaction_trigger)
+    }
+
+    pub fn level_tables(&self, level: usize) -> &[SSTable] {
+        &self.levels[level]
+    }
+
+    /// Merges `tables` (newest first) into one image, keeping tombstones so
+    /// they keep shadowing older levels.
+    pub fn merge_tables(&self, tables: &[SSTable]) -> Result<Vec<u8>> {
+        let mut merged: BTreeMap<Vec<u8>, MemEntry> = BTreeMap::new();
+        for table in tables {
+            for (key, encoded) in table.iter()? {
+                merged.entry(key).or_insert_with(|| decode_entry(&encoded));
+            }
+        }
+        Ok(self.build_from(merged.into_iter().collect()))
+    }
+
+    /// Replaces `level` with nothing and puts `merged` at the front of the
+    /// next level.
+    pub fn apply_merge(&mut self, level: usize, merged: SSTable) {
+        self.levels[level].clear();
+        if self.levels.len() <= level + 1 {
+            self.levels.resize(level + 2, Vec::new());
+        }
+        self.levels[level + 1].insert(0, merged);
+    }
+
+    /// Turns the memtable into a new level-0 table (minor compaction) and
+    /// cascades any level that reached the trigger.
     pub fn flush(&mut self) -> Result<()> {
         if let Some(image) = self.memtable_image() {
-            self.add_sstable(SSTable::parse(image)?);
+            self.insert_level0(SSTable::parse(image)?);
             self.reset_memtable();
+            self.cascade()?;
         }
         Ok(())
     }
 
-    /// Merges every SSTable into one, dropping shadowed values and tombstones
-    /// (major compaction).
+    fn cascade(&mut self) -> Result<()> {
+        while let Some(level) = self.level_needing_compaction() {
+            let tables: Vec<SSTable> = self.level_tables(level).to_vec();
+            let merged = SSTable::parse(self.merge_tables(&tables)?)?;
+            self.apply_merge(level, merged);
+        }
+        Ok(())
+    }
+
+    /// Merges every table into one, dropping shadowed values and tombstones.
     pub fn compact(&mut self) -> Result<()> {
         if let Some(image) = self.compacted_image()? {
-            self.replace_sstables(vec![SSTable::parse(image)?]);
+            self.levels = vec![vec![SSTable::parse(image)?]];
         }
         Ok(())
     }
