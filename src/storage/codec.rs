@@ -52,7 +52,24 @@ pub fn decode_record(
     }
     let creator = u32::from_le_bytes(data[0..4].try_into().unwrap());
     let deleter = u32::from_le_bytes(data[4..8].try_into().unwrap());
-    let (row, _) = decode_row_with(&data[8..], Some(lobs))?;
+    let (row, _) = decode_row_with(&data[8..], Some(lobs), None)?;
+    Ok((creator, deleter, row))
+}
+
+/// Like [`decode_record`], but skips resolving large objects in columns whose
+/// `keep` entry is `false` (such a column becomes NULL). Callers must only set
+/// `false` for columns the query never reads.
+pub fn decode_record_pruned(
+    data: &[u8],
+    lobs: &dyn LobResolver,
+    keep: &[bool],
+) -> Result<(u32, u32, Vec<Value>)> {
+    if data.len() < 8 {
+        return Err(Error::Runtime("truncated versioned record".into()));
+    }
+    let creator = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let deleter = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let (row, _) = decode_row_with(&data[8..], Some(lobs), Some(keep))?;
     Ok((creator, deleter, row))
 }
 
@@ -141,7 +158,7 @@ pub fn encode_row(row: &[Value]) -> Vec<u8> {
 }
 
 pub fn decode_row(data: &[u8]) -> Result<(Vec<Value>, usize)> {
-    decode_row_with(data, None)
+    decode_row_with(data, None, None)
 }
 
 fn encode_row_with(
@@ -190,12 +207,13 @@ fn encode_row_with(
 fn decode_row_with(
     data: &[u8],
     lobs: Option<&dyn LobResolver>,
+    keep: Option<&[bool]>,
 ) -> Result<(Vec<Value>, usize)> {
     let mut pos = 0;
     let hb = take(data, &mut pos, 2)?;
     let count = u16::from_le_bytes(hb.try_into().unwrap()) as usize;
     let mut row = Vec::with_capacity(count);
-    for _ in 0..count {
+    for i in 0..count {
         let tag = data[pos];
         pos += 1;
         let v = match tag {
@@ -219,13 +237,18 @@ fn decode_row_with(
             TAG_LOB => {
                 let b = take(data, &mut pos, 8)?;
                 let id = u64::from_le_bytes(b.try_into().unwrap());
-                let Some(lobs) = lobs else {
-                    return Err(Error::Runtime("lob reference without a resolver".into()));
-                };
-                let bytes = lobs.get(id)?;
-                Value::Str(String::from_utf8(bytes).map_err(|_| {
-                    Error::Runtime("invalid utf8 in stored lob".into())
-                })?)
+                // a column the query never reads is left unresolved
+                if keep.is_some_and(|keep| !keep.get(i).copied().unwrap_or(true)) {
+                    Value::Null
+                } else {
+                    let Some(lobs) = lobs else {
+                        return Err(Error::Runtime("lob reference without a resolver".into()));
+                    };
+                    let bytes = lobs.get(id)?;
+                    Value::Str(String::from_utf8(bytes).map_err(|_| {
+                        Error::Runtime("invalid utf8 in stored lob".into())
+                    })?)
+                }
             }
             TAG_BOOL => {
                 let b = take(data, &mut pos, 1)?;

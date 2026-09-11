@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     BinOp, DataType, Expr, JoinKind, Limit as LimitClause, SelectItem, SelectStmt, Stmt, TableRef,
@@ -49,6 +49,9 @@ pub struct TableScan {
     table: String,
     schema: Schema,
     scanner: Option<Box<dyn RowScanner>>,
+    /// Per base-column flag: `false` means the query never reads that column,
+    /// so a large object stored there need not be resolved. `None` reads all.
+    keep: Option<Vec<bool>>,
 }
 
 impl TableScan {
@@ -59,6 +62,15 @@ impl TableScan {
     /// `owner` is the alias (or table name) that qualifies this scan's
     /// columns, so qualified references resolve correctly.
     pub fn with_owner(db: &Database, table: &str, owner: &str) -> Result<Self> {
+        Self::with_owner_keep(db, table, owner, None)
+    }
+
+    pub fn with_owner_keep(
+        db: &Database,
+        table: &str,
+        owner: &str,
+        keep: Option<Vec<bool>>,
+    ) -> Result<Self> {
         let columns = db.catalog().table(table)?.schema.columns.clone();
         let owner = owner.to_string();
         let schema = Schema {
@@ -67,7 +79,7 @@ impl TableScan {
                 .map(|c| ColumnDesc::plain(Some(owner.clone()), c.name, c.dtype))
                 .collect(),
         };
-        Ok(Self { table: table.to_string(), schema, scanner: None })
+        Ok(Self { table: table.to_string(), schema, scanner: None, keep })
     }
 }
 
@@ -87,7 +99,16 @@ impl PhysicalOperator for TableScan {
             let (creator, deleter, row) = {
                 let scanner = self.scanner.as_mut().expect("table scan not opened");
                 match scanner.next(&ctx.db.pool)? {
-                    Some((_, record)) => decode_record(&record, ctx.db.lobs())?,
+                    Some((_, record)) => match &self.keep {
+                        Some(keep) => {
+                            crate::storage::codec::decode_record_pruned(
+                                &record,
+                                ctx.db.lobs(),
+                                keep,
+                            )?
+                        }
+                        None => decode_record(&record, ctx.db.lobs())?,
+                    },
                     None => return Ok(None),
                 }
             };
@@ -1153,7 +1174,16 @@ pub fn build_select(
                     let column = scan.ordered_column().to_string();
                     (Box::new(scan), Some(column))
                 }
-                None => (Box::new(TableScan::with_owner(db, &tref.name, owner)?), None),
+                None => {
+                    // sequential scans may skip large objects the query never reads
+                    let keep = lob_keep(
+                        select,
+                        &db.catalog().table(&tref.name)?.schema.columns,
+                        owner,
+                        &tref.name,
+                    );
+                    (Box::new(TableScan::with_owner_keep(db, &tref.name, owner, keep)?), None)
+                }
             }
         }
     } else {
@@ -1281,6 +1311,87 @@ fn build_projection(schema: &Schema, items: &[SelectItem]) -> (Vec<Expr>, Vec<St
         }
     }
     (exprs, headers)
+}
+
+/// Per-column flags marking which base columns a single-table SELECT reads.
+/// Returns `None` (do not prune) whenever the analysis cannot be certain:
+/// multiple sources, a `*` projection, a subquery, or a foreign qualifier.
+fn lob_keep(
+    select: &SelectStmt,
+    columns: &[ColumnDesc],
+    owner: &str,
+    table: &str,
+) -> Option<Vec<bool>> {
+    if select.from.len() != 1 {
+        return None;
+    }
+    let mut needed: HashSet<String> = HashSet::new();
+    let mut safe = true;
+    let visit = |expr: &Expr, needed: &mut HashSet<String>, safe: &mut bool| {
+        if !collect_column_refs(expr, owner, table, needed) {
+            *safe = false;
+        }
+    };
+    for item in &select.items {
+        match item {
+            SelectItem::Star => return None,
+            SelectItem::Expr(e) | SelectItem::Aliased(e, _) => {
+                visit(e, &mut needed, &mut safe);
+            }
+        }
+    }
+    if let Some(selection) = &select.selection {
+        visit(selection, &mut needed, &mut safe);
+    }
+    for expr in &select.group_by {
+        visit(expr, &mut needed, &mut safe);
+    }
+    if let Some(having) = &select.having {
+        visit(having, &mut needed, &mut safe);
+    }
+    for (expr, _) in &select.order_by {
+        visit(expr, &mut needed, &mut safe);
+    }
+    if !safe {
+        return None;
+    }
+    Some(columns.iter().map(|c| needed.contains(&c.name)).collect())
+}
+
+/// Records base-column references; returns `false` when it sees something it
+/// cannot classify (a subquery or a foreign qualifier), forcing full decoding.
+fn collect_column_refs(expr: &Expr, owner: &str, table: &str, needed: &mut HashSet<String>) -> bool {
+    match expr {
+        Expr::Column(name) => {
+            needed.insert(name.clone());
+            true
+        }
+        Expr::QualifiedColumn(qual, name) => {
+            if qual == owner || qual == table {
+                needed.insert(name.clone());
+                true
+            } else {
+                false
+            }
+        }
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Null | Expr::Value(_) => true,
+        Expr::Unary(_, a) => collect_column_refs(a, owner, table, needed),
+        Expr::Binary(_, a, b) => {
+            collect_column_refs(a, owner, table, needed)
+                & collect_column_refs(b, owner, table, needed)
+        }
+        Expr::IsNull(a, _) => collect_column_refs(a, owner, table, needed),
+        Expr::Like { expr, pattern, .. } => {
+            collect_column_refs(expr, owner, table, needed)
+                & collect_column_refs(pattern, owner, table, needed)
+        }
+        Expr::Function(_, args) => args
+            .iter()
+            .all(|a| collect_column_refs(a, owner, table, needed)),
+        Expr::Aggregate(_, Some(a), _) => collect_column_refs(a, owner, table, needed),
+        Expr::Aggregate(_, None, _) => true,
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => false,
+    }
 }
 
 fn items_have_aggregate(items: &[SelectItem]) -> bool {

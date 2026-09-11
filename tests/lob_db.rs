@@ -113,6 +113,29 @@ fn update_then_vacuum_reclaims_the_old_lob() {
 }
 
 #[test]
+fn scans_skip_lob_columns_a_query_does_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_with_config(dir.path(), &lob_config()).unwrap();
+    db.execute_sql("create table t (id int, body text);").unwrap();
+
+    let big = "s".repeat(300);
+    db.execute_sql(&format!("insert into t values (1, '{big}');")).unwrap();
+
+    // remove the external object: anything that needs `body` must now fail
+    let lob_dir = dir.path().join("lobs");
+    let file = std::fs::read_dir(&lob_dir).unwrap().next().unwrap().unwrap().path();
+    std::fs::remove_file(&file).unwrap();
+
+    // count(*) and a projection of `id` never touch `body`
+    assert_eq!(rows(&db, "select count(*) from t;"), [[Value::Int(1)]]);
+    assert_eq!(rows(&db, "select id from t;"), [[Value::Int(1)]]);
+    // but reading `body` does
+    assert!(db.execute_sql("select body from t;").is_err());
+    // and so does filtering on it
+    assert!(db.execute_sql("select id from t where body = 'x';").is_err());
+}
+
+#[test]
 fn drop_table_reclaims_lob_files() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open_with_config(dir.path(), &lob_config()).unwrap();
