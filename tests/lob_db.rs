@@ -113,6 +113,20 @@ fn update_then_vacuum_reclaims_the_old_lob() {
 }
 
 #[test]
+fn drop_table_reclaims_lob_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_with_config(dir.path(), &lob_config()).unwrap();
+    db.execute_sql("create table t (id int, body text);").unwrap();
+
+    let big = "d".repeat(300);
+    db.execute_sql(&format!("insert into t values (1, '{big}');")).unwrap();
+    assert_eq!(lob_count(dir.path()), 1);
+
+    db.execute_sql("drop table t;").unwrap();
+    assert_eq!(lob_count(dir.path()), 0);
+}
+
+#[test]
 fn externalized_values_recover_from_wal_after_a_crash() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = lob_config();

@@ -902,6 +902,12 @@ impl Database {
     /// Drops a table: catalog first (durability), then its heap and index
     /// files. A crash in between leaves harmless orphan files behind.
     pub(crate) fn drop_table(&self, name: &str) -> Result<()> {
+        // free every large object the table owns before it disappears
+        if let Ok(records) = self.store_scan_raw(name) {
+            for (_, record) in &records {
+                self.free_lob_refs(record);
+            }
+        }
         let dropped = self.catalog_mut().drop_table(name)?;
         self.save_catalog()?;
         if dropped.engine == EngineKind::Lsm {
