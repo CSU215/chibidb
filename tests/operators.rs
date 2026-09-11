@@ -119,6 +119,23 @@ fn constant_and_distinct_selects_build_plans() {
 }
 
 #[test]
+fn joins_build_an_operator_plan() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table a (id int);").unwrap();
+    db.execute_sql("create table b (id int);").unwrap();
+
+    for sql in [
+        "select * from a, b;",
+        "select * from a join b on a.id = b.id;",
+        "select * from a left join b on a.id = b.id;",
+        "select * from a right join b on a.id = b.id;",
+    ] {
+        let select = parse_select(sql);
+        assert!(build_select(&mut db, &select).unwrap().is_some(), "{sql}");
+    }
+}
+
+#[test]
 fn set_operations_fall_back_to_the_materialized_path() {
     let mut db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int);").unwrap();

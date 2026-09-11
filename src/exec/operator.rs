@@ -1,4 +1,4 @@
-use crate::ast::{DataType, Expr, SelectItem, SelectStmt};
+use crate::ast::{DataType, Expr, JoinKind, SelectItem, SelectStmt};
 use crate::catalog::{ColumnDesc, Schema};
 use crate::storage::codec::decode_record;
 use crate::storage::engine::{HeapEngine, RowScanner, TableEngine};
@@ -436,6 +436,136 @@ impl PhysicalOperator for GroupBy {
     }
 }
 
+/// Left-deep nested-loop join. Materializes both children, then produces the
+/// combined rows; LEFT/RIGHT keep unmatched rows with NULLs on the other side.
+pub struct NestedLoopJoin {
+    left: Box<dyn PhysicalOperator>,
+    right: Box<dyn PhysicalOperator>,
+    kind: JoinKind,
+    condition: Option<Expr>,
+    schema: Schema,
+    rows: Vec<Vec<Value>>,
+    pos: usize,
+}
+
+impl NestedLoopJoin {
+    pub fn new(
+        left: Box<dyn PhysicalOperator>,
+        right: Box<dyn PhysicalOperator>,
+        kind: JoinKind,
+        condition: Option<Expr>,
+    ) -> Result<Self> {
+        if matches!(kind, JoinKind::Left | JoinKind::Right) && condition.is_none() {
+            return Err(Error::Runtime("outer join requires an on clause".into()));
+        }
+        let mut schema = left.schema().clone();
+        schema.columns.extend(right.schema().columns.iter().cloned());
+        Ok(Self { left, right, kind, condition, schema, rows: Vec::new(), pos: 0 })
+    }
+
+    fn matches(&self, ctx: &mut ExecContext<'_>, row: &[Value]) -> Result<bool> {
+        match &self.condition {
+            None => Ok(true),
+            Some(condition) => {
+                eval_predicate_bound(ctx.db, ctx.session.trx(), condition, &self.schema, row, None)
+            }
+        }
+    }
+}
+
+impl PhysicalOperator for NestedLoopJoin {
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
+        let left_rows = drain(&mut self.left, ctx)?;
+        let right_rows = drain(&mut self.right, ctx)?;
+        let left_cols = self.left.schema().columns.len();
+        let right_cols = self.right.schema().columns.len();
+
+        let mut rows = Vec::new();
+        match self.kind {
+            JoinKind::Left => {
+                for left in &left_rows {
+                    let mut matched = false;
+                    for right in &right_rows {
+                        let mut row = left.clone();
+                        row.extend(right.iter().cloned());
+                        if self.matches(ctx, &row)? {
+                            rows.push(row);
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        let mut row = left.clone();
+                        row.extend(vec![Value::Null; right_cols]);
+                        rows.push(row);
+                    }
+                }
+            }
+            JoinKind::Right => {
+                for right in &right_rows {
+                    let mut matched = false;
+                    for left in &left_rows {
+                        let mut row = left.clone();
+                        row.extend(right.iter().cloned());
+                        if self.matches(ctx, &row)? {
+                            rows.push(row);
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        let mut row = vec![Value::Null; left_cols];
+                        row.extend(right.iter().cloned());
+                        rows.push(row);
+                    }
+                }
+            }
+            JoinKind::Cross | JoinKind::Inner => {
+                for left in &left_rows {
+                    for right in &right_rows {
+                        let mut row = left.clone();
+                        row.extend(right.iter().cloned());
+                        if self.matches(ctx, &row)? {
+                            rows.push(row);
+                        }
+                    }
+                }
+            }
+        }
+        self.rows = rows;
+        self.pos = 0;
+        Ok(())
+    }
+
+    fn next(&mut self, _ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
+        if self.pos >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.pos].clone();
+        self.pos += 1;
+        Ok(Some(row))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.rows.clear();
+        self.pos = 0;
+        Ok(())
+    }
+}
+
+/// Opens `op`, collects all its rows, and closes it.
+fn drain(op: &mut Box<dyn PhysicalOperator>, ctx: &mut ExecContext<'_>) -> Result<Vec<Vec<Value>>> {
+    op.open(ctx)?;
+    let mut rows = Vec::new();
+    while let Some(row) = op.next(ctx)? {
+        rows.push(row);
+    }
+    op.close()?;
+    Ok(rows)
+}
+
 /// Index scan: fetches exactly the row ids the access path selected.
 pub struct IndexScan {
     schema: Schema,
@@ -537,24 +667,44 @@ pub fn build_select(
         return Ok(Some(Box::new(plan)));
     }
 
-    // joins are not covered yet
-    if select.from.len() != 1 {
-        return Ok(None);
-    }
-    let table = &select.from[0].name;
-    if db.catalog().view(table).is_some() {
-        return Ok(None);
-    }
-    let owner = select.from[0].alias.as_deref().unwrap_or(table);
-
-    let (mut op, ordered_by): (Box<dyn PhysicalOperator>, Option<String>) =
+    // FROM: a single table uses the best access path; multiple tables build a
+    // left-deep nested-loop join over plain scans.
+    let (mut op, ordered_by): (Box<dyn PhysicalOperator>, Option<String>) = if select.from.len() == 1
+    {
+        let table = &select.from[0].name;
+        if db.catalog().view(table).is_some() {
+            return Ok(None);
+        }
+        let owner = select.from[0].alias.as_deref().unwrap_or(table);
         match IndexScan::with_owner(db, table, owner, select.selection.as_ref())? {
             Some(scan) => {
                 let column = scan.ordered_column().to_string();
                 (Box::new(scan), Some(column))
             }
             None => (Box::new(TableScan::with_owner(db, table, owner)?), None),
-        };
+        }
+    } else {
+        let first = &select.from[0];
+        if db.catalog().view(&first.name).is_some() {
+            return Ok(None);
+        }
+        let owner = first.alias.as_deref().unwrap_or(&first.name);
+        let mut op: Box<dyn PhysicalOperator> =
+            Box::new(TableScan::with_owner(db, &first.name, owner)?);
+        for i in 1..select.from.len() {
+            let tref = &select.from[i];
+            if db.catalog().view(&tref.name).is_some() {
+                return Ok(None);
+            }
+            let owner = tref.alias.as_deref().unwrap_or(&tref.name);
+            let right: Box<dyn PhysicalOperator> =
+                Box::new(TableScan::with_owner(db, &tref.name, owner)?);
+            let kind = select.joins.get(i).copied().unwrap_or(JoinKind::Cross);
+            let condition = select.on.get(i - 1).cloned();
+            op = Box::new(NestedLoopJoin::new(op, right, kind, condition)?);
+        }
+        (op, None)
+    };
     if let Some(selection) = &select.selection {
         op = Box::new(Filter::new(op, selection.clone()));
     }
