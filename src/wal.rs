@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
+use parking_lot::Mutex;
+
 use crate::storage::Rid;
 use crate::{Error, Result};
 
@@ -32,7 +34,7 @@ pub enum Record {
 }
 
 pub struct Wal {
-    file: std::fs::File,
+    file: Mutex<std::fs::File>,
 }
 
 impl Wal {
@@ -46,22 +48,27 @@ impl Wal {
             .truncate(false) // never destroy an existing log on open
             .open(path)
             .map_err(|e| Error::Runtime(format!("cannot open wal {}: {e}", path.display())))?;
-        Ok(Self { file })
+        Ok(Self { file: Mutex::new(file) })
     }
 
-    pub fn append(&mut self, trx_id: u32, rec: &Record) -> Result<()> {
-        self.file.seek(SeekFrom::End(0)).map_err(wal_io)?;
-        self.file.write_all(&encode_frame(trx_id, rec)).map_err(wal_io)
+    /// Appends a frame at the end of the log. The file lock makes the
+    /// seek+write atomic, so concurrent committers never interleave bytes.
+    pub fn append(&self, trx_id: u32, rec: &Record) -> Result<()> {
+        let mut file = self.file.lock();
+        file.seek(SeekFrom::End(0)).map_err(wal_io)?;
+        file.write_all(&encode_frame(trx_id, rec)).map_err(wal_io)
     }
 
     /// Durability point: every record appended so far survives a crash.
-    pub fn sync(&mut self) -> Result<()> {
-        self.file.sync_all().map_err(wal_io)
+    /// Because appends are serialized, one `sync` flushes all writers that
+    /// raced ahead of it (a simple group commit).
+    pub fn sync(&self) -> Result<()> {
+        self.file.lock().sync_all().map_err(wal_io)
     }
 
     /// Current log size in bytes (for budget checks).
     pub fn len(&self) -> Result<u64> {
-        self.file.metadata().map(|m| m.len()).map_err(wal_io)
+        self.file.lock().metadata().map(|m| m.len()).map_err(wal_io)
     }
 
     /// True when the log holds no frames.
@@ -70,9 +77,10 @@ impl Wal {
     }
 
     /// Checkpoint: only call this after all data pages reached the disk.
-    pub fn truncate(&mut self) -> Result<()> {
-        self.file.set_len(0).map_err(wal_io)?;
-        self.file.seek(SeekFrom::Start(0)).map_err(wal_io)?;
+    pub fn truncate(&self) -> Result<()> {
+        let mut file = self.file.lock();
+        file.set_len(0).map_err(wal_io)?;
+        file.seek(SeekFrom::Start(0)).map_err(wal_io)?;
         Ok(())
     }
 }
@@ -251,6 +259,43 @@ mod tests {
         let (pos2, ..) = plan.committed[1];
         assert!(*pos1 < pos2);
         assert_eq!(plan.max_trx_id, 2);
+    }
+
+    #[test]
+    fn concurrent_appends_are_framed_and_recoverable() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(Wal::open(&dir.path().join("wal.bin")).unwrap());
+        let mut handles = Vec::new();
+        for trx in 1..=8u32 {
+            let wal = Arc::clone(&wal);
+            handles.push(std::thread::spawn(move || {
+                for slot in 0..50u16 {
+                    wal.append(
+                        trx,
+                        &Record::Insert {
+                            file_no: 0,
+                            rid: Rid::new(1, slot),
+                            record: vec![trx as u8],
+                        },
+                    )
+                    .unwrap();
+                }
+                wal.append(trx, &Record::Commit).unwrap();
+                wal.sync().unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let bytes = std::fs::read(dir.path().join("wal.bin")).unwrap();
+        let plan = plan_recovery(&bytes);
+        assert_eq!(plan.committed_ids.len(), 8);
+        assert_eq!(plan.committed.len(), 8);
+        assert_eq!(plan.max_trx_id, 8);
+        for (_, _, recs) in &plan.committed {
+            assert_eq!(recs.len(), 50, "every transaction's frames stay intact");
+        }
     }
 
     #[test]
