@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：P10.1 分库锁落地（去全局锁、跨库并行）；P5.5 DML 算子化完成；380 tests 全绿、clippy 零警告。
+> 最后更新：P10.1 完成（分库锁 + 去全局锁 + `ThreadHandler` 双线程后端）；382 tests 全绿、clippy 零警告。
 
 ---
 
@@ -54,7 +54,8 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 ```
 
 启动时会在**当前工作目录**读取 `config.toml`（缺失即全用默认值）。已生效条目：
-`storage.buffer_pool_frames`、`storage.double_write`、`wal.checkpoint_threshold`、`server.addr`。其余条目
+`storage.buffer_pool_frames`、`storage.double_write`、`wal.checkpoint_threshold`、`server.addr`、
+`server.thread_model`/`worker_threads`。其余条目
 （`storage.page_size/default_engine/double_write/inline_lob_limit`、`execution.mode`、
 `auth.enabled`、`server.protocols`）是后续阶段的预留位；其中 `page_size` 当前必须等于编译期
 `PAGE_SIZE`，否则打开数据库时报错（动态页大小属 P6 存储抽象）。
@@ -85,7 +86,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `result.rs` | `ResultSet::Message / Rows` | |
 | `render.rs` | 对齐表格渲染（REPL 与 client 共用） | `write_result` |
 | `repl.rs` | 本地 REPL（`db>` 提示符、exit/quit），持 `Instance` | `run_repl` |
-| `server.rs` | tokio TCP server，`Arc<Instance>`，长度前缀协议，每连接一 Session；执行时只锁目标库 | `serve(SharedInstance, TcpListener)` |
+| `server.rs` | tokio 只负责 accept；`ThreadHandler` 把连接派发到阻塞线程（`per-connection` 或 `thread-pool`，config `server.thread_model`/`worker_threads`），同步执行 SQL | `serve(SharedInstance, TcpListener)` |
 | `client.rs` | TCP 客户端 | `run_client` |
 | `wire.rs` | ResultSet/帧二进制编解码 | `encode_result_frame` / `decode_frame` |
 | `protocol.rs` | 前端编解码接缝：`Protocol` trait + `TextProtocol`（`[u32 len][sql]` 请求 / 帧响应） | `decode_request` / `encode_success` / `encode_failure` |
@@ -356,7 +357,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 验收记录（M20–M25 评审）：296 tests 全绿 + clippy 零警告；人工边界复验（跨列同值、DROP TABLE 清约束索引、链式 RIGHT JOIN、ESCAPE 角例、OrderedIndexScan 含 DESC、DML 子查询、恢复路径 `rebuild_indexes` 覆盖约束索引）均通过。**发现并修复 1 处阻断性缺陷**：`check_unique` 的 `claimed` 查重表跨唯一索引共享，同一行两个不同约束列取同值（如 PK 列与 UNIQUE 列同为 1）会被误判 `duplicate key`——红测试复现后按列下标区分修复，见 `abd0dbb`。已知边界（如实记档）：UNION 各臂不做类型统一，混型结果集上比较会报 type mismatch。
 
-提交基线：`4984822 feat: per-database locking and removal of the global instance lock`（HEAD）。
+提交基线：`a1acc25 feat: add ThreadHandler with per-connection and thread-pool backends`（HEAD）。
 
 ---
 
@@ -397,7 +398,7 @@ DML 先算子化（P5.5），使执行层统一走算子。
 | P7 | LSM 引擎（下一阶段） | ⬜ |
 | P8 | LOB（外存 + `LobReader` 流式） | ⬜ |
 | P9 | 多前端（MySQL/HTTP/Text TCP） | ⬜ |
-| P10 | 并发：`ThreadHandler`（per-connection/thread-pool）+ 去全局锁 + 可配置冲突策略（FCW/2PL） | 🟡 分库锁 + 去全局锁已落地（`4984822`）；`ThreadHandler` 抽象、库内读并发、FCW/2PL 待做 |
+| P10 | 并发：`ThreadHandler`（per-connection/thread-pool）+ 去全局锁 + 可配置冲突策略（FCW/2PL） | 🟡 P10.1 完成：分库锁 + 去全局锁（`4984822`）+ `ThreadHandler` 双后端（`a1acc25`）；P10.2 库内读并发、P10.3 FCW/2PL 待做 |
 
 工作纪律：每步先写失败测试（红）再最小实现（绿），提交粒度对齐 chibicc（一次一件事），
 提交前全量 `cargo test` + clippy 零警告，并同步本文档与 README。
