@@ -5,6 +5,7 @@ pub mod config;
 pub mod datetime;
 mod error;
 pub mod exec;
+pub mod http;
 pub mod index;
 pub mod instance;
 pub mod lexer;

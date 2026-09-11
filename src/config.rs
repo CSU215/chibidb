@@ -79,6 +79,8 @@ pub struct WalConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub addr: String,
+    /// Optional second listener serving the HTTP/JSON frontend.
+    pub http_addr: Option<String>,
     pub protocols: Vec<String>,
     pub thread_model: ThreadModel,
     pub worker_threads: usize,
@@ -132,6 +134,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             addr: "127.0.0.1:5678".into(),
+            http_addr: None,
             protocols: vec!["text".into()],
             thread_model: ThreadModel::PerConnection,
             worker_threads: 4,

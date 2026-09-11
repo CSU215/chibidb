@@ -42,6 +42,16 @@ async fn main() -> std::io::Result<()> {
         3 | 4 if args[1] == "serve" => {
             let addr = args.get(3).cloned().unwrap_or_else(|| default_addr.clone());
             let instance = Arc::new(open(&args[2], &config));
+            if let Some(http_addr) = config.server.http_addr.clone() {
+                let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
+                eprintln!("chibidb http listening on {http_addr}");
+                let http_instance = instance.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = chibidb::http::serve(http_instance, http_listener).await {
+                        eprintln!("http server error: {e}");
+                    }
+                });
+            }
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("chibidb server listening on {addr}");
             server::serve(instance, listener).await
