@@ -96,10 +96,18 @@ pub struct AuthConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TransactionConfig {
     pub conflict: ConflictStrategy,
+    /// How long a writer waits for the 2PL database lock before giving up.
+    pub lock_timeout_ms: u64,
+}
+
+impl Default for TransactionConfig {
+    fn default() -> Self {
+        Self { conflict: ConflictStrategy::Fcw, lock_timeout_ms: 5000 }
+    }
 }
 
 impl Default for StorageConfig {

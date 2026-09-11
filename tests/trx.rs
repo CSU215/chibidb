@@ -1,5 +1,13 @@
+use chibidb::config::{Config, ConflictStrategy};
 use chibidb::value::Value;
 use chibidb::{Database, ResultSet, Session};
+
+fn two_pl_config() -> Config {
+    let mut cfg = Config::default();
+    cfg.transaction.conflict = ConflictStrategy::TwoPl;
+    cfg.transaction.lock_timeout_ms = 100;
+    cfg
+}
 
 fn setup(db: &Database, session: &mut Session) {
     db.execute_sql_with(session, "create table t (id int, name char(8));")
@@ -248,5 +256,51 @@ fn first_committer_wins_keeps_independent_updates() {
         rows(&db, &mut a, "select name from t order by id;"),
         [[Value::Str("a".into())], [Value::Str("b".into())]]
     );
+}
+
+#[test]
+fn two_pl_serializes_writers_and_times_out() {
+    let cfg = two_pl_config();
+    let db = Database::open_in_memory_with_config(&cfg).unwrap();
+    let mut a = Session::new();
+    let mut b = Session::new();
+    setup(&db, &mut a);
+    db.execute_sql_with(&mut a, "insert into t values (1, 'base');").unwrap();
+
+    db.execute_sql_with(&mut a, "begin;").unwrap();
+    db.execute_sql_with(&mut a, "update t set name = 'a' where id = 1;").unwrap();
+
+    // b cannot BEGIN while a holds the database write lock
+    let err = db.execute_sql_with(&mut b, "begin;").unwrap_err();
+    assert!(err.to_string().contains("lock wait timeout"), "{err}");
+
+    // once a releases it, b proceeds against a fresh snapshot and sees a
+    db.execute_sql_with(&mut a, "commit;").unwrap();
+    db.execute_sql_with(&mut b, "begin;").unwrap();
+    db.execute_sql_with(&mut b, "update t set name = 'b' where id = 1;").unwrap();
+    db.execute_sql_with(&mut b, "commit;").unwrap();
+    assert_eq!(rows(&db, &mut b, "select name from t;"), [[Value::Str("b".into())]]);
+    assert_eq!(rows(&db, &mut b, "select count(*) from t;"), [[Value::Int(1)]]);
+}
+
+#[test]
+fn two_pl_lock_also_covers_autocommit_writers() {
+    let cfg = two_pl_config();
+    let db = Database::open_in_memory_with_config(&cfg).unwrap();
+    let mut a = Session::new();
+    let mut b = Session::new();
+    setup(&db, &mut a);
+    db.execute_sql_with(&mut a, "insert into t values (1, 'base');").unwrap();
+
+    db.execute_sql_with(&mut a, "begin;").unwrap();
+    db.execute_sql_with(&mut a, "update t set name = 'a' where id = 1;").unwrap();
+
+    // an autocommitted write from another session waits for the lock too
+    let err = db.execute_sql_with(&mut b, "insert into t values (2, 'x');").unwrap_err();
+    assert!(err.to_string().contains("lock wait timeout"), "{err}");
+
+    db.execute_sql_with(&mut a, "commit;").unwrap();
+    db.execute_sql_with(&mut b, "insert into t values (2, 'x');").unwrap();
+    assert_eq!(rows(&db, &mut b, "select count(*) from t;"), [[Value::Int(2)]]);
 }
 

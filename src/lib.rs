@@ -27,9 +27,55 @@ pub use result::ResultSet;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// A per-database 2PL write lock. It is reference-counted so callers can hold
+/// it (and wait on it) without holding the database lock itself, which keeps
+/// lock acquisition from deadlocking against statement execution.
+pub(crate) struct DatabaseWriteLock {
+    owner: Mutex<Option<u64>>,
+    cv: Condvar,
+    timeout: Duration,
+}
+
+impl DatabaseWriteLock {
+    fn new(timeout_ms: u64) -> Self {
+        Self {
+            owner: Mutex::new(None),
+            cv: Condvar::new(),
+            timeout: Duration::from_millis(timeout_ms),
+        }
+    }
+
+    /// Takes the lock for `session_id`, blocking until it is free or the
+    /// configured timeout elapses. Re-entrant by owner id.
+    pub(crate) fn acquire(&self, session_id: u64) -> Result<()> {
+        let mut owner = self.owner.lock();
+        if *owner == Some(session_id) {
+            return Ok(());
+        }
+        while owner.is_some() {
+            let timed_out = self.cv.wait_for(&mut owner, self.timeout).timed_out();
+            if timed_out && owner.is_some() {
+                return Err(Error::Runtime("lock wait timeout".into()));
+            }
+        }
+        *owner = Some(session_id);
+        Ok(())
+    }
+
+    pub(crate) fn release(&self, session_id: u64) {
+        let mut owner = self.owner.lock();
+        if *owner == Some(session_id) {
+            *owner = None;
+            self.cv.notify_one();
+        }
+    }
+}
 
 use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
@@ -62,6 +108,9 @@ pub struct Database {
     open_trxs: RwLock<HashSet<u32>>,
     wal_checkpoint_threshold: AtomicU64,
     conflict: ConflictStrategy,
+    /// The per-database 2PL write lock, shared with the instance layer so it
+    /// can be acquired before the database lock.
+    writer: Arc<DatabaseWriteLock>,
     _temp: Option<tempfile::TempDir>,
 }
 
@@ -202,6 +251,7 @@ impl Database {
             open_trxs: RwLock::new(HashSet::new()),
             wal_checkpoint_threshold: AtomicU64::new(config.wal.checkpoint_threshold),
             conflict: config.transaction.conflict,
+            writer: Arc::new(DatabaseWriteLock::new(config.transaction.lock_timeout_ms)),
             _temp: None,
         };
         db.recover_from_wal(&plan, &mut touched)?;
@@ -516,6 +566,13 @@ impl Database {
                 if session.trx.is_some() {
                     return Err(Error::Runtime("transaction already begun".into()));
                 }
+                // 2PL: a transaction holds the database write lock from BEGIN
+                // (before its snapshot) until COMMIT/ROLLBACK, so writers
+                // serialize and later writers build on the latest commit.
+                if self.conflict == ConflictStrategy::TwoPl {
+                    self.acquire_writer(session.id())?;
+                    session.set_holds_writer(true);
+                }
                 let id = self.alloc_trx_id();
                 let committed = self.committed_snapshot();
                 session.begin(id, &committed, true);
@@ -526,16 +583,18 @@ impl Database {
                 if session.trx.is_none() {
                     return Err(Error::Runtime("no active transaction".into()));
                 }
+                let mut result = Ok(None);
                 if let Some(mut trx) = session.trx.take() {
                     let wrote = !trx.undo.is_empty();
                     if let Err(e) = self.commit_trx(&trx, wrote) {
                         // a conflict aborts this transaction: undo its work
                         self.rollback_trx(&mut trx)?;
                         self.open_trxs.write().remove(&trx.id);
-                        return Err(e);
+                        result = Err(e);
                     }
                 }
-                Ok(None)
+                self.end_writer(session);
+                result
             }
             crate::ast::Stmt::Trx(crate::ast::TrxCtl::Rollback) => {
                 if session.trx.is_none() {
@@ -545,11 +604,16 @@ impl Database {
                     self.rollback_trx(&mut trx)?;
                     self.open_trxs.write().remove(&trx.id);
                 }
+                self.end_writer(session);
                 Ok(None)
             }
             other => {
                 let read_only = is_read_only(other);
                 let autocommit = session.trx.is_none();
+                let took_writer = self.needs_writer(session, read_only);
+                if took_writer {
+                    self.acquire_writer(session.id())?;
+                }
                 if autocommit {
                     if read_only {
                         let committed = self.committed_snapshot();
@@ -562,7 +626,7 @@ impl Database {
                     }
                 }
                 let mut event = SqlEvent::new(other);
-                match pipeline.run(self, session, &mut event) {
+                let outcome = match pipeline.run(self, session, &mut event) {
                     Ok(()) => {
                         let rs = event.result.take().expect("execute stage produced no result");
                         if autocommit
@@ -573,10 +637,13 @@ impl Database {
                             if let Err(e) = self.commit_trx(&trx, wrote) {
                                 self.rollback_trx(&mut trx)?;
                                 self.open_trxs.write().remove(&trx.id);
-                                return Err(e);
+                                Err(e)
+                            } else {
+                                Ok(Some(rs))
                             }
+                        } else {
+                            Ok(Some(rs))
                         }
-                        Ok(Some(rs))
                     }
                     Err(e) => {
                         // undo partial statement work; an explicit
@@ -593,8 +660,20 @@ impl Database {
                         }
                         Err(e)
                     }
+                };
+                if took_writer {
+                    self.release_writer(session.id());
                 }
+                outcome
             }
+        }
+    }
+
+    /// Releases the 2PL write lock at the end of an explicit transaction.
+    fn end_writer(&self, session: &mut Session) {
+        if session.holds_writer() {
+            self.release_writer(session.id());
+            session.set_holds_writer(false);
         }
     }
 
@@ -604,6 +683,7 @@ impl Database {
             self.rollback_trx(&mut trx)?;
             self.open_trxs.write().remove(&trx.id);
         }
+        self.end_writer(session);
         Ok(())
     }
 
@@ -625,6 +705,27 @@ impl Database {
     /// A copy of the committed set, the snapshot a new transaction sees.
     fn committed_snapshot(&self) -> HashSet<u32> {
         self.committed_trxs.read().clone()
+    }
+
+    /// The database's 2PL write lock, so the instance layer can take it before
+    /// acquiring the database lock.
+    pub(crate) fn write_lock(&self) -> Arc<DatabaseWriteLock> {
+        Arc::clone(&self.writer)
+    }
+
+    /// 2PL: takes the database write lock for `session_id`.
+    fn acquire_writer(&self, session_id: u64) -> Result<()> {
+        self.writer.acquire(session_id)
+    }
+
+    /// 2PL: releases the database write lock held by `session_id`.
+    fn release_writer(&self, session_id: u64) {
+        self.writer.release(session_id);
+    }
+
+    /// Whether the session needs to take the 2PL write lock for a statement.
+    fn needs_writer(&self, session: &Session, read_only: bool) -> bool {
+        self.conflict == ConflictStrategy::TwoPl && !read_only && !session.holds_writer()
     }
 
     fn rollback_trx(&self, trx: &mut TrxState) -> Result<()> {
