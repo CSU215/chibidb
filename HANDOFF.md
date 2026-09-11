@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：P5 起步（物化基准 + 火山算子层 `PhysicalOperator`/`TableScan`/`Filter`/`Project`/`Limit`）；P4 Resolve/Optimize 阶段就位；356 tests 全绿、clippy 零警告。
+> 最后更新：P5 算子路径接管简单单表 SELECT（`OptimizeStage` 建算子树、`ExecuteStage` 执行）；358 tests 全绿、clippy 零警告。
 
 ---
 
@@ -77,7 +77,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `exec/aggregate.rs` | 聚合求值、GROUP BY/HAVING、ORDER BY（聚合与普通行两路）、DISTINCT、LIMIT | `execute_grouped_select` |
 | `exec/join.rs` | FROM 展开（表/视图）与嵌套循环 INNER/LEFT JOIN | `nested_loop` / `from_source` |
 | `exec/plan.rs` | EXPLAIN 计划、规则式索引访问路径（sargable）、同列上下界合并为范围扫、**有序索引扫描判定**（`order_by_matches`）、索引扫描取行 | `execute_explain` / `index_scan_source` |
-| `exec/operator.rs` | 火山算子接缝：`PhysicalOperator` + `ExecContext{db,session}` + `TableScan`（MVCC 可见性）/`Filter`/`Project`/`Limit`；`Database::collect_plan` 驱动 | |
+| `exec/operator.rs` | 火山算子：`PhysicalOperator` + `ExecContext{db,session}` + `TableScan`/`IndexScan`/`Filter`/`Project`/`Limit`；`build_simple_select` 为单表 SELECT 建树；`Database::collect_plan` 驱动 | |
 | `exec/subquery.rs` | 子查询物化改写（IN/EXISTS/标量）：按当前外层行求值后改写为字面量；`eval_bound`/`eval_predicate_bound` 是接入点 | `bind_expr` |
 | `value.rs` | `Value`：Null/Bool/Int(i64)/Float(f64)/Str/Date(i32 纪元天数)/Text | Display 决定 REPL 输出 |
 | `datetime.rs` | 日期校验：civil-date 算法（Hinnant），`'YYYY-MM-DD'` 比较时隐式转日期 | `parse_date` |
@@ -89,7 +89,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `client.rs` | TCP 客户端 | `run_client` |
 | `wire.rs` | ResultSet/帧二进制编解码 | `encode_result_frame` / `decode_frame` |
 | `protocol.rs` | 前端编解码接缝：`Protocol` trait + `TextProtocol`（`[u32 len][sql]` 请求 / 帧响应） | `decode_request` / `encode_success` / `encode_failure` |
-| `pipeline.rs` | SQL 阶段：`Stage`/`Pipeline`/`SqlEvent`；`ResolveStage`（表/视图存在性校验）、`OptimizeStage`（记录 SELECT 访问路径 `plan`）、`ExecuteStage`（执行） | `Pipeline::run` |
+| `pipeline.rs` | SQL 阶段：`Stage`/`Pipeline`/`SqlEvent`；`ResolveStage`（表/视图存在性）、`OptimizeStage`（记录 `plan` 文本 + 建单表算子物理计划）、`ExecuteStage`（优先跑算子，否则 `exec::execute`） | `Pipeline::run` |
 | `instance.rs` | 单实例多库：数据根 `<db>/` + 系统库 `chibi_meta/`（真实 Database，`databases`/`users`/`privileges` 表；口令加盐 SHA-256）；`execute_with` 顶层入口（拦截库/用户/权限语句，其余路由到 current_db） | `Instance::open` / `execute_with` / `create_user` / `authenticate` / `grant` / `has_privilege` |
 | `config.rs` | 全局配置中心：`Config`（storage/wal/server/execution/auth），`config.toml` 加载、默认值、校验 | `Config::load` / `from_toml_str` / `validate` |
 | `catalog/mod.rs` | `Catalog`：`Table`/`HeapStore`/`IndexEntry`、`Schema`/`ColumnDesc`（带 `owner`）、`resolve()` 歧义检测 | |
@@ -353,7 +353,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 验收记录（M20–M25 评审）：296 tests 全绿 + clippy 零警告；人工边界复验（跨列同值、DROP TABLE 清约束索引、链式 RIGHT JOIN、ESCAPE 角例、OrderedIndexScan 含 DESC、DML 子查询、恢复路径 `rebuild_indexes` 覆盖约束索引）均通过。**发现并修复 1 处阻断性缺陷**：`check_unique` 的 `claimed` 查重表跨唯一索引共享，同一行两个不同约束列取同值（如 PK 列与 UNIQUE 列同为 1）会被误判 `duplicate key`——红测试复现后按列下标区分修复，见 `abd0dbb`。已知边界（如实记档）：UNION 各臂不做类型统一，混型结果集上比较会报 type mismatch。
 
-提交基线：`0d86313 feat: add volcano PhysicalOperator layer with scan/filter/project/limit`（HEAD）。
+提交基线：`f97c79d feat: execute simple single-table SELECTs through the operator plan`（HEAD）。
 
 ---
 
@@ -380,7 +380,7 @@ scan+project 31.1ms、filter tag=3 23.8ms、count(*) 18.9ms、group by tag 27.2m
 | P2+ | 其余接缝：`TransactionManager`、`PhysicalOperator` | ⬜ |
 | P3 | 单实例多库 + 系统元数据库 + 用户/权限 | 🟡 多库 + 前端接入 + 系统库 `chibi_meta`（`databases`/`users`/`privileges`）+ `CREATE/DROP USER` + `GRANT/REVOKE`（`e99c5ef`…`7d8a85f`）；认证/权限尚未在协议层强制、系统表未以 `information_schema` 暴露 |
 | P4 | Stage 流水线（Parse/Resolve/Optimize/Execute/Result） | 🟡 `ResolveStage`/`OptimizeStage` 落地（`dc312de`）；Parse 仍在 pipeline 外、Execute 尚未消费 `plan`、Result 写出仍在前端 |
-| P5 | 执行模型：基准 → 火山算子 → Chunk | 🟡 物化基准 + 火山算子层（scan/filter/project/limit，`0d86313`）；尚未接入 `execute_select`、无 IndexScan/Join/Agg/Sort 算子 |
+| P5 | 执行模型：基准 → 火山算子 → Chunk | 🟡 简单单表 SELECT（selection/projection/limit，含 IndexScan）已走火山算子；JOIN/聚合/ORDER/DISTINCT/UNION/子查询仍走物化；Chunk 未做 |
 | P6 | 存储引擎抽象落地：Heap + Double-Write Buffer | ⬜ |
 | P7 | LSM 引擎（下一阶段） | ⬜ |
 | P8 | LOB（外存 + `LobReader` 流式） | ⬜ |
