@@ -214,7 +214,6 @@ fn bound<'a>(key: Option<&'a Vec<u8>>, inclusive: bool) -> Bound<'a> {
 /// Index-derived row ids for a sargable selection, if one applies. The
 /// `IndexScan` operator consumes this.
 pub(crate) struct IndexScanRids {
-    pub heap_file: crate::storage::FileId,
     pub column: String,
     pub rids: Vec<Rid>,
 }
@@ -254,8 +253,7 @@ pub(crate) fn plan_index_scan(
             scan_rids(&btree, &db.pool, start, end)?
         }
     };
-    let heap_file = db.catalog().table(table)?.heap.file;
-    Ok(Some(IndexScanRids { heap_file, column: sarg.column, rids }))
+    Ok(Some(IndexScanRids { column: sarg.column, rids }))
 }
 
 fn scan_rids(

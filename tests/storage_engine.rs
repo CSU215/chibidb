@@ -1,5 +1,7 @@
-use chibidb::storage::engine::{HeapEngine, TableEngine};
+use chibidb::storage::codec::encode_record;
+use chibidb::storage::engine::{HeapEngine, TableEngine, TableStorage};
 use chibidb::storage::{BufferPool, DiskManager, HeapFile, Rid};
+use chibidb::value::Value;
 
 fn setup(dir: &tempfile::TempDir, name: &str) -> (BufferPool, u32) {
     let mut disk = DiskManager::new();
@@ -64,4 +66,28 @@ fn heap_engine_get_missing_record_errors() {
 
     let engine = HeapEngine::new(f);
     assert!(engine.get(&bp, rid).is_err());
+}
+
+#[test]
+fn table_storage_supports_the_mvcc_version_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = setup(&dir, "e.dbf");
+    HeapFile::init(&bp, f).unwrap();
+    let engine = HeapEngine::new(f);
+    assert_eq!(engine.file_id(), f);
+
+    // insert a version (creator, deleter, row) and read it back
+    let data = encode_record(1, 0, &[Value::Int(42)]);
+    let rid = engine.insert(&bp, &data).unwrap();
+    assert_eq!(engine.get(&bp, rid).unwrap(), data);
+
+    // a delete-mark reports the previous (zero) marker
+    assert_eq!(engine.delete_mark(&bp, rid, 7).unwrap(), 0);
+    // and a second marker reports the first
+    assert_eq!(engine.delete_mark(&bp, rid, 8).unwrap(), 7);
+
+    // physical delete removes it from the scan
+    engine.delete(&bp, rid).unwrap();
+    let mut scanner = engine.scan(&bp).unwrap();
+    assert!(scanner.next(&bp).unwrap().is_none());
 }

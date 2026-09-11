@@ -23,8 +23,27 @@ pub trait TableEngine: Send + Sync {
     fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>>;
 }
 
+/// Full table-storage seam: MVCC version writes plus the read cursor. The
+/// heap is the only implementation today; an LSM engine will implement the
+/// same surface with its own versioning.
+pub trait TableStorage: TableEngine + std::fmt::Debug {
+    /// Appends a versioned record and returns its row id.
+    fn insert(&self, bp: &BufferPool, record: &[u8]) -> Result<Rid>;
+
+    /// Physically removes a record (rollback and vacuum).
+    fn delete(&self, bp: &BufferPool, rid: Rid) -> Result<()>;
+
+    /// Rewrites the record's deleter field; returns the previous deleter,
+    /// which first-committer-wins needs.
+    fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u32) -> Result<u32>;
+
+    /// The file backing this table, for WAL replay and index mapping.
+    fn file_id(&self) -> FileId;
+}
+
 /// Engine backed by the current on-disk heap layout. `new` is an unvalidated
 /// handle; callers rely on the catalog having opened/validated the file.
+#[derive(Debug)]
 pub struct HeapEngine {
     file: FileId,
 }
@@ -42,6 +61,24 @@ impl TableEngine for HeapEngine {
 
     fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>> {
         HeapFile::at(self.file).get(bp, rid)
+    }
+}
+
+impl TableStorage for HeapEngine {
+    fn insert(&self, bp: &BufferPool, record: &[u8]) -> Result<Rid> {
+        HeapFile::at(self.file).insert(bp, record)
+    }
+
+    fn delete(&self, bp: &BufferPool, rid: Rid) -> Result<()> {
+        HeapFile::at(self.file).delete(bp, rid)
+    }
+
+    fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u32) -> Result<u32> {
+        HeapFile::at(self.file).delete_mark(bp, rid, deleter)
+    }
+
+    fn file_id(&self) -> FileId {
+        self.file
     }
 }
 

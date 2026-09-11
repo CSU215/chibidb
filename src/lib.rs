@@ -83,7 +83,6 @@ use crate::config::{Config, ConflictStrategy};
 use crate::index::{encode_key, BTree};
 use crate::pipeline::{ExecuteStage, OptimizeStage, Pipeline, ResolveStage, SqlEvent};
 use crate::storage::codec::{decode_record, encode_record};
-use crate::storage::engine::{HeapEngine, TableEngine};
 use crate::storage::slotted::{page_get, page_put_at};
 use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, Rid};
 use crate::trx::{TrxState, Undo};
@@ -308,6 +307,7 @@ impl Database {
         let metas = self.catalog().table_metas();
         for meta in metas {
             let ops = self.index_ops(&meta.name)?;
+            let engine = self.catalog().table(&meta.name)?.engine();
             for (rid, rec) in self.store_scan_raw(&meta.name)? {
                 let (creator, deleter, row) = crate::storage::codec::decode_record(&rec)?;
                 let dead = !committed.contains(&creator)
@@ -319,8 +319,7 @@ impl Database {
                     let key = encode_key(&row[*ci])?;
                     BTree::at(*ix_file).delete(&self.pool, &key, rid)?;
                 }
-                let file = self.catalog().table(&meta.name)?.heap.file;
-                HeapFile::at(file).delete(&self.pool, rid)?;
+                engine.delete(&self.pool, rid)?;
                 purged += 1;
             }
         }
@@ -462,8 +461,8 @@ impl Database {
             if self.conflicting_committer(trx, prev) {
                 return Err(conflict_error(table));
             }
-            let file = self.catalog().table(table)?.heap.file;
-            let rec = HeapFile::at(file).get(&self.pool, rid)?;
+            let engine = self.catalog().table(table)?.engine();
+            let rec = engine.get(&self.pool, rid)?;
             let (_, current, _) = decode_record(&rec)?;
             if self.conflicting_committer(trx, current) {
                 return Err(conflict_error(table));
@@ -732,25 +731,25 @@ impl Database {
         while let Some(undo) = trx.undo.pop() {
             match undo {
                 Undo::Insert { table, rid, row } => {
-                    let file = self.catalog().table(&table)?.heap.file;
-                    HeapFile::at(file).delete(&self.pool, rid)?;
+                    let engine = self.catalog().table(&table)?.engine();
+                    engine.delete(&self.pool, rid)?;
                     for (ci, ix_file) in self.index_ops(&table)? {
                         let key = encode_key(&row[ci])?;
                         BTree::at(ix_file).delete(&self.pool, &key, rid)?;
                     }
                 }
                 Undo::DeleteMark { table, rid, prev_deleter } => {
-                    let file = self.catalog().table(&table)?.heap.file;
-                    HeapFile::at(file).delete_mark(&self.pool, rid, prev_deleter)?;
+                    let engine = self.catalog().table(&table)?.engine();
+                    engine.delete_mark(&self.pool, rid, prev_deleter)?;
                 }
                 Undo::Update { table, old_rid, new_rid, new_row, prev_deleter } => {
-                    let file = self.catalog().table(&table)?.heap.file;
-                    HeapFile::at(file).delete(&self.pool, new_rid)?;
+                    let engine = self.catalog().table(&table)?.engine();
+                    engine.delete(&self.pool, new_rid)?;
                     for (ci, ix_file) in self.index_ops(&table)? {
                         let key = encode_key(&new_row[ci])?;
                         BTree::at(ix_file).delete(&self.pool, &key, new_rid)?;
                     }
-                    HeapFile::at(file).delete_mark(&self.pool, old_rid, prev_deleter)?;
+                    engine.delete_mark(&self.pool, old_rid, prev_deleter)?;
                 }
             }
         }
@@ -841,8 +840,7 @@ impl Database {
 
     /// Raw versioned records; callers decode and apply visibility.
     pub(crate) fn store_scan_raw(&self, name: &str) -> Result<Vec<(Rid, Vec<u8>)>> {
-        let file = self.catalog().table(name)?.heap.file;
-        let engine = HeapEngine::new(file);
+        let engine = self.catalog().table(name)?.engine();
         let mut scanner = engine.scan(&self.pool)?;
         let mut out = Vec::new();
         while let Some(row) = scanner.next(&self.pool)? {
@@ -865,7 +863,7 @@ impl Database {
         trx: &TrxState,
         claimed: &mut Vec<(usize, Vec<u8>)>,
     ) -> Result<()> {
-        let (checks, heap_file) = {
+        let (checks, engine) = {
             let catalog = self.catalog();
             let schema = &catalog.table(table)?.schema;
             let checks: Vec<(usize, FileId, String)> = catalog
@@ -876,12 +874,11 @@ impl Database {
                     (ci, ix.store.file, ix.column.clone())
                 })
                 .collect();
-            (checks, catalog.table(table)?.heap.file)
+            (checks, catalog.table(table)?.engine())
         };
         if checks.is_empty() {
             return Ok(());
         }
-        let heap = HeapFile::at(heap_file);
         for (ci, ix_file, column) in checks {
             if matches!(row[ci], Value::Null) {
                 continue; // UNIQUE permits multiple NULLs
@@ -895,7 +892,7 @@ impl Database {
                 if Some(rid) == exclude {
                     continue;
                 }
-                let rec = heap.get(&self.pool, rid)?;
+                let rec = engine.get(&self.pool, rid)?;
                 let (creator, deleter, _) = decode_record(&rec)?;
                 if trx.visible(creator, deleter) {
                     return Err(Error::Runtime(format!("duplicate key: {table}({column})")));
@@ -911,14 +908,13 @@ impl Database {
         row: Vec<Value>,
         creator: u32,
     ) -> Result<Rid> {
-        let (file, file_no) = {
+        let (file_no, engine) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
-            (t.heap.file, t.heap.file_no)
+            (t.heap.file_no, t.engine())
         };
-        let heap = HeapFile::at(file);
         let data = encode_record(creator, 0, &row);
-        let rid = heap.insert(&self.pool, &data)?;
+        let rid = engine.insert(&self.pool, &data)?;
         self.wal.append(creator, &Record::Insert { file_no, rid, record: data.clone() })?;
         for (ci, ix_file) in self.index_ops(name)? {
             let key = encode_key(&row[ci])?;
@@ -935,15 +931,14 @@ impl Database {
         rids: &[Rid],
         deleter: u32,
     ) -> Result<Vec<u32>> {
-        let (file, file_no) = {
+        let (file_no, engine) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
-            (t.heap.file, t.heap.file_no)
+            (t.heap.file_no, t.engine())
         };
-        let heap = HeapFile::at(file);
         let mut previous = Vec::with_capacity(rids.len());
         for rid in rids {
-            previous.push(heap.delete_mark(&self.pool, *rid, deleter)?);
+            previous.push(engine.delete_mark(&self.pool, *rid, deleter)?);
             self.wal.append(deleter, &Record::DeleteMark { file_no, rid: *rid, deleter })?;
         }
         Ok(previous)
@@ -958,20 +953,19 @@ impl Database {
         updates: &[(Rid, Vec<Value>)],
         trx_id: u32,
     ) -> Result<Vec<(Rid, u32)>> {
-        let (file, file_no) = {
+        let (file_no, engine) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
-            (t.heap.file, t.heap.file_no)
+            (t.heap.file_no, t.engine())
         };
-        let heap = HeapFile::at(file);
         let ops = self.index_ops(name)?;
         let mut new_rids = Vec::with_capacity(updates.len());
         for (rid, new_row) in updates {
-            let prev_deleter = heap.delete_mark(&self.pool, *rid, trx_id)?;
+            let prev_deleter = engine.delete_mark(&self.pool, *rid, trx_id)?;
             self.wal
                 .append(trx_id, &Record::DeleteMark { file_no, rid: *rid, deleter: trx_id })?;
             let data = encode_record(trx_id, 0, new_row);
-            let new_rid = heap.insert(&self.pool, &data)?;
+            let new_rid = engine.insert(&self.pool, &data)?;
             self.wal.append(
                 trx_id,
                 &Record::Insert { file_no, rid: new_rid, record: data.clone() },

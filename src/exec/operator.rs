@@ -6,8 +6,7 @@ use crate::ast::{
 use crate::catalog::{ColumnDesc, Schema};
 use crate::index::encode_key;
 use crate::storage::codec::decode_record;
-use crate::storage::engine::{HeapEngine, RowScanner, TableEngine};
-use crate::storage::heap::HeapFile;
+use crate::storage::engine::RowScanner;
 use crate::storage::Rid;
 use crate::value::Value;
 use crate::{Database, Error, Result};
@@ -78,8 +77,8 @@ impl PhysicalOperator for TableScan {
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
-        let file = ctx.db.catalog().table(&self.table)?.heap.file;
-        self.scanner = Some(HeapEngine::new(file).scan(&ctx.db.pool)?);
+        let engine = ctx.db.catalog().table(&self.table)?.engine();
+        self.scanner = Some(engine.scan(&ctx.db.pool)?);
         Ok(())
     }
 
@@ -1000,7 +999,7 @@ impl PhysicalOperator for Union {
 /// Index scan: fetches exactly the row ids the access path selected.
 pub struct IndexScan {
     schema: Schema,
-    heap_file: crate::storage::FileId,
+    engine: std::sync::Arc<dyn crate::storage::engine::TableStorage>,
     column: String,
     rids: Vec<Rid>,
     pos: usize,
@@ -1022,7 +1021,11 @@ impl IndexScan {
         let Some(plan) = crate::exec::plan::plan_index_scan(db, table, selection)? else {
             return Ok(None);
         };
-        let columns = db.catalog().table(table)?.schema.columns.clone();
+        let (columns, engine) = {
+            let catalog = db.catalog();
+            let t = catalog.table(table)?;
+            (t.schema.columns.clone(), t.engine())
+        };
         let owner = owner.to_string();
         let schema = Schema {
             columns: columns
@@ -1032,7 +1035,7 @@ impl IndexScan {
         };
         Ok(Some(Self {
             schema,
-            heap_file: plan.heap_file,
+            engine,
             column: plan.column,
             rids: plan.rids,
             pos: 0,
@@ -1059,7 +1062,7 @@ impl PhysicalOperator for IndexScan {
         while self.pos < self.rids.len() {
             let rid = self.rids[self.pos];
             self.pos += 1;
-            let record = HeapFile::at(self.heap_file).get(&ctx.db.pool, rid)?;
+            let record = self.engine.get(&ctx.db.pool, rid)?;
             let (creator, deleter, row) = decode_record(&record)?;
             if ctx.trx.visible(creator, deleter) {
                 return Ok(Some(row));

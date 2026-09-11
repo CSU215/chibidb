@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::ast::DataType;
+use crate::storage::engine::{HeapEngine, TableStorage};
 use crate::storage::FileId;
 use crate::value::Value;
 use crate::{Error, Result};
@@ -104,6 +106,15 @@ pub(crate) struct IndexEntry {
 pub struct Table {
     pub schema: Schema,
     pub(crate) heap: HeapStore,
+    /// The storage engine backing this table (heap today, LSM later).
+    pub(crate) engine: Arc<dyn TableStorage>,
+}
+
+impl Table {
+    /// A shared handle to this table's storage engine.
+    pub(crate) fn engine(&self) -> Arc<dyn TableStorage> {
+        Arc::clone(&self.engine)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -123,7 +134,8 @@ impl Catalog {
         if self.tables.contains_key(name) || self.views.contains_key(name) {
             return Err(Error::Runtime(format!("table already exists: {name}")));
         }
-        self.tables.insert(name.to_string(), Table { schema, heap });
+        let engine: Arc<dyn TableStorage> = Arc::new(HeapEngine::new(heap.file));
+        self.tables.insert(name.to_string(), Table { schema, heap, engine });
         Ok(())
     }
 
