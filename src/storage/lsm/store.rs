@@ -74,22 +74,20 @@ impl LsmStore {
         self.sstables.len()
     }
 
-    /// Turns the memtable into a new SSTable (minor compaction).
-    pub fn flush(&mut self) -> Result<()> {
+    /// The memtable as an SSTable image, or `None` when it is empty. Does not
+    /// mutate the store, so a caller can persist the image first.
+    pub fn memtable_image(&self) -> Option<Vec<u8>> {
         if self.memtable.is_empty() {
-            return Ok(());
+            return None;
         }
-        let image = self.build_from(self.memtable.iter());
-        self.sstables.push(SSTable::parse(image)?);
-        self.memtable = MemTable::new();
-        Ok(())
+        Some(self.build_from(self.memtable.iter()))
     }
 
-    /// Merges every SSTable into one, dropping shadowed values and tombstones
-    /// (major compaction).
-    pub fn compact(&mut self) -> Result<()> {
+    /// The major-compaction image of all SSTables (tombstones dropped), or
+    /// `None` when there is nothing to merge.
+    pub fn compacted_image(&self) -> Result<Option<Vec<u8>>> {
         if self.sstables.len() < 2 {
-            return Ok(());
+            return Ok(None);
         }
         let mut merged: BTreeMap<Vec<u8>, MemEntry> = BTreeMap::new();
         for sstable in &self.sstables {
@@ -97,8 +95,36 @@ impl LsmStore {
                 merged.insert(key, decode_entry(&encoded));
             }
         }
-        let image = self.build_from(merged.into_iter().collect::<Vec<_>>());
-        self.sstables = vec![SSTable::parse(image)?];
+        Ok(Some(self.build_from(merged.into_iter().collect::<Vec<_>>())))
+    }
+
+    pub fn add_sstable(&mut self, sstable: SSTable) {
+        self.sstables.push(sstable);
+    }
+
+    pub fn replace_sstables(&mut self, sstables: Vec<SSTable>) {
+        self.sstables = sstables;
+    }
+
+    pub fn reset_memtable(&mut self) {
+        self.memtable = MemTable::new();
+    }
+
+    /// Turns the memtable into a new SSTable (minor compaction).
+    pub fn flush(&mut self) -> Result<()> {
+        if let Some(image) = self.memtable_image() {
+            self.add_sstable(SSTable::parse(image)?);
+            self.reset_memtable();
+        }
+        Ok(())
+    }
+
+    /// Merges every SSTable into one, dropping shadowed values and tombstones
+    /// (major compaction).
+    pub fn compact(&mut self) -> Result<()> {
+        if let Some(image) = self.compacted_image()? {
+            self.replace_sstables(vec![SSTable::parse(image)?]);
+        }
         Ok(())
     }
 
