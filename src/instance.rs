@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::ast::{Privilege, Stmt};
+use crate::ast::{DataType, Privilege, Stmt};
 use crate::config::Config;
 use crate::parser;
 use crate::result::ResultSet;
@@ -18,6 +18,11 @@ pub const META_DIR: &str = "chibi_meta";
 
 /// Database selected when a session runs a table statement before choosing one.
 pub const DEFAULT_DB: &str = "main";
+
+/// A read-only virtual database exposing instance metadata. It has no
+/// directory; `USE` selects it and queries run against materialized system
+/// tables.
+pub const INFORMATION_SCHEMA: &str = "information_schema";
 
 /// One server instance: a data root holding multiple named databases, each in
 /// its own directory. Each database has its own lock, so different databases
@@ -219,6 +224,10 @@ impl Instance {
                     out.push(ResultSet::Message("SUCCESS".into()));
                 }
                 other => {
+                    if session.current_db() == Some(INFORMATION_SCHEMA) {
+                        out.push(self.query_information_schema(session, other)?);
+                        continue;
+                    }
                     let db_name = self.ensure_current_db(session)?;
                     let db = self.database(&db_name)?;
                     let read_only = crate::is_read_only(other);
@@ -301,10 +310,66 @@ impl Instance {
     }
 
     fn use_database(&self, session: &mut Session, name: &str) -> Result<()> {
+        if name == INFORMATION_SCHEMA {
+            session.set_current_db(Some(name.to_string()));
+            return Ok(());
+        }
         if !self.databases()?.iter().any(|d| d == name) {
             return Err(Error::Runtime(format!("no such database: {name}")));
         }
         session.set_current_db(Some(name.to_string()));
+        Ok(())
+    }
+
+    /// Runs a read-only statement against a freshly materialized copy of the
+    /// instance metadata (`schemata`, `tables`, `columns`).
+    fn query_information_schema(&self, session: &mut Session, stmt: &Stmt) -> Result<ResultSet> {
+        if !matches!(stmt, Stmt::Select(_) | Stmt::Explain(_)) {
+            return Err(Error::Runtime(
+                "information_schema is read-only (select only)".into(),
+            ));
+        }
+        let tmp = Database::open_in_memory_with_config(&self.config)?;
+        self.materialize_information_schema(&tmp)?;
+        tmp.execute_stmt_with(session, stmt)?
+            .ok_or_else(|| Error::Runtime("information_schema query produced no result".into()))
+    }
+
+    fn materialize_information_schema(&self, db: &Database) -> Result<()> {
+        db.execute_sql("create table schemata (schema_name char(64) primary key);")?;
+        db.execute_sql(
+            "create table tables (table_schema char(64), table_name char(64), engine char(8));",
+        )?;
+        db.execute_sql(
+            "create table columns (table_schema char(64), table_name char(64), \
+             column_name char(64), data_type char(32), not_null int, primary_key int, is_unique int);",
+        )?;
+        for name in self.databases()? {
+            db.execute_sql(&format!("insert into schemata values ('{name}');"))?;
+            let handle = self.database(&name)?;
+            let guard = handle.read();
+            for meta in guard.catalog().table_metas() {
+                let engine = match meta.engine {
+                    crate::config::EngineKind::Heap => "heap",
+                    crate::config::EngineKind::Lsm => "lsm",
+                };
+                db.execute_sql(&format!(
+                    "insert into tables values ('{name}', '{}', '{engine}');",
+                    meta.name
+                ))?;
+                for c in &meta.columns {
+                    db.execute_sql(&format!(
+                        "insert into columns values ('{name}', '{}', '{}', '{}', {}, {}, {});",
+                        meta.name,
+                        c.name,
+                        dtype_name(c.dtype),
+                        c.not_null as i32,
+                        c.primary_key as i32,
+                        c.unique as i32,
+                    ))?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -352,6 +417,10 @@ impl Instance {
                 | Stmt::CreateDatabase(_)
                 | Stmt::DropDatabase(_)
         ) {
+            return Ok(());
+        }
+        // the virtual metadata database is readable by any logged-in user
+        if session.current_db() == Some(INFORMATION_SCHEMA) {
             return Ok(());
         }
         let Some(privilege) = statement_privilege(stmt) else {
@@ -456,6 +525,17 @@ impl Instance {
             "select kind from privileges where username = '{user}' and kind = '{kind}' and (dbname = '{database}' or dbname = '*');"
         ))?;
         Ok(matches!(result.into_iter().next(), Some(ResultSet::Rows { rows, .. }) if !rows.is_empty()))
+    }
+}
+
+/// The SQL name of a column type, for `information_schema.columns`.
+fn dtype_name(dtype: DataType) -> String {
+    match dtype {
+        DataType::Int => "int".into(),
+        DataType::Float => "float".into(),
+        DataType::Char(n) => format!("char({n})"),
+        DataType::Date => "date".into(),
+        DataType::Text => "text".into(),
     }
 }
 
