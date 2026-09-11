@@ -5,6 +5,7 @@
 //! `COM_PING`/`COM_INIT_DB`/`COM_QUIT`. Hand-rolled (including a small SHA-1
 //! for the native challenge) so no dependency is added.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -39,6 +40,21 @@ const COM_QUIT: u8 = 0x01;
 const COM_INIT_DB: u8 = 0x02;
 const COM_QUERY: u8 = 0x03;
 const COM_PING: u8 = 0x0e;
+const COM_STMT_PREPARE: u8 = 0x16;
+const COM_STMT_EXECUTE: u8 = 0x17;
+const COM_STMT_CLOSE: u8 = 0x19;
+const COM_STMT_RESET: u8 = 0x1a;
+
+// Parameter type codes we understand.
+const MYSQL_TYPE_TINY: u8 = 1;
+const MYSQL_TYPE_SHORT: u8 = 2;
+const MYSQL_TYPE_LONG: u8 = 3;
+const MYSQL_TYPE_FLOAT: u8 = 4;
+const MYSQL_TYPE_DOUBLE: u8 = 5;
+const MYSQL_TYPE_NULL: u8 = 6;
+const MYSQL_TYPE_LONGLONG: u8 = 8;
+const MYSQL_TYPE_STRING: u8 = 0xfe;
+const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 
 /// Accepts MySQL connections until the listener closes.
 pub async fn serve(instance: SharedInstance, listener: TcpListener) -> io::Result<()> {
@@ -90,6 +106,9 @@ fn serve_connection(instance: &crate::instance::Instance, mut stream: TcpStream)
         let _ = instance.execute_with(&mut session, &format!("use {db};"));
     }
 
+    let mut prepared: HashMap<u32, String> = HashMap::new();
+    let mut next_statement_id: u32 = 1;
+
     while let Ok((_, packet)) = read_packet(&mut stream) {
         let Some((&command, payload)) = packet.split_first() else {
             continue;
@@ -109,6 +128,51 @@ fn serve_connection(instance: &crate::instance::Instance, mut stream: TcpStream)
                     Err(e) => write_packet(&mut stream, 1, &err_packet(1064, &e.to_string()))?,
                 }
             }
+            COM_STMT_PREPARE => {
+                let sql = String::from_utf8_lossy(payload).into_owned();
+                let id = next_statement_id;
+                next_statement_id += 1;
+                let params = placeholder_count(&sql);
+                prepared.insert(id, sql);
+                let mut seq = 1u8;
+                write_packet(&mut stream, seq, &prepare_ok_packet(id, params))?;
+                seq = seq.wrapping_add(1);
+                for _ in 0..params {
+                    write_packet(&mut stream, seq, &column_definition("?"))?;
+                    seq = seq.wrapping_add(1);
+                }
+                if params > 0 {
+                    write_packet(&mut stream, seq, &eof_packet(STATUS_AUTOCOMMIT))?;
+                }
+            }
+            COM_STMT_EXECUTE => {
+                let mut pos = 0;
+                let Some(id) = read_u32(payload, &mut pos) else {
+                    write_packet(&mut stream, 1, &err_packet(1064, "bad execute packet"))?;
+                    continue;
+                };
+                let Some(sql) = prepared.get(&id).cloned() else {
+                    write_packet(&mut stream, 1, &err_packet(1243, "unknown prepared statement"))?;
+                    continue;
+                };
+                let params = placeholder_count(&sql);
+                let Some(values) = parse_execute(payload, params) else {
+                    write_packet(&mut stream, 1, &err_packet(1064, "bad parameters"))?;
+                    continue;
+                };
+                let bound = bind_params(&sql, &values);
+                match instance.execute_with(&mut session, &bound) {
+                    Ok(results) => send_results(&mut stream, &results)?,
+                    Err(e) => write_packet(&mut stream, 1, &err_packet(1064, &e.to_string()))?,
+                }
+            }
+            COM_STMT_CLOSE => {
+                let mut pos = 0;
+                if let Some(id) = read_u32(payload, &mut pos) {
+                    prepared.remove(&id);
+                }
+            }
+            COM_STMT_RESET => write_packet(&mut stream, 1, &ok_packet(STATUS_AUTOCOMMIT))?,
             _ => write_packet(&mut stream, 1, &err_packet(1047, "unsupported command"))?,
         }
     }
@@ -178,6 +242,162 @@ fn send_results(stream: &mut TcpStream, results: &[ResultSet]) -> io::Result<()>
         }
     }
     Ok(())
+}
+
+/// A bound parameter value from `COM_STMT_EXECUTE`.
+enum ParamValue {
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+/// Counts `?` placeholders outside single-quoted strings.
+fn placeholder_count(sql: &str) -> usize {
+    let mut count = 0;
+    let mut in_string = false;
+    for c in sql.chars() {
+        match c {
+            '\'' => in_string = !in_string,
+            '?' if !in_string => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
+/// Substitutes parameter literals for the `?` placeholders.
+fn bind_params(sql: &str, values: &[Option<ParamValue>]) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut index = 0;
+    let mut in_string = false;
+    for c in sql.chars() {
+        if c == '\'' {
+            in_string = !in_string;
+            out.push(c);
+            continue;
+        }
+        if c == '?' && !in_string {
+            match values.get(index) {
+                Some(Some(ParamValue::Int(n))) => out.push_str(&n.to_string()),
+                Some(Some(ParamValue::Float(x))) => out.push_str(&x.to_string()),
+                Some(Some(ParamValue::Str(s))) => {
+                    out.push('\'');
+                    out.push_str(s);
+                    out.push('\'');
+                }
+                _ => out.push_str("NULL"),
+            }
+            index += 1;
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn prepare_ok_packet(statement_id: u32, params: usize) -> Vec<u8> {
+    let mut p = vec![0x00];
+    p.extend_from_slice(&statement_id.to_le_bytes());
+    p.extend_from_slice(&0u16.to_le_bytes()); // column count
+    p.extend_from_slice(&(params as u16).to_le_bytes());
+    p.push(0); // reserved filler
+    p.extend_from_slice(&0u16.to_le_bytes()); // warning count
+    p
+}
+
+fn parse_execute(payload: &[u8], num_params: usize) -> Option<Vec<Option<ParamValue>>> {
+    let mut pos = 0;
+    read_u32(payload, &mut pos)?; // statement id
+    pos += 1; // flags
+    pos += 4; // iteration count
+    let null_len = num_params.div_ceil(8);
+    let nulls = payload.get(pos..pos + null_len)?.to_vec();
+    pos += null_len;
+    let new_bound = *payload.get(pos)?;
+    pos += 1;
+
+    let mut types = vec![0u8; num_params];
+    if new_bound == 1 {
+        for slot in types.iter_mut() {
+            *slot = *payload.get(pos)?;
+            pos += 2; // type + unsigned flag
+        }
+    }
+
+    let mut values = Vec::with_capacity(num_params);
+    for (i, &ty) in types.iter().enumerate() {
+        let is_null = nulls[i / 8] & (1 << (i % 8)) != 0 || ty == MYSQL_TYPE_NULL;
+        if is_null {
+            values.push(None);
+            continue;
+        }
+        let value = match ty {
+            MYSQL_TYPE_TINY => {
+                let byte = *payload.get(pos)?;
+                pos += 1;
+                ParamValue::Int(byte as i8 as i64)
+            }
+            MYSQL_TYPE_SHORT => {
+                let b = payload.get(pos..pos + 2)?;
+                pos += 2;
+                ParamValue::Int(i16::from_le_bytes(b.try_into().unwrap()) as i64)
+            }
+            MYSQL_TYPE_LONG => {
+                let b = payload.get(pos..pos + 4)?;
+                pos += 4;
+                ParamValue::Int(i32::from_le_bytes(b.try_into().unwrap()) as i64)
+            }
+            MYSQL_TYPE_LONGLONG => {
+                let b = payload.get(pos..pos + 8)?;
+                pos += 8;
+                ParamValue::Int(i64::from_le_bytes(b.try_into().unwrap()))
+            }
+            MYSQL_TYPE_FLOAT => {
+                let b = payload.get(pos..pos + 4)?;
+                pos += 4;
+                ParamValue::Float(f32::from_le_bytes(b.try_into().unwrap()) as f64)
+            }
+            MYSQL_TYPE_DOUBLE => {
+                let b = payload.get(pos..pos + 8)?;
+                pos += 8;
+                ParamValue::Float(f64::from_le_bytes(b.try_into().unwrap()))
+            }
+            MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => {
+                let (bytes, next) = read_lenenc_bytes(payload, pos)?;
+                pos = next;
+                ParamValue::Str(String::from_utf8_lossy(&bytes).into_owned())
+            }
+            _ => return None,
+        };
+        values.push(Some(value));
+    }
+    Some(values)
+}
+
+fn read_lenenc_bytes(data: &[u8], mut pos: usize) -> Option<(Vec<u8>, usize)> {
+    let first = *data.get(pos)?;
+    pos += 1;
+    let len = match first {
+        0..=250 => first as usize,
+        0xfc => {
+            let b = data.get(pos..pos + 2)?;
+            pos += 2;
+            u16::from_le_bytes(b.try_into().unwrap()) as usize
+        }
+        0xfd => {
+            let b = data.get(pos..pos + 3)?;
+            pos += 3;
+            b[0] as usize | (b[1] as usize) << 8 | (b[2] as usize) << 16
+        }
+        0xfe => {
+            let b = data.get(pos..pos + 8)?;
+            pos += 8;
+            u64::from_le_bytes(b.try_into().unwrap()) as usize
+        }
+        _ => return None,
+    };
+    let bytes = data.get(pos..pos + len)?.to_vec();
+    Some((bytes, pos + len))
 }
 
 fn handshake_packet(connection_id: u32, scramble: &[u8; 20]) -> Vec<u8> {

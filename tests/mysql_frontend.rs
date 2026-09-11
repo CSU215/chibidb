@@ -80,6 +80,52 @@ fn mysql_query_returns_a_text_result_set() {
 }
 
 #[test]
+fn mysql_prepared_statements_bind_parameters() {
+    let (addr, _dir) = start_server();
+    let mut stream = connect(addr);
+
+    // COM_STMT_PREPARE "select ? + 1 as v"
+    let mut prepare = vec![0x16];
+    prepare.extend_from_slice(b"select ? + 1 as v");
+    write_packet(&mut stream, 0, &prepare);
+
+    let prepare_ok = read_packet(&mut stream);
+    assert_eq!(prepare_ok[0], 0x00, "expected prepare OK");
+    assert_eq!(u16::from_le_bytes([prepare_ok[5], prepare_ok[6]]), 0, "no columns");
+    assert_eq!(u16::from_le_bytes([prepare_ok[7], prepare_ok[8]]), 1, "one param");
+    let statement_id = u32::from_le_bytes(prepare_ok[1..5].try_into().unwrap());
+    let _param_def = read_packet(&mut stream);
+    let _param_eof = read_packet(&mut stream);
+
+    // COM_STMT_EXECUTE with a LONGLONG parameter = 7
+    let mut execute = vec![0x17];
+    execute.extend_from_slice(&statement_id.to_le_bytes());
+    execute.push(0); // flags
+    execute.extend_from_slice(&1u32.to_le_bytes()); // iteration
+    execute.push(0); // null bitmap (1 byte, none null)
+    execute.push(1); // new params bound
+    execute.push(8); // MYSQL_TYPE_LONGLONG
+    execute.push(0); // unsigned flag
+    execute.extend_from_slice(&7i64.to_le_bytes());
+    write_packet(&mut stream, 0, &execute);
+
+    let column_count = read_packet(&mut stream);
+    assert_eq!(column_count, vec![1]);
+    let _column = read_packet(&mut stream);
+    let _eof = read_packet(&mut stream);
+    let row = read_packet(&mut stream);
+    assert_eq!(row, vec![1, b'8'], "expected 7 + 1 = 8");
+    let _end = read_packet(&mut stream);
+
+    // COM_STMT_CLOSE is silent
+    let mut close = vec![0x19];
+    close.extend_from_slice(&statement_id.to_le_bytes());
+    write_packet(&mut stream, 0, &close);
+
+    write_packet(&mut stream, 0, &[0x01]); // COM_QUIT
+}
+
+#[test]
 fn mysql_reports_errors_and_pings() {
     let (addr, _dir) = start_server();
     let mut stream = connect(addr);
