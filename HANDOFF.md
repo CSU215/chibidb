@@ -1,7 +1,7 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：P10/P7/P8/P2+/P3 + P9（HTTP+MySQL 含预处理）+ LSM 分级压实/流式 + 堆/LSM 差分等价与性能探针；477 tests 全绿、clippy 零警告。
+> 最后更新：src 按层重组为 `sql/`/`db/`/`net/`（`lib.rs` 用 `pub use` 保留旧扁平路径）+ catalog 原子写（temp+rename）+ 新增 `config.example.toml`；P10/P7/P8/P2+/P3 + P9（HTTP+MySQL 含预处理）+ LSM 分级压实/流式 + 堆/LSM 差分等价与性能探针；477 tests 全绿、clippy 零警告。
 
 ---
 
@@ -114,7 +114,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `index/btree.rs` | B+ 树主体：`init/open/open_or_repair/at`、递归插入双级分裂长高、search（跨叶重复键回退）、scan_range 叶链、delete 借用/合并/根收缩（~880 行） | |
 | `wal.rs` | 预写日志：帧 `[u32 len][u8 type][u32 trx][payload]`，Record::Insert/DeleteMark/Commit，追加 + `sync()`（提交点）+ `truncate()`（checkpoint）；`plan_recovery` 解析日志（容忍截断尾帧），纯函数有单测 | `Wal` / `plan_recovery` |
 
-### 3.2 测试（`tests/`，27 个文件 / 296 tests）
+### 3.2 测试（`tests/`，57 个文件 / 477 tests）
 
 - 与源码分层对应：`lexer / parser / eval / agg / join / db / db_index / db_persist / trx / wal / storage_* / index_* / wire / server / repl / datetime / codec / catalog_meta / miniob_compat`
 - `miniob_compat`：student/course/sc 端到端组合场景（CRUD+聚合、分组/having、内外连接、不相关子查询、索引/EXPLAIN）
@@ -152,7 +152,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | M14 加固 | ✅ DROP TABLE（`d0e239c`）、跨语句事务会话修复（`bcfd6ee`）、clippy 清零（`0023a43`）、README + 冒烟脚本（`46c8637`） | `46c8637` |
 | M15 查询/运维增强 | ✅ CHECKPOINT 语句 + WAL 预算护栏（`c8e060e`）、DISTINCT（`2389f99`）、LEFT [OUTER] JOIN（`5f31ea2`） | `5f31ea2` |
 | M16 空间回收 | ✅ VACUUM：物理回收已提交删除标记行/孤儿版本 + stale 索引项清理；flush() 开事务守卫（`975dab2`） | `975dab2` |
-| M17 表达式面 | ✅ `%` 标点入 lexer；`expr [NOT] LIKE`（`%`/`_` 通配，无转义）；MOD 运算符；字符串函数 concat/upper/lower/length/substring；exec.rs 拆分为 exec/ 六模块 | `d3a85ad` |
+| M17 表达式面 | ✅ `%` 标点入 lexer；`expr [NOT] LIKE`（`%`/`_` 通配，无转义）；MOD 运算符；字符串函数 concat/upper/lower/length/substring；exec/ 拆分为 mod/dml/eval/aggregate/plan/operator/subquery | `d3a85ad` |
 | M18 查询/性能 | ✅ miniob 经典 student/course/sc 端到端回归；忽略式索引基准（`tests/bench.rs`）；修复单表索引扫描仍先全表扫的空转；AND 链同列上下界合并为一段范围扫；只读事务不再重写 catalog | `5c4e26e` + `546b601` |
 | M19 相关子查询 | ✅ `EvalCtx` 改为带父链的作用域（列解析逐层向外）；子查询改为在求值点按当前行/组物化（`bind_expr`/`eval_bound`），支持多层嵌套的相关引用 | `8dce9a3` |
 | M20 表约束 | ✅ 列选项 PRIMARY KEY / UNIQUE / NOT NULL / DEFAULT 解析并持久化（CHIDCAT5）；INSERT 列清单 + DEFAULT 补全；NOT NULL 在 INSERT/UPDATE 校验；PK/UNIQUE 自动建唯一索引并在 DML 查重（`duplicate key`），约束索引不可单独 DROP | `18e940d`…`e381c87` |

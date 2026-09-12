@@ -126,6 +126,23 @@ SQL 字符串
   → DiskManager    分页文件 IO
 ```
 
+### 源码结构
+
+`src/` 按层分组；`lib.rs` 是核心门面，并用 `pub use` 保留了旧的扁平路径
+（`chibidb::value`、`crate::parser` 等旧引用仍然可用）：
+
+```
+src/
+  lib.rs  main.rs  error.rs  config.rs  wal.rs
+  sql/       lexer parser ast value result datetime pipeline
+  exec/      mod dml eval aggregate plan operator subquery
+  storage/   page disk header dwb buffer slotted engine heap codec lob lsm/*
+  index/     key node btree
+  catalog/   mod meta
+  db/        instance transaction trx
+  net/       server client protocol wire http mysql repl render
+```
+
 表存储通过 `TableStorage` 抽象（`Arc<dyn TableStorage>` 存于 catalog），执行层与
 `Database` 的 `store_*`/回滚/vacuum/唯一性检查都走该接缝。两种引擎：
 - **Heap**（默认）：`HeapEngine` + slotted page + B+ 树索引
