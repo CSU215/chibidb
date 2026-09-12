@@ -54,11 +54,10 @@ python3 scripts/smoke.py     # Windows: python scripts\smoke.py；期望输出 S
 ```
 
 启动时会在**当前工作目录**读取 `config.toml`（缺失即全用默认值）。已生效条目：
-`storage.buffer_pool_frames`、`storage.double_write`、`wal.checkpoint_threshold`、`server.addr`、
-`server.thread_model`/`worker_threads`。其余条目
-（`storage.page_size/default_engine/double_write/inline_lob_limit`、`execution.mode`、
-`auth.enabled`、`server.protocols`）是后续阶段的预留位；其中 `page_size` 当前必须等于编译期
-`PAGE_SIZE`，否则打开数据库时报错（动态页大小属 P6 存储抽象）。
+`storage.buffer_pool_frames`、`storage.double_write`、`storage.default_engine`、`storage.inline_lob_limit`、
+`storage.lsm_compaction_trigger`、`wal.checkpoint_threshold`、`server.addr`/`http_addr`/`mysql_addr`、
+`server.thread_model`/`worker_threads`、`execution.mode`、`auth.enabled`、`transaction.conflict`/`lock_timeout_ms`。
+页大小（`PAGE_SIZE=8192`）是编译期常量，**不是**配置项（动态页大小属 P6 存储抽象）。
 
 ---
 
