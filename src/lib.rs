@@ -1,32 +1,23 @@
-pub mod ast;
 pub mod catalog;
-pub mod client;
 pub mod config;
-pub mod datetime;
+pub mod db;
 mod error;
 pub mod exec;
-pub mod http;
 pub mod index;
-pub mod instance;
-pub mod lexer;
-pub mod mysql;
-pub mod parser;
-pub mod pipeline;
-pub mod protocol;
-pub mod render;
-mod repl;
-pub mod result;
-pub mod server;
+pub mod net;
+pub mod sql;
 pub mod storage;
-pub mod transaction;
-pub mod trx;
-pub mod value;
 pub mod wal;
-pub mod wire;
+
+// Compatibility re-exports: the implementation now lives in subdirectories,
+// but these paths stay valid for callers (and the crate's own `crate::x` paths).
+pub use db::{instance, transaction, trx};
+pub use net::{client, http, mysql, protocol, render, server, wire};
+pub use sql::{ast, datetime, lexer, parser, pipeline, result, value};
 
 pub use error::{Error, Result};
-pub use repl::run_repl;
-pub use result::ResultSet;
+pub use net::run_repl;
+pub use sql::result::ResultSet;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
