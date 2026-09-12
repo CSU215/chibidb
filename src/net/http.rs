@@ -11,9 +11,8 @@ use std::net::TcpStream;
 use tokio::net::TcpListener;
 
 use crate::instance::Instance;
-use crate::result::ResultSet;
+use crate::result::{encode_error, encode_results};
 use crate::trx::Session;
-use crate::value::Value;
 
 use crate::server::SharedInstance;
 
@@ -74,14 +73,14 @@ fn route(
         ("POST", "/query") => {
             let text = String::from_utf8_lossy(body);
             let Some(sql) = json_string_field(&text, "sql") else {
-                return ("400 Bad Request", error_json("expected a JSON body {\"sql\": ...}"));
+                return ("400 Bad Request", encode_error("expected a JSON body {\"sql\": ...}"));
             };
             match instance.execute_with(session, &sql) {
                 Ok(results) => ("200 OK", encode_results(&results)),
-                Err(e) => ("400 Bad Request", error_json(&e.to_string())),
+                Err(e) => ("400 Bad Request", encode_error(&e.to_string())),
             }
         }
-        _ => ("404 Not Found", error_json("not found")),
+        _ => ("404 Not Found", encode_error("not found")),
     }
 }
 
@@ -149,82 +148,6 @@ fn write_response(
     stream.flush()
 }
 
-fn error_json(message: &str) -> String {
-    format!("{{\"error\":{}}}", json_string(message))
-}
-
-pub(crate) fn encode_results(results: &[ResultSet]) -> String {
-    let mut out = String::from("{\"results\":[");
-    for (i, rs) in results.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        match rs {
-            ResultSet::Message(m) => {
-                out.push_str("{\"type\":\"message\",\"message\":");
-                out.push_str(&json_string(m));
-                out.push('}');
-            }
-            ResultSet::Rows { columns, rows } => {
-                out.push_str("{\"type\":\"rows\",\"columns\":[");
-                for (j, c) in columns.iter().enumerate() {
-                    if j > 0 {
-                        out.push(',');
-                    }
-                    out.push_str(&json_string(c));
-                }
-                out.push_str("],\"rows\":[");
-                for (j, row) in rows.iter().enumerate() {
-                    if j > 0 {
-                        out.push(',');
-                    }
-                    out.push('[');
-                    for (k, v) in row.iter().enumerate() {
-                        if k > 0 {
-                            out.push(',');
-                        }
-                        out.push_str(&json_value(v));
-                    }
-                    out.push(']');
-                }
-                out.push_str("]}");
-            }
-        }
-    }
-    out.push_str("]}");
-    out
-}
-
-fn json_value(v: &Value) -> String {
-    match v {
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Int(n) => n.to_string(),
-        Value::Float(x) if x.is_finite() => x.to_string(),
-        Value::Float(_) => "null".to_string(),
-        Value::Str(s) => json_string(s),
-        Value::Date(d) => json_string(&crate::datetime::format_date(*d)),
-    }
-}
-
-pub(crate) fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 /// Extracts a top-level string field from a tiny JSON object.
 fn json_string_field(text: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
@@ -271,6 +194,8 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::result::ResultSet;
+    use crate::value::Value;
 
     #[test]
     fn encodes_rows_and_messages() {
