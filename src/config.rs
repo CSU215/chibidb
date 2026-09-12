@@ -62,8 +62,6 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub default_engine: EngineKind,
-    /// Only affects newly created files; open files use their own header.
-    pub page_size: u32,
     pub buffer_pool_frames: usize,
     pub double_write: bool,
     pub inline_lob_limit: usize,
@@ -120,7 +118,6 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             default_engine: EngineKind::Heap,
-            page_size: 8192,
             buffer_pool_frames: 64,
             double_write: false,
             inline_lob_limit: 4096,
@@ -172,12 +169,6 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        let page_size = self.storage.page_size;
-        if page_size < 512 || !page_size.is_power_of_two() {
-            return Err(Error::Runtime(format!(
-                "storage.page_size must be a power of two >= 512, got {page_size}"
-            )));
-        }
         if self.storage.buffer_pool_frames == 0 {
             return Err(Error::Runtime(
                 "storage.buffer_pool_frames must be greater than zero".into(),

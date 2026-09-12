@@ -7,7 +7,6 @@ use chibidb::{Database, ResultSet};
 #[test]
 fn defaults_are_sane() {
     let c = Config::default();
-    assert_eq!(c.storage.page_size, 8192);
     assert_eq!(c.storage.buffer_pool_frames, 64);
     assert_eq!(c.storage.default_engine, EngineKind::Heap);
     assert!(!c.storage.double_write);
@@ -30,8 +29,8 @@ fn transaction_conflict_strategy_parses() {
 
 #[test]
 fn partial_toml_fills_remaining_defaults() {
-    let c = Config::from_toml_str("[storage]\npage_size = 4096\n").unwrap();
-    assert_eq!(c.storage.page_size, 4096);
+    let c = Config::from_toml_str("[storage]\ninline_lob_limit = 2048\n").unwrap();
+    assert_eq!(c.storage.inline_lob_limit, 2048);
     assert_eq!(c.storage.buffer_pool_frames, 64);
     assert_eq!(c.storage.default_engine, EngineKind::Heap);
     assert_eq!(c.server.addr, "127.0.0.1:5678");
@@ -42,7 +41,6 @@ fn parses_all_sections() {
     let toml = r#"
 [storage]
 default_engine = "lsm"
-page_size = 16384
 buffer_pool_frames = 128
 double_write = true
 inline_lob_limit = 2048
@@ -62,7 +60,6 @@ enabled = true
 "#;
     let c = Config::from_toml_str(toml).unwrap();
     assert_eq!(c.storage.default_engine, EngineKind::Lsm);
-    assert_eq!(c.storage.page_size, 16384);
     assert_eq!(c.storage.buffer_pool_frames, 128);
     assert!(c.storage.double_write);
     assert_eq!(c.storage.inline_lob_limit, 2048);
@@ -79,15 +76,9 @@ fn rejects_unknown_field() {
 }
 
 #[test]
-fn rejects_non_power_of_two_page_size() {
-    let c = Config::from_toml_str("[storage]\npage_size = 1000\n").unwrap();
-    assert!(c.validate().is_err());
-}
-
-#[test]
-fn rejects_zero_page_size() {
-    let c = Config::from_toml_str("[storage]\npage_size = 0\n").unwrap();
-    assert!(c.validate().is_err());
+fn rejects_page_size_as_unknown_field() {
+    // page size is a compile-time constant; a config must not try to set it.
+    assert!(Config::from_toml_str("[storage]\npage_size = 8192\n").is_err());
 }
 
 #[test]
@@ -126,16 +117,16 @@ fn load_reads_and_validates_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let mut f = std::fs::File::create(&path).unwrap();
-    writeln!(f, "[storage]\npage_size = 4096").unwrap();
+    writeln!(f, "[storage]\nbuffer_pool_frames = 8").unwrap();
     let c = Config::load(&path).unwrap();
-    assert_eq!(c.storage.page_size, 4096);
+    assert_eq!(c.storage.buffer_pool_frames, 8);
 }
 
 #[test]
 fn load_rejects_invalid_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
-    std::fs::write(&path, "[storage]\npage_size = 1000\n").unwrap();
+    std::fs::write(&path, "[storage]\nbuffer_pool_frames = 0\n").unwrap();
     assert!(Config::load(&path).is_err());
 }
 
@@ -162,13 +153,6 @@ fn open_in_memory_honors_config() {
     let cfg = Config::from_toml_str("[storage]\nbuffer_pool_frames = 1\n").unwrap();
     let db = Database::open_in_memory_with_config(&cfg).unwrap();
     assert_eq!(db.config().storage.buffer_pool_frames, 1);
-}
-
-#[test]
-fn rejects_page_size_differing_from_build() {
-    let cfg = Config::from_toml_str("[storage]\npage_size = 4096\n").unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    assert!(Database::open_with_config(dir.path(), &cfg).is_err());
 }
 
 #[test]
