@@ -1,16 +1,19 @@
 """Full-table aggregation: measures scan + aggregate throughput.
 
 Uses ``sum`` rather than ``count(*)``: miniob's observer drops the connection
-on ``count``, while ``sum`` is supported by every target.
+on ``count``, while ``sum`` is supported by every target. ``BENCH_AGG_ROWS``
+overrides the seeded row count when the scan, not the round trip, should
+dominate.
 """
 
 from __future__ import annotations
 
+import os
 import time
 
 from benchkit import Bench, Env, Target, seed_int_table
 
-ROWS = 2000
+ROWS = int(os.environ.get("BENCH_AGG_ROWS", "2000"))
 QUERIES = 100
 
 
