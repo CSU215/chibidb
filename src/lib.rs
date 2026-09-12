@@ -889,8 +889,21 @@ impl Database {
             views: self.catalog().view_metas(),
         };
         let bytes = encode_catalog(&snap);
-        std::fs::write(self.data_dir.join("catalog.bin"), bytes)
-            .map_err(|e| Error::Runtime(format!("cannot write catalog: {e}")))
+        // Write a temp file, fsync it, then rename over catalog.bin. Rename is
+        // atomic, so a crash leaves either the old catalog or the new one,
+        // never a half-written one (same pattern as the LSM manifest).
+        let tmp = self.data_dir.join("catalog.tmp");
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(&tmp)
+                .map_err(|e| Error::Runtime(format!("cannot create catalog temp: {e}")))?;
+            file.write_all(&bytes)
+                .map_err(|e| Error::Runtime(format!("cannot write catalog: {e}")))?;
+            file.sync_all()
+                .map_err(|e| Error::Runtime(format!("cannot sync catalog: {e}")))?;
+        }
+        std::fs::rename(&tmp, self.data_dir.join("catalog.bin"))
+            .map_err(|e| Error::Runtime(format!("cannot replace catalog: {e}")))
     }
 
     /// Drops a table: catalog first (durability), then its heap and index
