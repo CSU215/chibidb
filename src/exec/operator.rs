@@ -14,7 +14,7 @@ use crate::{Database, Error, Result};
 
 use super::aggregate::{expr_has_aggregate, sort_rows};
 use super::chunk::{CHUNK_ROWS, Chunk, Column};
-use super::eval::{eval_const, EvalCtx};
+use super::eval::{eval_binary, eval_const, EvalCtx};
 use super::subquery::{eval_bound, eval_predicate_bound};
 
 /// Context threaded through operators: the database, the session's active
@@ -283,6 +283,75 @@ fn simple_column(schema: &Schema, expr: &Expr) -> Option<usize> {
     }
 }
 
+fn is_comparison(op: BinOp) -> bool {
+    matches!(op, BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+}
+
+/// One side of a vectorized comparison: a column of the current chunk, or a
+/// constant evaluated once.
+enum Operand<'a> {
+    Column(&'a Column),
+    Const(Value),
+}
+
+impl Operand<'_> {
+    fn value(&self, index: usize) -> Value {
+        match self {
+            Operand::Column(column) => column.value(index),
+            Operand::Const(value) => value.clone(),
+        }
+    }
+}
+
+fn operand<'a>(expr: &Expr, schema: &Schema, chunk: &'a Chunk) -> Option<Operand<'a>> {
+    if let Some(index) = simple_column(schema, expr) {
+        return Some(Operand::Column(chunk.column(index)));
+    }
+    eval_const(expr).ok().map(Operand::Const)
+}
+
+/// Column-wise WHERE evaluation for comparisons, `and`/`or` and `is [not]
+/// null`, reusing [`eval_binary`] so NULL and coercion semantics match the row
+/// path. Returns `None` for shapes that need rows (subqueries, computed
+/// operands, `not`, `in`, ...), so the caller falls back.
+fn predicate_mask(expr: &Expr, chunk: &Chunk, schema: &Schema) -> Result<Option<Vec<bool>>> {
+    match expr {
+        Expr::Binary(BinOp::And, l, r) => {
+            match (predicate_mask(l, chunk, schema)?, predicate_mask(r, chunk, schema)?) {
+                (Some(a), Some(b)) => Ok(Some(a.iter().zip(&b).map(|(x, y)| *x && *y).collect())),
+                _ => Ok(None),
+            }
+        }
+        Expr::Binary(BinOp::Or, l, r) => {
+            match (predicate_mask(l, chunk, schema)?, predicate_mask(r, chunk, schema)?) {
+                (Some(a), Some(b)) => Ok(Some(a.iter().zip(&b).map(|(x, y)| *x || *y).collect())),
+                _ => Ok(None),
+            }
+        }
+        Expr::Binary(op, l, r) if is_comparison(*op) => {
+            let (Some(left), Some(right)) =
+                (operand(l, schema, chunk), operand(r, schema, chunk))
+            else {
+                return Ok(None);
+            };
+            let mut mask = Vec::with_capacity(chunk.len());
+            for i in 0..chunk.len() {
+                let passed = eval_binary(*op, left.value(i), right.value(i))?;
+                mask.push(matches!(passed, Value::Bool(true)));
+            }
+            Ok(Some(mask))
+        }
+        Expr::IsNull(inner, negated) => match simple_column(schema, inner) {
+            Some(index) => {
+                let column = chunk.column(index);
+                Ok(Some((0..chunk.len()).map(|i| column.is_null(i) != *negated).collect()))
+            }
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
 /// Drops rows whose predicate does not evaluate to true.
 pub struct Filter {
     child: Box<dyn PhysicalOperator>,
@@ -328,21 +397,29 @@ impl PhysicalOperator for Filter {
                 return Ok(None);
             };
             let schema = self.child.schema();
-            let mut keep = Vec::new();
-            let mut row = Vec::with_capacity(chunk.num_columns());
-            for i in 0..chunk.len() {
-                chunk.row_into(i, &mut row);
-                if eval_predicate_bound(
-                    ctx.db,
-                    ctx.trx,
-                    &self.predicate,
-                    schema,
-                    &row,
-                    ctx.outer,
-                )? {
-                    keep.push(i);
+            let keep: Vec<usize> = match predicate_mask(&self.predicate, &chunk, schema)? {
+                Some(mask) => {
+                    mask.iter().enumerate().filter_map(|(i, &pass)| pass.then_some(i)).collect()
                 }
-            }
+                None => {
+                    let mut keep = Vec::new();
+                    let mut row = Vec::with_capacity(chunk.num_columns());
+                    for i in 0..chunk.len() {
+                        chunk.row_into(i, &mut row);
+                        if eval_predicate_bound(
+                            ctx.db,
+                            ctx.trx,
+                            &self.predicate,
+                            schema,
+                            &row,
+                            ctx.outer,
+                        )? {
+                            keep.push(i);
+                        }
+                    }
+                    keep
+                }
+            };
             if !keep.is_empty() {
                 return Ok(Some(chunk.take(&keep)));
             }

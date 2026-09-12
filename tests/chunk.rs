@@ -120,6 +120,23 @@ fn lsm_engine_matches() {
 }
 
 #[test]
+fn vectorized_predicates_match() {
+    assert_same(
+        "create table t (id int, a int, b int, score float, name char(4));\
+         insert into t values (1,1,1,1.5,'x'),(2,1,2,2.5,'y'),(3,null,3,null,null);\
+         select * from t where a = b;\
+         select * from t where a <> b;\
+         select * from t where score > 1.5;\
+         select * from t where id = 1 or id = 3;\
+         select * from t where (id >= 1 and score < 3.0) or name = 'y';\
+         select * from t where a is null;\
+         select * from t where a is not null;\
+         select * from t where name = 'x';\
+         select * from t where a + b > 2;",
+    );
+}
+
+#[test]
 fn aggregate_edge_cases_match() {
     assert_same(
         "create table t (id int, v int, f float, name char(4));\
