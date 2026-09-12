@@ -1014,6 +1014,35 @@ fn encode_join_key(
     Ok(Some(encoded))
 }
 
+/// Resolves hash-join keys that are plain columns to their schema positions.
+fn key_indices(keys: &[Expr], schema: &Schema) -> Option<Vec<usize>> {
+    let mut indices = Vec::with_capacity(keys.len());
+    for key in keys {
+        let index = match key {
+            Expr::Column(name) => schema.columns.iter().position(|c| &c.name == name)?,
+            Expr::QualifiedColumn(owner, name) => schema
+                .columns
+                .iter()
+                .position(|c| c.owner.as_deref() == Some(owner) && &c.name == name)?,
+            _ => return None,
+        };
+        indices.push(index);
+    }
+    Some(indices)
+}
+
+fn encode_row_key(indices: &[usize], row: &[Value]) -> Result<Option<Vec<Vec<u8>>>> {
+    let mut encoded = Vec::with_capacity(indices.len());
+    for &index in indices {
+        let value = &row[index];
+        if matches!(value, Value::Null) {
+            return Ok(None);
+        }
+        encoded.push(encode_key(value)?);
+    }
+    Ok(Some(encoded))
+}
+
 /// Hash equi-join: builds a hash table on one side, then streams the other
 /// side in chunks, preserving row order. Supports INNER/LEFT (build right)
 /// and RIGHT (build left).
@@ -1030,6 +1059,7 @@ pub struct HashJoin {
     probe_is_right: bool,
     probe_keys: Vec<Expr>,
     probe_schema: Schema,
+    probe_key_indices: Option<Vec<usize>>,
     probe_open: bool,
     probe_done: bool,
     pending: VecDeque<Vec<Value>>,
@@ -1059,11 +1089,39 @@ impl HashJoin {
             probe_is_right: false,
             probe_keys: Vec::new(),
             probe_schema: Schema::default(),
+            probe_key_indices: None,
             probe_open: false,
             probe_done: false,
             pending: VecDeque::new(),
             left_cols: 0,
             right_cols: 0,
+        }
+    }
+
+    /// Encodes one probe row's join key straight from its columns, without a
+    /// row context; `None` means a NULL key (never matches).
+    fn probe_key(
+        &self,
+        chunk: &Chunk,
+        i: usize,
+        ctx: &mut ExecContext<'_>,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        match &self.probe_key_indices {
+            Some(indices) => {
+                let mut encoded = Vec::with_capacity(indices.len());
+                for &index in indices {
+                    let value = chunk.column(index).value(i);
+                    if matches!(value, Value::Null) {
+                        return Ok(None);
+                    }
+                    encoded.push(encode_key(&value)?);
+                }
+                Ok(Some(encoded))
+            }
+            None => {
+                let row = chunk.row(i);
+                encode_join_key(&self.probe_keys, &self.probe_schema, &row, ctx.db, ctx.trx)
+            }
         }
     }
 
@@ -1096,11 +1154,20 @@ impl HashJoin {
         };
 
         for i in 0..chunk.len() {
+            let key = self.probe_key(&chunk, i, ctx)?;
+            let matches = key.as_ref().and_then(|k| self.table.get(k));
+            let outer = if self.probe_is_right {
+                self.kind == JoinKind::Right
+            } else {
+                self.kind == JoinKind::Left
+            };
+            let has_match = matches.is_some_and(|indices| !indices.is_empty());
+            if !has_match && !outer {
+                continue;
+            }
             let row = chunk.row(i);
-            let key =
-                encode_join_key(&self.probe_keys, &self.probe_schema, &row, ctx.db, ctx.trx)?;
             let mut matched = false;
-            if let Some(indices) = key.as_ref().and_then(|k| self.table.get(k)) {
+            if let Some(indices) = matches {
                 for &build_index in indices {
                     let mut combined = if self.probe_is_right {
                         self.build_rows[build_index].clone()
@@ -1118,18 +1185,17 @@ impl HashJoin {
                     }
                 }
             }
-            if !matched {
-                if self.probe_is_right {
-                    if self.kind == JoinKind::Right {
-                        let mut combined = vec![Value::Null; self.left_cols];
-                        combined.extend(row.iter().cloned());
-                        self.pending.push_back(combined);
-                    }
-                } else if self.kind == JoinKind::Left {
-                    let mut combined = row.clone();
-                    combined.extend(vec![Value::Null; self.right_cols]);
-                    self.pending.push_back(combined);
-                }
+            if !matched && outer {
+                let combined = if self.probe_is_right {
+                    let mut nulls = vec![Value::Null; self.left_cols];
+                    nulls.extend(row.iter().cloned());
+                    nulls
+                } else {
+                    let mut left = row.clone();
+                    left.extend(vec![Value::Null; self.right_cols]);
+                    left
+                };
+                self.pending.push_back(combined);
             }
         }
         Ok(true)
@@ -1177,8 +1243,13 @@ impl PhysicalOperator for HashJoin {
         } else {
             (self.left.schema().clone(), self.left_keys.clone())
         };
+        let build_key_indices = key_indices(&build_keys, &build_schema);
         for (i, row) in build_rows.iter().enumerate() {
-            if let Some(key) = encode_join_key(&build_keys, &build_schema, row, ctx.db, ctx.trx)? {
+            let key = match &build_key_indices {
+                Some(indices) => encode_row_key(indices, row)?,
+                None => encode_join_key(&build_keys, &build_schema, row, ctx.db, ctx.trx)?,
+            };
+            if let Some(key) = key {
                 self.table.entry(key).or_default().push(i);
             }
         }
@@ -1191,6 +1262,7 @@ impl PhysicalOperator for HashJoin {
             self.probe_keys = self.left_keys.clone();
             self.probe_schema = self.left.schema().clone();
         }
+        self.probe_key_indices = key_indices(&self.probe_keys, &self.probe_schema);
         Ok(())
     }
 
