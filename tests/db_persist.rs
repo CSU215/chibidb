@@ -90,3 +90,30 @@ fn reopen_rejects_corrupt_catalog() {
     std::fs::write(dir.path().join("catalog.bin"), b"garbage!!!").unwrap();
     assert!(Database::open(dir.path()).is_err());
 }
+
+#[test]
+fn catalog_save_is_atomic_and_ignores_stale_temp() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Database::open(dir.path()).unwrap();
+        db.execute_sql("create table t (id int);").unwrap();
+        db.execute_sql("insert into t values (1);").unwrap();
+    }
+    // The atomic replace must not leave its temp file behind.
+    assert!(
+        !dir.path().join("catalog.tmp").exists(),
+        "temp catalog file should be renamed away"
+    );
+
+    // A leftover temp file from a crashed writer is ignored: recovery reads
+    // catalog.bin, which is always a complete image.
+    std::fs::write(dir.path().join("catalog.tmp"), b"torn write").unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let rs = db.execute_sql("select count(*) from t;").unwrap();
+    match &rs[0] {
+        chibidb::ResultSet::Rows { rows, .. } => {
+            assert_eq!(rows[0][0], chibidb::value::Value::Int(1))
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
