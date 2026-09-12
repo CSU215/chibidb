@@ -12,6 +12,7 @@ use crate::value::Value;
 use crate::{Database, Error, Result};
 
 use super::aggregate::{expr_has_aggregate, sort_rows};
+use super::chunk::{CHUNK_ROWS, Chunk, Column};
 use super::eval::{eval_const, EvalCtx};
 use super::subquery::{eval_bound, eval_predicate_bound};
 
@@ -36,6 +37,24 @@ pub trait PhysicalOperator {
     fn schema(&self) -> &Schema;
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()>;
     fn next(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>>;
+
+    /// Emits one columnar batch, or `None` at EOF.
+    ///
+    /// The default bridges the row interface, so every operator already works
+    /// in chunk mode; operators with a native columnar path override this and
+    /// [`PhysicalOperator::chunk_native`].
+    fn next_chunk(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Chunk>> {
+        match self.next(ctx)? {
+            Some(row) => Ok(Some(Chunk::from_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether [`PhysicalOperator::next_chunk`] is a native columnar path.
+    fn chunk_native(&self) -> bool {
+        false
+    }
+
     fn close(&mut self) -> Result<()>;
 
     /// Commands (DML) perform their work in `open` and yield no rows.
@@ -116,6 +135,36 @@ impl PhysicalOperator for TableScan {
                 return Ok(Some(row));
             }
         }
+    }
+
+    fn next_chunk(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Chunk>> {
+        let mut chunk = Chunk::with_schema(&self.schema);
+        while chunk.len() < CHUNK_ROWS {
+            let (creator, deleter, row) = {
+                let scanner = self.scanner.as_mut().expect("table scan not opened");
+                match scanner.next(&ctx.db.pool)? {
+                    Some((_, record)) => match &self.keep {
+                        Some(keep) => {
+                            crate::storage::codec::decode_record_pruned(
+                                &record,
+                                ctx.db.lobs(),
+                                keep,
+                            )?
+                        }
+                        None => decode_record(&record, ctx.db.lobs())?,
+                    },
+                    None => break,
+                }
+            };
+            if ctx.trx.visible(creator, deleter) {
+                chunk.push_row(&row)?;
+            }
+        }
+        Ok((!chunk.is_empty()).then_some(chunk))
+    }
+
+    fn chunk_native(&self) -> bool {
+        true
     }
 
     fn close(&mut self) -> Result<()> {
@@ -223,6 +272,16 @@ impl PhysicalOperator for ConstantScan {
     }
 }
 
+/// Resolves a bare column reference against `schema` for the zero-copy
+/// projection path; `None` means fall back to row-wise evaluation.
+fn simple_column(schema: &Schema, expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::Column(name) => schema.resolve(None, name).ok(),
+        Expr::QualifiedColumn(owner, name) => schema.resolve(Some(owner), name).ok(),
+        _ => None,
+    }
+}
+
 /// Drops rows whose predicate does not evaluate to true.
 pub struct Filter {
     child: Box<dyn PhysicalOperator>,
@@ -260,6 +319,37 @@ impl PhysicalOperator for Filter {
                 return Ok(Some(row));
             }
         }
+    }
+
+    fn next_chunk(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Chunk>> {
+        loop {
+            let Some(chunk) = self.child.next_chunk(ctx)? else {
+                return Ok(None);
+            };
+            let schema = self.child.schema();
+            let mut keep = Vec::new();
+            let mut row = Vec::with_capacity(chunk.num_columns());
+            for i in 0..chunk.len() {
+                chunk.row_into(i, &mut row);
+                if eval_predicate_bound(
+                    ctx.db,
+                    ctx.trx,
+                    &self.predicate,
+                    schema,
+                    &row,
+                    ctx.outer,
+                )? {
+                    keep.push(i);
+                }
+            }
+            if !keep.is_empty() {
+                return Ok(Some(chunk.take(&keep)));
+            }
+        }
+    }
+
+    fn chunk_native(&self) -> bool {
+        true
     }
 
     fn close(&mut self) -> Result<()> {
@@ -306,6 +396,35 @@ impl PhysicalOperator for Project {
             out.push(eval_bound(ctx.db, ctx.trx, expr, Some(&eval_ctx))?);
         }
         Ok(Some(out))
+    }
+
+    fn next_chunk(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Chunk>> {
+        let Some(chunk) = self.child.next_chunk(ctx)? else {
+            return Ok(None);
+        };
+        let schema = self.child.schema();
+        let mut columns = Vec::with_capacity(self.exprs.len());
+        let mut row = Vec::with_capacity(chunk.num_columns());
+        for expr in &self.exprs {
+            // Bare column: reuse the source column without touching rows.
+            if let Some(index) = simple_column(schema, expr) {
+                columns.push(chunk.column(index).clone());
+                continue;
+            }
+            let mut values = Vec::with_capacity(chunk.len());
+            for i in 0..chunk.len() {
+                chunk.row_into(i, &mut row);
+                let mut eval_ctx = EvalCtx::row(schema, &row);
+                eval_ctx.parent = ctx.outer;
+                values.push(eval_bound(ctx.db, ctx.trx, expr, Some(&eval_ctx))?);
+            }
+            columns.push(Column::from_values(&values)?);
+        }
+        Ok(Some(Chunk::from_columns(columns)))
+    }
+
+    fn chunk_native(&self) -> bool {
+        true
     }
 
     fn close(&mut self) -> Result<()> {
@@ -1090,6 +1209,24 @@ impl PhysicalOperator for IndexScan {
             }
         }
         Ok(None)
+    }
+
+    fn next_chunk(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Chunk>> {
+        let mut chunk = Chunk::with_schema(&self.schema);
+        while chunk.len() < CHUNK_ROWS && self.pos < self.rids.len() {
+            let rid = self.rids[self.pos];
+            self.pos += 1;
+            let record = self.engine.get(&ctx.db.pool, rid)?;
+            let (creator, deleter, row) = decode_record(&record, ctx.db.lobs())?;
+            if ctx.trx.visible(creator, deleter) {
+                chunk.push_row(&row)?;
+            }
+        }
+        Ok((!chunk.is_empty()).then_some(chunk))
+    }
+
+    fn chunk_native(&self) -> bool {
+        true
     }
 
     fn close(&mut self) -> Result<()> {

@@ -73,7 +73,7 @@ impl DatabaseWriteLock {
 
 use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
-use crate::config::{Config, ConflictStrategy, EngineKind};
+use crate::config::{Config, ConflictStrategy, EngineKind, ExecutionMode};
 use crate::index::{encode_key, BTree};
 use crate::pipeline::{ExecuteStage, OptimizeStage, Pipeline, ResolveStage, SqlEvent};
 use crate::storage::codec::{decode_record, encode_record};
@@ -1106,8 +1106,14 @@ fn run_plan(
 ) -> Result<()> {
     let mut ctx = crate::exec::operator::ExecContext { db, trx: session.trx(), outer: None };
     plan.open(&mut ctx)?;
-    while let Some(row) = plan.next(&mut ctx)? {
-        out.push(row);
+    if db.config().execution.mode == ExecutionMode::Chunk {
+        while let Some(chunk) = plan.next_chunk(&mut ctx)? {
+            out.extend(chunk.to_rows());
+        }
+    } else {
+        while let Some(row) = plan.next(&mut ctx)? {
+            out.push(row);
+        }
     }
     plan.close()?;
     Ok(())
