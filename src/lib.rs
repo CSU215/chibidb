@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 mod error;
 pub mod exec;
+pub mod ffi;
 pub mod index;
 pub mod net;
 pub mod sql;
