@@ -170,3 +170,12 @@ fn rejects_page_size_differing_from_build() {
     let dir = tempfile::tempdir().unwrap();
     assert!(Database::open_with_config(dir.path(), &cfg).is_err());
 }
+
+#[test]
+fn example_config_stays_valid() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let cfg = Config::from_toml_str(&text).unwrap();
+    cfg.validate().unwrap();
+    assert_eq!(cfg, Config::default());
+}
