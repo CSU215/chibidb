@@ -19,7 +19,7 @@ cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表�
 
 REPL / client 中输入 `exit` 或 `quit` 退出。
 
-启动时从当前目录读取 `config.toml`（缺失则全用默认值）。已生效条目：
+启动时从当前目录读取 `config.toml`（缺失则全用默认值）；可复制 `config.example.toml` 为起点，其中含各条目说明与默认值。已生效条目：
 `storage.buffer_pool_frames`、`storage.double_write`、`storage.default_engine`（`"heap"` / `"lsm"`）、
 `storage.inline_lob_limit`、`storage.lsm_compaction_trigger`、`wal.checkpoint_threshold`、`server.addr`、
 `server.http_addr`（可选，HTTP/JSON 监听）、`server.mysql_addr`（可选，MySQL wire 监听）、

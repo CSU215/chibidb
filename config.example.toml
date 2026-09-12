@@ -1,0 +1,66 @@
+# chibidb 示例配置
+#
+# 用法：复制为 config.toml，程序启动时会从当前工作目录读取（缺失则全部使用默认值）。
+#   Copy-Item config.example.toml config.toml
+#
+# 所有条目都可省略，省略即采用下面的默认值。
+# 配置为严格模式（deny_unknown_fields）：出现未知条目会直接报错。
+
+[storage]
+# 新建表的默认存储引擎：heap（堆表 + B+ 树）或 lsm（分级 LSM）。
+# 已存在的表在文件头中记录自身引擎，不受此项影响。
+default_engine = "heap"
+
+# 页大小（字节，必须是 >= 512 的 2 的幂）。当前必须等于编译期 PAGE_SIZE（8192）。
+page_size = 8192
+
+# 缓冲池帧数（必须大于 0）。每帧一个页。
+buffer_pool_frames = 64
+
+# 是否启用 Double-Write Buffer，防止页半写。开启后 flush 前先写 dwb.bin。
+double_write = false
+
+# 行内 LOB 阈值（字节）。超过该长度的字符串外存为 lobs/<id>.lob 引用。
+inline_lob_limit = 4096
+
+# 活跃 SSTable 数量达到该值时触发一次自动 LSM 压实。
+lsm_compaction_trigger = 4
+
+[wal]
+# WAL 字节数超过该阈值且无未提交事务时，自动 checkpoint（刷盘 + 截断日志）。
+checkpoint_threshold = 8388608
+
+[server]
+# Text TCP 监听地址。
+addr = "127.0.0.1:5678"
+
+# 可选的 HTTP/JSON 前端监听地址；取消注释即可同时开启。
+# POST /query {"sql":"..."} -> {"results":[...]}，GET /health。
+# http_addr = "127.0.0.1:8080"
+
+# 可选的 MySQL wire 协议监听地址；取消注释即可用 mysql 客户端连接。
+# mysql_addr = "127.0.0.1:3306"
+
+# 启用的协议列表（预留）。
+protocols = ["text"]
+
+# 连接处理模型：per-connection（每连接一个阻塞线程）或 thread-pool（共享工作线程池）。
+thread_model = "per-connection"
+
+# thread_model = "thread-pool" 时的工作线程数（必须大于 0）。
+worker_threads = 4
+
+[execution]
+# 执行模型：volcano（行式火山算子，默认）或 chunk（批量，后续阶段预留）。
+mode = "volcano"
+
+[auth]
+# 是否强制认证/授权。开启后需先 LOGIN，SELECT/EXPLAIN 需 read，DML/DDL 需 write。
+enabled = false
+
+[transaction]
+# 写写冲突策略：fcw（先提交者胜，乐观，默认）或 2pl（悲观两阶段锁）。
+conflict = "fcw"
+
+# 2PL 模式下写者等待数据库锁的超时时间（毫秒）。
+lock_timeout_ms = 5000
