@@ -66,13 +66,17 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 
 ### 3.1 源码（`src/`）
 
+源码按层分组到子目录（`sql/`、`exec/`、`storage/`、`index/`、`catalog/`、`db/`、`net/`）；
+各模块在 `lib.rs` 用 `pub use` 保留了旧的扁平路径（如 `chibidb::value`、`crate::parser`），
+故内部与测试的 `crate::x` / `chibidb::x` 引用无需改动。
+
 | 文件 | 职责 | 关键类型/入口 |
 |---|---|---|
 | `main.rs` | 二进制入口：REPL / `serve` / `client` 子命令 | |
 | `lib.rs` | **核心门面**：`Database`、打开/建库、会话执行、存储操作、索引维护、undo 回滚 | `Database::open` / `open_in_memory` / `execute_sql` / `execute_sql_with` |
-| `lexer.rs` | 分词：整数/浮点/字符串/标识符/标点/`--` 注释 | `lex(src) -> Result<Vec<Token>>` |
-| `parser.rs` | 递归下降解析全部 SQL（文法见 §5） | `parse(sql) -> Result<Vec<Stmt>>` |
-| `ast.rs` | AST：`Stmt` / `Expr` / `SelectStmt` / DDL / `TrxCtl` 等 | |
+| `sql/lexer.rs` | 分词：整数/浮点/字符串/标识符/标点/`--` 注释 | `lex(src) -> Result<Vec<Token>>` |
+| `sql/parser.rs` | 递归下降解析全部 SQL（文法见 §5） | `parse(sql) -> Result<Vec<Stmt>>` |
+| `sql/ast.rs` | AST：`Stmt` / `Expr` / `SelectStmt` / DDL / `TrxCtl` 等 | |
 | `exec/mod.rs` | 执行器入口：语句分发、DDL（`SELECT`/DML 必须走算子计划，此处报错）、`coerce` | `execute(db, trx, stmt)` |
 | `exec/dml.rs` | DML 命令算子：`InsertOp`/`UpdateOp`/`DeleteOp`（`open` 执行写入、`next` 无行、`output_kind = Command`） | |
 | `exec/eval.rs` | 表达式双上下文求值（`EvalCtx` 带父链的 Row/Group 作用域，`resolve_column` 逐层向外）、算子、三值逻辑、LIKE、标量函数、`eval_const` | `eval` / `eval_const` |
@@ -80,18 +84,19 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOK
 | `exec/plan.rs` | EXPLAIN 计划、规则式索引访问路径（sargable）、同列上下界合并为范围扫、**有序索引扫描判定**（`order_by_matches`）、`plan_index_scan` | `execute_explain` / `plan_index_scan` |
 | `exec/operator.rs` | 火山算子：`PhysicalOperator`（`output_kind`）+ `ExecContext{db,trx,outer}` + `TableScan`/`IndexScan`/`ViewScan`/`ConstantScan`/`Filter`/`Project`/`Distinct`/`Sort`/`GroupBy`/`NestedLoopJoin`/`HashJoin`/`Union`/`Limit`；`build_select`/`build_statement` 递归建树；`Database::collect_plan` 驱动 | |
 | `exec/subquery.rs` | 子查询（IN/EXISTS/标量）：按当前外层行构建并运行算子子计划，改写为字面量；`eval_bound`/`eval_predicate_bound` 是接入点 | `bind_expr` |
-| `value.rs` | `Value`：Null/Bool/Int(i64)/Float(f64)/Str/Date(i32 纪元天数)/Text | Display 决定 REPL 输出 |
-| `datetime.rs` | 日期校验：civil-date 算法（Hinnant），`'YYYY-MM-DD'` 比较时隐式转日期 | `parse_date` |
-| `trx.rs` | 事务：`Session`（trx + `current_db`）/ `TrxState`（id+快照+undo）/ 可见性判定 / `Undo` | `TrxState::visible` |
-| `result.rs` | `ResultSet::Message / Rows` | |
-| `render.rs` | 对齐表格渲染（REPL 与 client 共用） | `write_result` |
-| `repl.rs` | 本地 REPL（`db>` 提示符、exit/quit），持 `Instance` | `run_repl` |
-| `server.rs` | tokio 只负责 accept；`ThreadHandler` 把连接派发到阻塞线程（`per-connection` 或 `thread-pool`，config `server.thread_model`/`worker_threads`），同步执行 SQL | `serve(SharedInstance, TcpListener)` |
-| `client.rs` | TCP 客户端 | `run_client` |
-| `wire.rs` | ResultSet/帧二进制编解码 | `encode_result_frame` / `decode_frame` |
-| `protocol.rs` | 前端编解码接缝：`Protocol` trait + `TextProtocol`（`[u32 len][sql]` 请求 / 帧响应） | `decode_request` / `encode_success` / `encode_failure` |
-| `pipeline.rs` | SQL 阶段：`Stage`/`Pipeline`/`SqlEvent`；`ResolveStage`（表/视图存在性）、`OptimizeStage`（记录 `plan` 文本 + 建单表算子物理计划）、`ExecuteStage`（优先跑算子，否则 `exec::execute`） | `Pipeline::run` |
-| `instance.rs` | 单实例多库：数据根 `<db>/` + 系统库 `chibi_meta/`；每库一个 `parking_lot::Mutex<Database>`（**跨库并行、库内串行**），系统库同样受锁保护；`execute_with` 顶层入口（拦截库/用户/权限语句，其余路由到 current_db） | `Instance::open` / `execute_with` / `with_database_mut` |
+| `sql/value.rs` | `Value`：Null/Bool/Int(i64)/Float(f64)/Str/Date(i32 纪元天数)/Text | Display 决定 REPL 输出 |
+| `sql/datetime.rs` | 日期校验：civil-date 算法（Hinnant），`'YYYY-MM-DD'` 比较时隐式转日期 | `parse_date` |
+| `db/trx.rs` | 事务：`Session`（trx + `current_db`）/ `TrxState`（id+快照+undo）/ 可见性判定 / `Undo` | `TrxState::visible` |
+| `db/transaction.rs` | 事务簿记：id 分配、`committed`/`open` 集合、快照、FCW/2PL 校验辅助 | `TransactionManager` |
+| `sql/result.rs` | `ResultSet::Message / Rows` | |
+| `net/render.rs` | 对齐表格渲染（REPL 与 client 共用） | `write_result` |
+| `net/repl.rs` | 本地 REPL（`db>` 提示符、exit/quit），持 `Instance` | `run_repl` |
+| `net/server.rs` | tokio 只负责 accept；`ThreadHandler` 把连接派发到阻塞线程（`per-connection` 或 `thread-pool`，config `server.thread_model`/`worker_threads`），同步执行 SQL | `serve(SharedInstance, TcpListener)` |
+| `net/client.rs` | TCP 客户端 | `run_client` |
+| `net/wire.rs` | ResultSet/帧二进制编解码 | `encode_result_frame` / `decode_frame` |
+| `net/protocol.rs` | 前端编解码接缝：`Protocol` trait + `TextProtocol`（`[u32 len][sql]` 请求 / 帧响应） | `decode_request` / `encode_success` / `encode_failure` |
+| `sql/pipeline.rs` | SQL 阶段：`Stage`/`Pipeline`/`SqlEvent`；`ResolveStage`（表/视图存在性）、`OptimizeStage`（记录 `plan` 文本 + 建单表算子物理计划）、`ExecuteStage`（优先跑算子，否则 `exec::execute`） | `Pipeline::run` |
+| `db/instance.rs` | 单实例多库：数据根 `<db>/` + 系统库 `chibi_meta/`；每库一个 `parking_lot::Mutex<Database>`（**跨库并行、库内串行**），系统库同样受锁保护；`execute_with` 顶层入口（拦截库/用户/权限语句，其余路由到 current_db） | `Instance::open` / `execute_with` / `with_database_mut` |
 | `config.rs` | 全局配置中心：`Config`（storage/wal/server/execution/auth），`config.toml` 加载、默认值、校验 | `Config::load` / `from_toml_str` / `validate` |
 | `catalog/mod.rs` | `Catalog`：`Table`/`HeapStore`/`IndexEntry`、`Schema`/`ColumnDesc`（带 `owner`）、`resolve()` 歧义检测 | |
 | `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT6** + 统一文件头（事务簿记 + 视图定义 + 列约束 + 唯一索引标记） | `CatalogSnapshot` |
@@ -244,7 +249,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 ### 6.2 MVCC 现状（M12.1）
 
 - 每条堆记录物理格式：`[u32 creator_trx][u32 deleter_trx][行 codec]`（见 `codec::encode_record/decode_record`）
-- 事务状态在 `trx.rs`：
+- 事务状态在 `db/trx.rs`：
   - `Session { trx: Option<TrxState> }`（server 每连接一个；REPL 一个）
   - `TrxState { id, snapshot: HashSet<u32> 已提交集合快照, undo, explicit }`
   - 可见性：creator ∈ {0, self, snapshot} 且 deleter=0 或 deleter=self 的反向规则——
@@ -257,7 +262,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
   - UPDATE → 标记旧版本 + 追加新版本（新 Rid）；索引只追加新键项，旧项靠读时可见性过滤；undo 删新版本+索引项+解除旧标记
 - 提交：`committed_trxs.insert(id)` 后，**只有写事务**（undo 非空）才追加 Commit 帧 + `wal.sync()` + `save_catalog()`；只读事务只更新内存 committed 集就返回（无版本行引用其 id，落盘无意义，且避免每条 SELECT 重写 catalog）
 - 读路径统一走 `decode_visible(records, trx)`；JOIN 流水线、索引扫描（store_get_records）都要过这层
-- 并发模型：全局单 Mutex 串行化，允许多个 BEGIN 并存但执行串行；连接断开时应 `rollback_session`（server.rs 当前在连接结束路径，确认已接入）
+- 并发模型：全局单 Mutex 串行化，允许多个 BEGIN 并存但执行串行；连接断开时应 `rollback_session`（net/server.rs 当前在连接结束路径，确认已接入）
 - 索引与可见性：索引本身**不含** trx 信息，扫到 rid 后回表 + 可见性过滤；UPDATE/DELETE 会积累 stale 索引项（空间债）
 
 ### 6.3 WAL + 崩溃恢复（M12.3，已实现）
@@ -390,7 +395,7 @@ DML 先算子化（P5.5），使执行层统一走算子。
 | P1 | 配置中心（`config.rs` + `config.toml` + 接入 DB/server） | ✅ |
 | P1.3 | 文件头 `format_version/page_size/engine` 元数据 | ⏩ 延到 P6（`PAGE_SIZE` 现为编译期常量，动态化随存储抽象做） |
 | P2 | 抽象接缝：存储读接口 `RowScanner`/`TableEngine` + `HeapEngine`；`Protocol`/`TextProtocol` 编解码；`Stage`/`Pipeline` + `ExecuteStage` | 🟡 三个接缝落地（`d220fcb`、`7b351d6`、`9c5199a`） |
-| P2+ | 其余接缝：`TransactionManager`、`PhysicalOperator` | ✅ `PhysicalOperator` 于 P5 落地；`TransactionManager` 抽出（`src/transaction.rs`：id 分配、`committed`/`open` 集合、快照、校验辅助；`Database` 改持 `trx: TransactionManager` 并删除散落字段，行为不变）（`3153593`） |
+| P2+ | 其余接缝：`TransactionManager`、`PhysicalOperator` | ✅ `PhysicalOperator` 于 P5 落地；`TransactionManager` 抽出（`src/db/transaction.rs`：id 分配、`committed`/`open` 集合、快照、校验辅助；`Database` 改持 `trx: TransactionManager` 并删除散落字段，行为不变）（`3153593`） |
 | P3 | 单实例多库 + 系统元数据库 + 用户/权限 | 🟡 多库 + 前端接入 + 系统库 `chibi_meta`（`databases`/`users`/`privileges`）+ `CREATE/DROP USER` + `GRANT/REVOKE`（`e99c5ef`…`7d8a85f`）；认证/权限已强制（`d773d5e`）：`auth.enabled = true` 时，`LOGIN u IDENTIFIED BY 'p'` 认证并绑定会话；未登录报 `not logged in`，越权报 `permission denied`（SELECT/EXPLAIN 需 Read；DML/DDL 需 Write；用户/库管理仅需登录）；无用户时允许免登录 `CREATE USER` 作为引导。`information_schema` 已暴露（`b877b7a`）：`USE information_schema;` 后可 SELECT `schemata`/`tables`/`columns`（表名、引擎、列类型/约束），实现为每次查询把元数据物化进临时内存库再走常规执行器，只读；已登录用户可读（不额外校验权限）。P3 完成 |
 | P4 | Stage 流水线（Parse/Resolve/Optimize/Execute/Result） | 🟡 `ResolveStage`/`OptimizeStage` 落地（`dc312de`）；Parse 仍在 pipeline 外、Execute 尚未消费 `plan`、Result 写出仍在前端 |
 | P5 | 执行模型：基准 → 火山算子 → Chunk | ✅ SELECT 全走算子（单/多表、`HashJoin`、分组聚合、DISTINCT、ORDER、LIMIT、UNION、视图、相关/不相关子查询）；物化 SELECT 主干已删除；Chunk 按评估暂缓 |
@@ -402,7 +407,7 @@ DML 先算子化（P5.5），使执行层统一走算子。
 
 **可观测性与性能探针（`aacb920`）**：`BufferPool` 增 `PoolStats { hits, misses, evictions }` 原子计数与 `BufferPool::stats()`，`Database::buffer_pool_stats()` 对外暴露。`tests/perf_stats.rs` 为 `#[ignore]` 探针（`cargo test --test perf_stats -- --ignored --nocapture`）：分级 LSM 的活跃表数随 flush 呈对数增长（64 次 flush 后 ≤9 张）；16 帧池下 1500 次主键点查命中率约 99%、有淘汰。 |
 | P8 | LOB（外存 + `LobReader` 流式） | ✅ P8.1：`src/storage/lob.rs`——`LobStore`（每对象一个 `<id>.lob` 文件，id 打开时按现存最大文件续号、删除不复用；`write/read/len/is_empty/reader/delete`）与 `LobReader`（`read` 小缓冲 / `next_chunk` 64KB 流式）；`tests/storage_lob.rs` 覆盖空/小/1MB 往返、小缓冲流式、跨 chunk、删除、重开续号（`0d48d50`）。P8.2 完成：行编解码接入 LOB——`Database` 增 `lobs: LobStore`（`<db>/lobs`）；`codec` 增 `LobResolver` trait、`TAG_LOB` 与 `encode_record/decode_record`（带 resolver）及 `encoded_row_size`；超过 `storage.inline_lob_limit` 的字符串编码为 LOB 引用、解码时解析回 `Value::Str`（`Value` 模型不变）；插入大小检查改用外存后尺寸，故超页文本也可存；WAL 记录存的是含引用的记录字节，恢复无需解析；`tests/lob_db.rs` 覆盖外存/读回、超页文本、checkpoint 重开、崩溃 WAL 恢复（`caef3e6`）。P8.3 完成：`codec::collect_lob_ids`（不解析、尽力扫描 `TAG_LOB` id）；`Database::free_lob_refs` 在物理删除记录时删除其 LOB——`rollback_trx`（Insert/Update 的新版本）与 `vacuum` 均调用；`tests/lob_db.rs` 增 vacuum 回收、回滚回收、更新后 vacuum 回收三例（`16ea4b8`）。DROP TABLE 亦在删表前扫描记录回收其 LOB（`27a2e85`）。P8.3b 完成：LOB 列剪裁——`codec::decode_record_pruned` + `TableScan` 的 `keep` 掩码，`build_select` 对单表无子查询查询做保守列引用分析，未被引用的 LOB 列跳过读取（`SELECT count(*)`/未投影列不读大对象；遇到 `*`/子查询/外部限定名则回退全量解码），`tests/lob_db.rs` 用「删掉 LOB 文件后查 count/id 仍成功、查 body 报错」证明（`d11e46c`）。**已知限制**：`LobReader` 单值仍整体物化为字符串（剪裁避免了不必要的读，但不做真正的流式消费） |
-| P9 | 多前端（MySQL/HTTP/Text TCP） | 🟡 HTTP/JSON 前端落地（`c17c8cf`）：`src/http.rs` 手写 HTTP/1.1（无新依赖），`POST /query`（JSON `{"sql":...}` → `{"results":[...]}`）、`GET /health`；每连接一个 `Session`（`LOGIN`/事务跨请求），keep-alive；由 `server.http_addr` 决定是否同时开第二个监听；`tests/http_frontend.rs` 覆盖查询/消息+错误/health。Text TCP 已有；MySQL wire 完成（`b09fd78`）：`src/mysql.rs` 手写 protocol 4.1（含内置 SHA-1），Handshake V10 + `mysql_native_password`（用户表增 `native` 列存 `SHA1(SHA1(pw))`，`auth.enabled` 时校验，否则放行）、`COM_QUERY` 文本结果集（列数/列定义/EOF/行/EOF，多结果集用 `SERVER_MORE_RESULTS_EXISTS`）、`COM_PING`/`COM_INIT_DB`/`COM_QUIT`；由 `server.mysql_addr` 选择监听；`tests/mysql_frontend.rs` 用最小客户端跑通握手+查询/错误+ping。预处理语句（`5e43f87`）：`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`，`?` 占位符按参数类型（int/float/string/null）绑定为字面量后执行。**限制**：仅文本结果集、列类型统一 `VAR_STRING`、无 SSL/二进制结果集 |
+| P9 | 多前端（MySQL/HTTP/Text TCP） | 🟡 HTTP/JSON 前端落地（`c17c8cf`）：`src/net/http.rs` 手写 HTTP/1.1（无新依赖），`POST /query`（JSON `{"sql":...}` → `{"results":[...]}`）、`GET /health`；每连接一个 `Session`（`LOGIN`/事务跨请求），keep-alive；由 `server.http_addr` 决定是否同时开第二个监听；`tests/http_frontend.rs` 覆盖查询/消息+错误/health。Text TCP 已有；MySQL wire 完成（`b09fd78`）：`src/net/mysql.rs` 手写 protocol 4.1（含内置 SHA-1），Handshake V10 + `mysql_native_password`（用户表增 `native` 列存 `SHA1(SHA1(pw))`，`auth.enabled` 时校验，否则放行）、`COM_QUERY` 文本结果集（列数/列定义/EOF/行/EOF，多结果集用 `SERVER_MORE_RESULTS_EXISTS`）、`COM_PING`/`COM_INIT_DB`/`COM_QUIT`；由 `server.mysql_addr` 选择监听；`tests/mysql_frontend.rs` 用最小客户端跑通握手+查询/错误+ping。预处理语句（`5e43f87`）：`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`，`?` 占位符按参数类型（int/float/string/null）绑定为字面量后执行。**限制**：仅文本结果集、列类型统一 `VAR_STRING`、无 SSL/二进制结果集 |
 | P10 | 并发：`ThreadHandler`（per-connection/thread-pool）+ 去全局锁 + 可配置冲突策略（FCW/2PL） | 🟡 P10.1：分库锁 + 去全局锁（`4984822`）+ `ThreadHandler` 双后端（`a1acc25`）。P10.2a：只读 autocommit 走本地快照事务，不写 `next_trx_id`/`open_trxs`/`committed_trxs`（`879c39e`）。P10.2b：`BufferPool` 元数据锁 + 每帧 `Mutex<PageData>`/`AtomicBool` 脏位，方法 `&self`（`f56694b`）。P10.2c：WAL 内部 `Mutex`（`f56c78d`）、Catalog `RwLock`（`9f8e801`）、事务簿记 `Atomic*`/`RwLock`（`64b52c1`）。P10.2d：`Database` 方法全 `&self`、读路径 `&Database`、`Instance` 每库 `RwLock<Database>`（读并发、写独占）（`2c70856`）。P10.3：`transaction.conflict = "fcw" | "2pl"`（`e068598`）。FCW：提交时按 `prev_deleter`/当前标记检测写写冲突并回滚失败方。2PL：每库悲观写锁（`Arc<DatabaseWriteLock>`，`Condvar` 等待 + `lock_timeout_ms`），显式事务在 `BEGIN`（取快照前）持锁至 `COMMIT/ROLLBACK`，自动提交写在语句内持锁；`Instance` 在取库锁前先取写锁，避免与 COMMIT 形成锁序死锁（`80596c1`）；`rollback_session` 释放。**P10 阶段完成** |
 
 工作纪律：每步先写失败测试（红）再最小实现（绿），提交粒度对齐 chibicc（一次一件事），
