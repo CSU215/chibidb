@@ -11,8 +11,8 @@ use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::config::{Config, ExecutionMode};
-use crate::Database;
+use chibidb::config::{Config, ExecutionMode};
+use chibidb::{Database, result};
 
 /// Opaque handle to an open database.
 pub struct ChibiDb {
@@ -98,7 +98,7 @@ pub extern "C" fn chibidb_exec(db: *mut ChibiDb, sql: *const c_char) -> i32 {
 pub extern "C" fn chibidb_query(db: *mut ChibiDb, sql: *const c_char) -> *mut c_char {
     let handle = if db.is_null() {
         set_error("null database handle");
-        return into_c_string("{\"error\":\"null database handle\"}".into());
+        return into_c_string(result::encode_error("null database handle"));
     } else {
         unsafe { &*db }
     };
@@ -106,15 +106,15 @@ pub extern "C" fn chibidb_query(db: *mut ChibiDb, sql: *const c_char) -> *mut c_
         Ok(value) => value,
         Err(error) => {
             set_error(&error);
-            return into_c_string(format!("{{\"error\":{}}}", crate::http::json_string(&error)));
+            return into_c_string(result::encode_error(&error));
         }
     };
     match handle.inner.execute_sql(&sql) {
-        Ok(results) => into_c_string(crate::http::encode_results(&results)),
+        Ok(results) => into_c_string(result::encode_results(&results)),
         Err(error) => {
             let message = error.to_string();
             set_error(&message);
-            into_c_string(format!("{{\"error\":{}}}", crate::http::json_string(&message)))
+            into_c_string(result::encode_error(&message))
         }
     }
 }

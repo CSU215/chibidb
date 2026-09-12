@@ -21,11 +21,11 @@ def library_path() -> str:
     if override:
         return override
     if sys.platform.startswith("win"):
-        names = ("chibidb.dll",)
+        names = ("chibidb_ffi.dll",)
     elif sys.platform == "darwin":
-        names = ("libchibidb.dylib",)
+        names = ("libchibidb_ffi.dylib",)
     else:
-        names = ("libchibidb.so",)
+        names = ("libchibidb_ffi.so",)
     for profile in ("release", "debug"):
         for name in names:
             candidate = os.path.join(ROOT, "target", profile, name)

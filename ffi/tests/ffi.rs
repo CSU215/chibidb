@@ -2,7 +2,9 @@
 
 use std::ffi::{CStr, CString, c_char};
 
-use chibidb::ffi::{chibidb_close, chibidb_exec, chibidb_free, chibidb_last_error, chibidb_open, chibidb_query};
+use chibidb_ffi::{
+    chibidb_close, chibidb_exec, chibidb_free, chibidb_last_error, chibidb_open, chibidb_query,
+};
 
 fn c(text: &str) -> CString {
     CString::new(text).unwrap()
