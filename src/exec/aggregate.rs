@@ -7,6 +7,7 @@ use crate::{Database, Error, Result};
 use super::eval::{
     cmp_values, eval, eval_binary, eval_const, expr_has_column, type_mismatch, EvalCtx,
 };
+use super::operator::{ExecContext, PhysicalOperator};
 use super::subquery::eval_bound;
 
 pub(crate) fn expr_has_aggregate(expr: &Expr) -> bool {
@@ -320,5 +321,198 @@ fn sort_groups(
     }
     pairs.sort_by(|(_, ka), (_, kb)| cmp_sort_keys(ka, kb, order_by));
     groups.extend(pairs.into_iter().map(|(g, _)| g));
+    Ok(())
+}
+
+/// A columnar aggregate for the common global shape: `SELECT agg(col)...
+/// FROM t` with no GROUP BY, HAVING, DISTINCT, ORDER BY or LIMIT and every
+/// projection a direct `count/sum/avg/min/max`.
+///
+/// Returns `Ok(None)` without consuming the child when the shape does not
+/// qualify, so the caller can fall back to [`grouped_select_rows`]. The
+/// accumulators mirror [`eval_aggregate`] (same comparators, same arithmetic,
+/// same NULL rules) so results are identical to the row path.
+pub(crate) fn chunk_global_aggregate(
+    ctx: &mut ExecContext<'_>,
+    schema: &Schema,
+    child: &mut dyn PhysicalOperator,
+    select: &SelectStmt,
+    exprs: &[Expr],
+) -> Result<Option<Vec<Vec<Value>>>> {
+    if !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(kinds) = exprs.iter().map(|e| agg_kind(schema, e)).collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    if kinds.is_empty() {
+        return Ok(None);
+    }
+
+    let mut states: Vec<AggState> = kinds.iter().map(|k| new_state(*k)).collect();
+    while let Some(chunk) = child.next_chunk(ctx)? {
+        for (kind, state) in kinds.iter().zip(states.iter_mut()) {
+            update_state(kind, state, &chunk)?;
+        }
+    }
+
+    let row = states
+        .into_iter()
+        .map(|state| match state {
+            AggState::Count(n) => Value::Int(n),
+            AggState::Sum(acc) => acc.unwrap_or(Value::Null),
+            AggState::Avg { total, count } => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Float(total / count as f64)
+                }
+            }
+            AggState::Min(best) | AggState::Max(best) => best.unwrap_or(Value::Null),
+        })
+        .collect();
+    Ok(Some(vec![row]))
+}
+
+#[derive(Clone, Copy)]
+enum AggKind {
+    /// `count(*)` when `None`, `count(col)` when `Some(column index)`.
+    Count(Option<usize>),
+    Sum(usize),
+    Avg(usize),
+    Min(usize),
+    Max(usize),
+}
+
+enum AggState {
+    Count(i64),
+    Sum(Option<Value>),
+    Avg { total: f64, count: i64 },
+    Min(Option<Value>),
+    Max(Option<Value>),
+}
+
+fn agg_kind(schema: &Schema, expr: &Expr) -> Option<AggKind> {
+    let Expr::Aggregate(func, arg, distinct) = expr else {
+        return None;
+    };
+    if *distinct {
+        return None;
+    }
+    let index = arg.as_deref().and_then(|a| column_index(schema, a));
+    match func {
+        AggFunc::Count => match arg {
+            None => Some(AggKind::Count(None)),
+            Some(_) => index.map(|i| AggKind::Count(Some(i))),
+        },
+        AggFunc::Sum => index.map(AggKind::Sum),
+        AggFunc::Avg => index.map(AggKind::Avg),
+        AggFunc::Min => index.map(AggKind::Min),
+        AggFunc::Max => index.map(AggKind::Max),
+    }
+}
+
+fn column_index(schema: &Schema, expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::Column(name) => schema.resolve(None, name).ok(),
+        Expr::QualifiedColumn(owner, name) => schema.resolve(Some(owner), name).ok(),
+        _ => None,
+    }
+}
+
+fn new_state(kind: AggKind) -> AggState {
+    match kind {
+        AggKind::Count(_) => AggState::Count(0),
+        AggKind::Sum(_) => AggState::Sum(None),
+        AggKind::Avg(_) => AggState::Avg { total: 0.0, count: 0 },
+        AggKind::Min(_) => AggState::Min(None),
+        AggKind::Max(_) => AggState::Max(None),
+    }
+}
+
+fn update_state(
+    kind: &AggKind,
+    state: &mut AggState,
+    chunk: &super::chunk::Chunk,
+) -> Result<()> {
+    match kind {
+        AggKind::Count(None) => {
+            let AggState::Count(n) = state else { unreachable!("count state") };
+            *n += chunk.len() as i64;
+        }
+        AggKind::Count(Some(index)) => {
+            let column = chunk.column(*index);
+            let AggState::Count(n) = state else { unreachable!("count state") };
+            for i in 0..chunk.len() {
+                if !column.is_null(i) {
+                    *n += 1;
+                }
+            }
+        }
+        AggKind::Sum(index) => {
+            let column = chunk.column(*index);
+            let AggState::Sum(acc) = state else { unreachable!("sum state") };
+            for i in 0..chunk.len() {
+                let value = column.value(i);
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                *acc = Some(match acc.take() {
+                    None => value,
+                    Some(prev) => eval_binary(BinOp::Add, prev, value)?,
+                });
+            }
+        }
+        AggKind::Avg(index) => {
+            let column = chunk.column(*index);
+            let AggState::Avg { total, count } = state else { unreachable!("avg state") };
+            for i in 0..chunk.len() {
+                match column.value(i) {
+                    Value::Null => {}
+                    Value::Int(n) => {
+                        *total += n as f64;
+                        *count += 1;
+                    }
+                    Value::Float(x) => {
+                        *total += x;
+                        *count += 1;
+                    }
+                    _ => return Err(type_mismatch()),
+                }
+            }
+        }
+        AggKind::Min(index) | AggKind::Max(index) => {
+            let is_min = matches!(kind, AggKind::Min(_));
+            let column = chunk.column(*index);
+            let best = match state {
+                AggState::Min(best) | AggState::Max(best) => best,
+                _ => unreachable!("min/max state"),
+            };
+            for i in 0..chunk.len() {
+                let value = column.value(i);
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                *best = Some(match best.take() {
+                    None => value,
+                    Some(prev) => {
+                        let ord = cmp_values(&prev, &value)?.ok_or_else(type_mismatch)?;
+                        let take = if is_min {
+                            ord == std::cmp::Ordering::Greater
+                        } else {
+                            ord == std::cmp::Ordering::Less
+                        };
+                        if take { value } else { prev }
+                    }
+                });
+            }
+        }
+    }
     Ok(())
 }

@@ -4,6 +4,7 @@ use crate::ast::{
     BinOp, DataType, Expr, JoinKind, Limit as LimitClause, SelectItem, SelectStmt, Stmt, TableRef,
 };
 use crate::catalog::{ColumnDesc, Schema};
+use crate::config::ExecutionMode;
 use crate::index::encode_key;
 use crate::storage::codec::decode_record;
 use crate::storage::engine::RowScanner;
@@ -621,22 +622,36 @@ impl PhysicalOperator for GroupBy {
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         self.child.open(ctx)?;
-        let mut filtered = Vec::new();
-        while let Some(row) = self.child.next(ctx)? {
-            filtered.push(row);
-        }
-        self.child.close()?;
         let schema = self.child.schema().clone();
-        let rows = super::aggregate::grouped_select_rows(
-            ctx.db,
-            ctx.trx,
-            ctx.outer,
-            &schema,
-            &self.select,
-            filtered,
-            self.exprs.clone(),
-        )?;
-        self.rows = rows;
+        let mut columnar = None;
+        if ctx.db.config().execution.mode == ExecutionMode::Chunk {
+            columnar = super::aggregate::chunk_global_aggregate(
+                ctx,
+                &schema,
+                self.child.as_mut(),
+                &self.select,
+                &self.exprs,
+            )?;
+        }
+        self.rows = match columnar {
+            Some(rows) => rows,
+            None => {
+                let mut filtered = Vec::new();
+                while let Some(row) = self.child.next(ctx)? {
+                    filtered.push(row);
+                }
+                super::aggregate::grouped_select_rows(
+                    ctx.db,
+                    ctx.trx,
+                    ctx.outer,
+                    &schema,
+                    &self.select,
+                    filtered,
+                    self.exprs.clone(),
+                )?
+            }
+        };
+        self.child.close()?;
         self.pos = 0;
         Ok(())
     }
@@ -648,6 +663,20 @@ impl PhysicalOperator for GroupBy {
         let row = self.rows[self.pos].clone();
         self.pos += 1;
         Ok(Some(row))
+    }
+
+    fn next_chunk(&mut self, _ctx: &mut ExecContext<'_>) -> Result<Option<Chunk>> {
+        if self.pos >= self.rows.len() {
+            return Ok(None);
+        }
+        let end = (self.pos + CHUNK_ROWS).min(self.rows.len());
+        let batch = Chunk::from_rows(&self.rows[self.pos..end])?;
+        self.pos = end;
+        Ok(Some(batch))
+    }
+
+    fn chunk_native(&self) -> bool {
+        true
     }
 
     fn close(&mut self) -> Result<()> {
