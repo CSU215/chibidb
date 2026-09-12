@@ -132,6 +132,19 @@ fn lsm_engine_matches() {
 }
 
 #[test]
+fn ordering_matches() {
+    assert_same(
+        "create table t (id int, v int);\
+         insert into t values (1,3),(2,1),(3,null),(4,2),(5,1);\
+         select id from t order by v;\
+         select id from t order by v desc;\
+         select id from t order by v asc, id desc;\
+         select id from t order by v limit 2;\
+         select count(*) as c, v from t group by v order by v;",
+    );
+}
+
+#[test]
 fn grouped_aggregates_match() {
     assert_same(
         "create table t (w int, v int);\

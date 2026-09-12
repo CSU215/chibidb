@@ -123,12 +123,13 @@ fn volcano_vs_chunk() {
     let volcano = build_mode(ExecutionMode::Volcano);
     let chunk = build_mode(ExecutionMode::Chunk);
     println!("rows: {N}");
-    let cases: [(&str, &str, u32); 5] = [
+    let cases: [(&str, &str, u32); 6] = [
         ("scan+project", "select id, tag from t;", 5),
         ("filter tag = 3", "select id from t where tag = 3;", 10),
         ("sum(tag)", "select sum(tag) from t;", 10),
         ("5 aggregates", "select count(*), sum(tag), avg(tag), min(tag), max(tag) from t;", 10),
         ("group by tag", "select tag, count(*) from t group by tag;", 5),
+        ("order by tag", "select id from t order by tag;", 3),
     ];
     for (label, sql, iterations) in cases {
         let row = per_op(iterations, || {
