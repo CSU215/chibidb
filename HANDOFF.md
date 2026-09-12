@@ -49,8 +49,8 @@ cargo run -q -- client [addr]   # 交互式客户端
 
 全链路冒烟（起 server → client 建表/插入/跨语句事务 → 强杀进程 → 复开验证 WAL 恢复）已脚本化：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1   # 期望输出 SMOKE OK
+```bash
+python3 scripts/smoke.py     # Windows: python scripts\smoke.py；期望输出 SMOKE OK
 ```
 
 启动时会在**当前工作目录**读取 `config.toml`（缺失即全用默认值）。已生效条目：

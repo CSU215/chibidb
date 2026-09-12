@@ -29,8 +29,8 @@ REPL / client 中输入 `exit` 或 `quit` 退出。
 
 ### 冒烟演示
 
-```powershell
-scripts\smoke.ps1
+```bash
+python3 scripts/smoke.py     # Windows: python scripts\smoke.py
 ```
 
 脚本会启动 server、通过 client 建表/插入/建索引/查询，随后强杀 server 进程
