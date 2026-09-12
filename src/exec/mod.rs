@@ -10,6 +10,7 @@ use crate::value::Value;
 use crate::{Database, Error, Result};
 
 mod aggregate;
+pub mod chunk;
 mod dml;
 mod eval;
 pub mod operator;
