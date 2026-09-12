@@ -50,7 +50,8 @@ thread_model = "per-connection"
 worker_threads = 4
 
 [execution]
-# 执行模型：volcano（行式火山算子，默认）或 chunk（批量，后续阶段预留）。
+# 执行模型：volcano（行式火山算子，默认）或 chunk（列式批处理：扫描/过滤/投影/全局聚合，
+# 其余算子自动回退行路径；两模式结果一致）。
 mode = "volcano"
 
 [auth]

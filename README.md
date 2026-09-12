@@ -24,6 +24,7 @@ REPL / client 中输入 `exit` 或 `quit` 退出。
 `storage.inline_lob_limit`、`storage.lsm_compaction_trigger`、`wal.checkpoint_threshold`、`server.addr`、
 `server.http_addr`（可选，HTTP/JSON 监听）、`server.mysql_addr`（可选，MySQL wire 监听）、
 `server.thread_model`/`worker_threads`、
+`execution.mode`（`"volcano"` 默认 / `"chunk"` 列式批处理，见下）、
 `transaction.conflict`（`"fcw"` / `"2pl"`）、`transaction.lock_timeout_ms`；
 其余为后续阶段预留（详见 `HANDOFF.md` §10 重构路线图）。
 
@@ -202,6 +203,10 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
 要点：单表 SELECT 会在扫描前先选定访问路径，命中索引时完全跳过堆扫描；AND 链里
 同一索引列的 `>`/`>=`/`<`/`<=` 会合并为一段 B+ 树范围扫；ORDER BY 恰为索引列升序时
 直接复用叶链顺序、跳过排序（EXPLAIN 为 `OrderedIndexScan`）；只读事务不重写 catalog。
+
+执行模型可选 `execution.mode = "chunk"`：扫描、过滤、投影与全局聚合走列式 `Chunk`
+批处理（`src/exec/chunk.rs`，`CHUNK_ROWS = 1024`），其余算子自动回退火山行路径；
+默认 `volcano` 行为不变。`tests/chunk.rs` 用差分测试保证两种模式结果逐字一致。
 
 ## 依赖
 
