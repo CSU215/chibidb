@@ -12,6 +12,21 @@ use crate::{Error, Result};
 pub trait RowScanner: Send {
     /// Returns the next `(Rid, encoded record)` pair, or `None` at EOF.
     fn next(&mut self, bp: &BufferPool) -> Result<Option<(Rid, Vec<u8>)>>;
+
+    /// Fills a batch of up to `max` records (fewer only at EOF).
+    ///
+    /// The default drains [`RowScanner::next`]; the heap already reads whole
+    /// pages into an internal buffer, so this still batches page I/O.
+    fn next_batch(&mut self, bp: &BufferPool, max: usize) -> Result<Vec<(Rid, Vec<u8>)>> {
+        let mut batch = Vec::new();
+        while batch.len() < max {
+            match self.next(bp)? {
+                Some(entry) => batch.push(entry),
+                None => break,
+            }
+        }
+        Ok(batch)
+    }
 }
 
 /// Read seam over a table's storage. The executor depends on this, not on the

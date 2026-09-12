@@ -69,6 +69,29 @@ fn heap_engine_get_missing_record_errors() {
 }
 
 #[test]
+fn scanner_can_drain_in_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = setup(&dir, "f.dbf");
+    let heap = HeapFile::init(&bp, f).unwrap();
+    for i in 0..25u8 {
+        heap.insert(&bp, &[i]).unwrap();
+    }
+
+    let engine = HeapEngine::new(f);
+    let mut scanner = engine.scan(&bp).unwrap();
+    let mut rows = Vec::new();
+    loop {
+        let batch = scanner.next_batch(&bp, 4).unwrap();
+        assert!(batch.len() <= 4);
+        if batch.is_empty() {
+            break;
+        }
+        rows.extend(batch.into_iter().map(|(_, rec)| rec[0]));
+    }
+    assert_eq!(rows, (0..25u8).collect::<Vec<_>>());
+}
+
+#[test]
 fn table_storage_supports_the_mvcc_version_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let (bp, f) = setup(&dir, "e.dbf");
