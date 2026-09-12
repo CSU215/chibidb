@@ -153,7 +153,7 @@ fn error_json(message: &str) -> String {
     format!("{{\"error\":{}}}", json_string(message))
 }
 
-fn encode_results(results: &[ResultSet]) -> String {
+pub(crate) fn encode_results(results: &[ResultSet]) -> String {
     let mut out = String::from("{\"results\":[");
     for (i, rs) in results.iter().enumerate() {
         if i > 0 {
@@ -207,7 +207,7 @@ fn json_value(v: &Value) -> String {
     }
 }
 
-fn json_string(s: &str) -> String {
+pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
