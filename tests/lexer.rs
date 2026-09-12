@@ -63,6 +63,31 @@ fn tokenizes_floats() {
 }
 
 #[test]
+fn tokenizes_scientific_notation() {
+    let toks = lex("1e5 1.5e-3 2E+4").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![
+            TokenKind::Float(1e5),
+            TokenKind::Float(1.5e-3),
+            TokenKind::Float(2e4),
+        ]
+    );
+    assert_eq!(toks[0].pos, 0);
+    assert_eq!(toks[1].pos, 4);
+    assert_eq!(toks[2].pos, 11);
+}
+
+#[test]
+fn exponent_requires_digits() {
+    let toks = lex("1example").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![TokenKind::Int(1), TokenKind::Ident("example".into())]
+    );
+}
+
+#[test]
 fn tokenizes_strings() {
     let toks = lex("'abc' ''").unwrap();
     assert_eq!(

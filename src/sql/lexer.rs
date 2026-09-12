@@ -47,12 +47,30 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                let kind = if i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit()
-                {
-                    i += 1;
-                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                let mut is_float =
+                    if i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
                         i += 1;
+                        while i < bytes.len() && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+                    let mut j = i + 1;
+                    if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+                        j += 1;
                     }
+                    if j < bytes.len() && bytes[j].is_ascii_digit() {
+                        is_float = true;
+                        i = j;
+                        while i < bytes.len() && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
+                }
+                let kind = if is_float {
                     TokenKind::Float(src[start..i].parse().unwrap())
                 } else {
                     let n: i64 = src[start..i].parse().map_err(|_| {
