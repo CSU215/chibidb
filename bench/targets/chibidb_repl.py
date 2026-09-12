@@ -3,7 +3,8 @@
 Each statement is written as one line and we read until the next ``db> ``
 prompt, so one round trip == one parsed statement. The child runs with its
 working directory set to the scratch data dir, so a repo ``config.toml``
-cannot redirect the engine or enable auth.
+cannot redirect the engine or enable auth. Set ``CHIBIDB_MODE=chunk`` (or
+``volcano``) to write that execution mode into the scratch dir's config.
 """
 
 from __future__ import annotations
@@ -15,6 +16,10 @@ import sys
 from benchkit import ROOT, Env, Target
 
 PROMPT = b"db> "
+
+
+def execution_mode() -> str:
+    return os.environ.get("CHIBIDB_MODE", "").strip().lower()
 
 
 def binary_path() -> str:
@@ -29,9 +34,9 @@ def binary_path() -> str:
     return os.path.join(ROOT, "target", "debug", name)
 
 
-class ChibidbTarget(Target):
-    id = "chibidb"
-    title = "chibidb (REPL subprocess)"
+class ChibidbReplTarget(Target):
+    id = "chibidb-repl"
+    title = "chibidb (REPL subprocess, stdio)"
 
     def __init__(self):
         self._proc = None
@@ -41,9 +46,14 @@ class ChibidbTarget(Target):
         path = binary_path()
         if not os.path.isfile(path):
             return False, "binary not built: %s (run cargo build)" % path
-        return True, path
+        mode = execution_mode()
+        return True, path + (" [mode=%s]" % mode if mode else "")
 
     def open(self, env: Env):
+        mode = execution_mode()
+        if mode:
+            with open(os.path.join(env.data_dir, "config.toml"), "w", encoding="utf-8") as fh:
+                fh.write('[execution]\nmode = "%s"\n' % mode)
         self._proc = subprocess.Popen(
             [binary_path(), env.data_dir],
             cwd=env.data_dir,
@@ -83,4 +93,4 @@ class ChibidbTarget(Target):
         return output
 
 
-TARGET = ChibidbTarget()
+TARGET = ChibidbReplTarget()
