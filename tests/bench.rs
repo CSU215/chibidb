@@ -5,12 +5,19 @@
 //!     cargo test --release --test bench -- --ignored --nocapture
 
 use chibidb::Database;
+use chibidb::config::{Config, ExecutionMode};
 use std::time::{Duration, Instant};
 
 const N: i64 = 50_000;
 
 fn build() -> Database {
-    let db = Database::open_in_memory().unwrap();
+    build_mode(ExecutionMode::Volcano)
+}
+
+fn build_mode(mode: ExecutionMode) -> Database {
+    let mut config = Config::default();
+    config.execution.mode = mode;
+    let db = Database::open_in_memory_with_config(&config).unwrap();
     db.execute_sql("create table t (id int, tag int);").unwrap();
     let chunk = 500i64;
     let mut i = 0i64;
@@ -106,6 +113,34 @@ fn materialized_execution_baseline() {
             db.execute_sql(sql).unwrap();
         });
         println!("{label:<18} {elapsed:>12?}");
+    }
+}
+
+/// Vectorized (chunk) vs row (volcano) execution on the same 50k-row table.
+#[test]
+#[ignore = "micro-benchmark; run with --ignored --nocapture"]
+fn volcano_vs_chunk() {
+    let volcano = build_mode(ExecutionMode::Volcano);
+    let chunk = build_mode(ExecutionMode::Chunk);
+    println!("rows: {N}");
+    let cases: [(&str, &str, u32); 5] = [
+        ("scan+project", "select id, tag from t;", 5),
+        ("filter tag = 3", "select id from t where tag = 3;", 10),
+        ("sum(tag)", "select sum(tag) from t;", 10),
+        ("5 aggregates", "select count(*), sum(tag), avg(tag), min(tag), max(tag) from t;", 10),
+        ("group by tag", "select tag, count(*) from t group by tag;", 5),
+    ];
+    for (label, sql, iterations) in cases {
+        let row = per_op(iterations, || {
+            volcano.execute_sql(sql).unwrap();
+        });
+        let vec = per_op(iterations, || {
+            chunk.execute_sql(sql).unwrap();
+        });
+        println!(
+            "{label:<16} volcano {row:>12?}   chunk {vec:>12?}   {:>5.2}x",
+            row.as_secs_f64() / vec.as_secs_f64()
+        );
     }
 }
 
