@@ -84,10 +84,22 @@ fn joins_match() {
     assert_same(
         "create table a (id int, x int);\
          create table b (id int, y int);\
-         insert into a values (1,10),(2,20),(3,30);\
-         insert into b values (1,100),(2,200);\
-         select a.id, x, y from a join b on a.id = b.id order by a.id;\
-         select a.id, y from a left join b on a.id = b.id order by a.id;",
+         insert into a values (1,10),(2,20),(3,30),(null,40);\
+         insert into b values (1,100),(1,101),(2,200),(null,300);\
+         select a.id, x, y from a join b on a.id = b.id;\
+         select a.id, x, y from a join b on a.id = b.id order by a.id, y;\
+         select a.id, y from a left join b on a.id = b.id;\
+         select a.id, y from a right join b on a.id = b.id;\
+         select a.id, x, y from a join b on a.id = b.id and a.x < b.y;\
+         select a.id, x, y from a join b on a.id = b.id and a.x = b.y;",
+    );
+    assert_same(
+        "create table a (id int, x int);\
+         create table b (id int, y int);\
+         insert into a values (1,1),(1,2),(2,1);\
+         insert into b values (1,1),(1,2),(2,2);\
+         select a.id from a join b on a.id = b.id and a.x = b.y;\
+         select a.id, b.id from a join b on a.id = b.id and a.x = b.y;",
     );
 }
 

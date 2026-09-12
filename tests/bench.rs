@@ -144,6 +144,54 @@ fn volcano_vs_chunk() {
     }
 }
 
+/// Hash join: streaming (chunk) vs materialized (volcano) on 50k x 50k rows.
+#[test]
+#[ignore = "micro-benchmark; run with --ignored --nocapture"]
+fn volcano_vs_chunk_join() {
+    fn setup(mode: ExecutionMode) -> Database {
+        let mut config = Config::default();
+        config.execution.mode = mode;
+        let db = Database::open_in_memory_with_config(&config).unwrap();
+        db.execute_sql("create table a (id int, v int);").unwrap();
+        db.execute_sql("create table b (id int, w int);").unwrap();
+        let chunk = 500i64;
+        let mut i = 0i64;
+        while i < N {
+            let mut sa = String::from("insert into a values ");
+            let mut sb = String::from("insert into b values ");
+            for j in i..(i + chunk).min(N) {
+                if j > i {
+                    sa.push(',');
+                    sb.push(',');
+                }
+                sa.push_str(&format!("({j},{})", j % 10));
+                sb.push_str(&format!("({j},{})", j % 7));
+            }
+            sa.push(';');
+            sb.push(';');
+            db.execute_sql(&sa).unwrap();
+            db.execute_sql(&sb).unwrap();
+            i += chunk;
+        }
+        db
+    }
+
+    let volcano = setup(ExecutionMode::Volcano);
+    let chunk = setup(ExecutionMode::Chunk);
+    println!("rows: {N} x {N}");
+    let sql = "select count(*) from a join b on a.id = b.id;";
+    let row = per_op(3, || {
+        volcano.execute_sql(sql).unwrap();
+    });
+    let vec = per_op(3, || {
+        chunk.execute_sql(sql).unwrap();
+    });
+    println!(
+        "join count(*)    volcano {row:>12?}   chunk {vec:>12?}   {:>5.2}x",
+        row.as_secs_f64() / vec.as_secs_f64()
+    );
+}
+
 /// Hash join throughput on two 50k-row tables.
 #[test]
 #[ignore = "micro-benchmark; run with --ignored --nocapture"]

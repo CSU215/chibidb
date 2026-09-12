@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::ast::{
     BinOp, DataType, Expr, JoinKind, Limit as LimitClause, SelectItem, SelectStmt, Stmt, TableRef,
@@ -1014,8 +1014,9 @@ fn encode_join_key(
     Ok(Some(encoded))
 }
 
-/// Hash equi-join: builds a hash table on one side and probes with the other.
-/// Supports INNER/LEFT (build right) and RIGHT (build left).
+/// Hash equi-join: builds a hash table on one side, then streams the other
+/// side in chunks, preserving row order. Supports INNER/LEFT (build right)
+/// and RIGHT (build left).
 pub struct HashJoin {
     left: Box<dyn PhysicalOperator>,
     right: Box<dyn PhysicalOperator>,
@@ -1024,8 +1025,16 @@ pub struct HashJoin {
     right_keys: Vec<Expr>,
     residual: Option<Expr>,
     schema: Schema,
-    rows: Vec<Vec<Value>>,
-    pos: usize,
+    table: HashMap<Vec<Vec<u8>>, Vec<usize>>,
+    build_rows: Vec<Vec<Value>>,
+    probe_is_right: bool,
+    probe_keys: Vec<Expr>,
+    probe_schema: Schema,
+    probe_open: bool,
+    probe_done: bool,
+    pending: VecDeque<Vec<Value>>,
+    left_cols: usize,
+    right_cols: usize,
 }
 
 impl HashJoin {
@@ -1045,17 +1054,98 @@ impl HashJoin {
             right_keys: keys.right_keys,
             residual: keys.residual,
             schema,
-            rows: Vec::new(),
-            pos: 0,
+            table: HashMap::new(),
+            build_rows: Vec::new(),
+            probe_is_right: false,
+            probe_keys: Vec::new(),
+            probe_schema: Schema::default(),
+            probe_open: false,
+            probe_done: false,
+            pending: VecDeque::new(),
+            left_cols: 0,
+            right_cols: 0,
         }
     }
 
-    fn residual_ok(&self, ctx: &mut ExecContext<'_>, row: &[Value]) -> Result<bool> {
-        match &self.residual {
-            None => Ok(true),
-            Some(predicate) => {
-                eval_predicate_bound(ctx.db, ctx.trx, predicate, &self.schema, row, ctx.outer)
+    /// Pulls one probe chunk and appends its joined rows to `pending`.
+    /// Returns `false` once the probe side is exhausted.
+    fn fill_output(&mut self, ctx: &mut ExecContext<'_>) -> Result<bool> {
+        if self.probe_done {
+            return Ok(false);
+        }
+        if !self.probe_open {
+            if self.probe_is_right {
+                self.right.open(ctx)?;
+            } else {
+                self.left.open(ctx)?;
             }
+            self.probe_open = true;
+        }
+        let pulled = {
+            let probe: &mut Box<dyn PhysicalOperator> =
+                if self.probe_is_right { &mut self.right } else { &mut self.left };
+            probe.next_chunk(ctx)?
+        };
+        let Some(chunk) = pulled else {
+            let probe: &mut Box<dyn PhysicalOperator> =
+                if self.probe_is_right { &mut self.right } else { &mut self.left };
+            probe.close()?;
+            self.probe_open = false;
+            self.probe_done = true;
+            return Ok(false);
+        };
+
+        for i in 0..chunk.len() {
+            let row = chunk.row(i);
+            let key =
+                encode_join_key(&self.probe_keys, &self.probe_schema, &row, ctx.db, ctx.trx)?;
+            let mut matched = false;
+            if let Some(indices) = key.as_ref().and_then(|k| self.table.get(k)) {
+                for &build_index in indices {
+                    let mut combined = if self.probe_is_right {
+                        self.build_rows[build_index].clone()
+                    } else {
+                        row.clone()
+                    };
+                    if self.probe_is_right {
+                        combined.extend(row.iter().cloned());
+                    } else {
+                        combined.extend(self.build_rows[build_index].iter().cloned());
+                    }
+                    if residual_ok(&self.residual, &self.schema, ctx, &combined)? {
+                        self.pending.push_back(combined);
+                        matched = true;
+                    }
+                }
+            }
+            if !matched {
+                if self.probe_is_right {
+                    if self.kind == JoinKind::Right {
+                        let mut combined = vec![Value::Null; self.left_cols];
+                        combined.extend(row.iter().cloned());
+                        self.pending.push_back(combined);
+                    }
+                } else if self.kind == JoinKind::Left {
+                    let mut combined = row.clone();
+                    combined.extend(vec![Value::Null; self.right_cols]);
+                    self.pending.push_back(combined);
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn residual_ok(
+    residual: &Option<Expr>,
+    schema: &Schema,
+    ctx: &mut ExecContext<'_>,
+    row: &[Value],
+) -> Result<bool> {
+    match residual {
+        None => Ok(true),
+        Some(predicate) => {
+            eval_predicate_bound(ctx.db, ctx.trx, predicate, schema, row, ctx.outer)
         }
     }
 }
@@ -1066,100 +1156,78 @@ impl PhysicalOperator for HashJoin {
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
-        let left_rows = drain(&mut self.left, ctx)?;
-        let right_rows = drain(&mut self.right, ctx)?;
-        let left_schema = self.left.schema().clone();
-        let right_schema = self.right.schema().clone();
-        let left_cols = left_schema.columns.len();
-        let right_cols = right_schema.columns.len();
-        let mut rows = Vec::new();
+        self.pending.clear();
+        self.table.clear();
+        self.build_rows.clear();
+        self.probe_open = false;
+        self.probe_done = false;
+        self.left_cols = self.left.schema().columns.len();
+        self.right_cols = self.right.schema().columns.len();
 
-        if self.kind == JoinKind::Right {
-            let mut table: HashMap<Vec<Vec<u8>>, Vec<usize>> = HashMap::new();
-            for (i, left) in left_rows.iter().enumerate() {
-                let key =
-                    encode_join_key(&self.left_keys, &left_schema, left, ctx.db, ctx.trx)?;
-                if let Some(key) = key {
-                    table.entry(key).or_default().push(i);
-                }
-            }
-            for right in &right_rows {
-                let key = encode_join_key(
-                    &self.right_keys,
-                    &right_schema,
-                    right,
-                    ctx.db,
-                    ctx.trx,
-                )?;
-                let mut matched = false;
-                if let Some(indices) = key.as_ref().and_then(|k| table.get(k)) {
-                    for &i in indices {
-                        let mut row = left_rows[i].clone();
-                        row.extend(right.iter().cloned());
-                        if self.residual_ok(ctx, &row)? {
-                            rows.push(row);
-                            matched = true;
-                        }
-                    }
-                }
-                if !matched {
-                    let mut row = vec![Value::Null; left_cols];
-                    row.extend(right.iter().cloned());
-                    rows.push(row);
-                }
-            }
+        let build_is_right = self.kind != JoinKind::Right;
+        self.probe_is_right = !build_is_right;
+
+        let build_rows = if build_is_right {
+            drain(&mut self.right, ctx)?
         } else {
-            let mut table: HashMap<Vec<Vec<u8>>, Vec<usize>> = HashMap::new();
-            for (i, right) in right_rows.iter().enumerate() {
-                let key = encode_join_key(
-                    &self.right_keys,
-                    &right_schema,
-                    right,
-                    ctx.db,
-                    ctx.trx,
-                )?;
-                if let Some(key) = key {
-                    table.entry(key).or_default().push(i);
-                }
-            }
-            for left in &left_rows {
-                let key =
-                    encode_join_key(&self.left_keys, &left_schema, left, ctx.db, ctx.trx)?;
-                let mut matched = false;
-                if let Some(indices) = key.as_ref().and_then(|k| table.get(k)) {
-                    for &i in indices {
-                        let mut row = left.clone();
-                        row.extend(right_rows[i].iter().cloned());
-                        if self.residual_ok(ctx, &row)? {
-                            rows.push(row);
-                            matched = true;
-                        }
-                    }
-                }
-                if !matched && self.kind == JoinKind::Left {
-                    let mut row = left.clone();
-                    row.extend(vec![Value::Null; right_cols]);
-                    rows.push(row);
-                }
+            drain(&mut self.left, ctx)?
+        };
+        let (build_schema, build_keys) = if build_is_right {
+            (self.right.schema().clone(), self.right_keys.clone())
+        } else {
+            (self.left.schema().clone(), self.left_keys.clone())
+        };
+        for (i, row) in build_rows.iter().enumerate() {
+            if let Some(key) = encode_join_key(&build_keys, &build_schema, row, ctx.db, ctx.trx)? {
+                self.table.entry(key).or_default().push(i);
             }
         }
-        self.rows = rows;
-        self.pos = 0;
+        self.build_rows = build_rows;
+
+        if self.probe_is_right {
+            self.probe_keys = self.right_keys.clone();
+            self.probe_schema = self.right.schema().clone();
+        } else {
+            self.probe_keys = self.left_keys.clone();
+            self.probe_schema = self.left.schema().clone();
+        }
         Ok(())
     }
 
-    fn next(&mut self, _ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
-        if self.pos >= self.rows.len() {
-            return Ok(None);
+    fn next(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
+        loop {
+            if let Some(row) = self.pending.pop_front() {
+                return Ok(Some(row));
+            }
+            if !self.fill_output(ctx)? {
+                return Ok(None);
+            }
         }
-        let row = self.rows[self.pos].clone();
-        self.pos += 1;
-        Ok(Some(row))
+    }
+
+    fn next_chunk(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Chunk>> {
+        loop {
+            if !self.pending.is_empty() {
+                let take = self.pending.len().min(CHUNK_ROWS);
+                let rows: Vec<Vec<Value>> = self.pending.drain(..take).collect();
+                return Ok(Some(Chunk::from_rows(&rows)?));
+            }
+            if !self.fill_output(ctx)? {
+                return Ok(None);
+            }
+        }
     }
 
     fn close(&mut self) -> Result<()> {
-        self.rows.clear();
-        self.pos = 0;
+        if self.probe_open {
+            let probe: &mut Box<dyn PhysicalOperator> =
+                if self.probe_is_right { &mut self.right } else { &mut self.left };
+            probe.close()?;
+            self.probe_open = false;
+        }
+        self.table.clear();
+        self.build_rows.clear();
+        self.pending.clear();
         Ok(())
     }
 }
