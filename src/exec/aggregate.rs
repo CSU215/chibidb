@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::ast::{AggFunc, BinOp, Expr, Limit, SelectItem, SelectStmt};
 use crate::catalog::Schema;
 use crate::trx::TrxState;
@@ -362,21 +364,7 @@ pub(crate) fn chunk_global_aggregate(
         }
     }
 
-    let row = states
-        .into_iter()
-        .map(|state| match state {
-            AggState::Count(n) => Value::Int(n),
-            AggState::Sum(acc) => acc.unwrap_or(Value::Null),
-            AggState::Avg { total, count } => {
-                if count == 0 {
-                    Value::Null
-                } else {
-                    Value::Float(total / count as f64)
-                }
-            }
-            AggState::Min(best) | AggState::Max(best) => best.unwrap_or(Value::Null),
-        })
-        .collect();
+    let row = states.into_iter().map(finish).collect();
     Ok(Some(vec![row]))
 }
 
@@ -436,69 +424,62 @@ fn new_state(kind: AggKind) -> AggState {
     }
 }
 
-fn update_state(
+fn update_state(kind: &AggKind, state: &mut AggState, chunk: &super::chunk::Chunk) -> Result<()> {
+    for i in 0..chunk.len() {
+        update_row(kind, state, chunk, i)?;
+    }
+    Ok(())
+}
+
+fn update_row(
     kind: &AggKind,
     state: &mut AggState,
     chunk: &super::chunk::Chunk,
+    i: usize,
 ) -> Result<()> {
     match kind {
         AggKind::Count(None) => {
             let AggState::Count(n) = state else { unreachable!("count state") };
-            *n += chunk.len() as i64;
+            *n += 1;
         }
         AggKind::Count(Some(index)) => {
-            let column = chunk.column(*index);
-            let AggState::Count(n) = state else { unreachable!("count state") };
-            for i in 0..chunk.len() {
-                if !column.is_null(i) {
-                    *n += 1;
-                }
+            if !chunk.column(*index).is_null(i) {
+                let AggState::Count(n) = state else { unreachable!("count state") };
+                *n += 1;
             }
         }
         AggKind::Sum(index) => {
-            let column = chunk.column(*index);
-            let AggState::Sum(acc) = state else { unreachable!("sum state") };
-            for i in 0..chunk.len() {
-                let value = column.value(i);
-                if matches!(value, Value::Null) {
-                    continue;
-                }
+            let value = chunk.column(*index).value(i);
+            if !matches!(value, Value::Null) {
+                let AggState::Sum(acc) = state else { unreachable!("sum state") };
                 *acc = Some(match acc.take() {
                     None => value,
                     Some(prev) => eval_binary(BinOp::Add, prev, value)?,
                 });
             }
         }
-        AggKind::Avg(index) => {
-            let column = chunk.column(*index);
-            let AggState::Avg { total, count } = state else { unreachable!("avg state") };
-            for i in 0..chunk.len() {
-                match column.value(i) {
-                    Value::Null => {}
-                    Value::Int(n) => {
-                        *total += n as f64;
-                        *count += 1;
-                    }
-                    Value::Float(x) => {
-                        *total += x;
-                        *count += 1;
-                    }
-                    _ => return Err(type_mismatch()),
-                }
+        AggKind::Avg(index) => match chunk.column(*index).value(i) {
+            Value::Null => {}
+            Value::Int(n) => {
+                let AggState::Avg { total, count } = state else { unreachable!("avg state") };
+                *total += n as f64;
+                *count += 1;
             }
-        }
+            Value::Float(x) => {
+                let AggState::Avg { total, count } = state else { unreachable!("avg state") };
+                *total += x;
+                *count += 1;
+            }
+            _ => return Err(type_mismatch()),
+        },
         AggKind::Min(index) | AggKind::Max(index) => {
-            let is_min = matches!(kind, AggKind::Min(_));
-            let column = chunk.column(*index);
-            let best = match state {
-                AggState::Min(best) | AggState::Max(best) => best,
-                _ => unreachable!("min/max state"),
-            };
-            for i in 0..chunk.len() {
-                let value = column.value(i);
-                if matches!(value, Value::Null) {
-                    continue;
-                }
+            let value = chunk.column(*index).value(i);
+            if !matches!(value, Value::Null) {
+                let is_min = matches!(kind, AggKind::Min(_));
+                let best = match state {
+                    AggState::Min(best) | AggState::Max(best) => best,
+                    _ => unreachable!("min/max state"),
+                };
                 *best = Some(match best.take() {
                     None => value,
                     Some(prev) => {
@@ -515,4 +496,115 @@ fn update_state(
         }
     }
     Ok(())
+}
+
+fn finish(state: AggState) -> Value {
+    match state {
+        AggState::Count(n) => Value::Int(n),
+        AggState::Sum(acc) => acc.unwrap_or(Value::Null),
+        AggState::Avg { total, count } => {
+            if count == 0 {
+                Value::Null
+            } else {
+                Value::Float(total / count as f64)
+            }
+        }
+        AggState::Min(best) | AggState::Max(best) => best.unwrap_or(Value::Null),
+    }
+}
+
+/// One output column of a grouped aggregate.
+enum GroupProj {
+    /// The first row's value of a base column within each group.
+    First(usize),
+    /// The next aggregate state, consumed in projection order.
+    Agg,
+}
+
+/// Columnar GROUP BY for the common shape: every group key and aggregate
+/// argument is a base column, every projection is such a column or a direct
+/// aggregate, and there is no HAVING/DISTINCT/ORDER BY/LIMIT. Groups are
+/// emitted in first-seen order, matching the row path. Returns `Ok(None)`
+/// without consuming the child when the shape does not qualify.
+pub(crate) fn chunk_grouped_aggregate(
+    ctx: &mut ExecContext<'_>,
+    schema: &Schema,
+    child: &mut dyn PhysicalOperator,
+    select: &SelectStmt,
+    exprs: &[Expr],
+) -> Result<Option<Vec<Vec<Value>>>> {
+    if select.group_by.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+    {
+        return Ok(None);
+    }
+    let mut group_columns = Vec::with_capacity(select.group_by.len());
+    for g in &select.group_by {
+        match column_index(schema, g) {
+            Some(index) => group_columns.push(index),
+            None => return Ok(None),
+        }
+    }
+    let mut projection = Vec::with_capacity(exprs.len());
+    let mut kinds = Vec::new();
+    for e in exprs {
+        if let Some(index) = column_index(schema, e) {
+            projection.push(GroupProj::First(index));
+        } else if let Some(kind) = agg_kind(schema, e) {
+            projection.push(GroupProj::Agg);
+            kinds.push(kind);
+        } else {
+            return Ok(None);
+        }
+    }
+
+    struct Group {
+        states: Vec<AggState>,
+        first: Vec<Value>,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut lookup: HashMap<Vec<u8>, usize> = HashMap::new();
+    while let Some(chunk) = child.next_chunk(ctx)? {
+        for i in 0..chunk.len() {
+            let mut key = Vec::with_capacity(group_columns.len());
+            for &c in &group_columns {
+                key.push(chunk.column(c).value(i));
+            }
+            let encoded = crate::storage::codec::encode_row(&key);
+            let group = match lookup.get(&encoded) {
+                Some(&g) => g,
+                None => {
+                    let g = groups.len();
+                    lookup.insert(encoded, g);
+                    groups.push(Group {
+                        states: kinds.iter().map(|k| new_state(*k)).collect(),
+                        first: chunk.row(i),
+                    });
+                    g
+                }
+            };
+            for (kind, state) in kinds.iter().zip(groups[group].states.iter_mut()) {
+                update_row(kind, state, &chunk, i)?;
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut states = group.states.into_iter();
+        let mut row = Vec::with_capacity(projection.len());
+        for p in &projection {
+            match p {
+                GroupProj::First(index) => row.push(group.first[*index].clone()),
+                GroupProj::Agg => {
+                    row.push(finish(states.next().expect("one state per aggregate")))
+                }
+            }
+        }
+        out.push(row);
+    }
+    Ok(Some(out))
 }

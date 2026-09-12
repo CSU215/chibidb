@@ -120,6 +120,26 @@ fn lsm_engine_matches() {
 }
 
 #[test]
+fn grouped_aggregates_match() {
+    assert_same(
+        "create table t (w int, v int);\
+         insert into t values (1,10),(2,20),(1,30),(null,40),(2,50),(null,60);\
+         select w, count(*) from t group by w;\
+         select w, sum(v), avg(v), min(v), max(v) from t group by w;\
+         select w, count(v) from t group by w;\
+         select v, count(*) from t group by w;\
+         select w from t group by w;\
+         select w, sum(v) from t where v >= 20 group by w;",
+    );
+    assert_same(
+        "create table t (a int, b int);\
+         insert into t values (1,1),(1,2),(2,1),(2,2),(3,3);\
+         select a, b, count(*) from t group by a, b;\
+         select a, count(*) from t group by a;",
+    );
+}
+
+#[test]
 fn vectorized_predicates_match() {
     assert_same(
         "create table t (id int, a int, b int, score float, name char(4));\

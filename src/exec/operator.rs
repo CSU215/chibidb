@@ -702,13 +702,23 @@ impl PhysicalOperator for GroupBy {
         let schema = self.child.schema().clone();
         let mut columnar = None;
         if ctx.db.config().execution.mode == ExecutionMode::Chunk {
-            columnar = super::aggregate::chunk_global_aggregate(
-                ctx,
-                &schema,
-                self.child.as_mut(),
-                &self.select,
-                &self.exprs,
-            )?;
+            columnar = if self.select.group_by.is_empty() {
+                super::aggregate::chunk_global_aggregate(
+                    ctx,
+                    &schema,
+                    self.child.as_mut(),
+                    &self.select,
+                    &self.exprs,
+                )?
+            } else {
+                super::aggregate::chunk_grouped_aggregate(
+                    ctx,
+                    &schema,
+                    self.child.as_mut(),
+                    &self.select,
+                    &self.exprs,
+                )?
+            };
         }
         self.rows = match columnar {
             Some(rows) => rows,
