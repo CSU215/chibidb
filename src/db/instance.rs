@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::ast::{DataType, Privilege, Stmt};
+use crate::ast::{Privilege, Stmt};
 use crate::config::Config;
 use crate::parser;
 use crate::result::ResultSet;
@@ -199,6 +199,14 @@ impl Instance {
                     self.drop_database(&d.name)?;
                     out.push(ResultSet::Message("SUCCESS".into()));
                 }
+                Stmt::ShowDatabases => {
+                    let rows = self
+                        .databases()?
+                        .into_iter()
+                        .map(|name| vec![Value::Str(name)])
+                        .collect();
+                    out.push(ResultSet::Rows { columns: vec!["Database".into()], rows });
+                }
                 Stmt::Use(u) => {
                     self.reject_in_trx(session)?;
                     self.use_database(session, &u.name)?;
@@ -372,7 +380,7 @@ impl Instance {
                         "insert into columns values ('{name}', '{}', '{}', '{}', {}, {}, {});",
                         meta.name,
                         c.name,
-                        dtype_name(c.dtype),
+                        c.dtype,
                         c.not_null as i32,
                         c.primary_key as i32,
                         c.unique as i32,
@@ -562,21 +570,12 @@ impl Instance {
     }
 }
 
-/// The SQL name of a column type, for `information_schema.columns`.
-fn dtype_name(dtype: DataType) -> String {
-    match dtype {
-        DataType::Int => "int".into(),
-        DataType::Float => "float".into(),
-        DataType::Char(n) => format!("char({n})"),
-        DataType::Date => "date".into(),
-        DataType::Text => "text".into(),
-    }
-}
-
 /// The privilege a statement needs on its current database, if any.
 fn statement_privilege(stmt: &Stmt) -> Option<Privilege> {
     match stmt {
-        Stmt::Select(_) | Stmt::Explain(_) => Some(Privilege::Read),
+        Stmt::Select(_) | Stmt::Explain(_) | Stmt::ShowTables | Stmt::ShowColumns(_) => {
+            Some(Privilege::Read)
+        }
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Some(Privilege::Write),
         Stmt::CreateTable(_)
         | Stmt::CreateIndex(_)

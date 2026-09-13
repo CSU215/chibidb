@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -74,9 +75,10 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn repl(instance: Instance) -> std::io::Result<()> {
+    let interactive = std::io::stdin().is_terminal();
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
-    run_repl(&instance, stdin, &mut stdout).await?;
+    run_repl(&instance, stdin, &mut stdout, interactive).await?;
     if let Err(e) = instance.flush() {
         eprintln!("error: flush failed: {e}");
     }
@@ -86,7 +88,8 @@ async fn repl(instance: Instance) -> std::io::Result<()> {
 async fn connect(addr: &str) -> std::io::Result<()> {
     let mut stream = tokio::net::TcpStream::connect(addr).await?;
     eprintln!("connected to {addr}");
+    let interactive = std::io::stdin().is_terminal();
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
-    client::run_client(&mut stream, stdin, &mut stdout).await
+    client::run_client(&mut stream, stdin, &mut stdout, interactive).await
 }

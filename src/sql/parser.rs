@@ -2,9 +2,8 @@ use crate::ast::{
     AggFunc, BinOp, ColumnDef, CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt,
     CreateUserStmt, CreateViewStmt, DataType, DeleteStmt, DropDatabaseStmt, DropIndexStmt,
     DropTableStmt, DropUserStmt, DropViewStmt, ExplainStmt, Expr, GrantStmt, InsertStmt, JoinKind,
-    Limit, LoginStmt, Privilege, RevokeStmt, SelectItem, SelectStmt, Stmt, TableRef, TrxCtl, UnOp,
-    UpdateStmt,
-    UseStmt,
+    Limit, LoginStmt, Privilege, RevokeStmt, SelectItem, SelectStmt, ShowColumnsStmt, Stmt,
+    TableRef, TrxCtl, UnOp, UpdateStmt, UseStmt,
 };
 use crate::config::{EngineKind, PageLayout};
 use crate::lexer::{Punct, Token, TokenKind, lex};
@@ -105,6 +104,26 @@ impl<'a> Parser<'a> {
         }
         if self.eat_keyword("vacuum") {
             return Ok(Stmt::Vacuum);
+        }
+        if self.eat_keyword("show") {
+            if self.eat_keyword("tables") {
+                return Ok(Stmt::ShowTables);
+            }
+            if self.eat_keyword("database") || self.eat_keyword("databases") {
+                return Ok(Stmt::ShowDatabases);
+            }
+            if self.eat_keyword("columns") {
+                if !self.eat_keyword("from") && !self.eat_keyword("in") {
+                    return Err(self.unexpected("from"));
+                }
+                let table = self.parse_ident("table name")?;
+                return Ok(Stmt::ShowColumns(ShowColumnsStmt { table }));
+            }
+            return Err(self.unexpected("tables, databases or columns"));
+        }
+        if self.eat_keyword("describe") || self.eat_keyword("desc") {
+            let table = self.parse_ident("table name")?;
+            return Ok(Stmt::ShowColumns(ShowColumnsStmt { table }));
         }
         if self.eat_keyword("explain") {
             if !self.at_keyword("select") {

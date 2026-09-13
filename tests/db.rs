@@ -831,3 +831,58 @@ fn pax_layout_requires_heap_engine() {
         db.execute_sql("create table h (id int) page_layout = pax;").unwrap();
     });
 }
+
+#[test]
+fn show_tables_works_against_a_single_database() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int);").unwrap();
+        db.execute_sql("create view v as select id from t;").unwrap();
+        let out = db.execute_sql("show tables;").unwrap();
+        let (columns, rows) = rows(&out);
+        assert_eq!(columns, &["table".to_string()]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Str("t".into()));
+        assert_eq!(rows[1][0], Value::Str("v".into()));
+    });
+}
+
+#[test]
+fn show_columns_and_describe_against_a_single_database() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int primary key, s char(4) default 'a');")
+            .unwrap();
+        let out = db.execute_sql("show columns from t;").unwrap();
+        let (columns, data) = rows(&out);
+        assert_eq!(
+            columns,
+            ["Field", "Type", "Null", "Key", "Default", "Extra"]
+                .map(String::from)
+                .as_slice()
+        );
+        assert_eq!(
+            data[0],
+            vec![
+                Value::Str("id".into()),
+                Value::Str("int".into()),
+                Value::Str("NO".into()),
+                Value::Str("PRI".into()),
+                Value::Null,
+                Value::Str(String::new()),
+            ]
+        );
+        assert_eq!(
+            data[1],
+            vec![
+                Value::Str("s".into()),
+                Value::Str("char(4)".into()),
+                Value::Str("YES".into()),
+                Value::Str("".into()),
+                Value::Str("a".into()),
+                Value::Str(String::new()),
+            ]
+        );
+        // DESCRIBE is accepted as the same statement
+        let described = db.execute_sql("describe t;").unwrap();
+        assert_eq!(rows(&described).1, data);
+    });
+}

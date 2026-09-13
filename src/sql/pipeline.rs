@@ -131,6 +131,7 @@ impl Stage for OptimizeStage {
 fn referenced_tables(stmt: &Stmt) -> Vec<String> {
     match stmt {
         Stmt::Select(s) => s.from.iter().map(|t| t.name.clone()).collect(),
+        Stmt::ShowColumns(c) => vec![c.table.clone()],
         Stmt::Insert(i) => vec![i.table.clone()],
         Stmt::Update(u) => vec![u.table.clone()],
         Stmt::Delete(d) => vec![d.table.clone()],

@@ -152,6 +152,18 @@ pub enum DataType {
     Text,
 }
 
+impl fmt::Display for DataType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataType::Int => f.write_str("int"),
+            DataType::Float => f.write_str("float"),
+            DataType::Char(n) => write!(f, "char({n})"),
+            DataType::Date => f.write_str("date"),
+            DataType::Text => f.write_str("text"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDef {
     pub name: String,
@@ -208,6 +220,11 @@ pub struct DropIndexStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTableStmt {
     pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowColumnsStmt {
+    pub table: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -367,6 +384,12 @@ pub enum Stmt {
     Login(LoginStmt),
     Revoke(RevokeStmt),
     Select(Box<SelectStmt>),
+    /// `SHOW TABLES`: list the current database's tables and views.
+    ShowTables,
+    /// `SHOW DATABASES`: list the instance's databases.
+    ShowDatabases,
+    /// `SHOW COLUMNS FROM t` / `DESCRIBE t`: describe one table's columns.
+    ShowColumns(ShowColumnsStmt),
     Update(UpdateStmt),
     Use(UseStmt),
     Trx(TrxCtl),
