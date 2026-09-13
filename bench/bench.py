@@ -12,8 +12,11 @@ Usage (from the repo root):
     python bench/bench.py --benches point_select
     python bench/bench.py --list
     python bench/bench.py --json bench/result.json
+    python bench/bench.py --no-progress      # silence the progress bar
 
-Each bench times itself and returns a metrics dict; this script renders it.
+A progress bar on stderr tracks each (bench, target) step; it degrades to one
+plain line per step when stderr is not a TTY. Each bench times itself and
+returns a metrics dict; this script renders it.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +39,58 @@ from benchkit import Bench, Env, Target  # noqa: E402
 
 TARGETS_DIR = os.path.join(HERE, "targets")
 BENCHES_DIR = os.path.join(HERE, "benches")
+
+
+class Progress:
+    """Dependency-free progress bar for the (bench, target) run loop.
+
+    Renders to stderr so the results table on stdout stays clean. When the
+    stream is not a TTY (CI, redirected output) it falls back to one plain line
+    per step, and ``enabled=False`` (``--no-progress``) silences it entirely.
+    """
+
+    WIDTH = 24
+
+    def __init__(self, total: int, enabled: bool = True, stream=None):
+        self.total = max(1, total)
+        self.done = 0
+        self.enabled = enabled
+        self.stream = stream if stream is not None else sys.stderr
+        self.interactive = bool(enabled and self.stream.isatty())
+        self.start = time.monotonic()
+        self._last = 0
+
+    def update(self, label: str) -> None:
+        if not self.enabled:
+            return
+        self.done += 1
+        elapsed = time.monotonic() - self.start
+        ratio = self.done / self.total
+        filled = int(self.WIDTH * ratio)
+        bar = "#" * filled + "-" * (self.WIDTH - filled)
+        eta = elapsed / self.done * (self.total - self.done) if self.done else 0.0
+        text = "[%s] %d/%d %3d%%  %s  %.1fs ETA %.1fs" % (
+            bar,
+            self.done,
+            self.total,
+            int(ratio * 100),
+            label,
+            elapsed,
+            eta,
+        )
+        if self.interactive:
+            pad = " " * max(0, self._last - len(text))
+            self.stream.write("\r" + text + pad)
+            self.stream.flush()
+            self._last = len(text)
+        else:
+            self.stream.write(text + "\n")
+            self.stream.flush()
+
+    def finish(self) -> None:
+        if self.enabled and self.interactive:
+            self.stream.write("\n")
+            self.stream.flush()
 
 
 def load_objects(directory: str, attr: str, base: type) -> list:
@@ -145,6 +201,7 @@ def main() -> int:
     parser.add_argument("--benches", help="comma-separated bench ids")
     parser.add_argument("--json", dest="json_path", help="write structured results here")
     parser.add_argument("--keep", action="store_true", help="keep scratch data directories")
+    parser.add_argument("--no-progress", action="store_true", help="disable the progress bar")
     parser.add_argument("-v", "--verbose", action="store_true", help="print tracebacks on error")
     parser.add_argument("--list", action="store_true", help="list targets and benches")
     args = parser.parse_args()
@@ -174,8 +231,10 @@ def main() -> int:
     print()
 
     records = []
+    progress = Progress(len(benches) * len(targets), enabled=not args.no_progress)
     for bench in benches:
         for target in targets:
+            progress.update("%s / %s" % (bench.id, target.id))
             rec = {"bench": bench.id, "target": target.id}
             ok, reason = status[target.id]
             if not ok:
@@ -189,6 +248,7 @@ def main() -> int:
             finally:
                 if not args.keep:
                     shutil.rmtree(data_dir, ignore_errors=True)
+    progress.finish()
 
     print()
     render(records)
