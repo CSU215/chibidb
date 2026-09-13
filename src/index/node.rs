@@ -84,24 +84,28 @@ pub fn leaf_entry_at(page: &[u8], i: usize) -> (Vec<u8>, Rid) {
 
 /// First entry index whose key >= `key`.
 pub fn leaf_lower_bound(page: &[u8], key: &[u8]) -> usize {
-    let n = leaf_num(page);
-    for i in 0..n {
-        let (k, _) = leaf_entry_at(page, i);
-        if k.as_slice() >= key {
-            return i;
-        }
-    }
-    n
+    leaf_bound(page, key, false)
 }
 
 /// First entry index whose key > `key` (insertion point after equal keys).
 pub fn leaf_upper_bound(page: &[u8], key: &[u8]) -> usize {
+    leaf_bound(page, key, true)
+}
+
+/// Walks the variable-length entries once, comparing raw key bytes. Entries are
+/// not fixed-width, so a seek still costs one pass, but it avoids rescanning
+/// every earlier entry (and building a `Vec` key) at each step.
+fn leaf_bound(page: &[u8], key: &[u8], strict: bool) -> usize {
     let n = leaf_num(page);
+    let mut off = LEAF_ENTRIES;
     for i in 0..n {
-        let (k, _) = leaf_entry_at(page, i);
-        if k.as_slice() > key {
+        let key_len = u16_at(page, off);
+        let k = &page[off + 2..off + 2 + key_len];
+        let past = if strict { k > key } else { k >= key };
+        if past {
             return i;
         }
+        off += ENTRY_OVERHEAD + key_len + 6;
     }
     n
 }
@@ -204,13 +208,15 @@ pub fn internal_entries<'a>(page: &'a [u8]) -> impl Iterator<Item = (Vec<u8>, Pa
 pub fn internal_child_for(page: &[u8], key: &[u8]) -> PageNo {
     let n = internal_num(page);
     let mut child = internal_first_child(page);
-    for i in 0..n {
-        let (sep, c) = internal_entry_at(page, i);
-        if key >= sep.as_slice() {
-            child = c;
-        } else {
+    let mut off = INTERNAL_ENTRIES;
+    for _ in 0..n {
+        let key_len = u16_at(page, off);
+        let sep = &page[off + 2..off + 2 + key_len];
+        if key < sep {
             break;
         }
+        child = u32_at(page, off + 2 + key_len);
+        off += ENTRY_OVERHEAD + key_len + 4;
     }
     child
 }
@@ -252,4 +258,49 @@ pub fn internal_remove_at(page: &mut [u8; PAGE_SIZE], idx: usize) -> Result<()> 
 
 pub fn internal_bytes_used(page: &[u8]) -> usize {
     internal_entry_offset(page, internal_num(page))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::page::zeroed_page;
+
+    fn leaf_with(keys: &[&[u8]]) -> [u8; PAGE_SIZE] {
+        let mut page: [u8; PAGE_SIZE] = *zeroed_page();
+        leaf_init(&mut page, 0, 0);
+        for (i, key) in keys.iter().enumerate() {
+            leaf_insert_at(&mut page, i, key, Rid::new(1, i as u16)).unwrap();
+        }
+        page
+    }
+
+    #[test]
+    fn lower_and_upper_bound_cover_duplicates_and_edges() {
+        let page = leaf_with(&[b"\x01", b"\x03", b"\x03", b"\x03", b"\x07", b"\x09"]);
+        assert_eq!(leaf_lower_bound(&page, b"\x00"), 0);
+        assert_eq!(leaf_lower_bound(&page, b"\x01"), 0);
+        assert_eq!(leaf_lower_bound(&page, b"\x03"), 1);
+        assert_eq!(leaf_lower_bound(&page, b"\x04"), 4);
+        assert_eq!(leaf_lower_bound(&page, b"\x09"), 5);
+        assert_eq!(leaf_lower_bound(&page, b"\x0a"), 6);
+
+        assert_eq!(leaf_upper_bound(&page, b"\x00"), 0);
+        assert_eq!(leaf_upper_bound(&page, b"\x01"), 1);
+        assert_eq!(leaf_upper_bound(&page, b"\x03"), 4);
+        assert_eq!(leaf_upper_bound(&page, b"\x08"), 5);
+        assert_eq!(leaf_upper_bound(&page, b"\x09"), 6);
+    }
+
+    #[test]
+    fn internal_child_for_picks_the_rightmost_covering_separator() {
+        let mut page: [u8; PAGE_SIZE] = *zeroed_page();
+        internal_init(&mut page, 10);
+        internal_insert_entry(&mut page, 0, b"\x03", 11).unwrap();
+        internal_insert_entry(&mut page, 1, b"\x05", 12).unwrap();
+        assert_eq!(internal_child_for(&page, b"\x00"), 10);
+        assert_eq!(internal_child_for(&page, b"\x03"), 11);
+        assert_eq!(internal_child_for(&page, b"\x04"), 11);
+        assert_eq!(internal_child_for(&page, b"\x05"), 12);
+        assert_eq!(internal_child_for(&page, b"\xff"), 12);
+    }
 }
