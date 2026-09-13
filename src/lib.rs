@@ -633,10 +633,15 @@ impl Database {
                 if let Some(mut trx) = session.trx.take() {
                     let wrote = !trx.undo.is_empty();
                     if let Err(e) = self.commit_trx(&trx, wrote) {
-                        // a conflict aborts this transaction: undo its work
-                        self.rollback_trx(&mut trx)?;
+                        // a conflict or log failure aborts this transaction:
+                        // undo its work and drop its bookkeeping. Always clear
+                        // the open slot, even if the undo itself fails.
                         self.trx.remove_open(trx.id);
-                        result = Err(e);
+                        if let Err(rb) = self.rollback_trx(&mut trx) {
+                            result = Err(rb);
+                        } else {
+                            result = Err(e);
+                        }
                     }
                 }
                 self.end_writer(session);
@@ -646,12 +651,13 @@ impl Database {
                 if session.trx.is_none() {
                     return Err(Error::Runtime("no active transaction".into()));
                 }
+                let mut result: Result<Option<ResultSet>> = Ok(None);
                 if let Some(mut trx) = session.trx.take() {
-                    self.rollback_trx(&mut trx)?;
                     self.trx.remove_open(trx.id);
+                    result = self.rollback_trx(&mut trx).map(|()| None);
                 }
                 self.end_writer(session);
-                Ok(None)
+                result
             }
             other => {
                 let read_only = is_read_only(other);
@@ -681,12 +687,14 @@ impl Database {
                             && !read_only
                         {
                             let wrote = !trx.undo.is_empty();
-                            if let Err(e) = self.commit_trx(&trx, wrote) {
-                                self.rollback_trx(&mut trx)?;
-                                self.trx.remove_open(trx.id);
-                                Err(e)
-                            } else {
-                                Ok(Some(rs))
+                            match self.commit_trx(&trx, wrote) {
+                                Ok(()) => Ok(Some(rs)),
+                                Err(e) => {
+                                    // clear the open slot regardless of whether
+                                    // the compensating undo succeeds
+                                    self.trx.remove_open(trx.id);
+                                    Err(self.rollback_trx(&mut trx).err().unwrap_or(e))
+                                }
                             }
                         } else {
                             Ok(Some(rs))
@@ -733,12 +741,13 @@ impl Database {
 
     /// Rolls back any open transaction when a session goes away.
     pub fn rollback_session(&self, session: &mut Session) -> Result<()> {
+        let mut result = Ok(());
         if let Some(mut trx) = session.trx.take() {
-            self.rollback_trx(&mut trx)?;
             self.trx.remove_open(trx.id);
+            result = self.rollback_trx(&mut trx);
         }
         self.end_writer(session);
-        Ok(())
+        result
     }
 
     /// Whether any session other than `trx_id` has a transaction open.
