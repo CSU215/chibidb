@@ -251,3 +251,51 @@ fn delete_then_reinsert_stays_consistent() {
     assert_eq!(tree.search(&bp, b"key000100").unwrap(), [Rid::new(2, 100)]);
 }
 
+#[test]
+fn long_key_split_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = setup(&dir, "long.idxf");
+    let tree = BTree::init(&bp, f).unwrap();
+
+    // fill a leaf with short keys, then force a byte-aware split with a long key
+    let n = 600u32;
+    for i in 0..n {
+        let k = format!("k{i:04}");
+        tree.insert(&bp, k.as_bytes(), Rid::new(i / 8, (i % 8) as u16)).unwrap();
+    }
+    let long = vec![b'z'; 3000];
+    tree.insert(&bp, &long, Rid::new(9, 9)).unwrap();
+
+    for i in 0..n {
+        let k = format!("k{i:04}");
+        assert_eq!(tree.search(&bp, k.as_bytes()).unwrap(), [Rid::new(i / 8, (i % 8) as u16)]);
+    }
+    assert_eq!(tree.search(&bp, &long).unwrap(), [Rid::new(9, 9)]);
+}
+
+#[test]
+fn duplicate_run_delete_across_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = setup(&dir, "dups.idxf");
+    let tree = BTree::init(&bp, f).unwrap();
+
+    let n = 1200u16;
+    let key = b"dup";
+    let rid = |i: u16| Rid::new((i / 16) as u32, i % 16);
+    for i in 0..n {
+        tree.insert(&bp, key, rid(i)).unwrap();
+    }
+    // delete the first, a middle and the last entry of the duplicate run
+    for i in [0, n / 2, n - 1] {
+        tree.delete(&bp, key, rid(i)).unwrap();
+    }
+
+    let mut got = tree.search(&bp, key).unwrap();
+    got.sort();
+    let mut want: Vec<Rid> =
+        (0..n).filter(|i| *i != 0 && *i != n / 2 && *i != n - 1).map(rid).collect();
+    want.sort();
+    assert_eq!(got, want);
+}
+
+

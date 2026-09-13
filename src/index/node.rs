@@ -9,6 +9,12 @@ const MAX_KEY_LEN: usize = u16::MAX as usize;
 // leaf header: type@0, num@1..3, prev@3..7, next@7..11, entries@11
 const LEAF_ENTRIES: usize = 11;
 const ENTRY_OVERHEAD: usize = 2; // key_len u16
+/// Bytes occupied by a leaf page header (before the first entry).
+pub const LEAF_HEADER: usize = LEAF_ENTRIES;
+/// Encoded size of one leaf entry with a `key_len`-byte key.
+pub const fn leaf_entry_size(key_len: usize) -> usize {
+    ENTRY_OVERHEAD + key_len + 6
+}
 
 fn u16_at(page: &[u8], off: usize) -> usize {
     u16::from_le_bytes([page[off], page[off + 1]]) as usize
@@ -147,6 +153,12 @@ pub fn leaf_bytes_used(page: &[u8]) -> usize {
 
 // internal header: type@0, num@1..3, first_child@3..7, entries@7
 const INTERNAL_ENTRIES: usize = 7;
+/// Bytes occupied by an internal page header (before the first entry).
+pub const INTERNAL_HEADER: usize = INTERNAL_ENTRIES;
+/// Encoded size of one internal entry with a `key_len`-byte key.
+pub const fn internal_entry_size(key_len: usize) -> usize {
+    ENTRY_OVERHEAD + key_len + 4
+}
 
 pub fn internal_init(page: &mut [u8; PAGE_SIZE], first_child: PageNo) {
     page[0] = INTERNAL;
