@@ -5,7 +5,7 @@ use crate::ast::{
 };
 use crate::catalog::{ColumnDesc, Schema};
 use crate::config::ExecutionMode;
-use crate::index::encode_key;
+use crate::index::encode_key_into;
 use crate::storage::codec::decode_record;
 use crate::storage::engine::RowScanner;
 use crate::storage::Rid;
@@ -16,6 +16,29 @@ use super::aggregate::{expr_has_aggregate, sort_rows};
 use super::chunk::{CHUNK_ROWS, Chunk, Column};
 use super::eval::{eval_binary, eval_const, EvalCtx};
 use super::subquery::{eval_bound, eval_predicate_bound};
+
+/// Build-row indices matching one key. The common unique-key case stays inline
+/// so building the table does not allocate a `Vec` per key.
+enum MatchList {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl MatchList {
+    fn push(&mut self, row: usize) {
+        match self {
+            MatchList::One(first) => *self = MatchList::Many(vec![*first, row]),
+            MatchList::Many(rows) => rows.push(row),
+        }
+    }
+
+    fn copy_into(&self, out: &mut Vec<usize>) {
+        match self {
+            MatchList::One(row) => out.push(*row),
+            MatchList::Many(rows) => out.extend_from_slice(rows),
+        }
+    }
+}
 
 /// Context threaded through operators: the database, the session's active
 /// transaction, and the outer row/group context when this plan runs as a
@@ -996,6 +1019,26 @@ fn drain(op: &mut Box<dyn PhysicalOperator>, ctx: &mut ExecContext<'_>) -> Resul
     Ok(rows)
 }
 
+/// Opens `op`, appends all its rows to `out` flat (row-major), and closes it.
+/// The fused row path reuses one row buffer, so no `Vec` is allocated per row.
+fn drain_into(
+    op: &mut Box<dyn PhysicalOperator>,
+    ctx: &mut ExecContext<'_>,
+    out: &mut Vec<Value>,
+) -> Result<()> {
+    op.open(ctx)?;
+    let fused = op.for_each_row(ctx, &mut |row| {
+        out.extend_from_slice(row);
+        Ok(())
+    })?;
+    if !fused {
+        while let Some(row) = op.next(ctx)? {
+            out.extend_from_slice(&row);
+        }
+    }
+    op.close()
+}
+
 /// Dtype of a simple column reference, used to reject hash keys whose numerics
 /// would need coercion (the index key encoding is type-sensitive).
 fn column_dtype(schema: &Schema, expr: &Expr) -> Option<DataType> {
@@ -1169,9 +1212,11 @@ fn push_key_component(out: &mut Vec<u8>, value: &Value) -> Result<bool> {
     if matches!(value, Value::Null) {
         return Ok(false);
     }
-    let bytes = encode_key(value)?;
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(&bytes);
+    let start = out.len();
+    out.extend_from_slice(&[0u8; 4]); // length prefix, patched below
+    encode_key_into(out, value)?;
+    let len = (out.len() - start - 4) as u32;
+    out[start..start + 4].copy_from_slice(&len.to_le_bytes());
     Ok(true)
 }
 
@@ -1234,8 +1279,11 @@ pub struct HashJoin {
     right_keys: Vec<Expr>,
     residual: Option<Expr>,
     schema: Schema,
-    table: HashMap<Vec<u8>, Vec<usize>>,
-    build_rows: Vec<Vec<Value>>,
+    table: HashMap<Vec<u8>, MatchList>,
+    /// Build rows stored flat (row-major, `build_cols` per row) so building the
+    /// table does not allocate a `Vec` per row.
+    build_values: Vec<Value>,
+    build_cols: usize,
     probe_is_right: bool,
     probe_keys: Vec<Expr>,
     probe_schema: Schema,
@@ -1265,7 +1313,8 @@ impl HashJoin {
             residual: keys.residual,
             schema,
             table: HashMap::new(),
-            build_rows: Vec::new(),
+            build_values: Vec::new(),
+            build_cols: 0,
             probe_is_right: false,
             probe_keys: Vec::new(),
             probe_schema: Schema::default(),
@@ -1276,6 +1325,13 @@ impl HashJoin {
             left_cols: 0,
             right_cols: 0,
         }
+    }
+
+    /// The build row at `index`; build rows are stored flat with a fixed
+    /// `build_cols` stride into `build_values`.
+    fn build_row(&self, index: usize) -> &[Value] {
+        let start = index * self.build_cols;
+        &self.build_values[start..start + self.build_cols]
     }
 
     /// Encodes one probe row's join key into `out` (cleared); `false` means a
@@ -1333,32 +1389,35 @@ impl HashJoin {
             return Ok(false);
         };
 
+        let outer = if self.probe_is_right {
+            self.kind == JoinKind::Right
+        } else {
+            self.kind == JoinKind::Left
+        };
         let mut key_buf = Vec::new();
+        let mut match_buf: Vec<usize> = Vec::new();
         for i in 0..chunk.len() {
             let has_key = self.probe_key_into(&chunk, i, ctx, &mut key_buf)?;
-            let matches = if has_key { self.table.get(&key_buf) } else { None };
-            let outer = if self.probe_is_right {
-                self.kind == JoinKind::Right
-            } else {
-                self.kind == JoinKind::Left
-            };
-            let has_match = matches.is_some_and(|indices| !indices.is_empty());
-            if !has_match && !outer {
+            match_buf.clear();
+            if has_key && let Some(list) = self.table.get(&key_buf) {
+                list.copy_into(&mut match_buf);
+            }
+            if match_buf.is_empty() && !outer {
                 continue;
             }
             let row = chunk.row(i);
             let mut matched = false;
-            if let Some(indices) = matches {
-                for &build_index in indices {
+            if !match_buf.is_empty() {
+                for &build_index in &match_buf {
                     let mut combined = if self.probe_is_right {
-                        self.build_rows[build_index].clone()
+                        self.build_row(build_index).to_vec()
                     } else {
                         row.clone()
                     };
                     if self.probe_is_right {
                         combined.extend(row.iter().cloned());
                     } else {
-                        combined.extend(self.build_rows[build_index].iter().cloned());
+                        combined.extend_from_slice(self.build_row(build_index));
                     }
                     if residual_ok(&self.residual, &self.schema, ctx, &combined)? {
                         self.pending.push_back(combined);
@@ -1405,7 +1464,7 @@ impl PhysicalOperator for HashJoin {
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         self.pending.clear();
         self.table.clear();
-        self.build_rows.clear();
+        self.build_values.clear();
         self.probe_open = false;
         self.probe_done = false;
         self.left_cols = self.left.schema().columns.len();
@@ -1414,19 +1473,22 @@ impl PhysicalOperator for HashJoin {
         let build_is_right = self.kind != JoinKind::Right;
         self.probe_is_right = !build_is_right;
 
-        let build_rows = if build_is_right {
-            drain(&mut self.right, ctx)?
-        } else {
-            drain(&mut self.left, ctx)?
-        };
         let (build_schema, build_keys) = if build_is_right {
             (self.right.schema().clone(), self.right_keys.clone())
         } else {
             (self.left.schema().clone(), self.left_keys.clone())
         };
+        self.build_cols = build_schema.columns.len();
+        {
+            let build_op = if build_is_right { &mut self.right } else { &mut self.left };
+            drain_into(build_op, ctx, &mut self.build_values)?;
+        }
         let build_key_indices = key_indices(&build_keys, &build_schema);
+        let rows = self.build_values.len().checked_div(self.build_cols).unwrap_or(0);
+        self.table.reserve(rows);
         let mut key_buf = Vec::new();
-        for (i, row) in build_rows.iter().enumerate() {
+        for i in 0..rows {
+            let row = &self.build_values[i * self.build_cols..(i + 1) * self.build_cols];
             let has_key = match &build_key_indices {
                 Some(indices) => indices_key_into(indices, row, &mut key_buf)?,
                 None => {
@@ -1434,10 +1496,12 @@ impl PhysicalOperator for HashJoin {
                 }
             };
             if has_key {
-                self.table.entry(key_buf.clone()).or_default().push(i);
+                self.table
+                    .entry(key_buf.clone())
+                    .and_modify(|list| list.push(i))
+                    .or_insert(MatchList::One(i));
             }
         }
-        self.build_rows = build_rows;
 
         if self.probe_is_right {
             self.probe_keys = self.right_keys.clone();
@@ -1495,6 +1559,7 @@ impl PhysicalOperator for HashJoin {
         };
         let probe_cols = self.probe_schema.columns.len();
         let mut key_buf = Vec::new();
+        let mut match_buf: Vec<usize> = Vec::new();
         let mut combined: Vec<Value> = Vec::with_capacity(self.left_cols + self.right_cols);
         loop {
             let pulled = {
@@ -1505,17 +1570,19 @@ impl PhysicalOperator for HashJoin {
             let Some(chunk) = pulled else { break };
             for i in 0..chunk.len() {
                 let has_key = self.probe_key_into(&chunk, i, ctx, &mut key_buf)?;
-                let matches = if has_key { self.table.get(&key_buf) } else { None };
-                let has_match = matches.is_some_and(|indices| !indices.is_empty());
-                if !has_match && !outer {
+                match_buf.clear();
+                if has_key && let Some(list) = self.table.get(&key_buf) {
+                    list.copy_into(&mut match_buf);
+                }
+                if match_buf.is_empty() && !outer {
                     continue;
                 }
                 let mut matched = false;
-                if let Some(indices) = matches {
-                    for &build_index in indices {
+                if !match_buf.is_empty() {
+                    for &build_index in &match_buf {
                         combined.clear();
                         if self.probe_is_right {
-                            combined.extend(self.build_rows[build_index].iter().cloned());
+                            combined.extend_from_slice(self.build_row(build_index));
                             for c in 0..probe_cols {
                                 combined.push(chunk.column(c).value(i));
                             }
@@ -1523,7 +1590,7 @@ impl PhysicalOperator for HashJoin {
                             for c in 0..probe_cols {
                                 combined.push(chunk.column(c).value(i));
                             }
-                            combined.extend(self.build_rows[build_index].iter().cloned());
+                            combined.extend_from_slice(self.build_row(build_index));
                         }
                         if residual_ok(&self.residual, &self.schema, ctx, &combined)? {
                             sink(&combined)?;
@@ -1566,7 +1633,7 @@ impl PhysicalOperator for HashJoin {
             self.probe_open = false;
         }
         self.table.clear();
-        self.build_rows.clear();
+        self.build_values.clear();
         self.pending.clear();
         Ok(())
     }

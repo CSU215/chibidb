@@ -10,6 +10,13 @@ const TAG_DATE: u8 = 0x04;
 /// Order-preserving byte encoding so B+ tree nodes can compare keys with memcmp.
 pub fn encode_key(v: &Value) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
+    encode_key_into(&mut buf, v)?;
+    Ok(buf)
+}
+
+/// Appends the order-preserving encoding of `v` to `buf`, so callers can reuse
+/// a scratch buffer instead of allocating a `Vec` per key.
+pub fn encode_key_into(buf: &mut Vec<u8>, v: &Value) -> Result<()> {
     match v {
         Value::Null => buf.push(TAG_NULL),
         Value::Int(n) => {
@@ -40,5 +47,31 @@ pub fn encode_key(v: &Value) -> Result<Vec<u8>> {
             return Err(Error::Runtime("cannot index boolean values".into()));
         }
     }
-    Ok(buf)
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_into_appends_the_same_bytes() {
+        let values = [
+            Value::Null,
+            Value::Int(-7),
+            Value::Int(0),
+            Value::Int(42),
+            Value::Float(-0.0),
+            Value::Float(1.5),
+            Value::Str("hello".into()),
+            Value::Date(31),
+        ];
+        for value in &values {
+            let owned = encode_key(value).unwrap();
+            let mut buf = vec![0xAB];
+            encode_key_into(&mut buf, value).unwrap();
+            assert_eq!(&buf[1..], owned.as_slice(), "mismatch for {value:?}");
+        }
+        assert!(encode_key_into(&mut Vec::new(), &Value::Bool(true)).is_err());
+    }
 }
