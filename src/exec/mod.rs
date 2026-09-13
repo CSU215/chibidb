@@ -379,7 +379,7 @@ fn execute_create_table(db: &Database, c: &CreateTableStmt) -> Result<ResultSet>
             "page_layout=pax is only supported for engine=heap".into(),
         ));
     }
-    let (heap, engine) = db.new_table_storage(kind)?;
+    let (heap, engine) = db.new_table_storage(kind, layout)?;
     db.catalog_mut()
         .create_table(&c.name, schema, heap, kind, layout, engine)?;
     // PRIMARY KEY / UNIQUE get a constraint-backed unique index; the table is

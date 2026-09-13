@@ -79,7 +79,6 @@ use crate::pipeline::{ExecuteStage, OptimizeStage, Pipeline, ResolveStage, SqlEv
 use crate::storage::codec::{decode_record, encode_record};
 use crate::storage::engine::{HeapEngine, TableStorage};
 use crate::storage::lsm::engine::{LsmEngine, LSM_FILE_ID};
-use crate::storage::slotted::{page_get, page_put_at};
 use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, LobStore, Rid};
 use crate::transaction::TransactionManager;
 use crate::trx::{TrxState, Undo};
@@ -181,8 +180,11 @@ impl Database {
                     EngineKind::Heap => {
                         let fpath = tables_dir.join(format!("{:06}.dbf", meta.file_no));
                         let file = pool.open_file(&fpath)?;
-                        HeapFile::open_or_repair(&pool, file)?;
-                        (HeapStore { file, file_no: meta.file_no }, Arc::new(HeapEngine::new(file)))
+                        HeapFile::open_or_repair(&pool, file, meta.layout)?;
+                        (
+                            HeapStore { file, file_no: meta.file_no },
+                            Arc::new(HeapEngine::with_layout(file, meta.layout)),
+                        )
                     }
                     EngineKind::Lsm => {
                         let dir = tables_dir.join(format!("{:06}.lsm", meta.file_no));
@@ -339,19 +341,17 @@ impl Database {
     /// `touched` accumulates heap file numbers that must have their indexes
     /// rebuilt; it may arrive pre-seeded with repaired index files.
     fn recover_from_wal(&self, plan: &wal::RecoveryPlan, touched: &mut HashSet<u32>) -> Result<()> {
-        // Route each redo record to the engine that owns its table: the heap
-        // replays into pages, the LSM engine replays into its store.
-        let (storage, file_map): (StorageMap, std::collections::HashMap<u32, FileId>) = {
+        // Route each redo record to the engine that owns its table; every
+        // engine implements `insert_at`/`delete_mark` idempotently.
+        let storage: StorageMap = {
             let catalog = self.catalog();
-            let file_map: std::collections::HashMap<u32, FileId> =
-                catalog.heap_files().into_iter().collect();
             let mut storage = StorageMap::new();
             for (file_no, _) in catalog.heap_files() {
                 if let Some(entry) = catalog.storage_for_file_no(file_no) {
                     storage.insert(file_no, entry);
                 }
             }
-            (storage, file_map)
+            storage
         };
         for (_, _, records) in &plan.committed {
             for rec in records {
@@ -359,59 +359,25 @@ impl Database {
                     Record::Insert { file_no, rid, record } => {
                         // records of dropped tables (file no longer in the
                         // catalog) are stale and skipped
-                        let Some((kind, engine)) = storage.get(file_no) else { continue };
-                        match kind {
-                            EngineKind::Lsm => {
-                                engine.insert_at(&self.pool, *rid, record)?;
-                                touched.insert(*file_no);
-                            }
-                            EngineKind::Heap => {
-                                let file = file_map[file_no];
-                                while self.pool.page_count(file)? <= rid.page_no {
-                                    self.pool.alloc_page(file)?;
-                                }
-                                let occupied = self.pool.read_page(file, rid.page_no, |page| {
-                                    Ok(page_get(page, rid.slot)?.is_some())
-                                })?;
-                                if !occupied {
-                                    self.pool.with_page(file, rid.page_no, |page| {
-                                        page_put_at(page, rid.slot, record)
-                                    })?;
-                                    touched.insert(*file_no);
-                                }
-                            }
-                        }
+                        let Some((_kind, engine)) = storage.get(file_no) else { continue };
+                        engine.insert_at(&self.pool, *rid, record)?;
+                        touched.insert(*file_no);
                     }
                     Record::DeleteMark { file_no, rid, deleter } => {
                         let Some((kind, engine)) = storage.get(file_no) else { continue };
-                        match kind {
-                            EngineKind::Lsm => {
-                                if let Ok(bytes) = engine.get(&self.pool, *rid)
-                                    && bytes.len() >= 8
-                                    && u32::from_le_bytes(bytes[4..8].try_into().unwrap()) == 0
-                                {
-                                    engine.delete_mark(&self.pool, *rid, *deleter)?;
-                                    touched.insert(*file_no);
-                                }
-                            }
-                            EngineKind::Heap => {
-                                let file = file_map[file_no];
-                                if self.pool.page_count(file)? <= rid.page_no {
-                                    continue;
-                                }
-                                let unmarked = self.pool.read_page(file, rid.page_no, |page| {
-                                    match page_get(page, rid.slot)? {
-                                        Some(rec) if rec.len() >= 8 => {
-                                            Ok(u32::from_le_bytes(rec[4..8].try_into().unwrap()) == 0)
-                                        }
-                                        _ => Ok(false),
-                                    }
-                                })?;
-                                if unmarked {
-                                    HeapFile::at(file).delete_mark(&self.pool, *rid, *deleter)?;
-                                    touched.insert(*file_no);
-                                }
-                            }
+                        // a heap record past the last allocated page was never
+                        // written, so there is nothing to mark
+                        if *kind == EngineKind::Heap
+                            && self.pool.page_count(engine.file_id())? <= rid.page_no
+                        {
+                            continue;
+                        }
+                        if let Ok(bytes) = engine.get(&self.pool, *rid)
+                            && bytes.len() >= 8
+                            && u32::from_le_bytes(bytes[4..8].try_into().unwrap()) == 0
+                        {
+                            engine.delete_mark(&self.pool, *rid, *deleter)?;
+                            touched.insert(*file_no);
                         }
                     }
                     Record::Commit => {}
@@ -838,14 +804,18 @@ impl Database {
     pub(crate) fn new_table_storage(
         &self,
         kind: EngineKind,
+        layout: PageLayout,
     ) -> Result<(HeapStore, Arc<dyn TableStorage>)> {
         let file_no = self.next_table_file.fetch_add(1, Ordering::SeqCst);
         match kind {
             EngineKind::Heap => {
                 let path = self.data_dir.join("tables").join(format!("{file_no:06}.dbf"));
                 let file = self.pool.create_file(&path)?;
-                HeapFile::init(&self.pool, file)?;
-                Ok((HeapStore { file, file_no }, Arc::new(HeapEngine::new(file))))
+                HeapFile::init_with_layout(&self.pool, file, layout)?;
+                Ok((
+                    HeapStore { file, file_no },
+                    Arc::new(HeapEngine::with_layout(file, layout)),
+                ))
             }
             EngineKind::Lsm => {
                 let dir = self.data_dir.join("tables").join(format!("{file_no:06}.lsm"));

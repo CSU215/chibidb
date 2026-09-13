@@ -8,6 +8,7 @@ pub mod heap;
 pub mod lob;
 pub mod lsm;
 pub mod page;
+pub(crate) mod pax;
 pub mod slotted;
 
 pub use buffer::{BufferPool, PoolStats};

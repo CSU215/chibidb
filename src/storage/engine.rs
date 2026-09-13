@@ -1,7 +1,8 @@
+use crate::config::PageLayout;
 use crate::storage::buffer::BufferPool;
 use crate::storage::heap::{HeapFile, Rid};
 use crate::storage::page::{FileId, PageNo, PAGE_SIZE};
-use crate::storage::slotted::page_slots;
+use crate::storage::slotted::{page_get, page_put_at, page_slots};
 use crate::{Error, Result};
 /// A forward-only cursor over a table's rows, decoupled from the concrete
 /// storage engine.
@@ -90,59 +91,87 @@ pub trait TableStorage: TableEngine + std::fmt::Debug {
 #[derive(Debug)]
 pub struct HeapEngine {
     file: FileId,
+    layout: PageLayout,
 }
 
 impl HeapEngine {
     pub fn new(file: FileId) -> Self {
-        Self { file }
+        Self { file, layout: PageLayout::Row }
+    }
+
+    pub fn with_layout(file: FileId, layout: PageLayout) -> Self {
+        Self { file, layout }
     }
 }
 
 impl TableEngine for HeapEngine {
     fn scan(&self, bp: &BufferPool) -> Result<Box<dyn RowScanner>> {
-        Ok(Box::new(HeapScanner::new(bp, self.file)?))
+        Ok(Box::new(HeapScanner::new(bp, self.file, self.layout)?))
     }
 
     fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>> {
-        HeapFile::at(self.file).get(bp, rid)
+        HeapFile::at(self.file, self.layout).get(bp, rid)
     }
 }
 
 impl TableStorage for HeapEngine {
     fn insert(&self, bp: &BufferPool, record: &[u8]) -> Result<Rid> {
-        HeapFile::at(self.file).insert(bp, record)
+        HeapFile::at(self.file, self.layout).insert(bp, record)
     }
 
     fn delete(&self, bp: &BufferPool, rid: Rid) -> Result<()> {
-        HeapFile::at(self.file).delete(bp, rid)
+        HeapFile::at(self.file, self.layout).delete(bp, rid)
     }
 
     fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u32) -> Result<u32> {
-        HeapFile::at(self.file).delete_mark(bp, rid, deleter)
+        HeapFile::at(self.file, self.layout).delete_mark(bp, rid, deleter)
     }
 
     fn file_id(&self) -> FileId {
         self.file
     }
+
+    /// Replays a WAL insert at its original rid. Heap pages are page-addressed,
+    /// so the page is allocated and the record placed, unless it is already
+    /// present (replay is idempotent).
+    fn insert_at(&self, bp: &BufferPool, rid: Rid, record: &[u8]) -> Result<()> {
+        while bp.page_count(self.file)? <= rid.page_no {
+            bp.alloc_page(self.file)?;
+        }
+        let occupied = bp.read_page(self.file, rid.page_no, |page| match self.layout {
+            PageLayout::Row => Ok(page_get(page, rid.slot)?.is_some()),
+            PageLayout::Pax => Ok(!crate::storage::pax::is_empty(page, rid.slot)),
+        })?;
+        if occupied {
+            return Ok(());
+        }
+        bp.with_page(self.file, rid.page_no, |page| match self.layout {
+            PageLayout::Row => page_put_at(page, rid.slot, record),
+            PageLayout::Pax => crate::storage::pax::put_at(page, rid.slot, record),
+        })
+    }
 }
 
 struct HeapScanner {
     file: FileId,
+    layout: PageLayout,
     next_page: PageNo,
     last_page: PageNo,
     /// Image of the page currently being drained; reused across pages.
     page: Vec<u8>,
     page_no: PageNo,
-    /// `(slot, offset, length)` of each live record in `page`.
+    /// `(slot, offset, length)` of each live record in `page`; PAX records
+    /// reconstruct from columns, so their offset/length stay zero.
     slots: Vec<(u16, usize, usize)>,
     slot_pos: usize,
 }
 
 impl HeapScanner {
-    fn new(bp: &BufferPool, file: FileId) -> Result<Self> {
+    fn new(bp: &BufferPool, file: FileId, layout: PageLayout) -> Result<Self> {
         let pages = bp.page_count(file)?;
         Ok(Self {
             file,
+            layout,
             next_page: 1,
             last_page: pages,
             page: Vec::new(),
@@ -169,7 +198,12 @@ impl HeapScanner {
             })?;
             self.page_no = no;
             self.slots.clear();
-            self.slots.extend(page_slots(&self.page));
+            match self.layout {
+                PageLayout::Row => self.slots.extend(page_slots(&self.page)),
+                PageLayout::Pax => self
+                    .slots
+                    .extend(crate::storage::pax::alive_slots(&self.page).map(|s| (s, 0, 0))),
+            }
             self.slot_pos = 0;
         }
         Ok(true)
@@ -184,12 +218,26 @@ impl HeapScanner {
         self.slot_pos += 1;
         Ok(Some((Rid::new(self.page_no, slot), off, len)))
     }
+
+    fn record_into(&self, rid: Rid, off: usize, len: usize, out: &mut Vec<u8>) {
+        out.clear();
+        match self.layout {
+            PageLayout::Row => out.extend_from_slice(&self.page[off..off + len]),
+            PageLayout::Pax => {
+                crate::storage::pax::read_record(&self.page, rid.slot, None, out);
+            }
+        }
+    }
 }
 
 impl RowScanner for HeapScanner {
     fn next(&mut self, bp: &BufferPool) -> Result<Option<(Rid, Vec<u8>)>> {
         match self.take(bp)? {
-            Some((rid, off, len)) => Ok(Some((rid, self.page[off..off + len].to_vec()))),
+            Some((rid, off, len)) => {
+                let mut out = Vec::new();
+                self.record_into(rid, off, len, &mut out);
+                Ok(Some((rid, out)))
+            }
             None => Ok(None),
         }
     }
@@ -197,8 +245,7 @@ impl RowScanner for HeapScanner {
     fn next_into(&mut self, bp: &BufferPool, out: &mut Vec<u8>) -> Result<Option<Rid>> {
         match self.take(bp)? {
             Some((rid, off, len)) => {
-                out.clear();
-                out.extend_from_slice(&self.page[off..off + len]);
+                self.record_into(rid, off, len, out);
                 Ok(Some(rid))
             }
             None => Ok(None),

@@ -122,6 +122,41 @@ fn collect_row_lob_ids(data: &[u8], out: &mut Vec<u64>) {
     }
 }
 
+/// Byte ranges of each tagged value inside a row encoding. The leading `u16`
+/// column count is not part of any range. Lets the PAX page codec slice a
+/// stored record into columns without decoding the values.
+pub(crate) fn row_column_ranges(data: &[u8]) -> Result<Vec<(usize, usize)>> {
+    if data.len() < 2 {
+        return Err(Error::Runtime("truncated row data".into()));
+    }
+    let count = u16::from_le_bytes([data[0], data[1]]) as usize;
+    let mut ranges = Vec::with_capacity(count);
+    let mut pos = 2;
+    for _ in 0..count {
+        let start = pos;
+        let tag = *data
+            .get(pos)
+            .ok_or_else(|| Error::Runtime("truncated row data".into()))?;
+        pos += 1;
+        pos += match tag {
+            TAG_NULL => 0,
+            TAG_INT | TAG_FLOAT | TAG_LOB => 8,
+            TAG_BOOL => 1,
+            TAG_DATE => 4,
+            TAG_STR => {
+                let lb = take(data, &mut pos, 2)?;
+                u16::from_le_bytes(lb.try_into().unwrap()) as usize
+            }
+            _ => return Err(Error::Runtime(format!("unknown value tag 0x{tag:02x}"))),
+        };
+        if pos > data.len() {
+            return Err(Error::Runtime("truncated row data".into()));
+        }
+        ranges.push((start, pos));
+    }
+    Ok(ranges)
+}
+
 /// Size (excluding the version header) an externalized row encoding will have,
 /// without writing any large object.
 pub fn encoded_row_size(row: &[Value], inline_limit: usize) -> usize {
@@ -224,8 +259,7 @@ fn decode_row_with(
 /// Decodes an encoded row, handing each value to `sink` as it is read instead
 /// of collecting a `Vec<Value>`. Returns the column count. Lets a scan fill
 /// chunk columns directly.
-pub(crate) fn decode_row_each(
-    data: &[u8],
+pub(crate) fn decode_row_each(    data: &[u8],
     lobs: Option<&dyn LobResolver>,
     keep: Option<&[bool]>,
     mut sink: impl FnMut(usize, Value) -> Result<()>,
