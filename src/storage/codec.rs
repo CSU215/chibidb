@@ -191,7 +191,42 @@ pub fn encode_record_inline(creator: u32, deleter: u32, row: &[Value]) -> Vec<u8
 
 /// Encodes a row with every string inline (used for catalog metadata).
 pub fn encode_row(row: &[Value]) -> Vec<u8> {
-    encode_row_with(row, None, 0).expect("inline row encoding never fails")
+    let mut buf = Vec::new();
+    encode_row_into(row, &mut buf);
+    buf
+}
+
+/// Encodes a row with every string inline into `out` (cleared first), so
+/// callers that encode many rows (grouping, joins) reuse one allocation.
+pub(crate) fn encode_row_into(row: &[Value], out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(&(row.len() as u16).to_le_bytes());
+    for v in row {
+        match v {
+            Value::Null => out.push(TAG_NULL),
+            Value::Int(n) => {
+                out.push(TAG_INT);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Value::Float(x) => {
+                out.push(TAG_FLOAT);
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            Value::Str(s) => {
+                out.push(TAG_STR);
+                out.extend_from_slice(&(s.len() as u16).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            Value::Bool(b) => {
+                out.push(TAG_BOOL);
+                out.push(*b as u8);
+            }
+            Value::Date(d) => {
+                out.push(TAG_DATE);
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+        }
+    }
 }
 
 pub fn decode_row(data: &[u8]) -> Result<(Vec<Value>, usize)> {

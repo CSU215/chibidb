@@ -830,18 +830,22 @@ pub(crate) fn chunk_grouped_aggregate(
     let slot = |c: usize| needed.iter().position(|&x| x == c).expect("column is needed");
     let group_slots: Vec<usize> = group_columns.iter().map(|&c| slot(c)).collect();
     let agg_slots: Vec<Option<usize>> = kinds.iter().map(|k| k.column_index().map(slot)).collect();
+    // Reused across rows so grouping does not allocate a key per row.
+    let mut key_buf: Vec<Value> = Vec::with_capacity(group_slots.len());
+    let mut encoded: Vec<u8> = Vec::new();
 
     // A bare scan streams exactly the needed columns without materializing
     // chunks; anything else (a filter, join, ...) falls back below.
     let streamed = child
         .for_each_projected_row(ctx, &needed, &mut |_, _, values| {
-            let key: Vec<Value> = group_slots.iter().map(|&s| values[s].clone()).collect();
-            let encoded = crate::storage::codec::encode_row(&key);
+            key_buf.clear();
+            key_buf.extend(group_slots.iter().map(|&s| values[s].clone()));
+            crate::storage::codec::encode_row_into(&key_buf, &mut encoded);
             let group = match lookup.get(&encoded) {
                 Some(&g) => g,
                 None => {
                     let g = groups.len();
-                    lookup.insert(encoded, g);
+                    lookup.insert(encoded.clone(), g);
                     groups.push(Group {
                         states: kinds.iter().map(|k| new_state(*k)).collect(),
                         first: values.to_vec(),
@@ -865,14 +869,14 @@ pub(crate) fn chunk_grouped_aggregate(
     if !streamed {
         while let Some(chunk) = child.next_chunk(ctx)? {
             for i in 0..chunk.len() {
-                let key: Vec<Value> =
-                    group_columns.iter().map(|&c| chunk.column(c).value(i)).collect();
-                let encoded = crate::storage::codec::encode_row(&key);
+                key_buf.clear();
+                key_buf.extend(group_columns.iter().map(|&c| chunk.column(c).value(i)));
+                crate::storage::codec::encode_row_into(&key_buf, &mut encoded);
                 let group = match lookup.get(&encoded) {
                     Some(&g) => g,
                     None => {
                         let g = groups.len();
-                        lookup.insert(encoded, g);
+                        lookup.insert(encoded.clone(), g);
                         groups.push(Group {
                             states: kinds.iter().map(|k| new_state(*k)).collect(),
                             first: needed.iter().map(|&c| chunk.column(c).value(i)).collect(),
