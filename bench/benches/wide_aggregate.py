@@ -4,6 +4,7 @@ The layout matters here: a row-at-a-time scan walks past every column to reach
 the summed one, while a column-major (PAX) page reads only that column's bytes.
 ``BENCH_WIDE_COLS`` sets the int columns, ``BENCH_WIDE_PAD_COLS`` /
 ``BENCH_WIDE_PAD_LEN`` the wide ``char`` padding that the summed query skips.
+Set ``CHIBIDB_LAYOUT=pax`` (see ``targets/chibidb.py``) to run it on PAX tables.
 The default row count keeps the table inside the 64-frame buffer pool, so the
 measurement isolates scan/decoding CPU rather than page I/O.
 """

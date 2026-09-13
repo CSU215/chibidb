@@ -11,7 +11,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 use std::sync::Mutex;
 
-use chibidb::config::{Config, ExecutionMode};
+use chibidb::config::{Config, ExecutionMode, PageLayout};
 use chibidb::{Database, result};
 
 /// Opaque handle to an open database.
@@ -42,8 +42,28 @@ fn into_c_string(text: String) -> *mut c_char {
     }
 }
 
-/// Opens (or creates) a database directory. `mode` is `"volcano"`, `"chunk"`
-/// or null for the default. Returns null on failure.
+/// Applies open options to `config`: execution mode (`volcano`/`chunk`) and
+/// page layout for new tables (`row`/`pax`), any of them separated by `+` or
+/// `,` (e.g. `"chunk+pax"`). Unknown tokens are ignored.
+fn apply_open_options(config: &mut Config, options: &str) {
+    for token in options.split(['+', ',']) {
+        let token = token.trim();
+        if token.eq_ignore_ascii_case("chunk") {
+            config.execution.mode = ExecutionMode::Chunk;
+        } else if token.eq_ignore_ascii_case("volcano") {
+            config.execution.mode = ExecutionMode::Volcano;
+        } else if token.eq_ignore_ascii_case("pax") {
+            config.storage.page_layout = PageLayout::Pax;
+        } else if token.eq_ignore_ascii_case("row") {
+            config.storage.page_layout = PageLayout::Row;
+        }
+    }
+}
+
+/// Opens (or creates) a database directory. `mode` is an open-options string:
+/// `"volcano"`/`"chunk"` pick the execution model, `"pax"`/`"row"` the page
+/// layout new tables use, joined with `+` (e.g. `"chunk+pax"`); null uses the
+/// defaults. Returns null on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn chibidb_open(dir: *const c_char, mode: *const c_char) -> *mut ChibiDb {
     let dir = match read_str(dir) {
@@ -54,10 +74,8 @@ pub extern "C" fn chibidb_open(dir: *const c_char, mode: *const c_char) -> *mut 
         }
     };
     let mut config = Config::default();
-    if let Ok(mode) = read_str(mode)
-        && mode.eq_ignore_ascii_case("chunk")
-    {
-        config.execution.mode = ExecutionMode::Chunk;
+    if let Ok(options) = read_str(mode) {
+        apply_open_options(&mut config, &options);
     }
     match Database::open_with_config(Path::new(&dir), &config) {
         Ok(inner) => Box::into_raw(Box::new(ChibiDb { inner })),
@@ -142,5 +160,27 @@ pub extern "C" fn chibidb_last_error() -> *const c_char {
     match LAST_ERROR.lock() {
         Ok(slot) => slot.as_ref().map_or(std::ptr::null(), |text| text.as_ptr()),
         Err(_) => std::ptr::null(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_options_select_mode_and_layout() {
+        let mut config = Config::default();
+        apply_open_options(&mut config, "volcano+pax");
+        assert_eq!(config.execution.mode, ExecutionMode::Volcano);
+        assert_eq!(config.storage.page_layout, PageLayout::Pax);
+
+        apply_open_options(&mut config, "chunk,row");
+        assert_eq!(config.execution.mode, ExecutionMode::Chunk);
+        assert_eq!(config.storage.page_layout, PageLayout::Row);
+
+        // unknown tokens leave the defaults alone
+        let mut config = Config::default();
+        apply_open_options(&mut config, "bogus");
+        assert_eq!(config, Config::default());
     }
 }

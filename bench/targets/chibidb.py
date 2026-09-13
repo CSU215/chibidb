@@ -3,8 +3,9 @@
 Loads the shared library built by ``cargo build`` and calls
 ``chibidb_open``/``chibidb_exec``/``chibidb_close`` through ``ctypes``, so the
 benchmark measures the engine rather than a pipe. ``CHIBIDB_MODE`` selects the
-execution mode (``volcano``/``chunk``); ``CHIBIDB_LIB`` overrides the library
-path.
+execution mode (``volcano``/``chunk``), ``CHIBIDB_LAYOUT`` the page layout for
+new tables (``row``/``pax``); both are passed to ``chibidb_open`` together.
+``CHIBIDB_LIB`` overrides the library path.
 """
 
 from __future__ import annotations
@@ -38,6 +39,15 @@ def execution_mode() -> str:
     return os.environ.get("CHIBIDB_MODE", "").strip().lower()
 
 
+def page_layout() -> str:
+    return os.environ.get("CHIBIDB_LAYOUT", "").strip().lower()
+
+
+def open_options() -> str:
+    """Execution mode and page layout joined as ``chibidb_open`` options."""
+    return "+".join(part for part in (execution_mode(), page_layout()) if part)
+
+
 class ChibidbNativeTarget(Target):
     id = "chibidb"
     title = "chibidb (native cdylib)"
@@ -50,8 +60,8 @@ class ChibidbNativeTarget(Target):
         path = library_path()
         if not os.path.isfile(path):
             return False, "cdylib not built: %s (cargo build --release)" % path
-        mode = execution_mode()
-        return True, path + (" [mode=%s]" % mode if mode else "")
+        options = open_options()
+        return True, path + (" [%s]" % options if options else "")
 
     def _load(self):
         lib = ctypes.CDLL(library_path())
@@ -66,10 +76,10 @@ class ChibidbNativeTarget(Target):
 
     def open(self, env: Env):
         self._lib = self._load()
-        mode = execution_mode() or None
+        options = open_options() or None
         self._db = self._lib.chibidb_open(
             env.data_dir.encode("utf-8"),
-            mode.encode("utf-8") if mode else None,
+            options.encode("utf-8") if options else None,
         )
         if not self._db:
             raise RuntimeError("chibidb_open failed: %s" % self._last_error())

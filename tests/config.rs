@@ -152,6 +152,24 @@ fn database_applies_config_buffer_pool_frames() {
 }
 
 #[test]
+fn config_page_layout_applies_to_new_tables() {
+    let cfg = Config::from_toml_str("[storage]\npage_layout = \"pax\"\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_with_config(dir.path(), &cfg).unwrap();
+    db.execute_sql("create table t (id int, v int);").unwrap();
+    for i in 0..200 {
+        db.execute_sql(&format!("insert into t values ({i}, {});", i * 2)).unwrap();
+    }
+    let rs = db.execute_sql("select sum(v) from t;").unwrap();
+    match &rs[0] {
+        ResultSet::Rows { rows, .. } => {
+            assert_eq!(rows[0][0], Value::Int((0..200).map(|i| i * 2).sum()))
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
 fn open_in_memory_honors_config() {
     let cfg = Config::from_toml_str("[storage]\nbuffer_pool_frames = 1\n").unwrap();
     let db = Database::open_in_memory_with_config(&cfg).unwrap();
