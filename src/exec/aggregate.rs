@@ -648,6 +648,15 @@ fn update_value(kind: &AggKind, state: &mut AggState, value: Value) -> Result<()
                 let AggState::Sum(acc) = state else { unreachable!("sum state") };
                 *acc = Some(match acc.take() {
                     None => value,
+                    // Fast paths keep the common numeric sum off `eval_binary`.
+                    Some(Value::Int(a)) => match value {
+                        Value::Int(b) => Value::Int(a.checked_add(b).ok_or_else(int_overflow)?),
+                        other => eval_binary(BinOp::Add, Value::Int(a), other)?,
+                    },
+                    Some(Value::Float(a)) => match value {
+                        Value::Float(b) => Value::Float(a + b),
+                        other => eval_binary(BinOp::Add, Value::Float(a), other)?,
+                    },
                     Some(prev) => eval_binary(BinOp::Add, prev, value)?,
                 });
             }
