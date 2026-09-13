@@ -360,10 +360,13 @@ impl Database {
                         // records of dropped tables (file no longer in the
                         // catalog) are stale and skipped
                         let Some((kind, engine)) = storage.get(file_no) else { continue };
+                        // Rebuild the table's indexes for any committed record,
+                        // even if the heap page already reflects it: the derived
+                        // index page may not have reached disk.
+                        touched.insert(*file_no);
                         match kind {
                             EngineKind::Lsm => {
                                 engine.insert_at(&self.pool, *rid, record)?;
-                                touched.insert(*file_no);
                             }
                             EngineKind::Heap => {
                                 let file = file_map[file_no];
@@ -377,13 +380,13 @@ impl Database {
                                     self.pool.with_page(file, rid.page_no, |page| {
                                         page_put_at(page, rid.slot, record)
                                     })?;
-                                    touched.insert(*file_no);
                                 }
                             }
                         }
                     }
                     Record::DeleteMark { file_no, rid, deleter } => {
                         let Some((kind, engine)) = storage.get(file_no) else { continue };
+                        touched.insert(*file_no);
                         match kind {
                             EngineKind::Lsm => {
                                 if let Ok(bytes) = engine.get(&self.pool, *rid)
@@ -391,7 +394,6 @@ impl Database {
                                     && u32::from_le_bytes(bytes[4..8].try_into().unwrap()) == 0
                                 {
                                     engine.delete_mark(&self.pool, *rid, *deleter)?;
-                                    touched.insert(*file_no);
                                 }
                             }
                             EngineKind::Heap => {
@@ -409,7 +411,6 @@ impl Database {
                                 })?;
                                 if unmarked {
                                     HeapFile::at(file).delete_mark(&self.pool, *rid, *deleter)?;
-                                    touched.insert(*file_no);
                                 }
                             }
                         }
