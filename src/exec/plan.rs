@@ -43,7 +43,38 @@ pub(crate) fn plan_select(db: &Database, s: &SelectStmt) -> Result<String> {
                 describe_sarg(&sarg)
             ))
         }
-        None => Ok(format!("FullScan(table={}) -> Filter -> Project", s.from[0].name)),
+        None => {
+            if let Some(col) = single_asc_order_column(&s.order_by)
+                && db.catalog().view(&s.from[0].name).is_none()
+                && let Some(ix) = db
+                    .catalog()
+                    .indexes_for(&s.from[0].name)
+                    .into_iter()
+                    .find(|ix| ix.column == col)
+            {
+                Ok(format!(
+                    "OrderedIndexScan(index={}, table={}) -> Filter -> Project",
+                    ix.name, s.from[0].name
+                ))
+            } else {
+                Ok(format!("FullScan(table={}) -> Filter -> Project", s.from[0].name))
+            }
+        }
+    }
+}
+
+/// The plain column of a single ascending ORDER BY key, if any.
+pub(crate) fn single_asc_order_column(order_by: &[(Expr, bool)]) -> Option<String> {
+    let [(e, desc)] = order_by else {
+        return None;
+    };
+    if *desc {
+        return None;
+    }
+    match e {
+        Expr::Column(n) => Some(n.clone()),
+        Expr::QualifiedColumn(_, n) => Some(n.clone()),
+        _ => None,
     }
 }
 
@@ -272,4 +303,22 @@ fn scan_rids(
         .into_iter()
         .map(|(_, rid)| rid)
         .collect())
+}
+
+/// The index file backing an in-order scan of `column`, used to satisfy an
+/// `ORDER BY column` even when there is no WHERE clause to make it sargable.
+pub(crate) fn ordered_index_file(
+    db: &Database,
+    table: &str,
+    column: &str,
+) -> Result<Option<crate::storage::page::FileId>> {
+    let catalog = db.catalog();
+    if catalog.view(table).is_some() {
+        return Ok(None);
+    }
+    Ok(catalog
+        .indexes_for(table)
+        .into_iter()
+        .find(|ix| ix.column == column)
+        .map(|ix| ix.store.file))
 }

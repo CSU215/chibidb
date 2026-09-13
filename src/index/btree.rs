@@ -372,6 +372,14 @@ impl BTree {
         }
     }
 
+    /// A forward cursor over the leaf level, so a range can be read lazily in
+    /// key order (e.g. an `ORDER BY` that an index can satisfy, stopping after
+    /// the caller's LIMIT instead of materializing the whole range).
+    pub fn leaf_cursor(&self, bp: &BufferPool) -> Result<LeafCursor> {
+        let first = self.header_u32(bp, FIRST_LEAF_OFF)?;
+        Ok(LeafCursor { file: self.file, leaf: first, pos: 0 })
+    }
+
     pub fn delete(&self, bp: &BufferPool, key: &[u8], rid: Rid) -> Result<()> {
         let root = self.root(bp)?;
         if root == 0 {
@@ -848,6 +856,43 @@ fn u32_put(page: &mut [u8], off: usize, v: PageNo) {
 
 fn leaf_entry(page: &[u8], i: usize) -> (Vec<u8>, Rid) {
     leaf_entry_at(page, i)
+}
+
+/// A lazy, forward-only reader over a B+ tree's leaf level. Yields rids in
+/// ascending key order and holds only a `(leaf, position)` so it stops early.
+pub struct LeafCursor {
+    file: FileId,
+    leaf: PageNo,
+    pos: usize,
+}
+
+impl LeafCursor {
+    /// The next rid in key order, or `None` at the end of the tree.
+    pub fn next_rid(&mut self, bp: &BufferPool) -> Result<Option<Rid>> {
+        loop {
+            if self.leaf == 0 {
+                return Ok(None);
+            }
+            let (file, leaf, pos) = (self.file, self.leaf, self.pos);
+            let entry = bp.read_page(file, leaf, |page| {
+                if pos < leaf_num(page) {
+                    Ok(Some((leaf_entry_at(page, pos).1, leaf_next(page))))
+                } else {
+                    Ok(None)
+                }
+            })?;
+            match entry {
+                Some((rid, _)) => {
+                    self.pos += 1;
+                    return Ok(Some(rid));
+                }
+                None => {
+                    self.leaf = bp.read_page(file, leaf, |page| Ok(leaf_next(page)))?;
+                    self.pos = 0;
+                }
+            }
+        }
+    }
 }
 
 fn internal_sep_remove(

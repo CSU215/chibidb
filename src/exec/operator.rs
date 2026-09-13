@@ -1494,6 +1494,8 @@ pub struct IndexScan {
     engine: std::sync::Arc<dyn crate::storage::engine::TableStorage>,
     column: String,
     rids: Vec<Rid>,
+    /// A lazy in-order cursor over the index; when set, `rids` is unused.
+    cursor: Option<crate::index::LeafCursor>,
     pos: usize,
 }
 
@@ -1513,6 +1515,25 @@ impl IndexScan {
         let Some(plan) = crate::exec::plan::plan_index_scan(db, table, selection)? else {
             return Ok(None);
         };
+        let mut scan = Self::skeleton(db, table, owner, plan.column)?;
+        scan.rids = plan.rids;
+        Ok(Some(scan))
+    }
+
+    /// Scans `column`'s index in ascending key order, so an `ORDER BY column`
+    /// can reuse the index instead of sorting. The scan is lazy, so a LIMIT
+    /// stops it once it has the rows it needs. Returns `None` without that
+    /// index.
+    pub fn ordered(db: &Database, table: &str, owner: &str, column: &str) -> Result<Option<Self>> {
+        let Some(file) = crate::exec::plan::ordered_index_file(db, table, column)? else {
+            return Ok(None);
+        };
+        let mut scan = Self::skeleton(db, table, owner, column.to_string())?;
+        scan.cursor = Some(crate::index::BTree::at(file).leaf_cursor(&db.pool)?);
+        Ok(Some(scan))
+    }
+
+    fn skeleton(db: &Database, table: &str, owner: &str, column: String) -> Result<Self> {
         let (columns, engine) = {
             let catalog = db.catalog();
             let t = catalog.table(table)?;
@@ -1525,18 +1546,26 @@ impl IndexScan {
                 .map(|c| ColumnDesc::plain(Some(owner.clone()), c.name, c.dtype))
                 .collect(),
         };
-        Ok(Some(Self {
-            schema,
-            engine,
-            column: plan.column,
-            rids: plan.rids,
-            pos: 0,
-        }))
+        Ok(Self { schema, engine, column, rids: Vec::new(), cursor: None, pos: 0 })
     }
 
     /// The indexed column, which the scan yields in ascending order.
     pub fn ordered_column(&self) -> &str {
         &self.column
+    }
+
+    /// The next candidate rid, from the precomputed list or the lazy cursor.
+    fn next_rid(&mut self, pool: &crate::storage::BufferPool) -> Result<Option<Rid>> {
+        if let Some(cursor) = self.cursor.as_mut() {
+            return cursor.next_rid(pool);
+        }
+        if self.pos < self.rids.len() {
+            let rid = self.rids[self.pos];
+            self.pos += 1;
+            Ok(Some(rid))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -1551,9 +1580,7 @@ impl PhysicalOperator for IndexScan {
     }
 
     fn next(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
-        while self.pos < self.rids.len() {
-            let rid = self.rids[self.pos];
-            self.pos += 1;
+        while let Some(rid) = self.next_rid(&ctx.db.pool)? {
             let record = self.engine.get(&ctx.db.pool, rid)?;
             let (creator, deleter, row) = decode_record(&record, ctx.db.lobs())?;
             if ctx.trx.visible(creator, deleter) {
@@ -1565,9 +1592,10 @@ impl PhysicalOperator for IndexScan {
 
     fn next_chunk(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Chunk>> {
         let mut chunk = Chunk::with_schema(&self.schema);
-        while chunk.len() < CHUNK_ROWS && self.pos < self.rids.len() {
-            let rid = self.rids[self.pos];
-            self.pos += 1;
+        while chunk.len() < CHUNK_ROWS {
+            let Some(rid) = self.next_rid(&ctx.db.pool)? else {
+                break;
+            };
             let record = self.engine.get(&ctx.db.pool, rid)?;
             let (creator, deleter, row) = decode_record(&record, ctx.db.lobs())?;
             if ctx.trx.visible(creator, deleter) {
@@ -1665,14 +1693,27 @@ pub fn build_select(
                     (Box::new(scan), Some(column))
                 }
                 None => {
-                    // sequential scans may skip large objects the query never reads
-                    let keep = lob_keep(
-                        select,
-                        &db.catalog().table(&tref.name)?.schema.columns,
-                        owner,
-                        &tref.name,
-                    );
-                    (Box::new(TableScan::with_owner_keep(db, &tref.name, owner, keep)?), None)
+                    // An index on the ORDER BY column can supply the order even
+                    // without a WHERE clause, skipping the sort.
+                    if select.group_by.is_empty()
+                        && !items_have_aggregate(&select.items)
+                        && let Some(column) =
+                            crate::exec::plan::single_asc_order_column(&select.order_by)
+                        && let Some(scan) =
+                            IndexScan::ordered(db, &tref.name, owner, &column)?
+                    {
+                        let column = scan.ordered_column().to_string();
+                        (Box::new(scan), Some(column))
+                    } else {
+                        // sequential scans may skip large objects the query never reads
+                        let keep = lob_keep(
+                            select,
+                            &db.catalog().table(&tref.name)?.schema.columns,
+                            owner,
+                            &tref.name,
+                        );
+                        (Box::new(TableScan::with_owner_keep(db, &tref.name, owner, keep)?), None)
+                    }
                 }
             }
         }

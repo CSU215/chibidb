@@ -24,6 +24,14 @@ fn message(rs: &[ResultSet]) -> String {
     }
 }
 
+fn rows_of(db: &Database, sql: &str) -> Vec<Vec<Value>> {
+    let rs = db.execute_sql(sql).unwrap();
+    match &rs[0] {
+        ResultSet::Rows { rows, .. } => rows.clone(),
+        other => panic!("expected rows for {sql}, got {other:?}"),
+    }
+}
+
 fn seeded(db: &Database) {
     db.execute_sql("create table student (id int, name char(10), score float);")
         .unwrap();
@@ -89,6 +97,57 @@ fn explain_chooses_access_path() {
         let plan =
             message(&db.execute_sql("explain select * from student where name = 'x';").unwrap());
         assert!(plan.contains("FullScan"), "{plan}");
+    });
+}
+
+#[test]
+fn ordered_index_scan_handles_stale_versions() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int, v int);").unwrap();
+        db.execute_sql("insert into t values (1,10),(2,20),(3,30),(4,40),(5,50);").unwrap();
+        db.execute_sql("create index idx on t (id);").unwrap();
+        // an update leaves the old version's index entry behind for snapshots
+        db.execute_sql("update t set v = 99 where id = 2;").unwrap();
+        db.execute_sql("delete from t where id = 4;").unwrap();
+        db.execute_sql("insert into t values (3, 33);").unwrap();
+
+        let ids = rows_of(db, "select id from t order by id;");
+        assert_eq!(
+            ids,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)],
+                vec![Value::Int(3)],
+                vec![Value::Int(5)],
+            ]
+        );
+        let top2 = rows_of(db, "select id from t order by id limit 2;");
+        assert_eq!(top2, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    });
+}
+
+#[test]
+fn explain_uses_index_for_order_by() {
+    with_dbs(|db| {
+        seeded(db);
+        let sql = "select id from student order by id limit 10;";
+
+        let plan = message(&db.execute_sql(&format!("explain {sql}")).unwrap());
+        assert!(plan.contains("FullScan"), "{plan}");
+        let before = rows_of(db, sql);
+
+        db.execute_sql("create index idx_id on student (id);").unwrap();
+        let plan = message(&db.execute_sql(&format!("explain {sql}")).unwrap());
+        assert!(plan.contains("OrderedIndexScan"), "{plan}");
+        assert_eq!(before, rows_of(db, sql));
+
+        // descending order still needs an explicit sort
+        let plan = message(
+            &db.execute_sql("explain select id from student order by id desc limit 10;")
+                .unwrap(),
+        );
+        assert!(!plan.contains("OrderedIndexScan"), "{plan}");
     });
 }
 
