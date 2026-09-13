@@ -1039,15 +1039,19 @@ impl Database {
         &self,
         name: &str,
         row: Vec<Value>,
-        creator: u32,
+        trx: &mut TrxState,
     ) -> Result<Rid> {
         let (file_no, engine) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
             (t.heap.file_no, t.engine())
         };
+        let creator = trx.id;
         let data = encode_record(creator, 0, &row, &self.lobs, self.inline_lob_limit())?;
         let rid = engine.insert(&self.pool, &data)?;
+        // Record the undo as soon as the row exists so that a later failure in
+        // the WAL or index steps is still undone by the enclosing transaction.
+        trx.undo.push(Undo::Insert { table: name.to_string(), rid, row: row.clone() });
         self.wal.append(creator, &Record::Insert { file_no, rid, record: data.clone() })?;
         for (ci, ix_file) in self.index_ops(name)? {
             let key = encode_key(&row[ci])?;
@@ -1062,19 +1066,25 @@ impl Database {
         &self,
         name: &str,
         rids: &[Rid],
-        deleter: u32,
-    ) -> Result<Vec<u32>> {
+        trx: &mut TrxState,
+    ) -> Result<()> {
         let (file_no, engine) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
             (t.heap.file_no, t.engine())
         };
-        let mut previous = Vec::with_capacity(rids.len());
+        let deleter = trx.id;
         for rid in rids {
-            previous.push(engine.delete_mark(&self.pool, *rid, deleter)?);
-            self.wal.append(deleter, &Record::DeleteMark { file_no, rid: *rid, deleter })?;
+            let prev_deleter = engine.delete_mark(&self.pool, *rid, deleter)?;
+            trx.undo.push(Undo::DeleteMark {
+                table: name.to_string(),
+                rid: *rid,
+                prev_deleter,
+            });
+            self.wal
+                .append(deleter, &Record::DeleteMark { file_no, rid: *rid, deleter })?;
         }
-        Ok(previous)
+        Ok(())
     }
 
     /// MVCC update: delete-mark the old version, insert a new one. Index
@@ -1084,15 +1094,15 @@ impl Database {
         &self,
         name: &str,
         updates: &[(Rid, Vec<Value>)],
-        trx_id: u32,
-    ) -> Result<Vec<(Rid, u32)>> {
+        trx: &mut TrxState,
+    ) -> Result<()> {
         let (file_no, engine) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
             (t.heap.file_no, t.engine())
         };
+        let trx_id = trx.id;
         let ops = self.index_ops(name)?;
-        let mut new_rids = Vec::with_capacity(updates.len());
         for (rid, new_row) in updates {
             let prev_deleter = engine.delete_mark(&self.pool, *rid, trx_id)?;
             self.wal
@@ -1107,9 +1117,15 @@ impl Database {
                 let key = encode_key(&new_row[*ci])?;
                 BTree::at(*ix_file).insert(&self.pool, &key, new_rid)?;
             }
-            new_rids.push((new_rid, prev_deleter));
+            trx.undo.push(Undo::Update {
+                table: name.to_string(),
+                old_rid: *rid,
+                new_rid,
+                new_row: new_row.clone(),
+                prev_deleter,
+            });
         }
-        Ok(new_rids)
+        Ok(())
     }
 }
 

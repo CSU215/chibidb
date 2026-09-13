@@ -5,7 +5,7 @@ use crate::ast::{
 use crate::catalog::Schema;
 use crate::result::ResultSet;
 use crate::storage::codec::decode_record;
-use crate::trx::{TrxState, Undo};
+use crate::trx::TrxState;
 use crate::value::Value;
 use crate::{Database, Error, Result};
 
@@ -213,16 +213,7 @@ pub(crate) fn execute_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) 
         db.check_unique(&u.table, &new_row, Some(rid), trx, &mut claimed)?;
         updates.push((rid, new_row));
     }
-    let new_rids = db.store_update_versions(&u.table, &updates, trx.id)?;
-    for ((old_rid, new_row), (new_rid, prev_deleter)) in updates.into_iter().zip(new_rids) {
-        trx.undo.push(Undo::Update {
-            table: u.table.clone(),
-            old_rid,
-            new_rid,
-            new_row,
-            prev_deleter,
-        });
-    }
+    db.store_update_versions(&u.table, &updates, trx)?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
@@ -243,10 +234,7 @@ pub(crate) fn execute_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) 
             victims.push(rid);
         }
     }
-    let previous = db.store_delete_mark(&d.table, &victims, trx.id)?;
-    for (rid, prev_deleter) in victims.into_iter().zip(previous) {
-        trx.undo.push(Undo::DeleteMark { table: d.table.clone(), rid, prev_deleter });
-    }
+    db.store_delete_mark(&d.table, &victims, trx)?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
@@ -315,8 +303,7 @@ pub(crate) fn execute_insert(db: &Database, trx: &mut TrxState, i: &InsertStmt) 
                 "record too large ({size} bytes does not fit in a page)"
             )));
         }
-        let rid = db.store_insert(&i.table, row.clone(), trx.id)?;
-        trx.undo.push(Undo::Insert { table: i.table.clone(), rid, row });
+        db.store_insert(&i.table, row, trx)?;
     }
     Ok(ResultSet::Message("SUCCESS".into()))
 }
