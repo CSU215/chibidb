@@ -1,9 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::storage::disk::DiskManager;
 use crate::storage::page::{zeroed_page, FileId, PageData, PageNo, PAGE_SIZE};
@@ -17,11 +17,65 @@ struct Frame {
     no: PageNo,
     data: Mutex<PageData>,
     dirty: AtomicBool,
+    /// 活跃的 pin 数。非零期间这一帧不会被选为淘汰对象，所以闭包里的写入
+    /// 不可能落进一个已脱离页表的孤儿帧。见 `PinnedFrame`。
+    pins: AtomicU32,
+}
+
+/// RAII pin：存活期间该帧不会被淘汰。构造**只在持有 `state` 锁时**发生，
+/// 因此"帧进入页表"与"帧被 pin"之间不存在窗口；`Drop` 只碰帧自己的原子量，
+/// 不重新获取 `state`（解 pin 只会让帧变得可淘汰，晚一点可见是保守的）。
+struct PinnedFrame {
+    frame: Arc<Frame>,
+}
+
+impl PinnedFrame {
+    /// 把 `frame` 的 pin 计数加一。调用者必须持有 `state` 锁，否则就只是把
+    /// 原来的竞态窗口挪了个位置。
+    fn new(frame: Arc<Frame>) -> Self {
+        frame.pins.fetch_add(1, Ordering::Acquire);
+        Self { frame }
+    }
+
+    fn file(&self) -> FileId {
+        self.frame.file
+    }
+
+    fn no(&self) -> PageNo {
+        self.frame.no
+    }
+
+    /// 页闩。pin 保证帧还在页表里，页闩保证内容不被并发改写。
+    fn data(&self) -> MutexGuard<'_, PageData> {
+        self.frame.data.lock()
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.frame.dirty.load(Ordering::Acquire)
+    }
+
+    fn mark_dirty(&self) {
+        self.frame.dirty.store(true, Ordering::Release);
+    }
+
+    fn clear_dirty(&self) {
+        self.frame.dirty.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for PinnedFrame {
+    fn drop(&mut self) {
+        let prev = self.frame.pins.fetch_sub(1, Ordering::Release);
+        debug_assert!(prev > 0, "unbalanced pin on ({}, {})", self.frame.file, self.frame.no);
+    }
 }
 
 /// The page table and LRU order, guarded by one lock. Frame *contents* have
 /// their own latches, so this lock is held only while resolving a page to a
 /// frame, never while a closure runs.
+///
+/// 不变式 Ⅳ：每个存活帧在 `lru` 里恰好登记一次（`lru.len() == frames.len()`）。
+/// pin 不移除登记，只是让该帧失去淘汰候选资格 —— 所以被 pin 的帧仍在队列里。
 #[derive(Default)]
 struct PoolState {
     frames: HashMap<(FileId, PageNo), Arc<Frame>>,
@@ -78,10 +132,10 @@ impl BufferPool {
         no: PageNo,
         f: impl FnOnce(&mut [u8; PAGE_SIZE]) -> Result<T>,
     ) -> Result<T> {
-        let frame = self.frame_for(file, no)?;
-        let mut data = frame.data.lock();
+        let pinned = self.frame_for(file, no)?;
+        let mut data = pinned.data();
         let out = f(&mut data);
-        frame.dirty.store(true, Ordering::Release);
+        pinned.mark_dirty();
         out
     }
 
@@ -91,32 +145,34 @@ impl BufferPool {
         no: PageNo,
         f: impl FnOnce(&[u8; PAGE_SIZE]) -> Result<T>,
     ) -> Result<T> {
-        let frame = self.frame_for(file, no)?;
-        let data = frame.data.lock();
+        let pinned = self.frame_for(file, no)?;
+        let data = pinned.data();
         f(&data)
     }
 
     /// Resolves a page to its frame, loading and evicting as needed. The state
     /// lock is released before the caller latches the frame, so a page latch is
-    /// never held together with the metadata lock.
-    fn frame_for(&self, file: FileId, no: PageNo) -> Result<Arc<Frame>> {
+    /// never held together with the metadata lock. The returned guard holds a
+    /// pin, so the frame cannot be evicted while the caller still uses it.
+    fn frame_for(&self, file: FileId, no: PageNo) -> Result<PinnedFrame> {
         let key = (file, no);
         let mut state = self.state.lock();
-        if let Some(frame) = state.frames.get(&key).cloned() {
-            touch(&mut state.lru, key);
+        // `frames` 可变借用于淘汰，`lru` 可变借用于重排；拆开字段让两者并存。
+        let PoolState { frames, lru } = &mut *state;
+        if let Some(frame) = frames.get(&key).cloned() {
+            touch(lru, key);
             self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(frame);
+            return Ok(PinnedFrame::new(frame));
         }
-        while state.frames.len() >= self.capacity {
-            let victim_key = state
-                .lru
-                .pop_front()
-                .ok_or_else(|| Error::Runtime("buffer pool exhausted".into()))?;
+        while frames.len() >= self.capacity {
+            // 被 pin 的帧留在 LRU 队列里，只是不参与淘汰 —— 否则它们会丢掉
+            // 淘汰顺序信息（不变式 Ⅳ：登记数恒等于页表长度）。
+            let victim_key = take_victim(lru, frames).ok_or_else(|| {
+                Error::Runtime("buffer pool exhausted: every frame is pinned".into())
+            })?;
             self.evictions.fetch_add(1, Ordering::Relaxed);
-            let victim = state
-                .frames
-                .remove(&victim_key)
-                .expect("lru and page table stay in sync");
+            let victim =
+                frames.remove(&victim_key).expect("lru and page table stay in sync");
             if victim.dirty.load(Ordering::Acquire) {
                 // lock order disk -> frame latch, matching flush_all
                 let mut disk = self.disk.lock();
@@ -133,10 +189,12 @@ impl BufferPool {
             no,
             data: Mutex::new(data),
             dirty: AtomicBool::new(false),
+            pins: AtomicU32::new(0),
         });
-        state.frames.insert(key, frame.clone());
-        state.lru.push_back(key);
-        Ok(frame)
+        frames.insert(key, frame.clone());
+        lru.push_back(key);
+        debug_assert_eq!(frames.len(), lru.len(), "invariant Ⅳ: lru mirrors the page table");
+        Ok(PinnedFrame::new(frame))
     }
 
     pub fn alloc_page(&self, file: FileId) -> Result<PageNo> {
@@ -174,6 +232,10 @@ impl BufferPool {
 
     /// Drops all cached frames of a file without writing them back. A reader
     /// that already resolved a frame keeps its own `Arc`, so it is unaffected.
+    ///
+    /// 被 pin 的帧**不**被跳过：这是"这份数据已经不要了"的单写者契约，调用者
+    /// （`rebuild_indexes` / `drop_table`）持库级写锁，因此正常情况下没有在飞的
+    /// 闭包。真有的话，它的修改随最后一个 `Arc` 一起消失，这正是本方法要的语义。
     pub fn discard_file(&self, file: FileId) {
         let mut state = self.state.lock();
         state.frames.retain(|k, _| k.0 != file);
@@ -187,10 +249,10 @@ impl BufferPool {
         }
         let mut disk = self.disk.lock();
         for frame in frames {
-            if frame.dirty.load(Ordering::Acquire) {
-                let data = frame.data.lock();
-                disk.write_page(frame.file, frame.no, &data)?;
-                frame.dirty.store(false, Ordering::Release);
+            if frame.is_dirty() {
+                let data = frame.data();
+                disk.write_page(frame.file(), frame.no(), &data)?;
+                frame.clear_dirty();
             }
         }
         disk.sync_file(file)?;
@@ -206,18 +268,18 @@ impl BufferPool {
         // double-write: stage every page and sync before touching the final
         // files, so a crash mid-write can be repaired on the next open
         for frame in &frames {
-            let data = frame.data.lock();
-            disk.stage_page(frame.file, frame.no, &data)?;
+            let data = frame.data();
+            disk.stage_page(frame.file(), frame.no(), &data)?;
         }
         disk.sync_double_write()?;
         for frame in &frames {
-            let data = frame.data.lock();
-            disk.write_page(frame.file, frame.no, &data)?;
-            frame.dirty.store(false, Ordering::Release);
+            let data = frame.data();
+            disk.write_page(frame.file(), frame.no(), &data)?;
+            frame.clear_dirty();
         }
         // The final pages must be durable before the DWB can be discarded;
         // otherwise a crash after reset would lose them with no repair copy.
-        let mut files: Vec<FileId> = frames.iter().map(|f| f.file).collect();
+        let mut files: Vec<FileId> = frames.iter().map(|f| f.file()).collect();
         files.sort_unstable();
         files.dedup();
         for file in files {
@@ -229,7 +291,9 @@ impl BufferPool {
 
     /// Snapshots the frames that need writing back, optionally only those of
     /// one file. `flush_*` then writes them without holding the state lock.
-    fn dirty_frames(&self, only: Option<FileId>) -> Vec<Arc<Frame>> {
+    /// The snapshot pins every frame it returns: otherwise a concurrent
+    /// eviction could write the same page (or drop it) under our feet.
+    fn dirty_frames(&self, only: Option<FileId>) -> Vec<PinnedFrame> {
         let state = self.state.lock();
         state
             .frames
@@ -237,7 +301,7 @@ impl BufferPool {
             .filter(|(k, f)| {
                 only.is_none_or(|file| k.0 == file) && f.dirty.load(Ordering::Acquire)
             })
-            .map(|(_, f)| f.clone())
+            .map(|(_, f)| PinnedFrame::new(f.clone()))
             .collect()
     }
 }
@@ -248,6 +312,19 @@ fn touch(lru: &mut VecDeque<(FileId, PageNo)>, key: (FileId, PageNo)) {
         lru.remove(pos);
     }
     lru.push_back(key);
+}
+
+/// Picks the least recently used *evictable* frame, removing its registration.
+/// Frames with a live pin stay in the deque so they keep their place in the
+/// order; returning `None` means every registered frame is pinned.
+fn take_victim(
+    lru: &mut VecDeque<(FileId, PageNo)>,
+    frames: &HashMap<(FileId, PageNo), Arc<Frame>>,
+) -> Option<(FileId, PageNo)> {
+    let pos = lru
+        .iter()
+        .position(|k| frames.get(k).is_none_or(|f| f.pins.load(Ordering::Acquire) == 0))?;
+    lru.remove(pos)
 }
 
 impl Drop for BufferPool {

@@ -128,7 +128,7 @@ SQL 字符串
   → slotted page   8KB、槽目录、变长条目
   → TableStorage   表存储接缝（`insert/delete/delete_mark/scan/get`，带 MVCC 语义）
   → HeapEngine     `TableStorage` 的堆实现（Rid 寻址、多页 first-fit）
-  → BufferPool     8KB 帧、LRU、脏页写回（元数据锁 + 每帧页闩）
+  → BufferPool     8KB 帧、LRU、pin 引用计数、脏页写回（元数据锁 + 每帧页闩）
   → DiskManager    分页文件 IO
 ```
 
@@ -172,6 +172,9 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
   读时按可见性规则过滤；UPDATE = 删除标记 + 新版本
 - 库内读并发：每个数据库一把 `RwLock`，只读语句共享读锁，写语句独占；
   `BufferPool` 用元数据锁 + 每帧页闩，多读互不阻塞；写事务在语句粒度串行
+- 页 pin：`with_page`/`read_page` 的闭包期内帧被 pin（RAII guard），淘汰器只挑
+  `pins == 0` 的帧，所以正在写的页不会被搬走；池内每帧都被 pin 时返回
+  `buffer pool exhausted` 而不是静默丢写
 - 冲突策略可配置：`transaction.conflict = "fcw" | "2pl"`。默认 **FCW**
   （first-committer-wins）：提交时比对被改写基版本的 `prev_deleter` 与当前标记，
   若其间有后提交的事务改过同一行则回滚失败方
