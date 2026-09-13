@@ -1143,23 +1143,47 @@ pub(crate) fn select_uses_hash_join(db: &Database, s: &SelectStmt) -> Result<boo
     Ok(false)
 }
 
-fn encode_join_key(
+/// Appends one key component to `out`, length-prefixed so components cannot
+/// run together. Returns `false` for a NULL value (the key never matches).
+fn push_key_component(out: &mut Vec<u8>, value: &Value) -> Result<bool> {
+    if matches!(value, Value::Null) {
+        return Ok(false);
+    }
+    let bytes = encode_key(value)?;
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&bytes);
+    Ok(true)
+}
+
+/// Encodes the columns at `indices` into `out` (cleared); `false` on a NULL.
+fn indices_key_into(indices: &[usize], row: &[Value], out: &mut Vec<u8>) -> Result<bool> {
+    out.clear();
+    for &index in indices {
+        if !push_key_component(out, &row[index])? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Encodes expression keys into `out` (cleared); `false` on a NULL value.
+fn expr_key_into(
     keys: &[Expr],
     schema: &Schema,
     row: &[Value],
     db: &Database,
     trx: &mut crate::trx::TrxState,
-) -> Result<Option<Vec<Vec<u8>>>> {
+    out: &mut Vec<u8>,
+) -> Result<bool> {
+    out.clear();
     let ctx = EvalCtx::row(schema, row);
-    let mut encoded = Vec::with_capacity(keys.len());
     for key in keys {
         let value = eval_bound(db, trx, key, Some(&ctx))?;
-        if matches!(value, Value::Null) {
-            return Ok(None);
+        if !push_key_component(out, &value)? {
+            return Ok(false);
         }
-        encoded.push(encode_key(&value)?);
     }
-    Ok(Some(encoded))
+    Ok(true)
 }
 
 /// Resolves hash-join keys that are plain columns to their schema positions.
@@ -1179,18 +1203,6 @@ fn key_indices(keys: &[Expr], schema: &Schema) -> Option<Vec<usize>> {
     Some(indices)
 }
 
-fn encode_row_key(indices: &[usize], row: &[Value]) -> Result<Option<Vec<Vec<u8>>>> {
-    let mut encoded = Vec::with_capacity(indices.len());
-    for &index in indices {
-        let value = &row[index];
-        if matches!(value, Value::Null) {
-            return Ok(None);
-        }
-        encoded.push(encode_key(value)?);
-    }
-    Ok(Some(encoded))
-}
-
 /// Hash equi-join: builds a hash table on one side, then streams the other
 /// side in chunks, preserving row order. Supports INNER/LEFT (build right)
 /// and RIGHT (build left).
@@ -1202,7 +1214,7 @@ pub struct HashJoin {
     right_keys: Vec<Expr>,
     residual: Option<Expr>,
     schema: Schema,
-    table: HashMap<Vec<Vec<u8>>, Vec<usize>>,
+    table: HashMap<Vec<u8>, Vec<usize>>,
     build_rows: Vec<Vec<Value>>,
     probe_is_right: bool,
     probe_keys: Vec<Expr>,
@@ -1246,29 +1258,29 @@ impl HashJoin {
         }
     }
 
-    /// Encodes one probe row's join key straight from its columns, without a
-    /// row context; `None` means a NULL key (never matches).
-    fn probe_key(
+    /// Encodes one probe row's join key into `out` (cleared); `false` means a
+    /// NULL key (never matches).
+    fn probe_key_into(
         &self,
         chunk: &Chunk,
         i: usize,
         ctx: &mut ExecContext<'_>,
-    ) -> Result<Option<Vec<Vec<u8>>>> {
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
         match &self.probe_key_indices {
             Some(indices) => {
-                let mut encoded = Vec::with_capacity(indices.len());
+                out.clear();
                 for &index in indices {
                     let value = chunk.column(index).value(i);
-                    if matches!(value, Value::Null) {
-                        return Ok(None);
+                    if !push_key_component(out, &value)? {
+                        return Ok(false);
                     }
-                    encoded.push(encode_key(&value)?);
                 }
-                Ok(Some(encoded))
+                Ok(true)
             }
             None => {
                 let row = chunk.row(i);
-                encode_join_key(&self.probe_keys, &self.probe_schema, &row, ctx.db, ctx.trx)
+                expr_key_into(&self.probe_keys, &self.probe_schema, &row, ctx.db, ctx.trx, out)
             }
         }
     }
@@ -1301,9 +1313,10 @@ impl HashJoin {
             return Ok(false);
         };
 
+        let mut key_buf = Vec::new();
         for i in 0..chunk.len() {
-            let key = self.probe_key(&chunk, i, ctx)?;
-            let matches = key.as_ref().and_then(|k| self.table.get(k));
+            let has_key = self.probe_key_into(&chunk, i, ctx, &mut key_buf)?;
+            let matches = if has_key { self.table.get(&key_buf) } else { None };
             let outer = if self.probe_is_right {
                 self.kind == JoinKind::Right
             } else {
@@ -1392,13 +1405,16 @@ impl PhysicalOperator for HashJoin {
             (self.left.schema().clone(), self.left_keys.clone())
         };
         let build_key_indices = key_indices(&build_keys, &build_schema);
+        let mut key_buf = Vec::new();
         for (i, row) in build_rows.iter().enumerate() {
-            let key = match &build_key_indices {
-                Some(indices) => encode_row_key(indices, row)?,
-                None => encode_join_key(&build_keys, &build_schema, row, ctx.db, ctx.trx)?,
+            let has_key = match &build_key_indices {
+                Some(indices) => indices_key_into(indices, row, &mut key_buf)?,
+                None => {
+                    expr_key_into(&build_keys, &build_schema, row, ctx.db, ctx.trx, &mut key_buf)?
+                }
             };
-            if let Some(key) = key {
-                self.table.entry(key).or_default().push(i);
+            if has_key {
+                self.table.entry(key_buf.clone()).or_default().push(i);
             }
         }
         self.build_rows = build_rows;
@@ -1436,6 +1452,90 @@ impl PhysicalOperator for HashJoin {
                 return Ok(None);
             }
         }
+    }
+
+    fn for_each_row(
+        &mut self,
+        ctx: &mut ExecContext<'_>,
+        sink: &mut dyn FnMut(&[Value]) -> Result<()>,
+    ) -> Result<bool> {
+        if self.probe_done {
+            return Ok(true);
+        }
+        if !self.probe_open {
+            let probe: &mut Box<dyn PhysicalOperator> =
+                if self.probe_is_right { &mut self.right } else { &mut self.left };
+            probe.open(ctx)?;
+            self.probe_open = true;
+        }
+        let outer = if self.probe_is_right {
+            self.kind == JoinKind::Right
+        } else {
+            self.kind == JoinKind::Left
+        };
+        let probe_cols = self.probe_schema.columns.len();
+        let mut key_buf = Vec::new();
+        let mut combined: Vec<Value> = Vec::with_capacity(self.left_cols + self.right_cols);
+        loop {
+            let pulled = {
+                let probe: &mut Box<dyn PhysicalOperator> =
+                    if self.probe_is_right { &mut self.right } else { &mut self.left };
+                probe.next_chunk(ctx)?
+            };
+            let Some(chunk) = pulled else { break };
+            for i in 0..chunk.len() {
+                let has_key = self.probe_key_into(&chunk, i, ctx, &mut key_buf)?;
+                let matches = if has_key { self.table.get(&key_buf) } else { None };
+                let has_match = matches.is_some_and(|indices| !indices.is_empty());
+                if !has_match && !outer {
+                    continue;
+                }
+                let mut matched = false;
+                if let Some(indices) = matches {
+                    for &build_index in indices {
+                        combined.clear();
+                        if self.probe_is_right {
+                            combined.extend(self.build_rows[build_index].iter().cloned());
+                            for c in 0..probe_cols {
+                                combined.push(chunk.column(c).value(i));
+                            }
+                        } else {
+                            for c in 0..probe_cols {
+                                combined.push(chunk.column(c).value(i));
+                            }
+                            combined.extend(self.build_rows[build_index].iter().cloned());
+                        }
+                        if residual_ok(&self.residual, &self.schema, ctx, &combined)? {
+                            sink(&combined)?;
+                            matched = true;
+                        }
+                    }
+                }
+                if !matched && outer {
+                    combined.clear();
+                    if self.probe_is_right {
+                        combined.extend(std::iter::repeat_n(Value::Null, self.left_cols));
+                        for c in 0..probe_cols {
+                            combined.push(chunk.column(c).value(i));
+                        }
+                    } else {
+                        for c in 0..probe_cols {
+                            combined.push(chunk.column(c).value(i));
+                        }
+                        combined.extend(std::iter::repeat_n(Value::Null, self.right_cols));
+                    }
+                    sink(&combined)?;
+                }
+            }
+        }
+        if self.probe_open {
+            let probe: &mut Box<dyn PhysicalOperator> =
+                if self.probe_is_right { &mut self.right } else { &mut self.left };
+            probe.close()?;
+            self.probe_open = false;
+        }
+        self.probe_done = true;
+        Ok(true)
     }
 
     fn close(&mut self) -> Result<()> {
