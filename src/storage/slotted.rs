@@ -157,7 +157,16 @@ pub fn page_write(page: &mut [u8; PAGE_SIZE], slot: u16, data: &[u8]) -> Result<
     Ok(())
 }
 
-pub fn page_iter<'a>(page: &'a [u8; PAGE_SIZE]) -> impl Iterator<Item = (u16, &'a [u8])> + 'a {
+/// Yields `(slot, offset, length)` for every live record, so a scanner can copy
+/// a whole page once and slice records out of it later without re-parsing.
+pub fn page_slots(page: &[u8]) -> impl Iterator<Item = (u16, usize, usize)> + '_ {
     let n = num_slots(page) as u16;
-    (0..n).filter_map(move |s| page_get(page, s).ok().flatten().map(|r| (s, r)))
+    (0..n).filter_map(move |s| {
+        let (off, len) = get_slot(page, s as usize);
+        (!(off == 0 && len == 0)).then_some((s, off, len))
+    })
+}
+
+pub fn page_iter<'a>(page: &'a [u8; PAGE_SIZE]) -> impl Iterator<Item = (u16, &'a [u8])> + 'a {
+    page_slots(page).map(move |(s, off, len)| (s, &page[off..off + len]))
 }

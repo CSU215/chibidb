@@ -72,6 +72,9 @@ pub struct TableScan {
     /// Per base-column flag: `false` means the query never reads that column,
     /// so a large object stored there need not be resolved. `None` reads all.
     keep: Option<Vec<bool>>,
+    /// Reused buffer holding the current encoded record, so scanning does not
+    /// allocate per row.
+    record: Vec<u8>,
 }
 
 impl TableScan {
@@ -99,7 +102,7 @@ impl TableScan {
                 .map(|c| ColumnDesc::plain(Some(owner.clone()), c.name, c.dtype))
                 .collect(),
         };
-        Ok(Self { table: table.to_string(), schema, scanner: None, keep })
+        Ok(Self { table: table.to_string(), schema, scanner: None, keep, record: Vec::new() })
     }
 }
 
@@ -116,21 +119,18 @@ impl PhysicalOperator for TableScan {
 
     fn next(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
         loop {
-            let (creator, deleter, row) = {
+            let found = {
                 let scanner = self.scanner.as_mut().expect("table scan not opened");
-                match scanner.next(&ctx.db.pool)? {
-                    Some((_, record)) => match &self.keep {
-                        Some(keep) => {
-                            crate::storage::codec::decode_record_pruned(
-                                &record,
-                                ctx.db.lobs(),
-                                keep,
-                            )?
-                        }
-                        None => decode_record(&record, ctx.db.lobs())?,
-                    },
-                    None => return Ok(None),
+                scanner.next_into(&ctx.db.pool, &mut self.record)?
+            };
+            if found.is_none() {
+                return Ok(None);
+            }
+            let (creator, deleter, row) = match &self.keep {
+                Some(keep) => {
+                    crate::storage::codec::decode_record_pruned(&self.record, ctx.db.lobs(), keep)?
                 }
+                None => decode_record(&self.record, ctx.db.lobs())?,
             };
             if ctx.trx.visible(creator, deleter) {
                 return Ok(Some(row));
@@ -141,21 +141,18 @@ impl PhysicalOperator for TableScan {
     fn next_chunk(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Chunk>> {
         let mut chunk = Chunk::with_schema(&self.schema);
         while chunk.len() < CHUNK_ROWS {
-            let (creator, deleter, row) = {
+            let found = {
                 let scanner = self.scanner.as_mut().expect("table scan not opened");
-                match scanner.next(&ctx.db.pool)? {
-                    Some((_, record)) => match &self.keep {
-                        Some(keep) => {
-                            crate::storage::codec::decode_record_pruned(
-                                &record,
-                                ctx.db.lobs(),
-                                keep,
-                            )?
-                        }
-                        None => decode_record(&record, ctx.db.lobs())?,
-                    },
-                    None => break,
+                scanner.next_into(&ctx.db.pool, &mut self.record)?
+            };
+            if found.is_none() {
+                break;
+            }
+            let (creator, deleter, row) = match &self.keep {
+                Some(keep) => {
+                    crate::storage::codec::decode_record_pruned(&self.record, ctx.db.lobs(), keep)?
                 }
+                None => decode_record(&self.record, ctx.db.lobs())?,
             };
             if ctx.trx.visible(creator, deleter) {
                 chunk.push_row(&row)?;

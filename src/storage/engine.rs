@@ -1,7 +1,7 @@
 use crate::storage::buffer::BufferPool;
 use crate::storage::heap::{HeapFile, Rid};
-use crate::storage::page::{FileId, PageNo};
-use crate::storage::slotted::page_iter;
+use crate::storage::page::{FileId, PageNo, PAGE_SIZE};
+use crate::storage::slotted::page_slots;
 use crate::{Error, Result};
 /// A forward-only cursor over a table's rows, decoupled from the concrete
 /// storage engine.
@@ -130,35 +130,78 @@ struct HeapScanner {
     file: FileId,
     next_page: PageNo,
     last_page: PageNo,
-    buffer: std::vec::IntoIter<(Rid, Vec<u8>)>,
+    /// Image of the page currently being drained; reused across pages.
+    page: Vec<u8>,
+    page_no: PageNo,
+    /// `(slot, offset, length)` of each live record in `page`.
+    slots: Vec<(u16, usize, usize)>,
+    slot_pos: usize,
 }
 
 impl HeapScanner {
     fn new(bp: &BufferPool, file: FileId) -> Result<Self> {
         let pages = bp.page_count(file)?;
-        Ok(Self { file, next_page: 1, last_page: pages, buffer: Vec::new().into_iter() })
+        Ok(Self {
+            file,
+            next_page: 1,
+            last_page: pages,
+            page: Vec::new(),
+            page_no: 0,
+            slots: Vec::new(),
+            slot_pos: 0,
+        })
+    }
+
+    /// Advances to the next page holding a live record; `false` at EOF.
+    fn advance(&mut self, bp: &BufferPool) -> Result<bool> {
+        while self.slot_pos >= self.slots.len() {
+            if self.next_page >= self.last_page {
+                return Ok(false);
+            }
+            let no = self.next_page;
+            self.next_page += 1;
+            if self.page.len() != PAGE_SIZE {
+                self.page.resize(PAGE_SIZE, 0);
+            }
+            bp.read_page(self.file, no, |data| {
+                self.page.copy_from_slice(data);
+                Ok(())
+            })?;
+            self.page_no = no;
+            self.slots.clear();
+            self.slots.extend(page_slots(&self.page));
+            self.slot_pos = 0;
+        }
+        Ok(true)
+    }
+
+    /// Pops `(rid, offset, length)` of the next record.
+    fn take(&mut self, bp: &BufferPool) -> Result<Option<(Rid, usize, usize)>> {
+        if !self.advance(bp)? {
+            return Ok(None);
+        }
+        let (slot, off, len) = self.slots[self.slot_pos];
+        self.slot_pos += 1;
+        Ok(Some((Rid::new(self.page_no, slot), off, len)))
     }
 }
 
 impl RowScanner for HeapScanner {
     fn next(&mut self, bp: &BufferPool) -> Result<Option<(Rid, Vec<u8>)>> {
-        loop {
-            if let Some(row) = self.buffer.next() {
-                return Ok(Some(row));
+        match self.take(bp)? {
+            Some((rid, off, len)) => Ok(Some((rid, self.page[off..off + len].to_vec()))),
+            None => Ok(None),
+        }
+    }
+
+    fn next_into(&mut self, bp: &BufferPool, out: &mut Vec<u8>) -> Result<Option<Rid>> {
+        match self.take(bp)? {
+            Some((rid, off, len)) => {
+                out.clear();
+                out.extend_from_slice(&self.page[off..off + len]);
+                Ok(Some(rid))
             }
-            if self.next_page >= self.last_page {
-                return Ok(None);
-            }
-            let no = self.next_page;
-            self.next_page += 1;
-            let mut rows = Vec::new();
-            bp.read_page(self.file, no, |page| {
-                for (slot, rec) in page_iter(page) {
-                    rows.push((Rid::new(no, slot), rec.to_vec()));
-                }
-                Ok(())
-            })?;
-            self.buffer = rows.into_iter();
+            None => Ok(None),
         }
     }
 }
