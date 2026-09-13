@@ -29,6 +29,48 @@ fn rows_of(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     }
 }
 
+fn message_of(db: &Database, sql: &str) -> String {
+    let rs = db.execute_sql(sql).unwrap();
+    match &rs[0] {
+        chibidb::ResultSet::Message(m) => m.clone(),
+        other => panic!("expected message for {sql}, got {other:?}"),
+    }
+}
+
+/// A comma join whose equality lives in WHERE must plan as a hash join, and
+/// produce the same rows as the explicit `JOIN ... ON` form.
+#[test]
+fn comma_join_matches_explicit_and_hashes() {
+    with_dbs(|db| {
+        seeded(db);
+        let comma = rows_of(
+            db,
+            "select emp.name, dept.dname from emp, dept where emp.dept_id = dept.id \
+             order by emp.name;",
+        );
+        let explicit = rows_of(
+            db,
+            "select emp.name, dept.dname from emp join dept on emp.dept_id = dept.id \
+             order by emp.name;",
+        );
+        assert_eq!(comma, explicit);
+
+        let plan = message_of(
+            db,
+            "explain select emp.name from emp, dept where emp.dept_id = dept.id;",
+        );
+        assert!(plan.contains("HashJoin"), "{plan}");
+
+        let plan =
+            message_of(db, "explain select emp.name from emp join dept on emp.dept_id = dept.id;");
+        assert!(plan.contains("HashJoin"), "{plan}");
+
+        // no equi predicate between the tables stays a cross product
+        let plan = message_of(db, "explain select emp.name from emp, dept;");
+        assert!(plan.contains("NestedLoopJoin"), "{plan}");
+    });
+}
+
 #[test]
 fn comma_join_with_where() {
     with_dbs(|db| {

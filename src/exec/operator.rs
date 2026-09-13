@@ -1008,10 +1008,27 @@ fn analyze_hash_join(
         return None;
     }
     let condition = condition?;
+    let conjuncts: Vec<Expr> = split_conjuncts(condition).into_iter().cloned().collect();
+    let (left_keys, right_keys, residual) = extract_hash_keys(&conjuncts, left, right);
+    if left_keys.is_empty() {
+        return None;
+    }
+    Some(HashKeys { left_keys, right_keys, residual: combine_and(residual) })
+}
+
+/// Splits `conjuncts` into equi-join key pairs between `left` and `right`, plus
+/// the predicates that must still be evaluated. A conjunct becomes a key only
+/// when its two sides resolve to compatible columns of the respective schemas,
+/// so callers can safely drop the returned keys from a filter.
+fn extract_hash_keys(
+    conjuncts: &[Expr],
+    left: &Schema,
+    right: &Schema,
+) -> (Vec<Expr>, Vec<Expr>, Vec<Expr>) {
     let mut left_keys = Vec::new();
     let mut right_keys = Vec::new();
-    let mut residual = Vec::new();
-    for conjunct in split_conjuncts(condition) {
+    let mut kept = Vec::new();
+    for conjunct in conjuncts {
         if let Expr::Binary(BinOp::Eq, a, b) = conjunct {
             if let (Some(ld), Some(rd)) = (column_dtype(left, a), column_dtype(right, b))
                 && compatible(ld, rd)
@@ -1028,12 +1045,50 @@ fn analyze_hash_join(
                 continue;
             }
         }
-        residual.push(conjunct.clone());
+        kept.push(conjunct.clone());
     }
-    if left_keys.is_empty() {
-        return None;
+    (left_keys, right_keys, kept)
+}
+
+/// Whether the left-deep join chain hashes at least one pair. Lets `EXPLAIN`
+/// report a comma join rewritten onto WHERE equi-keys as a `HashJoin`.
+pub(crate) fn select_uses_hash_join(db: &Database, s: &SelectStmt) -> Result<bool> {
+    if s.from.len() < 2 {
+        return Ok(false);
     }
-    Some(HashKeys { left_keys, right_keys, residual: combine_and(residual) })
+    let Some(first) = build_from_source(db, &s.from[0])? else {
+        return Ok(false);
+    };
+    let mut left_schema = first.schema().clone();
+    let mut where_conjuncts: Vec<Expr> =
+        s.selection.as_ref().map(split_conjuncts).unwrap_or_default()
+            .into_iter().cloned().collect();
+    for i in 1..s.from.len() {
+        let Some(right) = build_from_source(db, &s.from[i])? else {
+            return Ok(false);
+        };
+        let right_schema = right.schema().clone();
+        let kind = s.joins.get(i).copied().unwrap_or(JoinKind::Cross);
+        let hashed = match s.on.get(i - 1) {
+            Some(on) => analyze_hash_join(kind, Some(on), &left_schema, &right_schema).is_some(),
+            None if kind == JoinKind::Cross => {
+                let (left_keys, _, kept) =
+                    extract_hash_keys(&where_conjuncts, &left_schema, &right_schema);
+                if left_keys.is_empty() {
+                    false
+                } else {
+                    where_conjuncts = kept;
+                    true
+                }
+            }
+            None => false,
+        };
+        if hashed {
+            return Ok(true);
+        }
+        left_schema.columns.extend(right_schema.columns.iter().cloned());
+    }
+    Ok(false)
 }
 
 fn encode_join_key(
@@ -1593,6 +1648,7 @@ pub fn build_select(
 
     // FROM: a single table uses the best access path; multiple tables build a
     // left-deep nested-loop/hash join over from-sources (tables or views).
+    let mut post_filter = select.selection.clone();
     let (mut op, ordered_by): (Box<dyn PhysicalOperator>, Option<String>) = if select.from.len() == 1
     {
         let tref = &select.from[0];
@@ -1624,23 +1680,44 @@ pub fn build_select(
         let Some(mut op) = build_from_source(db, &select.from[0])? else {
             return Ok(None);
         };
+        // Comma joins carry no ON clause; equi-predicates between the two sides
+        // are sourced from WHERE so the join can hash instead of cross-produce.
+        let mut where_conjuncts: Vec<Expr> =
+            select.selection.as_ref().map(split_conjuncts).unwrap_or_default()
+                .into_iter().cloned().collect();
+        let mut where_reduced = false;
         for i in 1..select.from.len() {
             let Some(right) = build_from_source(db, &select.from[i])? else {
                 return Ok(None);
             };
             let kind = select.joins.get(i).copied().unwrap_or(JoinKind::Cross);
-            let condition = select.on.get(i - 1).cloned();
-            if let Some(keys) =
-                analyze_hash_join(kind, condition.as_ref(), op.schema(), right.schema())
-            {
-                op = Box::new(HashJoin::new(op, right, kind, keys));
-            } else {
-                op = Box::new(NestedLoopJoin::new(op, right, kind, condition)?);
+            let on = select.on.get(i - 1);
+            let keys = match on {
+                Some(on) => analyze_hash_join(kind, Some(on), op.schema(), right.schema()),
+                None if kind == JoinKind::Cross => {
+                    let (left_keys, right_keys, kept) =
+                        extract_hash_keys(&where_conjuncts, op.schema(), right.schema());
+                    if left_keys.is_empty() {
+                        None
+                    } else {
+                        where_conjuncts = kept;
+                        where_reduced = true;
+                        Some(HashKeys { left_keys, right_keys, residual: None })
+                    }
+                }
+                None => None,
+            };
+            match keys {
+                Some(keys) => op = Box::new(HashJoin::new(op, right, kind, keys)),
+                None => op = Box::new(NestedLoopJoin::new(op, right, kind, on.cloned())?),
             }
+        }
+        if where_reduced {
+            post_filter = combine_and(where_conjuncts);
         }
         (op, None)
     };
-    if let Some(selection) = &select.selection {
+    if let Some(selection) = &post_filter {
         op = Box::new(Filter::new(op, selection.clone()));
     }
 

@@ -19,8 +19,13 @@ pub(crate) fn plan_select(db: &Database, s: &SelectStmt) -> Result<String> {
         return Ok("ConstantSelect -> Project".into());
     }
     if s.from.len() > 1 {
+        let strategy = if super::operator::select_uses_hash_join(db, s)? {
+            "HashJoin"
+        } else {
+            "NestedLoopJoin"
+        };
         return Ok(format!(
-            "NestedLoopJoin(tables={}) -> Filter -> Project",
+            "{strategy}(tables={}) -> Filter -> Project",
             s.from.len()
         ));
     }
