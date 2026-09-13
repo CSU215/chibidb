@@ -467,6 +467,7 @@ impl Instance {
     /// The stored MySQL `mysql_native_password` verifier for `name`, if the
     /// user exists.
     pub fn native_verifier(&self, name: &str) -> Result<Option<String>> {
+        validate_ident(name, "user name")?;
         let meta = self.meta.read();
         let result =
             meta.execute_sql(&format!("select native from users where name = '{name}';"))?;
@@ -493,6 +494,7 @@ impl Instance {
 
     /// True when `password` matches the stored hash for `name`.
     pub fn authenticate(&self, name: &str, password: &str) -> Result<bool> {
+        validate_ident(name, "user name")?;
         let meta = self.meta.read();
         let result =
             meta.execute_sql(&format!("select password from users where name = '{name}';"))?;
@@ -571,7 +573,9 @@ fn statement_privilege(stmt: &Stmt) -> Option<Privilege> {
         | Stmt::CreateView(_)
         | Stmt::DropTable(_)
         | Stmt::DropIndex(_)
-        | Stmt::DropView(_) => Some(Privilege::Write),
+        | Stmt::DropView(_)
+        | Stmt::Checkpoint
+        | Stmt::Vacuum => Some(Privilege::Write),
         _ => None,
     }
 }
