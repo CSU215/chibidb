@@ -43,9 +43,23 @@ fn serve_connection(instance: &Instance, mut stream: TcpStream) -> io::Result<()
         };
         let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
         let content_length = content_length(&head).unwrap_or(0);
-        read_body(&mut stream, &mut buf, header_end + content_length)?;
+        // Guard against an overflow or an oversized body from a hostile header
+        // before allocating/buffering anything.
+        let body_end = match header_end.checked_add(content_length) {
+            Some(end) if end <= MAX_REQUEST => end,
+            _ => {
+                write_response(
+                    &mut stream,
+                    "413 Payload Too Large",
+                    &encode_error("request too large"),
+                    false,
+                )?;
+                break Ok(());
+            }
+        };
+        read_body(&mut stream, &mut buf, body_end)?;
 
-        let body_end = (header_end + content_length).min(buf.len());
+        let body_end = body_end.min(buf.len());
         let body = &buf[header_end..body_end];
         let (method, path) = request_line(&head);
         let keep_alive = !head.to_ascii_lowercase().contains("connection: close");
