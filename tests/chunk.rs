@@ -253,3 +253,13 @@ fn integer_overflow_matches() {
     assert_eq!(errs[0], errs[1]);
     assert!(errs[0].contains("overflow"), "unexpected error: {}", errs[0]);
 }
+
+#[test]
+fn group_by_signed_zero_matches() {
+    // -0.0 == 0.0 in the row path, so the columnar group key must agree.
+    assert_same(
+        "create table t (f float, v int);\
+         insert into t values (0.0, 1), (-0.0, 2);\
+         select f, count(*) from t group by f;",
+    );
+}

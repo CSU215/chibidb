@@ -360,11 +360,15 @@ impl Database {
                         // records of dropped tables (file no longer in the
                         // catalog) are stale and skipped
                         let Some((_kind, engine)) = storage.get(file_no) else { continue };
-                        engine.insert_at(&self.pool, *rid, record)?;
+                        // Rebuild the table's indexes for any committed record,
+                        // even if the heap page already reflects it: the derived
+                        // index page may not have reached disk.
                         touched.insert(*file_no);
+                        engine.insert_at(&self.pool, *rid, record)?;
                     }
                     Record::DeleteMark { file_no, rid, deleter } => {
                         let Some((kind, engine)) = storage.get(file_no) else { continue };
+                        touched.insert(*file_no);
                         // a heap record past the last allocated page was never
                         // written, so there is nothing to mark
                         if *kind == EngineKind::Heap
@@ -377,7 +381,6 @@ impl Database {
                             && u32::from_le_bytes(bytes[4..8].try_into().unwrap()) == 0
                         {
                             engine.delete_mark(&self.pool, *rid, *deleter)?;
-                            touched.insert(*file_no);
                         }
                     }
                     Record::Commit => {}
@@ -426,24 +429,30 @@ impl Database {
         if wrote && self.conflict == ConflictStrategy::Fcw {
             self.check_conflicts(trx)?;
         }
-        self.trx.commit(trx_id);
         if !wrote {
             // A read-only transaction created no versioned rows, so no future
             // snapshot needs its id and its bookkeeping need not hit disk.
             // Skipping the catalog rewrite keeps SELECT cheap.
+            self.trx.commit(trx_id);
             return Ok(());
         }
-        // log durability first: after this point the transaction commits
-        // even if the process dies before its pages are flushed
+        // The synced commit record is the durability point. Append and sync it
+        // *before* marking the transaction committed in memory, so a logging
+        // failure cannot leave a "committed" id whose record is not durable.
         self.wal.append(trx_id, &Record::Commit)?;
         self.wal.sync()?;
-        self.save_catalog()?;
-        // opportunistic checkpoint once the log outgrew its budget and no
-        // open transaction is counting on its contents
-        if self.wal.len()? > self.wal_checkpoint_threshold.load(Ordering::Relaxed)
+        self.trx.commit(trx_id);
+        // From here the transaction is durable: recovery can replay it from the
+        // WAL even if the catalog is stale, so post-commit bookkeeping failures
+        // are reported but must not roll the transaction back.
+        if let Err(e) = self.save_catalog() {
+            eprintln!("commit: saving catalog failed: {e}");
+        }
+        if self.wal.len().unwrap_or(0) > self.wal_checkpoint_threshold.load(Ordering::Relaxed)
             && self.trx.no_open_transactions()
+            && let Err(e) = self.flush()
         {
-            self.flush()?;
+            eprintln!("commit: opportunistic checkpoint failed: {e}");
         }
         Ok(())
     }
@@ -592,10 +601,15 @@ impl Database {
                 if let Some(mut trx) = session.trx.take() {
                     let wrote = !trx.undo.is_empty();
                     if let Err(e) = self.commit_trx(&trx, wrote) {
-                        // a conflict aborts this transaction: undo its work
-                        self.rollback_trx(&mut trx)?;
+                        // a conflict or log failure aborts this transaction:
+                        // undo its work and drop its bookkeeping. Always clear
+                        // the open slot, even if the undo itself fails.
                         self.trx.remove_open(trx.id);
-                        result = Err(e);
+                        if let Err(rb) = self.rollback_trx(&mut trx) {
+                            result = Err(rb);
+                        } else {
+                            result = Err(e);
+                        }
                     }
                 }
                 self.end_writer(session);
@@ -605,12 +619,13 @@ impl Database {
                 if session.trx.is_none() {
                     return Err(Error::Runtime("no active transaction".into()));
                 }
+                let mut result: Result<Option<ResultSet>> = Ok(None);
                 if let Some(mut trx) = session.trx.take() {
-                    self.rollback_trx(&mut trx)?;
                     self.trx.remove_open(trx.id);
+                    result = self.rollback_trx(&mut trx).map(|()| None);
                 }
                 self.end_writer(session);
-                Ok(None)
+                result
             }
             other => {
                 let read_only = is_read_only(other);
@@ -630,6 +645,7 @@ impl Database {
                         self.trx.insert_open(id);
                     }
                 }
+                let undo_mark = session.trx.as_ref().map(|t| t.undo.len()).unwrap_or(0);
                 let mut event = SqlEvent::new(other);
                 let outcome = match pipeline.run(self, session, &mut event) {
                     Ok(()) => {
@@ -639,29 +655,38 @@ impl Database {
                             && !read_only
                         {
                             let wrote = !trx.undo.is_empty();
-                            if let Err(e) = self.commit_trx(&trx, wrote) {
-                                self.rollback_trx(&mut trx)?;
-                                self.trx.remove_open(trx.id);
-                                Err(e)
-                            } else {
-                                Ok(Some(rs))
+                            match self.commit_trx(&trx, wrote) {
+                                Ok(()) => Ok(Some(rs)),
+                                Err(e) => {
+                                    // clear the open slot regardless of whether
+                                    // the compensating undo succeeds
+                                    self.trx.remove_open(trx.id);
+                                    Err(self.rollback_trx(&mut trx).err().unwrap_or(e))
+                                }
                             }
                         } else {
                             Ok(Some(rs))
                         }
                     }
                     Err(e) => {
-                        // undo partial statement work; an explicit
-                        // transaction stays open for retry or rollback
-                        if let Some(mut trx) = session.trx.take()
-                            && !read_only
-                        {
-                            self.rollback_trx(&mut trx)?;
-                            if !autocommit {
-                                session.trx = Some(trx);
-                            } else {
+                        // Undo only what the failed statement changed. A
+                        // read-only autocommit pseudo-transaction is simply
+                        // discarded; an explicit transaction stays open for
+                        // retry or rollback with its earlier work intact.
+                        if autocommit {
+                            if let Some(mut trx) = session.trx.take() {
+                                let undone = if read_only {
+                                    Ok(())
+                                } else {
+                                    self.rollback_trx_to(&mut trx, undo_mark)
+                                };
                                 self.trx.remove_open(trx.id);
+                                undone?;
                             }
+                        } else if !read_only
+                            && let Some(trx) = session.trx.as_mut()
+                        {
+                            self.rollback_trx_to(trx, undo_mark)?;
                         }
                         Err(e)
                     }
@@ -684,12 +709,13 @@ impl Database {
 
     /// Rolls back any open transaction when a session goes away.
     pub fn rollback_session(&self, session: &mut Session) -> Result<()> {
+        let mut result = Ok(());
         if let Some(mut trx) = session.trx.take() {
-            self.rollback_trx(&mut trx)?;
             self.trx.remove_open(trx.id);
+            result = self.rollback_trx(&mut trx);
         }
         self.end_writer(session);
-        Ok(())
+        result
     }
 
     /// Whether any session other than `trx_id` has a transaction open.
@@ -724,7 +750,14 @@ impl Database {
     }
 
     fn rollback_trx(&self, trx: &mut TrxState) -> Result<()> {
-        while let Some(undo) = trx.undo.pop() {
+        self.rollback_trx_to(trx, 0)
+    }
+
+    /// Undoes only the undo entries above `mark`. Used for a statement-level
+    /// rollback inside an explicit transaction, so earlier statements survive.
+    fn rollback_trx_to(&self, trx: &mut TrxState, mark: usize) -> Result<()> {
+        while trx.undo.len() > mark {
+            let undo = trx.undo.pop().expect("len > mark checked");
             match undo {
                 Undo::Insert { table, rid, row } => {
                     let engine = self.catalog().table(&table)?.engine();
@@ -983,15 +1016,19 @@ impl Database {
         &self,
         name: &str,
         row: Vec<Value>,
-        creator: u32,
+        trx: &mut TrxState,
     ) -> Result<Rid> {
         let (file_no, engine) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
             (t.heap.file_no, t.engine())
         };
+        let creator = trx.id;
         let data = encode_record(creator, 0, &row, &self.lobs, self.inline_lob_limit())?;
         let rid = engine.insert(&self.pool, &data)?;
+        // Record the undo as soon as the row exists so that a later failure in
+        // the WAL or index steps is still undone by the enclosing transaction.
+        trx.undo.push(Undo::Insert { table: name.to_string(), rid, row: row.clone() });
         self.wal.append(creator, &Record::Insert { file_no, rid, record: data.clone() })?;
         for (ci, ix_file) in self.index_ops(name)? {
             let key = encode_key(&row[ci])?;
@@ -1006,19 +1043,25 @@ impl Database {
         &self,
         name: &str,
         rids: &[Rid],
-        deleter: u32,
-    ) -> Result<Vec<u32>> {
+        trx: &mut TrxState,
+    ) -> Result<()> {
         let (file_no, engine) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
             (t.heap.file_no, t.engine())
         };
-        let mut previous = Vec::with_capacity(rids.len());
+        let deleter = trx.id;
         for rid in rids {
-            previous.push(engine.delete_mark(&self.pool, *rid, deleter)?);
-            self.wal.append(deleter, &Record::DeleteMark { file_no, rid: *rid, deleter })?;
+            let prev_deleter = engine.delete_mark(&self.pool, *rid, deleter)?;
+            trx.undo.push(Undo::DeleteMark {
+                table: name.to_string(),
+                rid: *rid,
+                prev_deleter,
+            });
+            self.wal
+                .append(deleter, &Record::DeleteMark { file_no, rid: *rid, deleter })?;
         }
-        Ok(previous)
+        Ok(())
     }
 
     /// MVCC update: delete-mark the old version, insert a new one. Index
@@ -1028,15 +1071,15 @@ impl Database {
         &self,
         name: &str,
         updates: &[(Rid, Vec<Value>)],
-        trx_id: u32,
-    ) -> Result<Vec<(Rid, u32)>> {
+        trx: &mut TrxState,
+    ) -> Result<()> {
         let (file_no, engine) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
             (t.heap.file_no, t.engine())
         };
+        let trx_id = trx.id;
         let ops = self.index_ops(name)?;
-        let mut new_rids = Vec::with_capacity(updates.len());
         for (rid, new_row) in updates {
             let prev_deleter = engine.delete_mark(&self.pool, *rid, trx_id)?;
             self.wal
@@ -1051,9 +1094,15 @@ impl Database {
                 let key = encode_key(&new_row[*ci])?;
                 BTree::at(*ix_file).insert(&self.pool, &key, new_rid)?;
             }
-            new_rids.push((new_rid, prev_deleter));
+            trx.undo.push(Undo::Update {
+                table: name.to_string(),
+                old_rid: *rid,
+                new_rid,
+                new_row: new_row.clone(),
+                prev_deleter,
+            });
         }
-        Ok(new_rids)
+        Ok(())
     }
 }
 

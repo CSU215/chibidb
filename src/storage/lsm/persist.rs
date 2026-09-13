@@ -112,8 +112,16 @@ impl PersistentLsm {
         self.next_file_no += 1;
         self.store.insert_level0(SSTable::parse(image)?.with_file_no(no));
         self.store.reset_memtable();
-        self.cascade()?;
-        self.write_manifest()
+        let mut obsolete = Vec::new();
+        self.cascade(&mut obsolete)?;
+        // Commit the new table layout before deleting the files it replaced:
+        // otherwise a crash in between leaves the durable manifest pointing at
+        // removed files.
+        self.write_manifest()?;
+        for file in obsolete {
+            let _ = std::fs::remove_file(sstable_path(&self.dir, file));
+        }
+        Ok(())
     }
 
     /// Merges every level into one table, dropping tombstones (major
@@ -127,14 +135,18 @@ impl PersistentLsm {
         write_sstable(&self.dir, no, &image)?;
         self.next_file_no += 1;
         self.store.set_levels(vec![vec![SSTable::parse(image)?.with_file_no(no)]]);
+        // Commit the manifest before removing the obsolete tables (see flush).
+        self.write_manifest()?;
         for file in old {
             let _ = std::fs::remove_file(sstable_path(&self.dir, file));
         }
-        self.write_manifest()
+        Ok(())
     }
 
-    /// Merges every level that reached the trigger into the next level.
-    fn cascade(&mut self) -> Result<()> {
+    /// Merges every level that reached the trigger into the next level. The
+    /// replaced file numbers are collected in `obsolete` for the caller to
+    /// delete *after* the manifest is committed.
+    fn cascade(&mut self, obsolete: &mut Vec<u32>) -> Result<()> {
         while let Some(level) = self.store.level_needing_compaction() {
             let tables: Vec<SSTable> = self.store.level_tables(level).to_vec();
             let image = self.store.merge_tables(&tables)?;
@@ -144,7 +156,7 @@ impl PersistentLsm {
             let merged = SSTable::parse(image)?.with_file_no(no);
             for table in &tables {
                 if let Some(file) = table.file_no() {
-                    let _ = std::fs::remove_file(sstable_path(&self.dir, file));
+                    obsolete.push(file);
                 }
             }
             self.store.apply_merge(level, merged);

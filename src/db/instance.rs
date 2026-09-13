@@ -139,6 +139,9 @@ impl Instance {
         self.meta
             .write()
             .execute_sql(&format!("delete from databases where name = '{name}';"))?;
+        // Remove grants on this database so a same-named one cannot inherit them.
+        let meta = self.meta.write();
+        delete_privileges(&meta, &format!("dbname = '{name}'"))?;
         Ok(())
     }
 
@@ -472,6 +475,7 @@ impl Instance {
     /// The stored MySQL `mysql_native_password` verifier for `name`, if the
     /// user exists.
     pub fn native_verifier(&self, name: &str) -> Result<Option<String>> {
+        validate_ident(name, "user name")?;
         let meta = self.meta.read();
         let result =
             meta.execute_sql(&format!("select native from users where name = '{name}';"))?;
@@ -493,11 +497,14 @@ impl Instance {
             return Err(Error::Runtime(format!("no such user: {name}")));
         }
         meta.execute_sql(&format!("delete from users where name = '{name}';"))?;
+        // Drop the user's grants too, so recreating the name cannot inherit them.
+        delete_privileges(&meta, &format!("username = '{name}'"))?;
         Ok(())
     }
 
     /// True when `password` matches the stored hash for `name`.
     pub fn authenticate(&self, name: &str, password: &str) -> Result<bool> {
+        validate_ident(name, "user name")?;
         let meta = self.meta.read();
         let result =
             meta.execute_sql(&format!("select password from users where name = '{name}';"))?;
@@ -576,7 +583,9 @@ fn statement_privilege(stmt: &Stmt) -> Option<Privilege> {
         | Stmt::CreateView(_)
         | Stmt::DropTable(_)
         | Stmt::DropIndex(_)
-        | Stmt::DropView(_) => Some(Privilege::Write),
+        | Stmt::DropView(_)
+        | Stmt::Checkpoint
+        | Stmt::Vacuum => Some(Privilege::Write),
         _ => None,
     }
 }
@@ -590,6 +599,12 @@ fn revoke(meta: &Database, user: &str, database: &str, kind: &str) -> Result<()>
     meta.execute_sql(&format!(
         "delete from privileges where username = '{user}' and dbname = '{database}' and kind = '{kind}';"
     ))?;
+    Ok(())
+}
+
+/// Deletes every privilege row matching `predicate` (already SQL-escaped).
+fn delete_privileges(meta: &Database, predicate: &str) -> Result<()> {
+    meta.execute_sql(&format!("delete from privileges where {predicate};"))?;
     Ok(())
 }
 

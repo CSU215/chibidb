@@ -75,3 +75,35 @@ fn auth_disabled_allows_everything() {
     inst.execute_with(&mut s, "create table t (id int);").unwrap();
     inst.execute_with(&mut s, "insert into t values (1);").unwrap();
 }
+
+#[test]
+fn injected_user_name_is_rejected_not_executed() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = Instance::open(dir.path(), &auth_config()).unwrap();
+    let mut s = Session::new();
+    inst.execute_with(&mut s, "create user alice identified by 'pw';").unwrap();
+
+    // A quoted name used to be interpolated straight into the metadata query.
+    let injected = "x' or '1'='1";
+    assert!(inst.authenticate(injected, "pw").unwrap_err().to_string().contains("invalid"));
+    assert!(inst.native_verifier(injected).unwrap_err().to_string().contains("invalid"));
+
+    // the users table is intact: alice still authenticates
+    assert!(inst.authenticate("alice", "pw").unwrap());
+}
+
+#[test]
+fn checkpoint_and_vacuum_require_write_privilege() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = Instance::open(dir.path(), &auth_config()).unwrap();
+    let mut s = Session::new();
+    inst.execute_with(&mut s, "create user alice identified by 'pw';").unwrap();
+    inst.execute_with(&mut s, "login alice identified by 'pw';").unwrap();
+    inst.execute_with(&mut s, "create database shop;").unwrap();
+    inst.execute_with(&mut s, "grant read on shop to alice;").unwrap();
+    inst.execute_with(&mut s, "use shop;").unwrap();
+
+    // read alone must not allow maintenance statements
+    assert!(err(&inst, &mut s, "checkpoint;").contains("permission denied"));
+    assert!(err(&inst, &mut s, "vacuum;").contains("permission denied"));
+}

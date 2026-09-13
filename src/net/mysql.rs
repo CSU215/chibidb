@@ -241,6 +241,11 @@ fn send_results(stream: &mut TcpStream, results: &[ResultSet]) -> io::Result<()>
             }
         }
     }
+    // A statement with no result set (BEGIN/COMMIT/ROLLBACK...) still owes the
+    // client one packet, or it waits forever for a reply.
+    if results.is_empty() {
+        write_packet(stream, seq, &ok_packet(STATUS_AUTOCOMMIT))?;
+    }
     Ok(())
 }
 
@@ -396,8 +401,9 @@ fn read_lenenc_bytes(data: &[u8], mut pos: usize) -> Option<(Vec<u8>, usize)> {
         }
         _ => return None,
     };
-    let bytes = data.get(pos..pos + len)?.to_vec();
-    Some((bytes, pos + len))
+    let end = pos.checked_add(len)?;
+    let bytes = data.get(pos..end)?.to_vec();
+    Some((bytes, end))
 }
 
 fn handshake_packet(connection_id: u32, scramble: &[u8; 20]) -> Vec<u8> {

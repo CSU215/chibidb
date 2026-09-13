@@ -226,3 +226,20 @@ fn join_with_group_order_limit() {
         }
     });
 }
+
+#[test]
+fn comma_then_explicit_join_keeps_the_on_clause() {
+    with_dbs(|db| {
+        db.execute_sql("create table a (x int);").unwrap();
+        db.execute_sql("create table b (k int);").unwrap();
+        db.execute_sql("create table c (k int);").unwrap();
+        db.execute_sql("insert into a values (1);").unwrap();
+        db.execute_sql("insert into b values (1);").unwrap();
+        db.execute_sql("insert into c values (1);").unwrap();
+
+        // The ON belongs to `b join c`; a comma before it must not shift the
+        // ON onto the comma join (which used to reference `c` out of scope).
+        let rows = rows_of(db, "select a.x, b.k, c.k from a, b join c on b.k = c.k;");
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Int(1), Value::Int(1)]]);
+    });
+}

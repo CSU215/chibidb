@@ -61,6 +61,37 @@ fn granting_to_unknown_user_errors() {
 }
 
 #[test]
+fn dropping_a_user_removes_its_privileges() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = instance(&dir);
+    let mut s = Session::new();
+    setup(&inst, &mut s);
+    inst.execute_with(&mut s, "grant all on * to alice;").unwrap();
+    assert!(inst.has_privilege("alice", "shop", Privilege::Read).unwrap());
+
+    inst.execute_with(&mut s, "drop user alice;").unwrap();
+    // recreate the same name: old grants must not come back
+    inst.execute_with(&mut s, "create user alice identified by 'x';").unwrap();
+    assert!(!inst.has_privilege("alice", "shop", Privilege::Read).unwrap());
+    assert!(!inst.has_privilege("alice", "shop", Privilege::Write).unwrap());
+}
+
+#[test]
+fn dropping_a_database_removes_its_privileges() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = instance(&dir);
+    let mut s = Session::new();
+    setup(&inst, &mut s);
+    inst.execute_with(&mut s, "grant all on shop to alice;").unwrap();
+    assert!(inst.has_privilege("alice", "shop", Privilege::Read).unwrap());
+
+    inst.execute_with(&mut s, "drop database shop;").unwrap();
+    inst.execute_with(&mut s, "create database shop;").unwrap();
+    // recreate the same database: old grants must not come back
+    assert!(!inst.has_privilege("alice", "shop", Privilege::Read).unwrap());
+}
+
+#[test]
 fn parses_grant_and_revoke() {
     use chibidb::ast::{GrantStmt, RevokeStmt, Stmt};
     use chibidb::parser::parse;

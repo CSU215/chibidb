@@ -116,7 +116,9 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
     let next_index_file = take_u32(data, &mut pos)?;
     let next_trx_id = take_u32(data, &mut pos)?;
     let n_committed = take_u32(data, &mut pos)? as usize;
-    let mut committed_trxs = Vec::with_capacity(n_committed);
+    // Do not pre-allocate from a file-supplied count: a corrupt catalog could
+    // otherwise request a huge allocation before the reads fail.
+    let mut committed_trxs = Vec::new();
     for _ in 0..n_committed {
         committed_trxs.push(take_u32(data, &mut pos)?);
     }
@@ -125,7 +127,7 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
     for _ in 0..n_tables {
         let name = take_str(data, &mut pos)?;
         let n_cols = take_u32(data, &mut pos)? as usize;
-        let mut columns = Vec::with_capacity(n_cols);
+        let mut columns = Vec::new();
         for _ in 0..n_cols {
             let cname = take_str(data, &mut pos)?;
             let tag = take(data, &mut pos, 1)?[0];

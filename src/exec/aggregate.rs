@@ -834,12 +834,23 @@ pub(crate) fn chunk_grouped_aggregate(
     let mut key_buf: Vec<Value> = Vec::with_capacity(group_slots.len());
     let mut encoded: Vec<u8> = Vec::new();
 
+    // The row path groups by `Value` equality, where -0.0 == 0.0; normalise
+    // the signed zero so the encoded key agrees.
+    let normalize = |mut value: Value| {
+        if let Value::Float(f) = &value
+            && *f == 0.0
+        {
+            value = Value::Float(0.0);
+        }
+        value
+    };
+
     // A bare scan streams exactly the needed columns without materializing
     // chunks; anything else (a filter, join, ...) falls back below.
     let streamed = child
         .for_each_projected_row(ctx, &needed, &mut |_, _, values| {
             key_buf.clear();
-            key_buf.extend(group_slots.iter().map(|&s| values[s].clone()));
+            key_buf.extend(group_slots.iter().map(|&s| normalize(values[s].clone())));
             crate::storage::codec::encode_row_into(&key_buf, &mut encoded);
             let group = match lookup.get(&encoded) {
                 Some(&g) => g,
@@ -870,7 +881,9 @@ pub(crate) fn chunk_grouped_aggregate(
         while let Some(chunk) = child.next_chunk(ctx)? {
             for i in 0..chunk.len() {
                 key_buf.clear();
-                key_buf.extend(group_columns.iter().map(|&c| chunk.column(c).value(i)));
+                key_buf.extend(
+                    group_columns.iter().map(|&c| normalize(chunk.column(c).value(i))),
+                );
                 crate::storage::codec::encode_row_into(&key_buf, &mut encoded);
                 let group = match lookup.get(&encoded) {
                     Some(&g) => g,

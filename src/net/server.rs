@@ -66,7 +66,11 @@ impl ThreadPoolHandler {
                     guard.recv()
                 };
                 match job {
-                    Ok(job) => job(),
+                    Ok(job) => {
+                        // A panicking connection handler (e.g. from malformed
+                        // input) must not shrink the pool permanently.
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    }
                     Err(_) => break,
                 }
             }));

@@ -279,3 +279,30 @@ fn index_survives_reopen() {
     let (_, got) = rows(&rs);
     assert_eq!(got, [[Value::Str("new".into())]]);
 }
+
+#[test]
+fn order_by_alias_shadowing_index_column_keeps_alias_order() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int primary key, b int);").unwrap();
+        db.execute_sql("insert into t values (1, 100), (2, 50);").unwrap();
+
+        // `id` in ORDER BY is the alias for `b`, so the primary-key index on
+        // the base column `id` must not be used to skip the sort.
+        let plain = rows_of(db, "select b as id from t order by id;");
+        assert_eq!(plain, vec![vec![Value::Int(50)], vec![Value::Int(100)]]);
+
+        // same through the sargable/ordered-index path
+        let filtered = rows_of(db, "select b as id from t where id >= 1 order by id;");
+        assert_eq!(filtered, vec![vec![Value::Int(50)], vec![Value::Int(100)]]);
+    });
+}
+
+#[test]
+fn explain_does_not_claim_ordered_scan_for_aggregate() {
+    with_dbs(|db| {
+        db.execute_sql("create table t (id int primary key, v int);").unwrap();
+        db.execute_sql("insert into t values (1, 10), (2, 20);").unwrap();
+        let plan = message(&db.execute_sql("explain select count(*) from t order by id;").unwrap());
+        assert!(!plan.contains("OrderedIndexScan"), "{plan}");
+    });
+}

@@ -279,3 +279,25 @@ fn rollback_leaves_no_redo() {
     let db = Database::open(dir.path()).unwrap();
     assert_eq!(rows(&db, "select * from t;"), Vec::<Vec<Value>>::new());
 }
+
+#[test]
+fn index_lookup_works_after_crash_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Database::open(dir.path()).unwrap();
+        db.execute_sql("create table t (id int primary key, name char(10));").unwrap();
+        db.execute_sql("insert into t values (1, 'a'), (2, 'b'), (3, 'c');").unwrap();
+        db.execute_sql("create index idx_name on t (name);").unwrap();
+        // only the WAL survives; the derived index pages are rebuilt on open
+        db.simulate_crash();
+    }
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(
+        rows(&db, "select name from t where id = 2;"),
+        vec![vec![Value::Str("b".into())]]
+    );
+    assert_eq!(
+        rows(&db, "select id from t where name = 'c';"),
+        vec![vec![Value::Int(3)]]
+    );
+}
