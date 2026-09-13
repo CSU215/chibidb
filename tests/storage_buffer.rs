@@ -14,7 +14,7 @@ fn pool_with(
     cap: usize,
     policy: EvictionPolicy,
 ) -> (BufferPool, u32) {
-    let mut disk = DiskManager::new();
+    let disk = DiskManager::new();
     let file = disk.create_file(&dir.path().join(name)).unwrap();
     (BufferPool::new_with_eviction(disk, cap, policy), file)
 }
@@ -52,7 +52,7 @@ fn data_survives_pool_restart() {
     let path = dir.path().join("c.dbf");
 
     {
-        let mut disk = DiskManager::new();
+        let disk = DiskManager::new();
         let f = disk.create_file(&path).unwrap();
         let bp = BufferPool::new(disk, 4);
         bp.with_page(f, 2, |p| {
@@ -62,7 +62,7 @@ fn data_survives_pool_restart() {
         .unwrap();
     }
 
-    let mut disk = DiskManager::new();
+    let disk = DiskManager::new();
     let f = disk.open_file(&path).unwrap();
     let bp = BufferPool::new(disk, 4);
     let v = bp.with_page(f, 2, |p| Ok(p[5])).unwrap();
@@ -151,7 +151,7 @@ fn alloc_pages_are_appended_and_persisted() {
     let path = dir.path().join("e.dbf");
 
     {
-        let mut disk = DiskManager::new();
+        let disk = DiskManager::new();
         let f = disk.create_file(&path).unwrap();
         let bp = BufferPool::new(disk, 4);
         assert_eq!(bp.alloc_page(f).unwrap(), 0);
@@ -165,7 +165,7 @@ fn alloc_pages_are_appended_and_persisted() {
         .unwrap();
     }
 
-    let mut disk = DiskManager::new();
+    let disk = DiskManager::new();
     let f = disk.open_file(&path).unwrap();
     let bp = BufferPool::new(disk, 4);
     assert_eq!(bp.page_count(f).unwrap(), 3);
@@ -184,7 +184,7 @@ fn page_spans_full_page_size() {
 #[test]
 fn shared_pool_reads_and_writes_concurrently() {
     let dir = tempfile::tempdir().unwrap();
-    let mut disk = DiskManager::new();
+    let disk = DiskManager::new();
     let f = disk.create_file(&dir.path().join("g.dbf")).unwrap();
     let bp = Arc::new(BufferPool::new(disk, 8));
     for no in 0..4u32 {
@@ -327,7 +327,7 @@ fn hammer(path: &std::path::Path, policy: EvictionPolicy) -> (Vec<u32>, Vec<u32>
         Arc::new((0..PAGES).map(|_| AtomicU32::new(0)).collect());
 
     {
-        let mut disk = DiskManager::new();
+        let disk = DiskManager::new();
         let f = disk.create_file(path).unwrap();
         // 容量 4、4 个线程：每个线程最多持 1 个 pin，故总有可淘汰的帧，
         // 不会真的耗尽；保留重试分支以防实现细节变化。
@@ -361,7 +361,7 @@ fn hammer(path: &std::path::Path, policy: EvictionPolicy) -> (Vec<u32>, Vec<u32>
         }
     }
 
-    let mut disk = DiskManager::new();
+    let disk = DiskManager::new();
     let f = disk.open_file(path).unwrap();
     let bp = BufferPool::new(disk, PAGES as usize);
     let on_disk = (0..PAGES)

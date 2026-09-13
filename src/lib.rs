@@ -139,7 +139,7 @@ impl Database {
         let indexes_dir = path.join("indexes");
         std::fs::create_dir_all(&tables_dir).map_err(dir_err(&tables_dir))?;
         std::fs::create_dir_all(&indexes_dir).map_err(dir_err(&indexes_dir))?;
-        let mut disk = DiskManager::new();
+        let disk = DiskManager::new();
         if config.storage.double_write {
             let dwb_path = path.join("dwb.bin");
             crate::storage::dwb::recover(&dwb_path, crate::storage::dwb::write_page_at)?;

@@ -122,7 +122,9 @@ pub struct PoolStats {
 /// Thread-safe buffer pool: `&self` methods let readers share the pool while
 /// per-frame latches keep different pages independent.
 pub struct BufferPool {
-    disk: Mutex<DiskManager>,
+    /// 裸字段：`DiskManager` 自己已经按文件加锁，再套一层 `Mutex` 只会
+    /// 把不同文件的 I/O 重新串起来。
+    disk: DiskManager,
     state: Mutex<PoolState>,
     capacity: usize,
     hits: AtomicU64,
@@ -142,7 +144,7 @@ impl BufferPool {
         eviction: EvictionPolicy,
     ) -> Self {
         Self {
-            disk: Mutex::new(disk),
+            disk,
             state: Mutex::new(PoolState { frames: HashMap::new(), replacer: from_policy(eviction) }),
             capacity: capacity.max(1),
             hits: AtomicU64::new(0),
@@ -214,15 +216,15 @@ impl BufferPool {
                 .remove(&victim_key)
                 .expect("the replacer stays in sync with the page table");
             if victim.dirty.load(Ordering::Acquire) {
-                // lock order disk -> frame latch, matching flush_all
-                let mut disk = self.disk.lock();
+                // 锁序：页闩 → 文件锁，与 flush_* 同向。被选中的帧 pins == 0，
+                // 而页闩的持有期是 pin 持有期的子集，所以这句不会阻塞（§6.3）。
                 let data = victim.data.lock();
-                disk.write_page(victim.file, victim.no, &data)?;
+                self.disk.write_page(victim.file, victim.no, &data)?;
                 victim.dirty.store(false, Ordering::Release);
             }
         }
         let mut data = zeroed_page();
-        self.disk.lock().read_page(file, no, &mut data)?;
+        self.disk.read_page(file, no, &mut data)?;
         self.misses.fetch_add(1, Ordering::Relaxed);
         let frame = Arc::new(Frame {
             file,
@@ -238,37 +240,35 @@ impl BufferPool {
         Ok(PinnedFrame::new(frame))
     }
 
+    /// 追加一张零页（不变式 Ⅴ）。真正的"取页数 + 写零页"在 `DiskManager`
+    /// 里由同一个文件锁保护，所以这里不需要额外同步。
     pub fn alloc_page(&self, file: FileId) -> Result<PageNo> {
-        let mut disk = self.disk.lock();
-        let no = disk.page_count(file)?;
-        let empty = zeroed_page();
-        disk.write_page(file, no, &empty)?;
-        Ok(no)
+        self.disk.alloc_page(file)
     }
 
     pub fn create_file(&self, path: &Path) -> Result<FileId> {
-        self.disk.lock().create_file(path)
+        self.disk.create_file(path)
     }
 
     pub fn open_file(&self, path: &Path) -> Result<FileId> {
-        self.disk.lock().open_file(path)
+        self.disk.open_file(path)
     }
 
     pub fn page_count(&self, file: FileId) -> Result<PageNo> {
-        self.disk.lock().page_count(file)
+        self.disk.page_count(file)
     }
 
     /// Empties a file in place. Cached frames of the file must be dropped
     /// first (see `discard_file`).
     pub fn truncate_file(&self, file: FileId) -> Result<()> {
-        self.disk.lock().truncate_file(file)
+        self.disk.truncate_file(file)
     }
 
     /// Drops all cached frames of a file without writing them back, closes
     /// its handle and returns the path for deletion.
     pub fn close_file(&self, file: FileId) -> Result<PathBuf> {
         self.discard_file(file);
-        self.disk.lock().close_file(file)
+        self.disk.close_file(file)
     }
 
     /// Drops all cached frames of a file without writing them back. A reader
@@ -297,15 +297,16 @@ impl BufferPool {
         if frames.is_empty() {
             return Ok(());
         }
-        let mut disk = self.disk.lock();
         for frame in frames {
             if frame.is_dirty() {
+                // 锁序：页闩 → 文件锁，与淘汰路径同向（见 `frame_for` 的注释）。
+                // 这里**不**持 `state`（`dirty_frames` 返回前已释放），比淘汰少一层。
                 let data = frame.data();
-                disk.write_page(frame.file(), frame.no(), &data)?;
+                self.disk.write_page(frame.file(), frame.no(), &data)?;
                 frame.clear_dirty();
             }
         }
-        disk.sync_file(file)?;
+        self.disk.sync_file(file)?;
         Ok(())
     }
 
@@ -314,17 +315,17 @@ impl BufferPool {
         if frames.is_empty() {
             return Ok(());
         }
-        let mut disk = self.disk.lock();
         // double-write: stage every page and sync before touching the final
         // files, so a crash mid-write can be repaired on the next open
+        // 锁序：页闩 → 文件锁，与 `frame_for` 的淘汰回写同向（那边外面还套着 `state`）。
         for frame in &frames {
             let data = frame.data();
-            disk.stage_page(frame.file(), frame.no(), &data)?;
+            self.disk.stage_page(frame.file(), frame.no(), &data)?;
         }
-        disk.sync_double_write()?;
+        self.disk.sync_double_write()?;
         for frame in &frames {
             let data = frame.data();
-            disk.write_page(frame.file(), frame.no(), &data)?;
+            self.disk.write_page(frame.file(), frame.no(), &data)?;
             frame.clear_dirty();
         }
         // The final pages must be durable before the DWB can be discarded;
@@ -333,9 +334,9 @@ impl BufferPool {
         files.sort_unstable();
         files.dedup();
         for file in files {
-            disk.sync_file(file)?;
+            self.disk.sync_file(file)?;
         }
-        disk.reset_double_write()?;
+        self.disk.reset_double_write()?;
         Ok(())
     }
 

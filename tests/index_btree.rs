@@ -2,7 +2,7 @@ use chibidb::index::{BTree, Bound};
 use chibidb::storage::{BufferPool, DiskManager, Rid};
 
 fn setup(dir: &tempfile::TempDir, name: &str) -> (BufferPool, u32) {
-    let mut disk = DiskManager::new();
+    let disk = DiskManager::new();
     let file = disk.create_file(&dir.path().join(name)).unwrap();
     (BufferPool::new(disk, 32), file)
 }
@@ -45,14 +45,14 @@ fn survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.idxf");
     {
-        let mut disk = DiskManager::new();
+        let disk = DiskManager::new();
         let f = disk.create_file(&path).unwrap();
         let bp = BufferPool::new(disk, 8);
         let tree = BTree::init(&bp, f).unwrap();
         tree.insert(&bp, b"k1", Rid::new(7, 3)).unwrap();
         tree.insert(&bp, b"k2", Rid::new(7, 4)).unwrap();
     }
-    let mut disk = DiskManager::new();
+    let disk = DiskManager::new();
     let f = disk.open_file(&path).unwrap();
     let bp = BufferPool::new(disk, 8);
     let tree = BTree::open(&bp, f).unwrap();

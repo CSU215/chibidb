@@ -4,7 +4,7 @@ use chibidb::storage::{BufferPool, DiskManager, HeapFile, Rid};
 use chibidb::value::Value;
 
 fn setup(dir: &tempfile::TempDir, name: &str) -> (BufferPool, u32) {
-    let mut disk = DiskManager::new();
+    let disk = DiskManager::new();
     let file = disk.create_file(&dir.path().join(name)).unwrap();
     (BufferPool::new(disk, 8), file)
 }

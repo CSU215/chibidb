@@ -26,7 +26,7 @@ impl Rng {
 }
 
 fn setup(dir: &tempfile::TempDir) -> (BufferPool, u32) {
-    let mut disk = DiskManager::new();
+    let disk = DiskManager::new();
     let file = disk.create_file(&dir.path().join("model.idxf")).unwrap();
     (BufferPool::new(disk, 64), file)
 }
