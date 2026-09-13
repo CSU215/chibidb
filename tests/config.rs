@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use chibidb::config::{Config, ConflictStrategy, EngineKind, ExecutionMode, ThreadModel};
+use chibidb::config::{Config, ConflictStrategy, EngineKind, ExecutionMode, PageLayout, ThreadModel};
 use chibidb::value::Value;
 use chibidb::{Database, ResultSet};
 
@@ -9,6 +9,7 @@ fn defaults_are_sane() {
     let c = Config::default();
     assert_eq!(c.storage.buffer_pool_frames, 64);
     assert_eq!(c.storage.default_engine, EngineKind::Heap);
+    assert_eq!(c.storage.page_layout, PageLayout::Row);
     assert!(!c.storage.double_write);
     assert_eq!(c.storage.inline_lob_limit, 4096);
     assert_eq!(c.wal.checkpoint_threshold, 8 * 1024 * 1024);
@@ -41,6 +42,7 @@ fn parses_all_sections() {
     let toml = r#"
 [storage]
 default_engine = "lsm"
+page_layout = "pax"
 buffer_pool_frames = 128
 double_write = true
 inline_lob_limit = 2048
@@ -60,6 +62,7 @@ enabled = true
 "#;
     let c = Config::from_toml_str(toml).unwrap();
     assert_eq!(c.storage.default_engine, EngineKind::Lsm);
+    assert_eq!(c.storage.page_layout, PageLayout::Pax);
     assert_eq!(c.storage.buffer_pool_frames, 128);
     assert!(c.storage.double_write);
     assert_eq!(c.storage.inline_lob_limit, 2048);

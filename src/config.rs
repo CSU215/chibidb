@@ -25,6 +25,17 @@ pub enum ExecutionMode {
     Chunk,
 }
 
+/// Physical page layout for heap tables. `Row` is the slotted record layout;
+/// `Pax` stores a page as a column-major row group so a scan reads only the
+/// columns it needs. Only heap tables support `Pax`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PageLayout {
+    #[default]
+    Row,
+    Pax,
+}
+
 /// How write-write conflicts between concurrent transactions are resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 pub enum ConflictStrategy {
@@ -63,6 +74,8 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub default_engine: EngineKind,
+    /// Page layout new heap tables use.
+    pub page_layout: PageLayout,
     pub buffer_pool_frames: usize,
     pub double_write: bool,
     pub inline_lob_limit: usize,
@@ -119,6 +132,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             default_engine: EngineKind::Heap,
+            page_layout: PageLayout::Row,
             buffer_pool_frames: 64,
             double_write: false,
             inline_lob_limit: 4096,

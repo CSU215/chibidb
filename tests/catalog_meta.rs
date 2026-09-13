@@ -2,7 +2,7 @@ use chibidb::ast::DataType;
 use chibidb::catalog::meta::{
     decode_catalog, encode_catalog, CatalogSnapshot, ColumnMeta, IndexMeta, TableMeta, ViewMeta,
 };
-use chibidb::config::EngineKind;
+use chibidb::config::{EngineKind, PageLayout};
 use chibidb::value::Value;
 
 fn col(name: &str, dtype: DataType) -> ColumnMeta {
@@ -46,12 +46,14 @@ fn snapshot() -> CatalogSnapshot {
                 ],
                 file_no: 0,
                 engine: EngineKind::Heap,
+                layout: PageLayout::Pax,
             },
             TableMeta {
                 name: "课程".into(),
                 columns: vec![col("cid", DataType::Int), col("title", DataType::Char(32))],
                 file_no: 1,
                 engine: EngineKind::Lsm,
+                layout: PageLayout::Row,
             },
         ],
         indexes: vec![IndexMeta {
@@ -83,6 +85,8 @@ fn roundtrips_snapshot() {
     assert_eq!(back.tables[1].file_no, 1);
     assert_eq!(back.tables[0].engine, EngineKind::Heap);
     assert_eq!(back.tables[1].engine, EngineKind::Lsm);
+    assert_eq!(back.tables[0].layout, PageLayout::Pax);
+    assert_eq!(back.tables[1].layout, PageLayout::Row);
     assert_eq!(back.indexes.len(), 1);
     assert_eq!(back.indexes[0].name, "idx_id");
     assert_eq!(back.indexes[0].column, "id");

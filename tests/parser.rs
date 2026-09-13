@@ -152,6 +152,25 @@ fn parses_create_table() {
 }
 
 #[test]
+fn parses_create_table_storage_options() {
+    use chibidb::config::{EngineKind, PageLayout};
+
+    let c = create_table("create table t (id int) engine = lsm;");
+    assert_eq!(c.engine, Some(EngineKind::Lsm));
+    assert_eq!(c.layout, None);
+
+    let c = create_table("create table t (id int) page_layout = pax;");
+    assert_eq!(c.layout, Some(PageLayout::Pax));
+    assert_eq!(c.engine, None);
+
+    let c = create_table("create table t (id int) page_layout = pax engine = heap;");
+    assert_eq!(c.layout, Some(PageLayout::Pax));
+    assert_eq!(c.engine, Some(EngineKind::Heap));
+
+    err("create table t (id int) page_layout = columnar;");
+}
+
+#[test]
 fn parses_column_constraints() {
     let c = create_table(
         "create table t (\

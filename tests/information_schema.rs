@@ -57,6 +57,25 @@ fn information_schema_reports_the_engine() {
 }
 
 #[test]
+fn information_schema_reports_the_page_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let inst = Instance::open(dir.path(), &Config::default()).unwrap();
+        let mut s = Session::new();
+        inst.execute_with(&mut s, "create database shop;").unwrap();
+        inst.execute_with(&mut s, "use shop;").unwrap();
+        inst.execute_with(&mut s, "create table w (id int, v int) page_layout = pax;")
+            .unwrap();
+    }
+    // the layout is recorded in the catalog and survives a reopen
+    let inst = Instance::open(dir.path(), &Config::default()).unwrap();
+    let mut s = Session::new();
+    inst.execute_with(&mut s, "use information_schema;").unwrap();
+    let layout = rows(&inst, &mut s, "select page_layout from tables where table_name = 'w';");
+    assert_eq!(layout, [[Value::Str("pax".into())]]);
+}
+
+#[test]
 fn information_schema_is_read_only() {
     let dir = tempfile::tempdir().unwrap();
     let inst = Instance::open(dir.path(), &Config::default()).unwrap();

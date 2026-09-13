@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::ast::DataType;
-use crate::config::EngineKind;
+use crate::config::{EngineKind, PageLayout};
 use crate::storage::engine::TableStorage;
 use crate::storage::FileId;
 use crate::value::Value;
@@ -112,6 +112,8 @@ pub struct Table {
     /// The storage engine backing this table (heap or LSM).
     pub(crate) engine: Arc<dyn TableStorage>,
     pub(crate) engine_kind: EngineKind,
+    /// Physical page layout; `Pax` only applies to heap tables.
+    pub(crate) layout: PageLayout,
 }
 
 impl Table {
@@ -135,12 +137,16 @@ impl Catalog {
         schema: Schema,
         heap: HeapStore,
         engine_kind: EngineKind,
+        layout: PageLayout,
         engine: Arc<dyn TableStorage>,
     ) -> Result<()> {
         if self.tables.contains_key(name) || self.views.contains_key(name) {
             return Err(Error::Runtime(format!("table already exists: {name}")));
         }
-        self.tables.insert(name.to_string(), Table { schema, heap, engine, engine_kind });
+        self.tables.insert(
+            name.to_string(),
+            Table { schema, heap, engine, engine_kind, layout },
+        );
         Ok(())
     }
 
@@ -178,6 +184,7 @@ impl Catalog {
                     columns,
                     file_no: t.heap.file_no,
                     engine: t.engine_kind,
+                    layout: t.layout,
                 }
             })
             .collect()

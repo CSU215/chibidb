@@ -3,6 +3,7 @@ use crate::ast::{
     DropTableStmt, DropViewStmt, Expr, InsertStmt, Stmt, UpdateStmt,
 };
 use crate::catalog::Schema;
+use crate::config::{EngineKind, PageLayout};
 use crate::result::ResultSet;
 use crate::storage::codec::decode_record;
 use crate::trx::{TrxState, Undo};
@@ -372,8 +373,15 @@ fn execute_create_table(db: &Database, c: &CreateTableStmt) -> Result<ResultSet>
     }
     let schema = Schema { columns };
     let kind = c.engine.unwrap_or_else(|| db.default_engine());
+    let layout = c.layout.unwrap_or_else(|| db.default_layout());
+    if kind == EngineKind::Lsm && layout != PageLayout::Row {
+        return Err(Error::Runtime(
+            "page_layout=pax is only supported for engine=heap".into(),
+        ));
+    }
     let (heap, engine) = db.new_table_storage(kind)?;
-    db.catalog_mut().create_table(&c.name, schema, heap, kind, engine)?;
+    db.catalog_mut()
+        .create_table(&c.name, schema, heap, kind, layout, engine)?;
     // PRIMARY KEY / UNIQUE get a constraint-backed unique index; the table is
     // empty here, so there is nothing to populate.
     for cd in &c.columns {

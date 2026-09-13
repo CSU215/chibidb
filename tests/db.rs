@@ -819,3 +819,15 @@ fn drop_table_ddl_validation() {
         assert_eq!(message(&rs), "SUCCESS");
     });
 }
+
+#[test]
+fn pax_layout_requires_heap_engine() {
+    with_dbs(|db| {
+        let err = db
+            .execute_sql("create table t (id int) engine = lsm page_layout = pax;")
+            .unwrap_err();
+        assert!(err.to_string().contains("page_layout=pax"), "{err}");
+        // the same layout is fine on the heap engine
+        db.execute_sql("create table h (id int) page_layout = pax;").unwrap();
+    });
+}

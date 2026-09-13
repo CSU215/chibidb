@@ -340,7 +340,8 @@ impl Instance {
     fn materialize_information_schema(&self, db: &Database) -> Result<()> {
         db.execute_sql("create table schemata (schema_name char(64) primary key);")?;
         db.execute_sql(
-            "create table tables (table_schema char(64), table_name char(64), engine char(8));",
+            "create table tables (table_schema char(64), table_name char(64), engine char(8), \
+             page_layout char(8));",
         )?;
         db.execute_sql(
             "create table columns (table_schema char(64), table_name char(64), \
@@ -355,8 +356,12 @@ impl Instance {
                     crate::config::EngineKind::Heap => "heap",
                     crate::config::EngineKind::Lsm => "lsm",
                 };
+                let layout = match meta.layout {
+                    crate::config::PageLayout::Row => "row",
+                    crate::config::PageLayout::Pax => "pax",
+                };
                 db.execute_sql(&format!(
-                    "insert into tables values ('{name}', '{}', '{engine}');",
+                    "insert into tables values ('{name}', '{}', '{engine}', '{layout}');",
                     meta.name
                 ))?;
                 for c in &meta.columns {

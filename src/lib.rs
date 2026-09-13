@@ -73,7 +73,7 @@ impl DatabaseWriteLock {
 
 use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
-use crate::config::{Config, ConflictStrategy, EngineKind, ExecutionMode};
+use crate::config::{Config, ConflictStrategy, EngineKind, ExecutionMode, PageLayout};
 use crate::index::{encode_key, BTree};
 use crate::pipeline::{ExecuteStage, OptimizeStage, Pipeline, ResolveStage, SqlEvent};
 use crate::storage::codec::{decode_record, encode_record};
@@ -190,7 +190,7 @@ impl Database {
                         (HeapStore { file: LSM_FILE_ID, file_no: meta.file_no }, Arc::new(engine))
                     }
                 };
-                catalog.create_table(&meta.name, schema, heap, meta.engine, engine)?;
+                catalog.create_table(&meta.name, schema, heap, meta.engine, meta.layout, engine)?;
             }
             for ix in &snap.indexes {
                 let fpath = indexes_dir.join(format!("{:06}.idxf", ix.file_no));
@@ -827,6 +827,11 @@ impl Database {
     /// The configured engine for newly created tables.
     pub(crate) fn default_engine(&self) -> EngineKind {
         self.config.storage.default_engine
+    }
+
+    /// The configured page layout for newly created heap tables.
+    pub(crate) fn default_layout(&self) -> PageLayout {
+        self.config.storage.page_layout
     }
 
     /// Creates the physical storage for a new table of the given engine kind.

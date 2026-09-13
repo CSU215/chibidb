@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::config::EngineKind;
+use crate::config::{EngineKind, PageLayout};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOp {
@@ -168,6 +168,8 @@ pub struct CreateTableStmt {
     pub columns: Vec<ColumnDef>,
     /// `ENGINE = heap|lsm`; `None` uses `storage.default_engine`.
     pub engine: Option<EngineKind>,
+    /// `PAGE_LAYOUT = row|pax`; `None` uses `storage.page_layout`.
+    pub layout: Option<PageLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

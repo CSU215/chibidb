@@ -6,7 +6,7 @@ use crate::ast::{
     UpdateStmt,
     UseStmt,
 };
-use crate::config::EngineKind;
+use crate::config::{EngineKind, PageLayout};
 use crate::lexer::{Punct, Token, TokenKind, lex};
 use crate::{Error, Result};
 
@@ -582,22 +582,44 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(Punct::RParen)?;
-        let engine = if self.eat_keyword("engine") {
-            self.expect_punct(Punct::Eq)?;
-            let kind = match self.bump() {
-                Some(Token { kind: TokenKind::Ident(s), .. }) if s.eq_ignore_ascii_case("heap") => {
-                    EngineKind::Heap
-                }
-                Some(Token { kind: TokenKind::Ident(s), .. }) if s.eq_ignore_ascii_case("lsm") => {
-                    EngineKind::Lsm
-                }
-                _ => return Err(self.unexpected("engine name (heap or lsm)")),
-            };
-            Some(kind)
-        } else {
-            None
-        };
-        Ok(Stmt::CreateTable(CreateTableStmt { name, columns, engine }))
+        let mut engine = None;
+        let mut layout = None;
+        loop {
+            if self.eat_keyword("engine") {
+                self.expect_punct(Punct::Eq)?;
+                engine = Some(match self.bump() {
+                    Some(Token { kind: TokenKind::Ident(s), .. })
+                        if s.eq_ignore_ascii_case("heap") =>
+                    {
+                        EngineKind::Heap
+                    }
+                    Some(Token { kind: TokenKind::Ident(s), .. })
+                        if s.eq_ignore_ascii_case("lsm") =>
+                    {
+                        EngineKind::Lsm
+                    }
+                    _ => return Err(self.unexpected("engine name (heap or lsm)")),
+                });
+            } else if self.eat_keyword("page_layout") {
+                self.expect_punct(Punct::Eq)?;
+                layout = Some(match self.bump() {
+                    Some(Token { kind: TokenKind::Ident(s), .. })
+                        if s.eq_ignore_ascii_case("row") =>
+                    {
+                        PageLayout::Row
+                    }
+                    Some(Token { kind: TokenKind::Ident(s), .. })
+                        if s.eq_ignore_ascii_case("pax") =>
+                    {
+                        PageLayout::Pax
+                    }
+                    _ => return Err(self.unexpected("page layout (row or pax)")),
+                });
+            } else {
+                break;
+            }
+        }
+        Ok(Stmt::CreateTable(CreateTableStmt { name, columns, engine, layout }))
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef> {

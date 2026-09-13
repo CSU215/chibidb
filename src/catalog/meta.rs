@@ -1,11 +1,11 @@
 ﻿use crate::ast::DataType;
-use crate::config::EngineKind;
+use crate::config::{EngineKind, PageLayout};
 use crate::storage::codec::{decode_row, encode_row};
 use crate::storage::header::{self, FileKind};
 use crate::value::Value;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"CHIDCAT7";
+const MAGIC: [u8; 8] = *b"CHIDCAT8";
 
 const DTYPE_INT: u8 = 0x00;
 const DTYPE_FLOAT: u8 = 0x01;
@@ -29,6 +29,7 @@ pub struct TableMeta {
     pub columns: Vec<ColumnMeta>,
     pub file_no: u32,
     pub engine: EngineKind,
+    pub layout: PageLayout,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +91,7 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
         }
         put_u32(&mut buf, t.file_no);
         buf.push(engine_tag(t.engine));
+        buf.push(layout_tag(t.layout));
     }
     put_u32(&mut buf, snap.indexes.len() as u32);
     for ix in &snap.indexes {
@@ -147,7 +149,12 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
             1 => EngineKind::Lsm,
             other => return Err(Error::Runtime(format!("unknown engine tag 0x{other:02x}"))),
         };
-        tables.push(TableMeta { name, columns, file_no, engine });
+        let layout = match take(data, &mut pos, 1)?[0] {
+            0 => PageLayout::Row,
+            1 => PageLayout::Pax,
+            other => return Err(Error::Runtime(format!("unknown layout tag 0x{other:02x}"))),
+        };
+        tables.push(TableMeta { name, columns, file_no, engine, layout });
     }
     let n_indexes = take_u32(data, &mut pos)?;
     let mut indexes = Vec::new();
@@ -206,6 +213,13 @@ fn engine_tag(engine: EngineKind) -> u8 {
     match engine {
         EngineKind::Heap => 0,
         EngineKind::Lsm => 1,
+    }
+}
+
+fn layout_tag(layout: PageLayout) -> u8 {
+    match layout {
+        PageLayout::Row => 0,
+        PageLayout::Pax => 1,
     }
 }
 
