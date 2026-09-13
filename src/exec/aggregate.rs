@@ -804,12 +804,38 @@ pub(crate) fn chunk_grouped_aggregate(
     }
     let mut groups: Vec<Group> = Vec::new();
     let mut lookup: HashMap<Vec<u8>, usize> = HashMap::new();
-    while let Some(chunk) = child.next_chunk(ctx)? {
-        for i in 0..chunk.len() {
-            let mut key = Vec::with_capacity(group_columns.len());
-            for &c in &group_columns {
-                key.push(chunk.column(c).value(i));
-            }
+
+    // Columns the projected push must read: group keys, aggregate arguments,
+    // and any base column projected by value. Read once, in `needed` order.
+    let mut needed: Vec<usize> = Vec::new();
+    for &c in &group_columns {
+        if !needed.contains(&c) {
+            needed.push(c);
+        }
+    }
+    for p in &projection {
+        if let GroupProj::First(i) = p
+            && !needed.contains(i)
+        {
+            needed.push(*i);
+        }
+    }
+    for kind in &kinds {
+        if let Some(i) = kind.column_index()
+            && !needed.contains(&i)
+        {
+            needed.push(i);
+        }
+    }
+    let slot = |c: usize| needed.iter().position(|&x| x == c).expect("column is needed");
+    let group_slots: Vec<usize> = group_columns.iter().map(|&c| slot(c)).collect();
+    let agg_slots: Vec<Option<usize>> = kinds.iter().map(|k| k.column_index().map(slot)).collect();
+
+    // A bare scan streams exactly the needed columns without materializing
+    // chunks; anything else (a filter, join, ...) falls back below.
+    let streamed = child
+        .for_each_projected_row(ctx, &needed, &mut |_, _, values| {
+            let key: Vec<Value> = group_slots.iter().map(|&s| values[s].clone()).collect();
             let encoded = crate::storage::codec::encode_row(&key);
             let group = match lookup.get(&encoded) {
                 Some(&g) => g,
@@ -818,13 +844,45 @@ pub(crate) fn chunk_grouped_aggregate(
                     lookup.insert(encoded, g);
                     groups.push(Group {
                         states: kinds.iter().map(|k| new_state(*k)).collect(),
-                        first: chunk.row(i),
+                        first: values.to_vec(),
                     });
                     g
                 }
             };
-            for (kind, state) in kinds.iter().zip(groups[group].states.iter_mut()) {
-                update_row(kind, state, &chunk, i)?;
+            for ((kind, state), slot) in
+                kinds.iter().zip(groups[group].states.iter_mut()).zip(&agg_slots)
+            {
+                let value = match slot {
+                    Some(s) => values[*s].clone(),
+                    None => Value::Null,
+                };
+                update_value(kind, state, value)?;
+            }
+            Ok(())
+        })?
+        .unwrap_or(false);
+
+    if !streamed {
+        while let Some(chunk) = child.next_chunk(ctx)? {
+            for i in 0..chunk.len() {
+                let key: Vec<Value> =
+                    group_columns.iter().map(|&c| chunk.column(c).value(i)).collect();
+                let encoded = crate::storage::codec::encode_row(&key);
+                let group = match lookup.get(&encoded) {
+                    Some(&g) => g,
+                    None => {
+                        let g = groups.len();
+                        lookup.insert(encoded, g);
+                        groups.push(Group {
+                            states: kinds.iter().map(|k| new_state(*k)).collect(),
+                            first: needed.iter().map(|&c| chunk.column(c).value(i)).collect(),
+                        });
+                        g
+                    }
+                };
+                for (kind, state) in kinds.iter().zip(groups[group].states.iter_mut()) {
+                    update_row(kind, state, &chunk, i)?;
+                }
             }
         }
     }
@@ -835,7 +893,7 @@ pub(crate) fn chunk_grouped_aggregate(
         let mut row = Vec::with_capacity(projection.len());
         for p in &projection {
             match p {
-                GroupProj::First(index) => row.push(group.first[*index].clone()),
+                GroupProj::First(index) => row.push(group.first[slot(*index)].clone()),
                 GroupProj::Agg => {
                     row.push(finish(states.next().expect("one state per aggregate")))
                 }
