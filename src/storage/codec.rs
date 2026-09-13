@@ -239,7 +239,9 @@ pub(crate) fn decode_row_each(
     Ok(count)
 }
 
-/// Decodes one tagged value at `*pos`, advancing it past the value.
+/// Decodes one tagged value at `*pos`, advancing it past the value. When
+/// `keep[index]` is `false` the value is skipped without being built (a column
+/// the query never reads becomes NULL, and its LOB is not resolved).
 fn decode_value(
     data: &[u8],
     pos: &mut usize,
@@ -248,6 +250,31 @@ fn decode_value(
     keep: Option<&[bool]>,
 ) -> Result<Value> {
     let tag = take(data, pos, 1)?[0];
+    let needed = match keep {
+        None => true,
+        Some(keep) => keep.get(index).copied().unwrap_or(true),
+    };
+    if !needed {
+        match tag {
+            TAG_NULL => {}
+            TAG_INT | TAG_FLOAT | TAG_LOB => {
+                take(data, pos, 8)?;
+            }
+            TAG_BOOL => {
+                take(data, pos, 1)?;
+            }
+            TAG_DATE => {
+                take(data, pos, 4)?;
+            }
+            TAG_STR => {
+                let lb = take(data, pos, 2)?;
+                let len = u16::from_le_bytes(lb.try_into().unwrap()) as usize;
+                take(data, pos, len)?;
+            }
+            _ => return Err(Error::Runtime(format!("unknown value tag 0x{tag:02x}"))),
+        }
+        return Ok(Value::Null);
+    }
     Ok(match tag {
         TAG_NULL => Value::Null,
         TAG_INT => {
@@ -270,19 +297,14 @@ fn decode_value(
         TAG_LOB => {
             let b = take(data, pos, 8)?;
             let id = u64::from_le_bytes(b.try_into().unwrap());
-            // a column the query never reads is left unresolved
-            if keep.is_some_and(|keep| !keep.get(index).copied().unwrap_or(true)) {
-                Value::Null
-            } else {
-                let Some(lobs) = lobs else {
-                    return Err(Error::Runtime("lob reference without a resolver".into()));
-                };
-                let bytes = lobs.get(id)?;
-                Value::Str(
-                    String::from_utf8(bytes)
-                        .map_err(|_| Error::Runtime("invalid utf8 in stored lob".into()))?,
-                )
-            }
+            let Some(lobs) = lobs else {
+                return Err(Error::Runtime("lob reference without a resolver".into()));
+            };
+            let bytes = lobs.get(id)?;
+            Value::Str(
+                String::from_utf8(bytes)
+                    .map_err(|_| Error::Runtime("invalid utf8 in stored lob".into()))?,
+            )
         }
         TAG_BOOL => {
             let b = take(data, pos, 1)?;
