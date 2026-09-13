@@ -15,15 +15,19 @@ fn build() -> Database {
 }
 
 fn build_mode(mode: ExecutionMode) -> Database {
+    build_mode_rows(mode, N)
+}
+
+fn build_mode_rows(mode: ExecutionMode, n: i64) -> Database {
     let mut config = Config::default();
     config.execution.mode = mode;
     let db = Database::open_in_memory_with_config(&config).unwrap();
     db.execute_sql("create table t (id int, tag int);").unwrap();
     let chunk = 500i64;
     let mut i = 0i64;
-    while i < N {
+    while i < n {
         let mut sql = String::from("insert into t values ");
-        for j in i..(i + chunk).min(N) {
+        for j in i..(i + chunk).min(n) {
             if j > i {
                 sql.push(',');
             }
@@ -146,17 +150,20 @@ fn volcano_vs_chunk() {
 }
 
 /// Per-row cost of `sum(v)`, the workload the chunk aggregate path targets.
+/// Seeded with fewer rows than the other benches because table building, not
+/// the scan, dominates the runtime.
 #[test]
 #[ignore = "micro-benchmark; run with --ignored --nocapture"]
 fn chunk_aggregate_throughput() {
-    let volcano = build_mode(ExecutionMode::Volcano);
-    let chunk = build_mode(ExecutionMode::Chunk);
-    println!("rows: {N}");
+    const ROWS: i64 = 10_000;
+    let volcano = build_mode_rows(ExecutionMode::Volcano, ROWS);
+    let chunk = build_mode_rows(ExecutionMode::Chunk, ROWS);
+    println!("rows: {ROWS}");
     for (mode, db) in [("volcano", &volcano), ("chunk", &chunk)] {
         let elapsed = per_op(20, || {
             db.execute_sql("select sum(tag) from t;").unwrap();
         });
-        let ns = elapsed.as_secs_f64() * 1e9 / N as f64;
+        let ns = elapsed.as_secs_f64() * 1e9 / ROWS as f64;
         println!("{mode:<8} sum(tag) {elapsed:>12?}   {ns:>6.2} ns/row");
     }
 }
