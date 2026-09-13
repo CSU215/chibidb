@@ -126,6 +126,25 @@ fn mysql_prepared_statements_bind_parameters() {
 }
 
 #[test]
+fn mysql_transaction_control_gets_a_reply() {
+    let (addr, _dir) = start_server();
+    let mut stream = connect(addr);
+
+    // BEGIN/COMMIT/ROLLBACK produce no result set but still owe an OK packet,
+    // otherwise the client blocks waiting for a reply.
+    write_packet(&mut stream, 0, b"\x03begin;");
+    assert_eq!(read_packet(&mut stream)[0], 0x00, "BEGIN should be acknowledged");
+    write_packet(&mut stream, 0, b"\x03commit;");
+    assert_eq!(read_packet(&mut stream)[0], 0x00, "COMMIT should be acknowledged");
+    write_packet(&mut stream, 0, b"\x03begin;");
+    assert_eq!(read_packet(&mut stream)[0], 0x00, "BEGIN should be acknowledged");
+    write_packet(&mut stream, 0, b"\x03rollback;");
+    assert_eq!(read_packet(&mut stream)[0], 0x00, "ROLLBACK should be acknowledged");
+
+    write_packet(&mut stream, 0, &[0x01]); // COM_QUIT
+}
+
+#[test]
 fn mysql_reports_errors_and_pings() {
     let (addr, _dir) = start_server();
     let mut stream = connect(addr);
