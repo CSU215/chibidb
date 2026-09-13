@@ -234,3 +234,22 @@ fn pruned_lob_columns_match() {
          select count(*) from t;"
     ));
 }
+
+/// Both paths must reject integer overflow with the same error.
+#[test]
+fn integer_overflow_matches() {
+    let script = "create table t (id int, v int);\
+                  insert into t values (1, 9223372036854775807),(2, 1);\
+                  select sum(v) from t;";
+    let errs: Vec<String> = [ExecutionMode::Volcano, ExecutionMode::Chunk]
+        .into_iter()
+        .map(|mode| {
+            let mut config = Config::default();
+            config.execution.mode = mode;
+            let db = Database::open_in_memory_with_config(&config).unwrap();
+            db.execute_sql(script).unwrap_err().to_string()
+        })
+        .collect();
+    assert_eq!(errs[0], errs[1]);
+    assert!(errs[0].contains("overflow"), "unexpected error: {}", errs[0]);
+}

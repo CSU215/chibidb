@@ -6,6 +6,7 @@ use crate::trx::TrxState;
 use crate::value::Value;
 use crate::{Database, Error, Result};
 
+use super::chunk::{Chunk, Column};
 use super::eval::{
     cmp_values, eval, eval_binary, eval_const, expr_has_column, type_mismatch, EvalCtx,
 };
@@ -424,17 +425,174 @@ fn new_state(kind: AggKind) -> AggState {
     }
 }
 
-fn update_state(kind: &AggKind, state: &mut AggState, chunk: &super::chunk::Chunk) -> Result<()> {
-    for i in 0..chunk.len() {
-        update_row(kind, state, chunk, i)?;
+/// Accumulates a whole chunk. Int and float columns use tight per-column
+/// kernels; every other type falls back to the per-row [`update_row`] so the
+/// result stays identical to [`eval_aggregate`].
+fn update_state(kind: &AggKind, state: &mut AggState, chunk: &Chunk) -> Result<()> {
+    match kind {
+        AggKind::Count(None) => {
+            let AggState::Count(n) = state else { unreachable!("count state") };
+            *n += chunk.len() as i64;
+            Ok(())
+        }
+        AggKind::Count(Some(index)) => {
+            let AggState::Count(n) = state else { unreachable!("count state") };
+            *n += count_present(chunk.column(*index)) as i64;
+            Ok(())
+        }
+        AggKind::Sum(index) | AggKind::Avg(index) | AggKind::Min(index) | AggKind::Max(index) => {
+            match chunk.column(*index) {
+                Column::Int(values) => apply_int(kind, state, values),
+                Column::Float(values) => apply_float(kind, state, values),
+                _ => {
+                    for i in 0..chunk.len() {
+                        update_row(kind, state, chunk, i)?;
+                    }
+                    Ok(())
+                }
+            }
+        }
     }
-    Ok(())
+}
+
+fn count_present(column: &Column) -> usize {
+    match column {
+        Column::Bool(v) => v.iter().filter(|x| x.is_some()).count(),
+        Column::Int(v) => v.iter().filter(|x| x.is_some()).count(),
+        Column::Float(v) => v.iter().filter(|x| x.is_some()).count(),
+        Column::Str(v) => v.iter().filter(|x| x.is_some()).count(),
+        Column::Date(v) => v.iter().filter(|x| x.is_some()).count(),
+    }
+}
+
+fn int_overflow() -> Error {
+    Error::Runtime("integer overflow".into())
+}
+
+fn apply_int(kind: &AggKind, state: &mut AggState, values: &[Option<i64>]) -> Result<()> {
+    match kind {
+        AggKind::Sum(_) => {
+            let AggState::Sum(acc) = state else { unreachable!("sum state") };
+            let mut total = match acc.take() {
+                None => None,
+                Some(Value::Int(x)) => Some(x),
+                Some(other) => {
+                    *acc = Some(other);
+                    return Err(type_mismatch());
+                }
+            };
+            for &x in values.iter().flatten() {
+                total = Some(match total {
+                    None => x,
+                    Some(a) => a.checked_add(x).ok_or_else(int_overflow)?,
+                });
+            }
+            *acc = total.map(Value::Int);
+            Ok(())
+        }
+        AggKind::Avg(_) => {
+            let AggState::Avg { total, count } = state else { unreachable!("avg state") };
+            for &x in values.iter().flatten() {
+                *total += x as f64;
+                *count += 1;
+            }
+            Ok(())
+        }
+        AggKind::Min(_) | AggKind::Max(_) => {
+            let is_min = matches!(kind, AggKind::Min(_));
+            let best = match state {
+                AggState::Min(best) | AggState::Max(best) => best,
+                _ => unreachable!("min/max state"),
+            };
+            let mut current = match best.take() {
+                None => None,
+                Some(Value::Int(x)) => Some(x),
+                Some(other) => {
+                    *best = Some(other);
+                    return Err(type_mismatch());
+                }
+            };
+            for &x in values.iter().flatten() {
+                current = Some(match current {
+                    None => x,
+                    Some(prev) => {
+                        let take = if is_min { x < prev } else { x > prev };
+                        if take { x } else { prev }
+                    }
+                });
+            }
+            *best = current.map(Value::Int);
+            Ok(())
+        }
+        AggKind::Count(_) => unreachable!("count handled above"),
+    }
+}
+
+fn apply_float(kind: &AggKind, state: &mut AggState, values: &[Option<f64>]) -> Result<()> {
+    match kind {
+        AggKind::Sum(_) => {
+            let AggState::Sum(acc) = state else { unreachable!("sum state") };
+            let mut total = match acc.take() {
+                None => None,
+                Some(Value::Float(x)) => Some(x),
+                Some(other) => {
+                    *acc = Some(other);
+                    return Err(type_mismatch());
+                }
+            };
+            for &x in values.iter().flatten() {
+                total = Some(total.map_or(x, |a| a + x));
+            }
+            *acc = total.map(Value::Float);
+            Ok(())
+        }
+        AggKind::Avg(_) => {
+            let AggState::Avg { total, count } = state else { unreachable!("avg state") };
+            for &x in values.iter().flatten() {
+                *total += x;
+                *count += 1;
+            }
+            Ok(())
+        }
+        AggKind::Min(_) | AggKind::Max(_) => {
+            let is_min = matches!(kind, AggKind::Min(_));
+            let best = match state {
+                AggState::Min(best) | AggState::Max(best) => best,
+                _ => unreachable!("min/max state"),
+            };
+            let mut current = match best.take() {
+                None => None,
+                Some(Value::Float(x)) => Some(x),
+                Some(other) => {
+                    *best = Some(other);
+                    return Err(type_mismatch());
+                }
+            };
+            for &x in values.iter().flatten() {
+                current = Some(match current {
+                    None => x,
+                    Some(prev) => {
+                        let ord = prev.partial_cmp(&x).ok_or_else(type_mismatch)?;
+                        let take = if is_min {
+                            ord == std::cmp::Ordering::Greater
+                        } else {
+                            ord == std::cmp::Ordering::Less
+                        };
+                        if take { x } else { prev }
+                    }
+                });
+            }
+            *best = current.map(Value::Float);
+            Ok(())
+        }
+        AggKind::Count(_) => unreachable!("count handled above"),
+    }
 }
 
 fn update_row(
     kind: &AggKind,
     state: &mut AggState,
-    chunk: &super::chunk::Chunk,
+    chunk: &Chunk,
     i: usize,
 ) -> Result<()> {
     match kind {
