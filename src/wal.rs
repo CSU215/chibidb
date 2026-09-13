@@ -59,6 +59,17 @@ impl Wal {
         file.write_all(&encode_frame(trx_id, rec)).map_err(wal_io)
     }
 
+    /// Appends a batch of pre-encoded frames in one write, so a statement's
+    /// rows do not each pay a separate syscall.
+    pub fn append_frames(&self, frames: &[u8]) -> Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        let mut file = self.file.lock();
+        file.seek(SeekFrom::End(0)).map_err(wal_io)?;
+        file.write_all(frames).map_err(wal_io)
+    }
+
     /// Durability point: every record appended so far survives a crash.
     /// Because appends are serialized, one `sync` flushes all writers that
     /// raced ahead of it (a simple group commit).
@@ -91,31 +102,41 @@ fn wal_io(e: std::io::Error) -> Error {
 }
 
 pub fn encode_frame(trx_id: u32, rec: &Record) -> Vec<u8> {
-    let (ty, payload) = match rec {
+    let mut frame = Vec::new();
+    encode_frame_into(&mut frame, trx_id, rec);
+    frame
+}
+
+/// Appends one encoded frame to `out`, so a transaction can buffer its rows
+/// and flush them in a single write at commit.
+pub fn encode_frame_into(out: &mut Vec<u8>, trx_id: u32, rec: &Record) {
+    let start = out.len();
+    out.extend_from_slice(&[0u8; 4]); // length, patched once the frame is written
+    match rec {
         Record::Insert { file_no, rid, record } => {
-            let mut p = Vec::with_capacity(10 + record.len());
-            p.extend_from_slice(&file_no.to_le_bytes());
-            p.extend_from_slice(&rid.page_no.to_le_bytes());
-            p.extend_from_slice(&rid.slot.to_le_bytes());
-            p.extend_from_slice(record);
-            (REC_INSERT, p)
+            out.push(REC_INSERT);
+            out.extend_from_slice(&trx_id.to_le_bytes());
+            out.extend_from_slice(&file_no.to_le_bytes());
+            out.extend_from_slice(&rid.page_no.to_le_bytes());
+            out.extend_from_slice(&rid.slot.to_le_bytes());
+            out.extend_from_slice(record);
         }
         Record::DeleteMark { file_no, rid, deleter } => {
-            let mut p = Vec::with_capacity(14);
-            p.extend_from_slice(&file_no.to_le_bytes());
-            p.extend_from_slice(&rid.page_no.to_le_bytes());
-            p.extend_from_slice(&rid.slot.to_le_bytes());
-            p.extend_from_slice(&deleter.to_le_bytes());
-            (REC_DELETE_MARK, p)
+            out.push(REC_DELETE_MARK);
+            out.extend_from_slice(&trx_id.to_le_bytes());
+            out.extend_from_slice(&file_no.to_le_bytes());
+            out.extend_from_slice(&rid.page_no.to_le_bytes());
+            out.extend_from_slice(&rid.slot.to_le_bytes());
+            out.extend_from_slice(&deleter.to_le_bytes());
         }
-        Record::Commit => (REC_COMMIT, Vec::new()),
-    };
-    let mut frame = Vec::with_capacity(payload.len() + 9);
-    frame.extend_from_slice(&((payload.len() + HEADER_LEN) as u32).to_le_bytes());
-    frame.push(ty);
-    frame.extend_from_slice(&trx_id.to_le_bytes());
-    frame.extend_from_slice(&payload);
-    frame
+        Record::Commit => {
+            out.push(REC_COMMIT);
+            out.extend_from_slice(&trx_id.to_le_bytes());
+        }
+    }
+    // `len` counts everything after the length field, as `decode_frame` expects.
+    let len = (out.len() - start - 4) as u32;
+    out[start..start + 4].copy_from_slice(&len.to_le_bytes());
 }
 
 /// What recovery should do with a log image.
@@ -222,6 +243,24 @@ mod tests {
         // trx 7 and 8 never committed: no replay. trx 9 has a commit but no
         // data records: nothing to redo either.
         assert!(plan.committed.is_empty());
+    }
+
+    #[test]
+    fn buffered_frames_match_individual_encodes() {
+        let recs = [
+            (7u32, Record::Insert { file_no: 3, rid: rid(9, 4), record: vec![1, 2, 3] }),
+            (8u32, Record::DeleteMark { file_no: 3, rid: rid(9, 4), deleter: 8 }),
+            (8u32, Record::Commit),
+        ];
+        let mut buffered = Vec::new();
+        for (trx, rec) in &recs {
+            encode_frame_into(&mut buffered, *trx, rec);
+        }
+        let mut one_by_one = Vec::new();
+        for (trx, rec) in &recs {
+            one_by_one.extend_from_slice(&encode_frame(*trx, rec));
+        }
+        assert_eq!(buffered, one_by_one);
     }
 
     #[test]

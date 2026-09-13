@@ -69,6 +69,7 @@ impl Session {
             id,
             snapshot: committed.clone(),
             undo: Vec::new(),
+            wal: Vec::new(),
             explicit,
         });
     }
@@ -83,6 +84,7 @@ impl Session {
             id: READ_ONLY_TRX_ID,
             snapshot: committed.clone(),
             undo: Vec::new(),
+            wal: Vec::new(),
             explicit: false,
         });
     }
@@ -103,6 +105,9 @@ pub(crate) struct TrxState {
     /// Transactions that were committed when this transaction began.
     pub snapshot: HashSet<u32>,
     pub undo: Vec<Undo>,
+    /// Redo frames for this transaction's writes, buffered until commit so the
+    /// whole statement reaches the log in one write. Rolled back by truncating.
+    pub wal: Vec<u8>,
     /// True for BEGIN-initiated transactions (DDL is rejected inside those).
     pub explicit: bool,
 }

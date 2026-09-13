@@ -436,9 +436,11 @@ impl Database {
             self.trx.commit(trx_id);
             return Ok(());
         }
-        // The synced commit record is the durability point. Append and sync it
+        // The synced commit record is the durability point. Flush the
+        // statement's buffered rows and the commit record, then sync, all
         // *before* marking the transaction committed in memory, so a logging
         // failure cannot leave a "committed" id whose record is not durable.
+        self.wal.append_frames(&trx.wal)?;
         self.wal.append(trx_id, &Record::Commit)?;
         self.wal.sync()?;
         self.trx.commit(trx_id);
@@ -645,7 +647,11 @@ impl Database {
                         self.trx.insert_open(id);
                     }
                 }
-                let undo_mark = session.trx.as_ref().map(|t| t.undo.len()).unwrap_or(0);
+                let (undo_mark, wal_mark) = session
+                    .trx
+                    .as_ref()
+                    .map(|t| (t.undo.len(), t.wal.len()))
+                    .unwrap_or((0, 0));
                 let mut event = SqlEvent::new(other);
                 let outcome = match pipeline.run(self, session, &mut event) {
                     Ok(()) => {
@@ -678,7 +684,7 @@ impl Database {
                                 let undone = if read_only {
                                     Ok(())
                                 } else {
-                                    self.rollback_trx_to(&mut trx, undo_mark)
+                                    self.rollback_trx_to(&mut trx, undo_mark, wal_mark)
                                 };
                                 self.trx.remove_open(trx.id);
                                 undone?;
@@ -686,7 +692,7 @@ impl Database {
                         } else if !read_only
                             && let Some(trx) = session.trx.as_mut()
                         {
-                            self.rollback_trx_to(trx, undo_mark)?;
+                            self.rollback_trx_to(trx, undo_mark, wal_mark)?;
                         }
                         Err(e)
                     }
@@ -750,13 +756,16 @@ impl Database {
     }
 
     fn rollback_trx(&self, trx: &mut TrxState) -> Result<()> {
-        self.rollback_trx_to(trx, 0)
+        self.rollback_trx_to(trx, 0, 0)
     }
 
-    /// Undoes only the undo entries above `mark`. Used for a statement-level
-    /// rollback inside an explicit transaction, so earlier statements survive.
-    fn rollback_trx_to(&self, trx: &mut TrxState, mark: usize) -> Result<()> {
-        while trx.undo.len() > mark {
+    /// Undoes only the undo entries above `undo_mark` and drops the redo frames
+    /// buffered after `wal_mark`. Used for a statement-level rollback inside an
+    /// explicit transaction, so earlier statements survive and their buffered
+    /// frames stay.
+    fn rollback_trx_to(&self, trx: &mut TrxState, undo_mark: usize, wal_mark: usize) -> Result<()> {
+        trx.wal.truncate(wal_mark);
+        while trx.undo.len() > undo_mark {
             let undo = trx.undo.pop().expect("len > mark checked");
             match undo {
                 Undo::Insert { table, rid, row } => {
@@ -1029,7 +1038,11 @@ impl Database {
         // Record the undo as soon as the row exists so that a later failure in
         // the WAL or index steps is still undone by the enclosing transaction.
         trx.undo.push(Undo::Insert { table: name.to_string(), rid, row: row.clone() });
-        self.wal.append(creator, &Record::Insert { file_no, rid, record: data.clone() })?;
+        crate::wal::encode_frame_into(
+            &mut trx.wal,
+            creator,
+            &Record::Insert { file_no, rid, record: data },
+        );
         for (ci, ix_file) in self.index_ops(name)? {
             let key = encode_key(&row[ci])?;
             BTree::at(ix_file).insert(&self.pool, &key, rid)?;
@@ -1058,8 +1071,11 @@ impl Database {
                 rid: *rid,
                 prev_deleter,
             });
-            self.wal
-                .append(deleter, &Record::DeleteMark { file_no, rid: *rid, deleter })?;
+            crate::wal::encode_frame_into(
+                &mut trx.wal,
+                deleter,
+                &Record::DeleteMark { file_no, rid: *rid, deleter },
+            );
         }
         Ok(())
     }
@@ -1082,14 +1098,18 @@ impl Database {
         let ops = self.index_ops(name)?;
         for (rid, new_row) in updates {
             let prev_deleter = engine.delete_mark(&self.pool, *rid, trx_id)?;
-            self.wal
-                .append(trx_id, &Record::DeleteMark { file_no, rid: *rid, deleter: trx_id })?;
+            crate::wal::encode_frame_into(
+                &mut trx.wal,
+                trx_id,
+                &Record::DeleteMark { file_no, rid: *rid, deleter: trx_id },
+            );
             let data = encode_record(trx_id, 0, new_row, &self.lobs, self.inline_lob_limit())?;
             let new_rid = engine.insert(&self.pool, &data)?;
-            self.wal.append(
+            crate::wal::encode_frame_into(
+                &mut trx.wal,
                 trx_id,
-                &Record::Insert { file_no, rid: new_rid, record: data.clone() },
-            )?;
+                &Record::Insert { file_no, rid: new_rid, record: data },
+            );
             for (ci, ix_file) in &ops {
                 let key = encode_key(&new_row[*ci])?;
                 BTree::at(*ix_file).insert(&self.pool, &key, new_rid)?;

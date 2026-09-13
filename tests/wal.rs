@@ -1,5 +1,5 @@
 use chibidb::value::Value;
-use chibidb::{Database, ResultSet};
+use chibidb::{Database, ResultSet, Session};
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     match db.execute_sql(sql).unwrap().remove(0) {
@@ -33,6 +33,29 @@ fn committed_insert_survives_crash() {
             vec![Value::Int(2), Value::Str("bob".into())],
         ]
     );
+}
+
+#[test]
+fn failed_statement_leaves_no_redo_for_the_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Database::open(dir.path()).unwrap();
+        let mut s = Session::new();
+        db.execute_sql_with(&mut s, "create table t (id int, name char(4));").unwrap();
+        db.flush().unwrap();
+        db.execute_sql_with(&mut s, "begin;").unwrap();
+        db.execute_sql_with(&mut s, "insert into t values (1, 'ok');").unwrap();
+        // the first row is stored before the second fails, so the failed
+        // statement's buffered redo must be dropped, not replayed at commit
+        assert!(
+            db.execute_sql_with(&mut s, "insert into t values (2, 'ok'), (3, 'toolong');")
+                .is_err()
+        );
+        db.execute_sql_with(&mut s, "commit;").unwrap();
+        db.simulate_crash();
+    }
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(rows(&db, "select id from t order by id;"), vec![vec![Value::Int(1)]]);
 }
 
 #[test]
