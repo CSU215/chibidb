@@ -126,6 +126,11 @@ pub struct BufferPool {
     /// 把不同文件的 I/O 重新串起来。
     disk: DiskManager,
     state: Mutex<PoolState>,
+    /// 串行化整段 DWB 协议（stage → sync → 写回 → sync → reset）。逐文件锁
+    /// 把旧全局 `Mutex<DiskManager>` 顺带提供的互斥拆掉了，这里显式补回来，
+    /// 否则两个并发的 `flush_all`（如机会式 checkpoint）会交错 stage/reset。
+    /// 只加在 checkpoint 路径上，热路径无成本。
+    flush_lock: Mutex<()>,
     capacity: usize,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -146,6 +151,7 @@ impl BufferPool {
         Self {
             disk,
             state: Mutex::new(PoolState { frames: HashMap::new(), replacer: from_policy(eviction) }),
+            flush_lock: Mutex::new(()),
             capacity: capacity.max(1),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -293,6 +299,7 @@ impl BufferPool {
     /// 目前**没有调用者**（checkpoint 走 `flush_all`），保留它是为了给按文件
     /// checkpoint 留出接缝 —— 也正因为有它，`dirty_frames` 才需要 `only` 参数。
     pub fn flush_file(&self, file: FileId) -> Result<()> {
+        let _serial = self.flush_lock.lock();
         let frames = self.dirty_frames(Some(file));
         if frames.is_empty() {
             return Ok(());
@@ -311,6 +318,7 @@ impl BufferPool {
     }
 
     pub fn flush_all(&self) -> Result<()> {
+        let _serial = self.flush_lock.lock();
         let frames = self.dirty_frames(None);
         if frames.is_empty() {
             return Ok(());

@@ -85,6 +85,8 @@ impl Replacer for Lru {
     }
 
     fn record_access(&mut self, key: Key) {
+        // 线性扫描：本接缝的价值在"换出策略可替换"，不在复杂度；容量到上千时
+        // 这是明确的债（HANDOFF §8），要 O(1) 得换成索引结构。
         let Some(pos) = self.order.iter().position(|&k| k == key) else {
             debug_assert!(false, "record_access on an unregistered key");
             return;
