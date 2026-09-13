@@ -81,6 +81,7 @@ impl Wal {
         let mut file = self.file.lock();
         file.set_len(0).map_err(wal_io)?;
         file.seek(SeekFrom::Start(0)).map_err(wal_io)?;
+        file.sync_all().map_err(wal_io)?;
         Ok(())
     }
 }

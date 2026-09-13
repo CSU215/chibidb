@@ -134,6 +134,13 @@ impl DiskManager {
         Ok((len / PAGE_SIZE as u64) as PageNo)
     }
 
+    /// Flushes a file's data and metadata to stable storage. Used by the
+    /// buffer pool after writing final pages and before the WAL/double-write
+    /// buffer may be discarded.
+    pub fn sync_file(&mut self, file: FileId) -> Result<()> {
+        self.file(file)?.sync_all().map_err(io_err)
+    }
+
     /// Empties a file in place (used when rebuilding derived structures).
     pub fn truncate_file(&mut self, file: FileId) -> Result<()> {
         let f = self.file(file)?;

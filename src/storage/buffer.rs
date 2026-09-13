@@ -193,6 +193,7 @@ impl BufferPool {
                 frame.dirty.store(false, Ordering::Release);
             }
         }
+        disk.sync_file(file)?;
         Ok(())
     }
 
@@ -213,6 +214,14 @@ impl BufferPool {
             let data = frame.data.lock();
             disk.write_page(frame.file, frame.no, &data)?;
             frame.dirty.store(false, Ordering::Release);
+        }
+        // The final pages must be durable before the DWB can be discarded;
+        // otherwise a crash after reset would lose them with no repair copy.
+        let mut files: Vec<FileId> = frames.iter().map(|f| f.file).collect();
+        files.sort_unstable();
+        files.dedup();
+        for file in files {
+            disk.sync_file(file)?;
         }
         disk.reset_double_write()?;
         Ok(())

@@ -113,7 +113,9 @@ pub fn write_page_at(target: &Path, no: PageNo, page: &[u8]) -> Result<()> {
     }
     file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
     file.write_all(page).map_err(io_err)?;
-    file.flush().map_err(io_err)
+    // Durability of the repaired page matters before `recover` truncates the
+    // double-write buffer.
+    file.sync_all().map_err(io_err)
 }
 
 /// Reads a file fully, used only by tests.
