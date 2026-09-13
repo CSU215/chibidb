@@ -773,7 +773,15 @@ pub(crate) fn chunk_grouped_aggregate(
         for i in 0..chunk.len() {
             let mut key = Vec::with_capacity(group_columns.len());
             for &c in &group_columns {
-                key.push(chunk.column(c).value(i));
+                let mut value = chunk.column(c).value(i);
+                // The row path groups by `Value` equality, where -0.0 == 0.0;
+                // normalise the signed zero so the encoded key agrees.
+                if let Value::Float(f) = &value
+                    && *f == 0.0
+                {
+                    value = Value::Float(0.0);
+                }
+                key.push(value);
             }
             let encoded = crate::storage::codec::encode_row(&key);
             let group = match lookup.get(&encoded) {
