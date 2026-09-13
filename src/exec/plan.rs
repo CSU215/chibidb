@@ -200,6 +200,13 @@ fn find_sargable(
             continue;
         };
         let dtype = schema.columns[col_idx].dtype;
+        // A literal that cannot be losslessly coerced to the column type must
+        // not select an index: the row path compares it with `cmp_values`
+        // (e.g. `int_col = 1.0`), so reject the candidate and let the full
+        // scan handle it instead of erroring inside `literal_key`.
+        if literal_key(&lit, dtype, &cname).is_err() {
+            continue;
+        }
         if op == BinOp::Eq {
             return Ok(Some(Sargable {
                 index: ix.name.clone(),

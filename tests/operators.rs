@@ -257,3 +257,21 @@ fn unions_build_an_operator_plan() {
         assert!(build_select(&db, &select).unwrap().is_some(), "{sql}");
     }
 }
+
+#[test]
+fn float_literal_on_int_index_falls_back_to_scan() {
+    let db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int primary key, v int);").unwrap();
+    db.execute_sql("insert into t values (1, 10), (2, 20);").unwrap();
+
+    let rows = |sql: &str| -> Vec<Vec<Value>> {
+        match &db.execute_sql(sql).unwrap()[0] {
+            chibidb::ResultSet::Rows { rows, .. } => rows.clone(),
+            other => panic!("expected rows for {sql}, got {other:?}"),
+        }
+    };
+    // These must not error just because the column has a primary-key index;
+    // the row path compares with cmp_values.
+    assert_eq!(rows("select id from t where id = 1.0;"), vec![vec![Value::Int(1)]]);
+    assert_eq!(rows("select id from t where id > 1.5;"), vec![vec![Value::Int(2)]]);
+}
