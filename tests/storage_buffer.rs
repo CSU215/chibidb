@@ -2,12 +2,26 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 
+use chibidb::config::EvictionPolicy;
 use chibidb::storage::{BufferPool, DiskManager, PAGE_SIZE};
 
-fn pool(dir: &tempfile::TempDir, name: &str, cap: usize) -> (BufferPool, u32) {
+const ALL_POLICIES: [EvictionPolicy; 3] =
+    [EvictionPolicy::Lru, EvictionPolicy::Clock, EvictionPolicy::Fifo];
+
+fn pool_with(
+    dir: &tempfile::TempDir,
+    name: &str,
+    cap: usize,
+    policy: EvictionPolicy,
+) -> (BufferPool, u32) {
     let mut disk = DiskManager::new();
     let file = disk.create_file(&dir.path().join(name)).unwrap();
-    (BufferPool::new(disk, cap), file)
+    (BufferPool::new_with_eviction(disk, cap, policy), file)
+}
+
+/// 默认策略（`lru`）的池，供不关心策略的用例使用。
+fn pool(dir: &tempfile::TempDir, name: &str, cap: usize) -> (BufferPool, u32) {
+    pool_with(dir, name, cap, EvictionPolicy::Lru)
 }
 
 #[test]
@@ -55,10 +69,15 @@ fn data_survives_pool_restart() {
     assert_eq!(v, 42);
 }
 
+/// LRU 语义：容量 2 下写页 1、写页 2、读页 1（命中重排），再写页 3 时淘汰的是页 2。
+///
+/// 注意"淘汰了哪一帧"**不能**由读回值观察：脏页换出前会写回，读回来的值一样。
+/// 唯一可观察的是后续读是否缺页，所以断言落在 `PoolStats` 增量的方向上。
+/// 该断言对策略敏感：换成 `fifo`/`clock`，这里被淘汰的会变成页 1，用例即失败。
 #[test]
 fn evicts_least_recently_used() {
     let dir = tempfile::tempdir().unwrap();
-    let (bp, f) = pool(&dir, "d.dbf", 2);
+    let (bp, f) = pool_with(&dir, "d.dbf", 2, EvictionPolicy::Lru);
 
     bp.with_page(f, 1, |p| {
         p[0] = 10;
@@ -70,22 +89,60 @@ fn evicts_least_recently_used() {
         Ok(())
     })
     .unwrap();
-    // touch page 1: now page 2 is LRU
-    let v = bp.with_page(f, 1, |p| Ok(p[0])).unwrap();
-    assert_eq!(v, 10);
-    // forces eviction of page 2
+    // 命中页 1：页 2 从此成为 LRU。
+    assert_eq!(bp.read_page(f, 1, |p| Ok(p[0])).unwrap(), 10);
     bp.with_page(f, 3, |p| {
         p[0] = 30;
         Ok(())
     })
     .unwrap();
-    // page 1 still has its data, page 2 must come back from disk
-    let v = bp.with_page(f, 1, |p| Ok(p[0])).unwrap();
-    assert_eq!(v, 10);
-    let v = bp.with_page(f, 2, |p| Ok(p[0])).unwrap();
-    assert_eq!(v, 20);
-    let v = bp.with_page(f, 3, |p| Ok(p[0])).unwrap();
-    assert_eq!(v, 30);
+
+    // 页 1 是新近使用的，应当还在池里 → 命中。
+    let before = bp.stats();
+    assert_eq!(bp.read_page(f, 1, |p| Ok(p[0])).unwrap(), 10);
+    let after1 = bp.stats();
+    assert_eq!(after1.hits, before.hits + 1, "LRU 不该淘汰页 1");
+    assert_eq!(after1.misses, before.misses);
+
+    // 页 2 已被换出 → 必然缺页；值仍然对，因为换出时写回了。
+    assert_eq!(bp.read_page(f, 2, |p| Ok(p[0])).unwrap(), 20);
+    let after2 = bp.stats();
+    assert_eq!(after2.misses, after1.misses + 1, "LRU 应当已经淘汰了页 2");
+}
+
+/// FIFO 的镜像用例：同一访问序列下命中**不**重排，所以先入池的页 1 先出局。
+#[test]
+fn fifo_evicts_the_oldest_insertion() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = pool_with(&dir, "fifo.dbf", 2, EvictionPolicy::Fifo);
+
+    bp.with_page(f, 1, |p| {
+        p[0] = 10;
+        Ok(())
+    })
+    .unwrap();
+    bp.with_page(f, 2, |p| {
+        p[0] = 20;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(bp.read_page(f, 1, |p| Ok(p[0])).unwrap(), 10, "命中不改变入池顺序");
+    bp.with_page(f, 3, |p| {
+        p[0] = 30;
+        Ok(())
+    })
+    .unwrap();
+
+    // 页 1 最先进池 → 先出局；页 2 还在。
+    let before = bp.stats();
+    assert_eq!(bp.read_page(f, 2, |p| Ok(p[0])).unwrap(), 20);
+    let after2 = bp.stats();
+    assert_eq!(after2.hits, before.hits + 1, "FIFO 不该淘汰页 2");
+    assert_eq!(after2.misses, before.misses);
+
+    assert_eq!(bp.read_page(f, 1, |p| Ok(p[0])).unwrap(), 10);
+    let after1 = bp.stats();
+    assert_eq!(after1.misses, after2.misses + 1, "FIFO 应当已经淘汰了页 1");
 }
 
 #[test]
@@ -259,25 +316,22 @@ fn a_fully_pinned_pool_reports_exhaustion() {
     assert_eq!(bp.read_page(f, 1, |p| Ok(p[0])).unwrap(), 2);
 }
 
-/// 小池 + 多线程 + 频繁淘汰：每次成功自增都必须落到盘上，一次都不能丢。
-/// 断言的是"最终状态等于成功次数"这一确定性性质，与线程交错无关。
-#[test]
-fn concurrent_writers_do_not_lose_updates_under_eviction() {
+/// 用小池 + 多线程 + 频繁淘汰敲同一个文件，返回 `(每页的成功自增次数, 重开后盘上的值)`。
+/// 两个向量是否相等只取决于实现有没有丢写，与线程交错无关。
+fn hammer(path: &std::path::Path, policy: EvictionPolicy) -> (Vec<u32>, Vec<u32>) {
     const PAGES: u32 = 8;
     const THREADS: u32 = 4;
-    const OPS: usize = 400;
+    const OPS: usize = 200;
 
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("concurrent.dbf");
     let counts: Arc<Vec<AtomicU32>> =
         Arc::new((0..PAGES).map(|_| AtomicU32::new(0)).collect());
 
     {
         let mut disk = DiskManager::new();
-        let f = disk.create_file(&path).unwrap();
+        let f = disk.create_file(path).unwrap();
         // 容量 4、4 个线程：每个线程最多持 1 个 pin，故总有可淘汰的帧，
         // 不会真的耗尽；保留重试分支以防实现细节变化。
-        let bp = Arc::new(BufferPool::new(disk, 4));
+        let bp = Arc::new(BufferPool::new_with_eviction(disk, 4, policy));
         let mut handles = Vec::new();
         for t in 0..THREADS {
             let bp = Arc::clone(&bp);
@@ -308,12 +362,37 @@ fn concurrent_writers_do_not_lose_updates_under_eviction() {
     }
 
     let mut disk = DiskManager::new();
-    let f = disk.open_file(&path).unwrap();
+    let f = disk.open_file(path).unwrap();
     let bp = BufferPool::new(disk, PAGES as usize);
-    for page in 0..PAGES {
-        let v = bp
-            .read_page(f, page, |p| Ok(u32::from_le_bytes(p[0..4].try_into().unwrap())))
-            .unwrap();
-        assert_eq!(v, counts[page as usize].load(Ordering::Relaxed), "page {page} 丢了写");
+    let on_disk = (0..PAGES)
+        .map(|page| {
+            bp.read_page(f, page, |p| Ok(u32::from_le_bytes(p[0..4].try_into().unwrap())))
+                .unwrap()
+        })
+        .collect();
+    let counted = counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    (counted, on_disk)
+}
+
+/// 小池 + 多线程 + 频繁淘汰：每次成功自增都必须落到盘上，一次都不能丢。
+#[test]
+fn concurrent_writers_do_not_lose_updates_under_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (counted, on_disk) = hammer(&dir.path().join("concurrent.dbf"), EvictionPolicy::Lru);
+    for page in 0..counted.len() {
+        assert_eq!(on_disk[page], counted[page], "page {page} 丢了写");
+    }
+}
+
+/// 淘汰策略只决定"换出哪一帧"，不影响任何可观测结果 —— 同一套并发写用例
+/// 在三种策略下都必须一字不差地通过。
+#[test]
+fn every_eviction_policy_keeps_writes_correct() {
+    let dir = tempfile::tempdir().unwrap();
+    for policy in ALL_POLICIES {
+        let path = dir.path().join(format!("hammer-{policy:?}.dbf"));
+        let (counted, on_disk) = hammer(&path, policy);
+        assert_eq!(on_disk, counted, "{policy:?} 下丢了写");
+        assert!(counted.iter().all(|&c| c > 0), "{policy:?} 下并发负载没跑起来");
     }
 }

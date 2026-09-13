@@ -1,12 +1,14 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, MutexGuard};
 
+use crate::config::EvictionPolicy;
 use crate::storage::disk::DiskManager;
 use crate::storage::page::{zeroed_page, FileId, PageData, PageNo, PAGE_SIZE};
+use crate::storage::replacer::{from_policy, FrameVitals, Key, Replacer};
 use crate::{Error, Result};
 
 /// One cached page. Its key is fixed for the frame's lifetime, so a reader
@@ -20,6 +22,9 @@ struct Frame {
     /// 活跃的 pin 数。非零期间这一帧不会被选为淘汰对象，所以闭包里的写入
     /// 不可能落进一个已脱离页表的孤儿帧。见 `PinnedFrame`。
     pins: AtomicU32,
+    /// CLOCK 的引用位：命中或刚载入时置位，被淘汰器扫到时清零（"第二次机会"）。
+    /// 其它策略不读它。
+    accessed: AtomicBool,
 }
 
 /// RAII pin：存活期间该帧不会被淘汰。构造**只在持有 `state` 锁时**发生，
@@ -70,16 +75,36 @@ impl Drop for PinnedFrame {
     }
 }
 
-/// The page table and LRU order, guarded by one lock. Frame *contents* have
-/// their own latches, so this lock is held only while resolving a page to a
-/// frame, never while a closure runs.
+/// The page table and the eviction order, guarded by one lock. Frame
+/// *contents* have their own latches, so this lock is held only while
+/// resolving a page to a frame, never while a closure runs.
 ///
-/// 不变式 Ⅳ：每个存活帧在 `lru` 里恰好登记一次（`lru.len() == frames.len()`）。
-/// pin 不移除登记，只是让该帧失去淘汰候选资格 —— 所以被 pin 的帧仍在队列里。
-#[derive(Default)]
+/// 不变式 Ⅳ：每个存活帧在淘汰器里恰好登记一次（`replacer.len() == frames.len()`）。
+/// pin 不移除登记，只是让该帧失去淘汰候选资格 —— 所以被 pin 的帧仍在队列/环里。
 struct PoolState {
-    frames: HashMap<(FileId, PageNo), Arc<Frame>>,
-    lru: VecDeque<(FileId, PageNo)>,
+    frames: HashMap<Key, Arc<Frame>>,
+    replacer: Box<dyn Replacer>,
+}
+
+/// 把池的页表暴露给淘汰器。pin 数与引用位**只**存在帧上，策略不保存副本。
+struct PoolVitals<'a> {
+    frames: &'a HashMap<Key, Arc<Frame>>,
+}
+
+impl FrameVitals for PoolVitals<'_> {
+    fn pins(&self, key: Key) -> u32 {
+        self.frames.get(&key).map_or(u32::MAX, |f| f.pins.load(Ordering::Acquire))
+    }
+
+    fn referenced(&self, key: Key) -> bool {
+        self.frames.get(&key).is_some_and(|f| f.accessed.load(Ordering::Relaxed))
+    }
+
+    fn clear_referenced(&self, key: Key) {
+        if let Some(frame) = self.frames.get(&key) {
+            frame.accessed.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 /// A snapshot of the buffer pool's lookup counters, for observability and
@@ -106,10 +131,19 @@ pub struct BufferPool {
 }
 
 impl BufferPool {
+    /// 使用默认淘汰策略（`lru`）开池。
     pub fn new(disk: DiskManager, capacity: usize) -> Self {
+        Self::new_with_eviction(disk, capacity, EvictionPolicy::Lru)
+    }
+
+    pub fn new_with_eviction(
+        disk: DiskManager,
+        capacity: usize,
+        eviction: EvictionPolicy,
+    ) -> Self {
         Self {
             disk: Mutex::new(disk),
-            state: Mutex::new(PoolState::default()),
+            state: Mutex::new(PoolState { frames: HashMap::new(), replacer: from_policy(eviction) }),
             capacity: capacity.max(1),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -157,22 +191,28 @@ impl BufferPool {
     fn frame_for(&self, file: FileId, no: PageNo) -> Result<PinnedFrame> {
         let key = (file, no);
         let mut state = self.state.lock();
-        // `frames` 可变借用于淘汰，`lru` 可变借用于重排；拆开字段让两者并存。
-        let PoolState { frames, lru } = &mut *state;
+        // `frames` 可变借用于淘汰，`replacer` 可变借用于重排；拆开字段让两者并存。
+        let PoolState { frames, replacer } = &mut *state;
         if let Some(frame) = frames.get(&key).cloned() {
-            touch(lru, key);
+            replacer.record_access(key);
+            frame.accessed.store(true, Ordering::Relaxed); // CLOCK 的引用位
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(PinnedFrame::new(frame));
         }
         while frames.len() >= self.capacity {
-            // 被 pin 的帧留在 LRU 队列里，只是不参与淘汰 —— 否则它们会丢掉
-            // 淘汰顺序信息（不变式 Ⅳ：登记数恒等于页表长度）。
-            let victim_key = take_victim(lru, frames).ok_or_else(|| {
+            // 被 pin 的帧留在队列/环里，只是不参与淘汰 —— 否则它们会丢掉
+            // 淘汰顺序（不变式 Ⅳ：登记数恒等于页表长度）。
+            let victim_key = {
+                let vitals = PoolVitals { frames };
+                replacer.choose_victim(&vitals)
+            }
+            .ok_or_else(|| {
                 Error::Runtime("buffer pool exhausted: every frame is pinned".into())
             })?;
             self.evictions.fetch_add(1, Ordering::Relaxed);
-            let victim =
-                frames.remove(&victim_key).expect("lru and page table stay in sync");
+            let victim = frames
+                .remove(&victim_key)
+                .expect("the replacer stays in sync with the page table");
             if victim.dirty.load(Ordering::Acquire) {
                 // lock order disk -> frame latch, matching flush_all
                 let mut disk = self.disk.lock();
@@ -190,10 +230,11 @@ impl BufferPool {
             data: Mutex::new(data),
             dirty: AtomicBool::new(false),
             pins: AtomicU32::new(0),
+            accessed: AtomicBool::new(true), // 刚载入 → 有第二次机会
         });
         frames.insert(key, frame.clone());
-        lru.push_back(key);
-        debug_assert_eq!(frames.len(), lru.len(), "invariant Ⅳ: lru mirrors the page table");
+        replacer.push(key);
+        debug_assert_eq!(frames.len(), replacer.len(), "invariant Ⅳ: the replacer mirrors the page table");
         Ok(PinnedFrame::new(frame))
     }
 
@@ -238,10 +279,19 @@ impl BufferPool {
     /// 闭包。真有的话，它的修改随最后一个 `Arc` 一起消失，这正是本方法要的语义。
     pub fn discard_file(&self, file: FileId) {
         let mut state = self.state.lock();
-        state.frames.retain(|k, _| k.0 != file);
-        state.lru.retain(|k| k.0 != file);
+        let PoolState { frames, replacer } = &mut *state;
+        let dropped: Vec<Key> = frames.keys().filter(|k| k.0 == file).copied().collect();
+        frames.retain(|k, _| k.0 != file);
+        // 逐键注销：策略只提供 `forget(&mut self, key)`，没有"按文件清空"，
+        // 这样三种策略共用一条路径，也顺手维持了 `len()` 与页表同步。
+        for key in dropped {
+            replacer.forget(key);
+        }
     }
 
+    /// 只回写一个文件的脏帧，然后 `sync` 该文件。是 `flush_all` 的单文件版本，
+    /// 目前**没有调用者**（checkpoint 走 `flush_all`），保留它是为了给按文件
+    /// checkpoint 留出接缝 —— 也正因为有它，`dirty_frames` 才需要 `only` 参数。
     pub fn flush_file(&self, file: FileId) -> Result<()> {
         let frames = self.dirty_frames(Some(file));
         if frames.is_empty() {
@@ -304,27 +354,6 @@ impl BufferPool {
             .map(|(_, f)| PinnedFrame::new(f.clone()))
             .collect()
     }
-}
-
-/// Moves `key` to the back of the LRU deque.
-fn touch(lru: &mut VecDeque<(FileId, PageNo)>, key: (FileId, PageNo)) {
-    if let Some(pos) = lru.iter().position(|&k| k == key) {
-        lru.remove(pos);
-    }
-    lru.push_back(key);
-}
-
-/// Picks the least recently used *evictable* frame, removing its registration.
-/// Frames with a live pin stay in the deque so they keep their place in the
-/// order; returning `None` means every registered frame is pinned.
-fn take_victim(
-    lru: &mut VecDeque<(FileId, PageNo)>,
-    frames: &HashMap<(FileId, PageNo), Arc<Frame>>,
-) -> Option<(FileId, PageNo)> {
-    let pos = lru
-        .iter()
-        .position(|k| frames.get(k).is_none_or(|f| f.pins.load(Ordering::Acquire) == 0))?;
-    lru.remove(pos)
 }
 
 impl Drop for BufferPool {

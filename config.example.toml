@@ -20,6 +20,10 @@ page_layout = "row"
 # 缓冲池帧数（必须大于 0）。每帧一个页。
 buffer_pool_frames = 64
 
+# 缓冲池淘汰策略：lru（最近最少使用，默认）/ clock（二次机会）/ fifo（先进先出）。
+# 只影响"淘汰哪一帧"，不影响任何可观测结果。
+eviction = "lru"
+
 # 是否启用 Double-Write Buffer，防止页半写。开启后 flush 前先写 dwb.bin。
 double_write = false
 

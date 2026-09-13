@@ -20,7 +20,8 @@ cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表�
 REPL / client 中输入 `exit` 或 `quit` 退出。
 
 启动时从当前目录读取 `config.toml`（缺失则全用默认值）；可复制 `config.example.toml` 为起点，其中含各条目说明与默认值。已生效条目：
-`storage.buffer_pool_frames`、`storage.double_write`、`storage.default_engine`（`"heap"` / `"lsm"`）、
+`storage.buffer_pool_frames`、`storage.eviction`（`"lru"` 默认 / `"clock"` / `"fifo"`，缓冲池淘汰策略）、
+`storage.double_write`、`storage.default_engine`（`"heap"` / `"lsm"`）、
 `storage.inline_lob_limit`、`storage.lsm_compaction_trigger`、`wal.checkpoint_threshold`、`server.addr`、
 `server.http_addr`（可选，HTTP/JSON 监听）、`server.mysql_addr`（可选，MySQL wire 监听）、
 `server.thread_model`/`worker_threads`、
@@ -128,7 +129,7 @@ SQL 字符串
   → slotted page   8KB、槽目录、变长条目
   → TableStorage   表存储接缝（`insert/delete/delete_mark/scan/get`，带 MVCC 语义）
   → HeapEngine     `TableStorage` 的堆实现（Rid 寻址、多页 first-fit）
-  → BufferPool     8KB 帧、LRU、pin 引用计数、脏页写回（元数据锁 + 每帧页闩）
+  → BufferPool     8KB 帧、可配置淘汰（lru/clock/fifo）、pin 引用计数、脏页写回（元数据锁 + 每帧页闩）
   → DiskManager    分页文件 IO
 ```
 
@@ -142,7 +143,7 @@ src/
   lib.rs  main.rs  error.rs  config.rs  wal.rs
   sql/       lexer parser ast value result datetime pipeline
   exec/      mod dml eval aggregate plan operator subquery
-  storage/   page disk header dwb buffer slotted engine heap codec lob lsm/*
+  storage/   page disk header dwb buffer replacer slotted engine heap codec lob lsm/*
   index/     key node btree
   catalog/   mod meta
   db/        instance transaction trx
@@ -175,6 +176,9 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
 - 页 pin：`with_page`/`read_page` 的闭包期内帧被 pin（RAII guard），淘汰器只挑
   `pins == 0` 的帧，所以正在写的页不会被搬走；池内每帧都被 pin 时返回
   `buffer pool exhausted` 而不是静默丢写
+- 淘汰策略可配置：`storage.eviction = "lru" | "clock" | "fifo"`，默认 **LRU**。
+  策略只决定"换出哪一帧"，不影响任何可观测结果（换出的脏页会先写回）；
+  默认值保证行为与引入此键之前逐位一致
 - 冲突策略可配置：`transaction.conflict = "fcw" | "2pl"`。默认 **FCW**
   （first-committer-wins）：提交时比对被改写基版本的 `prev_deleter` 与当前标记，
   若其间有后提交的事务改过同一行则回滚失败方

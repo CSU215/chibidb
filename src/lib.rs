@@ -145,7 +145,11 @@ impl Database {
             crate::storage::dwb::recover(&dwb_path, crate::storage::dwb::write_page_at)?;
             disk.enable_double_write(&dwb_path)?;
         }
-        let pool = BufferPool::new(disk, config.storage.buffer_pool_frames);
+        let pool = BufferPool::new_with_eviction(
+            disk,
+            config.storage.buffer_pool_frames,
+            config.storage.eviction,
+        );
         let mut catalog = Catalog::default();
         let mut next_table_file = 0;
         let mut next_index_file = 0;
