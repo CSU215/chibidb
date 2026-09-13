@@ -49,6 +49,17 @@ fn per_op(iterations: u32, mut f: impl FnMut()) -> Duration {
     start.elapsed() / iterations
 }
 
+/// Fastest single call, which tolerates CPU clock drift between runs.
+fn per_op_min(iterations: u32, mut f: impl FnMut()) -> Duration {
+    let mut best = Duration::MAX;
+    for _ in 0..iterations {
+        let start = Instant::now();
+        f();
+        best = best.min(start.elapsed());
+    }
+    best
+}
+
 /// `col + 0` defeats the sargable rule, forcing a full table scan.
 fn bench(db: &Database, label: &str, indexed: &str, scanned: &str, indexed_iters: u32, scan_iters: u32) {
     let idx = per_op(indexed_iters, || {
@@ -160,7 +171,7 @@ fn chunk_aggregate_throughput() {
     let chunk = build_mode_rows(ExecutionMode::Chunk, ROWS);
     println!("rows: {ROWS}");
     for (mode, db) in [("volcano", &volcano), ("chunk", &chunk)] {
-        let elapsed = per_op(20, || {
+        let elapsed = per_op_min(200, || {
             db.execute_sql("select sum(tag) from t;").unwrap();
         });
         let ns = elapsed.as_secs_f64() * 1e9 / ROWS as f64;
