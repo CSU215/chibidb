@@ -49,6 +49,14 @@ pub trait RowScanner: Send {
 pub trait TableEngine: Send + Sync {
     fn scan(&self, bp: &BufferPool) -> Result<Box<dyn RowScanner>>;
 
+    /// Like [`TableEngine::scan`], but the caller promises it only reads the
+    /// columns where `keep` is `true`; other columns may come back as `NULL`.
+    /// A column-major engine uses this to skip unread columns entirely; the
+    /// default ignores the hint and scans everything.
+    fn scan_projected(&self, bp: &BufferPool, _keep: &[bool]) -> Result<Box<dyn RowScanner>> {
+        self.scan(bp)
+    }
+
     /// Point fetch of one encoded record by row id.
     fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>>;
 }
@@ -106,7 +114,17 @@ impl HeapEngine {
 
 impl TableEngine for HeapEngine {
     fn scan(&self, bp: &BufferPool) -> Result<Box<dyn RowScanner>> {
-        Ok(Box::new(HeapScanner::new(bp, self.file, self.layout)?))
+        Ok(Box::new(HeapScanner::new(bp, self.file, self.layout, None)?))
+    }
+
+    fn scan_projected(&self, bp: &BufferPool, keep: &[bool]) -> Result<Box<dyn RowScanner>> {
+        match self.layout {
+            // Row pages store whole records, so there is nothing to skip.
+            PageLayout::Row => self.scan(bp),
+            PageLayout::Pax => {
+                Ok(Box::new(HeapScanner::new(bp, self.file, self.layout, Some(keep.to_vec()))?))
+            }
+        }
     }
 
     fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>> {
@@ -155,6 +173,9 @@ impl TableStorage for HeapEngine {
 struct HeapScanner {
     file: FileId,
     layout: PageLayout,
+    /// Columns the caller reads; `None` reads every column. Only PAX pages
+    /// use this, to avoid touching unread column segments.
+    keep: Option<Vec<bool>>,
     next_page: PageNo,
     last_page: PageNo,
     /// Image of the page currently being drained; reused across pages.
@@ -167,11 +188,17 @@ struct HeapScanner {
 }
 
 impl HeapScanner {
-    fn new(bp: &BufferPool, file: FileId, layout: PageLayout) -> Result<Self> {
+    fn new(
+        bp: &BufferPool,
+        file: FileId,
+        layout: PageLayout,
+        keep: Option<Vec<bool>>,
+    ) -> Result<Self> {
         let pages = bp.page_count(file)?;
         Ok(Self {
             file,
             layout,
+            keep,
             next_page: 1,
             last_page: pages,
             page: Vec::new(),
@@ -224,7 +251,7 @@ impl HeapScanner {
         match self.layout {
             PageLayout::Row => out.extend_from_slice(&self.page[off..off + len]),
             PageLayout::Pax => {
-                crate::storage::pax::read_record(&self.page, rid.slot, None, out);
+                crate::storage::pax::read_record(&self.page, rid.slot, self.keep.as_deref(), out);
             }
         }
     }

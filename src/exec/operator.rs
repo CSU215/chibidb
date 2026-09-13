@@ -133,7 +133,11 @@ impl PhysicalOperator for TableScan {
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         let engine = ctx.db.catalog().table(&self.table)?.engine();
-        self.scanner = Some(engine.scan(&ctx.db.pool)?);
+        self.scanner = Some(match &self.keep {
+            // A columnar table can skip the columns the query never reads.
+            Some(keep) => engine.scan_projected(&ctx.db.pool, keep)?,
+            None => engine.scan(&ctx.db.pool)?,
+        });
         Ok(())
     }
 

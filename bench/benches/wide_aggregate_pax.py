@@ -1,11 +1,8 @@
-"""Wide-row aggregation: scan + sum over a table with many wide columns.
+"""Wide aggregation on a PAX (column-major) chibidb table.
 
-The layout matters here: a row-at-a-time scan walks past every column to reach
-the summed one, while a column-major (PAX) page reads only that column's bytes.
-``BENCH_WIDE_COLS`` sets the int columns, ``BENCH_WIDE_PAD_COLS`` /
-``BENCH_WIDE_PAD_LEN`` the wide ``char`` padding that the summed query skips.
-The default row count keeps the table inside the 64-frame buffer pool, so the
-measurement isolates scan/decoding CPU rather than page I/O.
+Same workload as ``wide_aggregate`` but the table is created with
+``page_layout = pax``, so the scan reads only the summed column and never the
+wide ``char`` padding. chibidb-only: the clause is not valid SQL elsewhere.
 """
 
 from __future__ import annotations
@@ -34,18 +31,19 @@ def row_values(i):
     return "%s, %s" % (ints, pads)
 
 
-class WideAggregate(Bench):
-    id = "wide_aggregate"
-    title = "%d sum scans over %d rows (%d int + %d char(%d))" % (
+class WideAggregatePax(Bench):
+    id = "wide_aggregate_pax"
+    title = "%d sum scans over %d rows (%d int + %d char(%d)) (pax)" % (
         QUERIES,
         ROWS,
         COLS,
         PAD_COLS,
         PAD_LEN,
     )
+    disabled_targets = ("sqlite3", "duckdb", "miniob")
 
     def run(self, target: Target, env: Env):
-        target.execute("create table wide (id int, %s);" % table_defs())
+        target.execute("create table wide (id int, %s) page_layout = pax;" % table_defs())
         for i in range(ROWS):
             target.execute("insert into wide values (%d, %s);" % (i, row_values(i)))
 
@@ -57,4 +55,4 @@ class WideAggregate(Bench):
         return {"seconds": seconds, "queries": QUERIES, "queries/s": QUERIES / seconds}
 
 
-BENCH = WideAggregate()
+BENCH = WideAggregatePax()
