@@ -81,7 +81,7 @@ async fn piped_output_has_no_prompt_and_stays_aligned() {
     assert!(!output.contains("db> "), "piped output must not include a prompt: {output:?}");
 
     let lines: Vec<&str> = output.lines().collect();
-    let header = lines.iter().find(|l| l.starts_with("Field")).expect("header row");
+    let header = lines.iter().find(|l| l.starts_with("field")).expect("header row");
     let sep = lines.iter().find(|l| l.starts_with('-')).expect("separator row");
     let pipes: Vec<usize> =
         header.char_indices().filter(|(_, c)| *c == '|').map(|(i, _)| i).collect();

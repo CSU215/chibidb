@@ -205,7 +205,7 @@ impl Instance {
                         .into_iter()
                         .map(|name| vec![Value::Str(name)])
                         .collect();
-                    out.push(ResultSet::Rows { columns: vec!["Database".into()], rows });
+                    out.push(ResultSet::Rows { columns: vec!["database".into()], rows });
                 }
                 Stmt::Use(u) => {
                     self.reject_in_trx(session)?;

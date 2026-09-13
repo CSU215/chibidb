@@ -94,7 +94,8 @@ fn execute_show_tables(db: &Database) -> Result<ResultSet> {
     Ok(ResultSet::Rows { columns: vec!["table".into()], rows })
 }
 
-/// `SHOW COLUMNS FROM t` / `DESCRIBE t`: one MySQL-style row per column.
+/// `SHOW COLUMNS FROM t` / `DESCRIBE t`: one row per column, MySQL-style values.
+/// Headers stay lowercase to match the engine's other metadata labels.
 fn execute_show_columns(db: &Database, s: &ShowColumnsStmt) -> Result<ResultSet> {
     if db.catalog().view(&s.table).is_some() {
         return Err(Error::Runtime(format!(
@@ -103,7 +104,7 @@ fn execute_show_columns(db: &Database, s: &ShowColumnsStmt) -> Result<ResultSet>
         )));
     }
     let schema = db.catalog().table(&s.table)?.schema.clone();
-    let columns = ["Field", "Type", "Null", "Key", "Default", "Extra"]
+    let columns = ["field", "type", "null", "key", "default", "extra"]
         .iter()
         .map(|c| (*c).to_string())
         .collect();

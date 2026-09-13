@@ -855,7 +855,7 @@ fn show_columns_and_describe_against_a_single_database() {
         let (columns, data) = rows(&out);
         assert_eq!(
             columns,
-            ["Field", "Type", "Null", "Key", "Default", "Extra"]
+            ["field", "type", "null", "key", "default", "extra"]
                 .map(String::from)
                 .as_slice()
         );

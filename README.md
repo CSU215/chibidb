@@ -13,7 +13,7 @@ cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
 # HTTP/JSON 前端：配置 server.http_addr 后，POST /query {"sql":"..."} → {"results":[...]}
 # MySQL 前端：配置 server.mysql_addr 后，可用 mysql 客户端连接（mysql_native_password、文本结果集、预处理语句）
-cargo test                      # 全量回归（477 tests）
+cargo test                      # 全量回归（557 tests，另有 8 个 #[ignore] 性能探针）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -44,6 +44,9 @@ python3 scripts/smoke.py     # Windows: python scripts\smoke.py
 CREATE DATABASE shop;  DROP DATABASE shop;  USE shop;
 -- 元数据（虚拟只读库：schemata / tables / columns）
 USE information_schema;  SELECT table_name, engine FROM tables WHERE table_schema = 'shop';
+-- 元命令（只读；结果列名为引擎风格小写：SHOW TABLES→table，SHOW DATABASES→database，
+--         SHOW COLUMNS/DESCRIBE→field/type/null/key/default/extra）
+SHOW TABLES;  SHOW DATABASES;  SHOW COLUMNS FROM t;  SHOW COLUMNS IN t;  DESCRIBE t;
 -- 用户（存于 chibi_meta 系统库，口令加盐 SHA-256）
 CREATE USER alice IDENTIFIED BY 'secret';  DROP USER alice;
 -- 认证（仅当 auth.enabled = true；登录绑定会话）
@@ -106,6 +109,8 @@ EXPLAIN SELECT ...;            -- 输出 FullScan / IndexScan / NestedLoopJoin
 - ORDER BY 可引用 SELECT 别名；JOIN 中同名非限定列报 ambiguous
 - 子查询支持相关（引用外层列，多层嵌套 OK）：按外层行求值并改写为字面量；视图可叠在 JOIN 中、可套视图
 - 显式事务内执行 DDL 报错
+- `SHOW COLUMNS`/`DESCRIBE` 仅描述表，视图报错；`SHOW TABLES` 列出表与视图并排序
+- REPL/client 仅在 stdin 为终端时打印 `db> ` 提示符，管道输入不再污染首行、表格保持对齐
 
 ## 架构（SQL 的一生）
 
@@ -182,7 +187,7 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
 
 ## 测试
 
-`cargo test` 跑 477 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
+`cargo test` 跑 557 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
 表约束（PK/UNIQUE/NOT NULL/DEFAULT）/索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等，
 另有 `tests/miniob_compat.rs` 用经典 student/course/sc 场景做端到端回归，`tests/engine_equivalence.rs`
 用确定性随机脚本对 heap/LSM 两引擎做差分等价（含中途重开）。`tests/perf_stats.rs` 为 `#[ignore]` 性能探针

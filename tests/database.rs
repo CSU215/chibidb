@@ -153,6 +153,7 @@ fn show_databases_lists_registered_databases() {
     inst.execute_with(&mut s, "create database shop;").unwrap();
     inst.execute_with(&mut s, "create database blog;").unwrap();
     let rs = inst.execute_with(&mut s, "show databases;").unwrap();
+    assert_eq!(columns_and_rows(&rs).0, ["database"].map(String::from).as_slice());
     assert_eq!(column_strings(&rs), ["blog", "shop"]);
 }
 
@@ -165,6 +166,7 @@ fn show_tables_lists_tables_and_views() {
     inst.execute_with(&mut s, "create table u (id int);").unwrap();
     inst.execute_with(&mut s, "create view v as select id from t;").unwrap();
     let rs = inst.execute_with(&mut s, "show tables;").unwrap();
+    assert_eq!(columns_and_rows(&rs).0, ["table"].map(String::from).as_slice());
     assert_eq!(column_strings(&rs), ["t", "u", "v"]);
 }
 
@@ -208,7 +210,7 @@ fn show_columns_describes_a_table() {
     let (cols, rows) = columns_and_rows(&rs);
     assert_eq!(
         cols,
-        ["Field", "Type", "Null", "Key", "Default", "Extra"]
+        ["field", "type", "null", "key", "default", "extra"]
             .map(String::from)
             .as_slice()
     );
