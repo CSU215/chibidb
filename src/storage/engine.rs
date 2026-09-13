@@ -13,6 +13,20 @@ pub trait RowScanner: Send {
     /// Returns the next `(Rid, encoded record)` pair, or `None` at EOF.
     fn next(&mut self, bp: &BufferPool) -> Result<Option<(Rid, Vec<u8>)>>;
 
+    /// Returns the next record's row id, writing its encoded bytes into `out`
+    /// (cleared first). Lets a scan decode from one reused buffer instead of
+    /// allocating per row; the default copies from [`RowScanner::next`].
+    fn next_into(&mut self, bp: &BufferPool, out: &mut Vec<u8>) -> Result<Option<Rid>> {
+        match self.next(bp)? {
+            Some((rid, record)) => {
+                out.clear();
+                out.extend_from_slice(&record);
+                Ok(Some(rid))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Fills a batch of up to `max` records (fewer only at EOF).
     ///
     /// The default drains [`RowScanner::next`]; the heap already reads whole

@@ -92,6 +92,33 @@ fn scanner_can_drain_in_batches() {
 }
 
 #[test]
+fn scanner_next_into_matches_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = setup(&dir, "g.dbf");
+    let heap = HeapFile::init(&bp, f).unwrap();
+    for i in 0..200u8 {
+        heap.insert(&bp, &[i; 100]).unwrap();
+    }
+
+    let engine = HeapEngine::new(f);
+    let mut owned = engine.scan(&bp).unwrap();
+    let mut reused = engine.scan(&bp).unwrap();
+    let mut buf = Vec::new();
+    loop {
+        let a = owned.next(&bp).unwrap();
+        let b = reused.next_into(&bp, &mut buf).unwrap();
+        match (a, b) {
+            (None, None) => break,
+            (Some((rid_a, rec_a)), Some(rid_b)) => {
+                assert_eq!(rid_a, rid_b, "row ids diverged");
+                assert_eq!(rec_a, buf, "record bytes diverged");
+            }
+            (a, b) => panic!("scanners diverged: {a:?} vs {b:?}"),
+        }
+    }
+}
+
+#[test]
 fn table_storage_supports_the_mvcc_version_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let (bp, f) = setup(&dir, "e.dbf");
