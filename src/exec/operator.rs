@@ -67,6 +67,19 @@ pub trait PhysicalOperator {
         Ok(false)
     }
 
+    /// Streams `(creator, deleter, value)` for one base column (`None` for a
+    /// count-only scan) when this operator is a bare scan, so single-column
+    /// aggregates need not rebuild rows. `Ok(None)` means no columnar path;
+    /// the caller falls back to [`PhysicalOperator::for_each_row`].
+    fn for_each_column_value(
+        &mut self,
+        _ctx: &mut ExecContext<'_>,
+        _col: Option<usize>,
+        _sink: &mut dyn FnMut(u32, u32, Value) -> Result<()>,
+    ) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
     fn close(&mut self) -> Result<()>;
 
     /// Commands (DML) perform their work in `open` and yield no rows.
@@ -211,6 +224,24 @@ impl PhysicalOperator for TableScan {
             sink(&self.row_buf)?;
         }
         Ok(true)
+    }
+
+    fn for_each_column_value(
+        &mut self,
+        ctx: &mut ExecContext<'_>,
+        col: Option<usize>,
+        sink: &mut dyn FnMut(u32, u32, Value) -> Result<()>,
+    ) -> Result<Option<bool>> {
+        let engine = ctx.db.catalog().table(&self.table)?.engine();
+        let Some(mut scanner) = engine.scan_column(&ctx.db.pool, col)? else {
+            return Ok(None);
+        };
+        while let Some((creator, deleter, value)) = scanner.next(&ctx.db.pool, ctx.db.lobs())? {
+            if ctx.trx.visible(creator, deleter) {
+                sink(creator, deleter, value)?;
+            }
+        }
+        Ok(Some(true))
     }
 
     fn close(&mut self) -> Result<()> {

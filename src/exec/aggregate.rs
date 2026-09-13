@@ -359,6 +359,26 @@ pub(crate) fn chunk_global_aggregate(
     }
 
     let mut states: Vec<AggState> = kinds.iter().map(|k| new_state(*k)).collect();
+    // A single base column can stream straight from storage: no row is rebuilt
+    // and no other column is decoded. Falls back when the child is not a bare
+    // scan (a filter, join, ...) or the aggregates read different columns.
+    if let Some(col) = shared_column(&kinds) {
+        let streamed = child.for_each_column_value(ctx, col, &mut |_, _, value| {
+            for (kind, state) in kinds.iter().zip(states.iter_mut()) {
+                let value = if kind.column_index().is_some() {
+                    value.clone()
+                } else {
+                    Value::Null
+                };
+                update_value(kind, state, value)?;
+            }
+            Ok(())
+        })?;
+        if streamed == Some(true) {
+            let row = states.into_iter().map(finish).collect();
+            return Ok(Some(vec![row]));
+        }
+    }
     // A scan can hand decoded rows straight to the accumulators, skipping
     // chunk materialization entirely.
     let fused = child.for_each_row(ctx, &mut |row| {
@@ -381,6 +401,23 @@ pub(crate) fn chunk_global_aggregate(
 
     let row = states.into_iter().map(finish).collect();
     Ok(Some(vec![row]))
+}
+
+/// The single base column every aggregate reads, or `None` when they disagree.
+/// `Some(None)` is a count-only shape (`count(*)`), which still streams
+/// versions without decoding any column.
+fn shared_column(kinds: &[AggKind]) -> Option<Option<usize>> {
+    let mut column = None;
+    for kind in kinds {
+        if let Some(i) = kind.column_index() {
+            match column {
+                None => column = Some(i),
+                Some(j) if j == i => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    Some(column)
 }
 
 #[derive(Clone, Copy)]

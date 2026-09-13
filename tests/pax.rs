@@ -78,6 +78,36 @@ fn pax_matches_row_on_a_mixed_workload() {
     assert_eq!(scenario(PageLayout::Row), scenario(PageLayout::Pax));
 }
 
+/// Single-column aggregates stream the column straight from storage; compare
+/// them (and the filtered fallback) across layouts.
+#[test]
+fn column_native_aggregates_match_row() {
+    fn run(layout: PageLayout) -> Vec<Vec<Value>> {
+        let db = Database::open_in_memory().unwrap();
+        db.execute_sql(&format!(
+            "create table t (id int, v int) page_layout = {};",
+            kw(layout)
+        ))
+        .unwrap();
+        for i in 0..200 {
+            let v = if i % 9 == 0 { "null".into() } else { i.to_string() };
+            db.execute_sql(&format!("insert into t values ({i}, {v});")).unwrap();
+        }
+        let mut out = Vec::new();
+        for sql in [
+            "select count(*) from t;",
+            "select count(v) from t;",
+            "select sum(v), avg(v), min(v), max(v) from t;",
+            "select sum(v) from t where id > 50;",
+        ] {
+            let rs = db.execute_sql(sql).unwrap();
+            out.extend(rows(&rs).iter().cloned());
+        }
+        out
+    }
+    assert_eq!(run(PageLayout::Row), run(PageLayout::Pax));
+}
+
 /// A wide table stresses the column-major scan the layout exists for.
 #[test]
 fn wide_pax_matches_row() {

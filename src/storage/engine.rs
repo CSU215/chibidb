@@ -1,8 +1,10 @@
 use crate::config::PageLayout;
 use crate::storage::buffer::BufferPool;
+use crate::storage::codec::{decode_column, decode_tagged_value, LobResolver};
 use crate::storage::heap::{HeapFile, Rid};
 use crate::storage::page::{FileId, PageNo, PAGE_SIZE};
 use crate::storage::slotted::{page_get, page_put_at, page_slots};
+use crate::value::Value;
 use crate::{Error, Result};
 /// A forward-only cursor over a table's rows, decoupled from the concrete
 /// storage engine.
@@ -57,8 +59,26 @@ pub trait TableEngine: Send + Sync {
         self.scan(bp)
     }
 
+    /// Streams one base column without reconstructing whole rows. `Some(col)`
+    /// yields each row's value, `None` yields nothing but the version (for
+    /// `count(*)`). Returns `Ok(None)` when the engine has no columnar path.
+    fn scan_column(
+        &self,
+        _bp: &BufferPool,
+        _col: Option<usize>,
+    ) -> Result<Option<Box<dyn ColumnScanner>>> {
+        Ok(None)
+    }
+
     /// Point fetch of one encoded record by row id.
     fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>>;
+}
+
+/// A single-column cursor: `(creator, deleter, value)`, with `value` NULL when
+/// the scan was asked for no column. The caller applies MVCC visibility.
+pub trait ColumnScanner: Send {
+    fn next(&mut self, bp: &BufferPool, lobs: &dyn LobResolver)
+    -> Result<Option<(u32, u32, Value)>>;
 }
 
 /// Full table-storage seam: MVCC version writes plus the read cursor. The
@@ -125,6 +145,14 @@ impl TableEngine for HeapEngine {
                 Ok(Box::new(HeapScanner::new(bp, self.file, self.layout, Some(keep.to_vec()))?))
             }
         }
+    }
+
+    fn scan_column(
+        &self,
+        bp: &BufferPool,
+        col: Option<usize>,
+    ) -> Result<Option<Box<dyn ColumnScanner>>> {
+        Ok(Some(Box::new(HeapColumnScanner::new(bp, self.file, self.layout, col)?)))
     }
 
     fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>> {
@@ -276,6 +304,116 @@ impl RowScanner for HeapScanner {
                 Ok(Some(rid))
             }
             None => Ok(None),
+        }
+    }
+}
+
+/// Streams one column's values, reading a row page's whole record (row layout)
+/// or a single column segment (PAX). No `Vec<Value>` row is ever built.
+struct HeapColumnScanner {
+    file: FileId,
+    layout: PageLayout,
+    col: Option<usize>,
+    next_page: PageNo,
+    last_page: PageNo,
+    page: Vec<u8>,
+    page_no: PageNo,
+    slots: Vec<(u16, usize, usize)>,
+    slot_pos: usize,
+}
+
+impl HeapColumnScanner {
+    fn new(
+        bp: &BufferPool,
+        file: FileId,
+        layout: PageLayout,
+        col: Option<usize>,
+    ) -> Result<Self> {
+        let pages = bp.page_count(file)?;
+        Ok(Self {
+            file,
+            layout,
+            col,
+            next_page: 1,
+            last_page: pages,
+            page: Vec::new(),
+            page_no: 0,
+            slots: Vec::new(),
+            slot_pos: 0,
+        })
+    }
+
+    fn advance(&mut self, bp: &BufferPool) -> Result<bool> {
+        while self.slot_pos >= self.slots.len() {
+            if self.next_page >= self.last_page {
+                return Ok(false);
+            }
+            let no = self.next_page;
+            self.next_page += 1;
+            if self.page.len() != PAGE_SIZE {
+                self.page.resize(PAGE_SIZE, 0);
+            }
+            bp.read_page(self.file, no, |data| {
+                self.page.copy_from_slice(data);
+                Ok(())
+            })?;
+            self.page_no = no;
+            self.slots.clear();
+            match self.layout {
+                PageLayout::Row => self.slots.extend(page_slots(&self.page)),
+                PageLayout::Pax => self
+                    .slots
+                    .extend(crate::storage::pax::alive_slots(&self.page).map(|s| (s, 0, 0))),
+            }
+            self.slot_pos = 0;
+        }
+        Ok(true)
+    }
+
+    fn take(&mut self, bp: &BufferPool) -> Result<Option<(Rid, usize, usize)>> {
+        if !self.advance(bp)? {
+            return Ok(None);
+        }
+        let (slot, off, len) = self.slots[self.slot_pos];
+        self.slot_pos += 1;
+        Ok(Some((Rid::new(self.page_no, slot), off, len)))
+    }
+}
+
+impl ColumnScanner for HeapColumnScanner {
+    fn next(
+        &mut self,
+        bp: &BufferPool,
+        lobs: &dyn LobResolver,
+    ) -> Result<Option<(u32, u32, Value)>> {
+        let Some((rid, off, len)) = self.take(bp)? else {
+            return Ok(None);
+        };
+        match self.layout {
+            PageLayout::Row => {
+                let rec = &self.page[off..off + len];
+                if rec.len() < 8 {
+                    return Err(Error::Runtime("truncated versioned record".into()));
+                }
+                let creator = u32::from_le_bytes(rec[0..4].try_into().unwrap());
+                let deleter = u32::from_le_bytes(rec[4..8].try_into().unwrap());
+                let value = match self.col {
+                    Some(c) => decode_column(&rec[8..], c, lobs)?,
+                    None => Value::Null,
+                };
+                Ok(Some((creator, deleter, value)))
+            }
+            PageLayout::Pax => {
+                let (creator, deleter) = crate::storage::pax::version_at(&self.page, rid.slot);
+                let value = match self.col {
+                    Some(c) => {
+                        let bytes = crate::storage::pax::column_bytes(&self.page, c, rid.slot);
+                        decode_tagged_value(bytes, lobs)?
+                    }
+                    None => Value::Null,
+                };
+                Ok(Some((creator, deleter, value)))
+            }
         }
     }
 }

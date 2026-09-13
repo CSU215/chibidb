@@ -86,6 +86,25 @@ pub(crate) fn alive_slots(page: &[u8]) -> impl Iterator<Item = u16> + '_ {
     (0..slot_count(page)).filter_map(move |s| (!is_empty(page, s as u16)).then_some(s as u16))
 }
 
+/// `(creator, deleter)` of a live slot's version.
+pub(crate) fn version_at(page: &[u8], slot: u16) -> (u32, u32) {
+    let (voff, _) = dir(page, 0);
+    let at = voff + slot as usize * 8;
+    (
+        u32::from_le_bytes(page[at..at + 4].try_into().unwrap()),
+        u32::from_le_bytes(page[at + 4..at + 8].try_into().unwrap()),
+    )
+}
+
+/// Tagged value bytes of column `col` in a slot; empty when the slot is empty.
+pub(crate) fn column_bytes(page: &[u8], col: usize, slot: u16) -> &[u8] {
+    if is_empty(page, slot) {
+        &[]
+    } else {
+        col_value(page, col, slot as usize)
+    }
+}
+
 /// Writes a fresh page from `nrows` slots and `ncols` columns. `ver(slot)`
 /// yields the 8 version bytes; `val(slot, col)` yields a column's tagged value
 /// bytes (`&[]` for an empty slot).

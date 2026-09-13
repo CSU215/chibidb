@@ -304,24 +304,7 @@ fn decode_value(
         Some(keep) => keep.get(index).copied().unwrap_or(true),
     };
     if !needed {
-        match tag {
-            TAG_NULL => {}
-            TAG_INT | TAG_FLOAT | TAG_LOB => {
-                take(data, pos, 8)?;
-            }
-            TAG_BOOL => {
-                take(data, pos, 1)?;
-            }
-            TAG_DATE => {
-                take(data, pos, 4)?;
-            }
-            TAG_STR => {
-                let lb = take(data, pos, 2)?;
-                let len = u16::from_le_bytes(lb.try_into().unwrap()) as usize;
-                take(data, pos, len)?;
-            }
-            _ => return Err(Error::Runtime(format!("unknown value tag 0x{tag:02x}"))),
-        }
+        skip_payload(data, pos, tag)?;
         return Ok(Value::Null);
     }
     Ok(match tag {
@@ -374,4 +357,60 @@ fn take<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8]> {
     let s = &data[*pos..*pos + n];
     *pos += n;
     Ok(s)
+}
+
+/// Advances `*pos` past the payload of an already-read `tag`, without building
+/// a value. Shared by the skip path and the single-column decoder.
+fn skip_payload(data: &[u8], pos: &mut usize, tag: u8) -> Result<()> {
+    match tag {
+        TAG_NULL => {}
+        TAG_INT | TAG_FLOAT | TAG_LOB => {
+            take(data, pos, 8)?;
+        }
+        TAG_BOOL => {
+            take(data, pos, 1)?;
+        }
+        TAG_DATE => {
+            take(data, pos, 4)?;
+        }
+        TAG_STR => {
+            let lb = take(data, pos, 2)?;
+            let len = u16::from_le_bytes(lb.try_into().unwrap()) as usize;
+            take(data, pos, len)?;
+        }
+        _ => return Err(Error::Runtime(format!("unknown value tag 0x{tag:02x}"))),
+    }
+    Ok(())
+}
+
+/// Decodes only column `index` of a row encoding, skipping the other columns
+/// without building them. Used by single-column scans.
+pub(crate) fn decode_column(
+    data: &[u8],
+    index: usize,
+    lobs: &dyn LobResolver,
+) -> Result<Value> {
+    let mut pos = 0;
+    let hb = take(data, &mut pos, 2)?;
+    let count = u16::from_le_bytes(hb.try_into().unwrap()) as usize;
+    if index >= count {
+        return Err(Error::Runtime("column index out of range".into()));
+    }
+    let mut target = Value::Null;
+    for i in 0..count {
+        if i == index {
+            target = decode_value(data, &mut pos, i, Some(lobs), None)?;
+        } else {
+            let tag = take(data, &mut pos, 1)?[0];
+            skip_payload(data, &mut pos, tag)?;
+        }
+    }
+    Ok(target)
+}
+
+/// Decodes a single tagged value that stands alone (no row count header), as
+/// stored in a PAX column segment.
+pub(crate) fn decode_tagged_value(data: &[u8], lobs: &dyn LobResolver) -> Result<Value> {
+    let mut pos = 0;
+    decode_value(data, &mut pos, 0, Some(lobs), None)
 }
