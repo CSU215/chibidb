@@ -7,15 +7,19 @@ use crate::render::write_result;
 use crate::wire::{self, Frame};
 
 /// Interactive client: reads SQL lines from `input`, renders server results.
+/// `interactive` controls whether the prompt is written (see `run_repl`).
 pub async fn run_client(
     stream: &mut TcpStream,
     mut input: impl AsyncBufRead + Unpin,
     output: &mut (impl AsyncWrite + Unpin),
+    interactive: bool,
 ) -> io::Result<()> {
     let mut line = String::new();
     loop {
-        output.write_all(b"chibidb> ").await?;
-        output.flush().await?;
+        if interactive {
+            output.write_all(b"chibidb> ").await?;
+            output.flush().await?;
+        }
         line.clear();
         if input.read_line(&mut line).await? == 0 {
             return Ok(());

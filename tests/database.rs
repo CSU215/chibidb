@@ -1,4 +1,4 @@
-use chibidb::ast::{CreateDatabaseStmt, DropDatabaseStmt, Stmt, UseStmt};
+use chibidb::ast::{CreateDatabaseStmt, DropDatabaseStmt, ShowColumnsStmt, Stmt, UseStmt};
 use chibidb::config::Config;
 use chibidb::instance::Instance;
 use chibidb::parser::parse;
@@ -121,4 +121,146 @@ fn database_statements_are_rejected_inside_a_transaction() {
     inst.execute_with(&mut s, "use shop;").unwrap();
     inst.execute_with(&mut s, "begin;").unwrap();
     assert!(inst.execute_with(&mut s, "create database other;").is_err());
+}
+
+fn column_strings(rs: &[ResultSet]) -> Vec<String> {
+    match &rs[0] {
+        ResultSet::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Str(s) => s.clone(),
+                v => panic!("expected string, got {v:?}"),
+            })
+            .collect(),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_show_statements() {
+    assert_eq!(one("show tables;"), Stmt::ShowTables);
+    assert_eq!(one("show databases;"), Stmt::ShowDatabases);
+    assert_eq!(one("SHOW DATABASES;"), Stmt::ShowDatabases);
+    assert!(parse("show;").is_err());
+    assert!(parse("show columns;").is_err());
+}
+
+#[test]
+fn show_databases_lists_registered_databases() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = instance(&dir);
+    let mut s = Session::new();
+    inst.execute_with(&mut s, "create database shop;").unwrap();
+    inst.execute_with(&mut s, "create database blog;").unwrap();
+    let rs = inst.execute_with(&mut s, "show databases;").unwrap();
+    assert_eq!(column_strings(&rs), ["blog", "shop"]);
+}
+
+#[test]
+fn show_tables_lists_tables_and_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = instance(&dir);
+    let mut s = Session::new();
+    inst.execute_with(&mut s, "create table t (id int);").unwrap();
+    inst.execute_with(&mut s, "create table u (id int);").unwrap();
+    inst.execute_with(&mut s, "create view v as select id from t;").unwrap();
+    let rs = inst.execute_with(&mut s, "show tables;").unwrap();
+    assert_eq!(column_strings(&rs), ["t", "u", "v"]);
+}
+
+fn columns_and_rows(rs: &[ResultSet]) -> (&[String], &[Vec<Value>]) {
+    match &rs[0] {
+        ResultSet::Rows { columns, rows } => (columns, rows),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+fn empty() -> Value {
+    Value::Str(String::new())
+}
+
+#[test]
+fn parses_show_columns_and_describe() {
+    for sql in ["show columns from t;", "show columns in t;", "describe t;", "desc t;"] {
+        assert_eq!(
+            one(sql),
+            Stmt::ShowColumns(ShowColumnsStmt { table: "t".into() }),
+            "{sql}"
+        );
+    }
+    assert!(parse("show columns;").is_err());
+    assert!(parse("show columns t;").is_err());
+    assert!(parse("describe;").is_err());
+}
+
+#[test]
+fn show_columns_describes_a_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = instance(&dir);
+    let mut s = Session::new();
+    inst.execute_with(
+        &mut s,
+        "create table t (id int primary key, name char(5) not null unique default 'x', score float);",
+    )
+    .unwrap();
+
+    let rs = inst.execute_with(&mut s, "show columns from t;").unwrap();
+    let (cols, rows) = columns_and_rows(&rs);
+    assert_eq!(
+        cols,
+        ["Field", "Type", "Null", "Key", "Default", "Extra"]
+            .map(String::from)
+            .as_slice()
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows[0],
+        vec![
+            Value::Str("id".into()),
+            Value::Str("int".into()),
+            Value::Str("NO".into()),
+            Value::Str("PRI".into()),
+            Value::Null,
+            empty(),
+        ]
+    );
+    assert_eq!(
+        rows[1],
+        vec![
+            Value::Str("name".into()),
+            Value::Str("char(5)".into()),
+            Value::Str("NO".into()),
+            Value::Str("UNI".into()),
+            Value::Str("x".into()),
+            empty(),
+        ]
+    );
+    assert_eq!(
+        rows[2],
+        vec![
+            Value::Str("score".into()),
+            Value::Str("float".into()),
+            Value::Str("YES".into()),
+            Value::Str("".into()),
+            Value::Null,
+            empty(),
+        ]
+    );
+
+    // DESCRIBE is the same as SHOW COLUMNS
+    let rs = inst.execute_with(&mut s, "describe t;").unwrap();
+    assert_eq!(columns_and_rows(&rs).1, rows);
+}
+
+#[test]
+fn show_columns_rejects_views_and_unknown_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = instance(&dir);
+    let mut s = Session::new();
+    inst.execute_with(&mut s, "create table t (id int);").unwrap();
+    inst.execute_with(&mut s, "create view v as select id from t;").unwrap();
+    let err = inst.execute_with(&mut s, "describe v;").unwrap_err().to_string();
+    assert!(err.contains("view"), "{err}");
+    let err = inst.execute_with(&mut s, "describe nope;").unwrap_err().to_string();
+    assert!(err.contains("no such table"), "{err}");
 }

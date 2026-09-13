@@ -1132,7 +1132,10 @@ impl Database {
 pub(crate) fn is_read_only(stmt: &crate::ast::Stmt) -> bool {
     matches!(
         stmt,
-        crate::ast::Stmt::Select(_) | crate::ast::Stmt::Explain(_)
+        crate::ast::Stmt::Select(_)
+            | crate::ast::Stmt::Explain(_)
+            | crate::ast::Stmt::ShowTables
+            | crate::ast::Stmt::ShowColumns(_)
     )
 }
 

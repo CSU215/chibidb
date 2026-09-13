@@ -6,17 +6,24 @@ use crate::instance::Instance;
 use crate::render::write_result;
 use crate::trx::Session;
 
+/// Runs the REPL. `interactive` controls whether the `db> ` prompt is written:
+/// a terminal echoes the input's newline, but piped input does not, so emitting
+/// the prompt there would glue it to the first result line and break table
+/// alignment.
 pub async fn run_repl(
     instance: &Instance,
     mut input: impl AsyncBufRead + Unpin,
     output: &mut (impl AsyncWrite + Unpin),
+    interactive: bool,
 ) -> io::Result<()> {
     // one session for the whole REPL so transactions span lines
     let mut session = Session::new();
     let mut line = String::new();
     let result = loop {
-        output.write_all(b"db> ").await?;
-        output.flush().await?;
+        if interactive {
+            output.write_all(b"db> ").await?;
+            output.flush().await?;
+        }
         line.clear();
         if input.read_line(&mut line).await? == 0 {
             break Ok(());

@@ -1,6 +1,6 @@
 use crate::ast::{
     CreateIndexStmt, CreateTableStmt, CreateViewStmt, DataType, DeleteStmt, DropIndexStmt,
-    DropTableStmt, DropViewStmt, Expr, InsertStmt, Stmt, UpdateStmt,
+    DropTableStmt, DropViewStmt, Expr, InsertStmt, ShowColumnsStmt, Stmt, UpdateStmt,
 };
 use crate::catalog::Schema;
 use crate::config::{EngineKind, PageLayout};
@@ -62,9 +62,12 @@ pub(crate) fn execute(db: &Database, trx: &mut TrxState, stmt: &Stmt) -> Result<
         Stmt::Select(_) => {
             Err(Error::Runtime("select must be executed through the operator plan".into()))
         }
+        Stmt::ShowTables => execute_show_tables(db),
+        Stmt::ShowColumns(c) => execute_show_columns(db, c),
         Stmt::Explain(e) => execute_explain(db, e),
         Stmt::CreateDatabase(_)
         | Stmt::DropDatabase(_)
+        | Stmt::ShowDatabases
         | Stmt::Use(_)
         | Stmt::CreateUser(_)
         | Stmt::DropUser(_)
@@ -79,6 +82,53 @@ pub(crate) fn execute(db: &Database, trx: &mut TrxState, stmt: &Stmt) -> Result<
 
 fn ddl_in_trx(_trx: &TrxState) -> Result<ResultSet> {
     Err(Error::Runtime("DDL inside a transaction is not supported".into()))
+}
+
+/// `SHOW TABLES`: names of this database's tables and views, sorted.
+fn execute_show_tables(db: &Database) -> Result<ResultSet> {
+    let mut names: Vec<String> = db.catalog().table_metas().into_iter().map(|t| t.name).collect();
+    names.extend(db.catalog().view_metas().into_iter().map(|v| v.name));
+    names.sort();
+    names.dedup();
+    let rows = names.into_iter().map(|name| vec![Value::Str(name)]).collect();
+    Ok(ResultSet::Rows { columns: vec!["table".into()], rows })
+}
+
+/// `SHOW COLUMNS FROM t` / `DESCRIBE t`: one MySQL-style row per column.
+fn execute_show_columns(db: &Database, s: &ShowColumnsStmt) -> Result<ResultSet> {
+    if db.catalog().view(&s.table).is_some() {
+        return Err(Error::Runtime(format!(
+            "SHOW COLUMNS is not supported for view: {}",
+            s.table
+        )));
+    }
+    let schema = db.catalog().table(&s.table)?.schema.clone();
+    let columns = ["Field", "Type", "Null", "Key", "Default", "Extra"]
+        .iter()
+        .map(|c| (*c).to_string())
+        .collect();
+    let rows = schema
+        .columns
+        .iter()
+        .map(|c| {
+            let key = if c.primary_key {
+                "PRI"
+            } else if c.unique {
+                "UNI"
+            } else {
+                ""
+            };
+            vec![
+                Value::Str(c.name.clone()),
+                Value::Str(c.dtype.to_string()),
+                Value::Str(if c.not_null { "NO" } else { "YES" }.into()),
+                Value::Str(key.into()),
+                c.default.clone().unwrap_or(Value::Null),
+                Value::Str(String::new()),
+            ]
+        })
+        .collect();
+    Ok(ResultSet::Rows { columns, rows })
 }
 
 fn execute_create_index(db: &Database, trx: &mut TrxState, c: &CreateIndexStmt) -> Result<ResultSet> {

@@ -4,6 +4,10 @@ use chibidb::run_repl;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, duplex};
 
 async fn run_with(input: &[u8]) -> String {
+    run_mode(input, true).await
+}
+
+async fn run_mode(input: &[u8], interactive: bool) -> String {
     let (mut cmd_tx, repl_input) = duplex(4096);
     let repl_input = BufReader::new(repl_input);
     let (mut repl_output, mut out_rx) = duplex(4096);
@@ -12,7 +16,7 @@ async fn run_with(input: &[u8]) -> String {
     cmd_tx.write_all(input).await.unwrap();
     cmd_tx.shutdown().await.unwrap();
 
-    run_repl(&instance, repl_input, &mut repl_output)
+    run_repl(&instance, repl_input, &mut repl_output, interactive)
         .await
         .unwrap();
     drop(repl_output);
@@ -64,4 +68,24 @@ async fn transactions_span_lines() {
     assert!(!output.contains("error"), "got: {output:?}");
     // the rolled-back insert left nothing behind
     assert!(output.contains("\n0\n"), "got: {output:?}");
+}
+
+#[tokio::test]
+async fn piped_output_has_no_prompt_and_stays_aligned() {
+    let output = run_mode(
+        b"create table t (id int primary key, name char(5));\nshow columns from t;\nexit\n",
+        false,
+    )
+    .await;
+
+    assert!(!output.contains("db> "), "piped output must not include a prompt: {output:?}");
+
+    let lines: Vec<&str> = output.lines().collect();
+    let header = lines.iter().find(|l| l.starts_with("Field")).expect("header row");
+    let sep = lines.iter().find(|l| l.starts_with('-')).expect("separator row");
+    let pipes: Vec<usize> =
+        header.char_indices().filter(|(_, c)| *c == '|').map(|(i, _)| i).collect();
+    let plus: Vec<usize> =
+        sep.char_indices().filter(|(_, c)| *c == '+').map(|(i, _)| i).collect();
+    assert_eq!(pipes, plus, "header and separator must align:\n{output}");
 }
