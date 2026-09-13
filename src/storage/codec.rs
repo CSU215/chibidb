@@ -43,15 +43,21 @@ pub fn encode_record(
     Ok(buf)
 }
 
-pub fn decode_record(
-    data: &[u8],
-    lobs: &dyn LobResolver,
-) -> Result<(u32, u32, Vec<Value>)> {
+/// Reads the `(creator, deleter)` version header of a versioned record.
+pub fn record_version(data: &[u8]) -> Result<(u32, u32)> {
     if data.len() < 8 {
         return Err(Error::Runtime("truncated versioned record".into()));
     }
     let creator = u32::from_le_bytes(data[0..4].try_into().unwrap());
     let deleter = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    Ok((creator, deleter))
+}
+
+pub fn decode_record(
+    data: &[u8],
+    lobs: &dyn LobResolver,
+) -> Result<(u32, u32, Vec<Value>)> {
+    let (creator, deleter) = record_version(data)?;
     let (row, _) = decode_row_with(&data[8..], Some(lobs), None)?;
     Ok((creator, deleter, row))
 }
@@ -64,11 +70,7 @@ pub fn decode_record_pruned(
     lobs: &dyn LobResolver,
     keep: &[bool],
 ) -> Result<(u32, u32, Vec<Value>)> {
-    if data.len() < 8 {
-        return Err(Error::Runtime("truncated versioned record".into()));
-    }
-    let creator = u32::from_le_bytes(data[0..4].try_into().unwrap());
-    let deleter = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let (creator, deleter) = record_version(data)?;
     let (row, _) = decode_row_with(&data[8..], Some(lobs), Some(keep))?;
     Ok((creator, deleter, row))
 }
@@ -214,55 +216,84 @@ fn decode_row_with(
     let count = u16::from_le_bytes(hb.try_into().unwrap()) as usize;
     let mut row = Vec::with_capacity(count);
     for i in 0..count {
-        let tag = data[pos];
-        pos += 1;
-        let v = match tag {
-            TAG_NULL => Value::Null,
-            TAG_INT => {
-                let b = take(data, &mut pos, 8)?;
-                Value::Int(i64::from_le_bytes(b.try_into().unwrap()))
-            }
-            TAG_FLOAT => {
-                let b = take(data, &mut pos, 8)?;
-                Value::Float(f64::from_le_bytes(b.try_into().unwrap()))
-            }
-            TAG_STR => {
-                let lb = take(data, &mut pos, 2)?;
-                let len = u16::from_le_bytes(lb.try_into().unwrap()) as usize;
-                let bytes = take(data, &mut pos, len)?;
-                Value::Str(String::from_utf8(bytes.to_vec()).map_err(|_| {
-                    Error::Runtime("invalid utf8 in stored string".into())
-                })?)
-            }
-            TAG_LOB => {
-                let b = take(data, &mut pos, 8)?;
-                let id = u64::from_le_bytes(b.try_into().unwrap());
-                // a column the query never reads is left unresolved
-                if keep.is_some_and(|keep| !keep.get(i).copied().unwrap_or(true)) {
-                    Value::Null
-                } else {
-                    let Some(lobs) = lobs else {
-                        return Err(Error::Runtime("lob reference without a resolver".into()));
-                    };
-                    let bytes = lobs.get(id)?;
-                    Value::Str(String::from_utf8(bytes).map_err(|_| {
-                        Error::Runtime("invalid utf8 in stored lob".into())
-                    })?)
-                }
-            }
-            TAG_BOOL => {
-                let b = take(data, &mut pos, 1)?;
-                Value::Bool(b[0] != 0)
-            }
-            TAG_DATE => {
-                let b = take(data, &mut pos, 4)?;
-                Value::Date(i32::from_le_bytes(b.try_into().unwrap()))
-            }
-            _ => return Err(Error::Runtime(format!("unknown value tag 0x{tag:02x}"))),
-        };
-        row.push(v);
+        row.push(decode_value(data, &mut pos, i, lobs, keep)?);
     }
     Ok((row, pos))
+}
+
+/// Decodes an encoded row, handing each value to `sink` as it is read instead
+/// of collecting a `Vec<Value>`. Returns the column count. Lets a scan fill
+/// chunk columns directly.
+pub(crate) fn decode_row_each(
+    data: &[u8],
+    lobs: Option<&dyn LobResolver>,
+    keep: Option<&[bool]>,
+    mut sink: impl FnMut(usize, Value) -> Result<()>,
+) -> Result<usize> {
+    let mut pos = 0;
+    let hb = take(data, &mut pos, 2)?;
+    let count = u16::from_le_bytes(hb.try_into().unwrap()) as usize;
+    for i in 0..count {
+        sink(i, decode_value(data, &mut pos, i, lobs, keep)?)?;
+    }
+    Ok(count)
+}
+
+/// Decodes one tagged value at `*pos`, advancing it past the value.
+fn decode_value(
+    data: &[u8],
+    pos: &mut usize,
+    index: usize,
+    lobs: Option<&dyn LobResolver>,
+    keep: Option<&[bool]>,
+) -> Result<Value> {
+    let tag = take(data, pos, 1)?[0];
+    Ok(match tag {
+        TAG_NULL => Value::Null,
+        TAG_INT => {
+            let b = take(data, pos, 8)?;
+            Value::Int(i64::from_le_bytes(b.try_into().unwrap()))
+        }
+        TAG_FLOAT => {
+            let b = take(data, pos, 8)?;
+            Value::Float(f64::from_le_bytes(b.try_into().unwrap()))
+        }
+        TAG_STR => {
+            let lb = take(data, pos, 2)?;
+            let len = u16::from_le_bytes(lb.try_into().unwrap()) as usize;
+            let bytes = take(data, pos, len)?;
+            Value::Str(
+                String::from_utf8(bytes.to_vec())
+                    .map_err(|_| Error::Runtime("invalid utf8 in stored string".into()))?,
+            )
+        }
+        TAG_LOB => {
+            let b = take(data, pos, 8)?;
+            let id = u64::from_le_bytes(b.try_into().unwrap());
+            // a column the query never reads is left unresolved
+            if keep.is_some_and(|keep| !keep.get(index).copied().unwrap_or(true)) {
+                Value::Null
+            } else {
+                let Some(lobs) = lobs else {
+                    return Err(Error::Runtime("lob reference without a resolver".into()));
+                };
+                let bytes = lobs.get(id)?;
+                Value::Str(
+                    String::from_utf8(bytes)
+                        .map_err(|_| Error::Runtime("invalid utf8 in stored lob".into()))?,
+                )
+            }
+        }
+        TAG_BOOL => {
+            let b = take(data, pos, 1)?;
+            Value::Bool(b[0] != 0)
+        }
+        TAG_DATE => {
+            let b = take(data, pos, 4)?;
+            Value::Date(i32::from_le_bytes(b.try_into().unwrap()))
+        }
+        _ => return Err(Error::Runtime(format!("unknown value tag 0x{tag:02x}"))),
+    })
 }
 
 fn take<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8]> {

@@ -209,3 +209,28 @@ fn char_and_text_columns_match() {
          select concat(name, '!') from t;",
     );
 }
+
+#[test]
+fn date_columns_match() {
+    assert_same(
+        "create table t (id int, d date, f float, s char(6));\
+         insert into t values (1,'2024-02-29',1.5,'ab'),(2,null,null,null);\
+         select * from t;\
+         select sum(id), avg(f), min(d), max(d) from t;\
+         select d, count(*) from t group by d;",
+    );
+}
+
+/// A `text` value above the inline limit is stored out-of-line; scanning a
+/// query that never reads it must prune the LOB identically in both paths.
+#[test]
+fn pruned_lob_columns_match() {
+    let big = "x".repeat(5000);
+    assert_same(&format!(
+        "create table t (id int, tiny char(4), big text);\
+         insert into t values (1,'a','{big}'),(2,'b','{big}');\
+         select id, tiny from t;\
+         select big from t where id = 1;\
+         select count(*) from t;"
+    ));
+}

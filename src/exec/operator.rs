@@ -148,15 +148,11 @@ impl PhysicalOperator for TableScan {
             if found.is_none() {
                 break;
             }
-            let (creator, deleter, row) = match &self.keep {
-                Some(keep) => {
-                    crate::storage::codec::decode_record_pruned(&self.record, ctx.db.lobs(), keep)?
-                }
-                None => decode_record(&self.record, ctx.db.lobs())?,
-            };
-            if ctx.trx.visible(creator, deleter) {
-                chunk.push_row(&row)?;
+            let (creator, deleter) = crate::storage::codec::record_version(&self.record)?;
+            if !ctx.trx.visible(creator, deleter) {
+                continue;
             }
+            chunk.push_encoded_row(&self.record[8..], ctx.db.lobs(), self.keep.as_deref())?;
         }
         Ok((!chunk.is_empty()).then_some(chunk))
     }

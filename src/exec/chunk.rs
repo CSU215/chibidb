@@ -200,6 +200,31 @@ impl Chunk {
         Ok(())
     }
 
+    /// Appends one row by decoding its (version-stripped) encoded image
+    /// straight into the typed columns, without materializing a `Vec<Value>`.
+    /// `keep` mirrors [`crate::storage::codec::decode_record_pruned`].
+    pub fn push_encoded_row(
+        &mut self,
+        data: &[u8],
+        lobs: &dyn crate::storage::codec::LobResolver,
+        keep: Option<&[bool]>,
+    ) -> Result<()> {
+        let width = self.columns.len();
+        let count = crate::storage::codec::decode_row_each(data, Some(lobs), keep, |i, value| {
+            match self.columns.get_mut(i) {
+                Some(column) => column.push(&value),
+                None => Err(Error::Runtime("row has more values than columns".into())),
+            }
+        })?;
+        if count != width {
+            return Err(Error::Runtime(format!(
+                "row has {count} values for {width} columns"
+            )));
+        }
+        self.len += 1;
+        Ok(())
+    }
+
     pub fn row(&self, index: usize) -> Vec<Value> {
         self.columns.iter().map(|c| c.value(index)).collect()
     }
