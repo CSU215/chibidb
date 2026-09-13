@@ -145,6 +145,22 @@ fn volcano_vs_chunk() {
     }
 }
 
+/// Per-row cost of `sum(v)`, the workload the chunk aggregate path targets.
+#[test]
+#[ignore = "micro-benchmark; run with --ignored --nocapture"]
+fn chunk_aggregate_throughput() {
+    let volcano = build_mode(ExecutionMode::Volcano);
+    let chunk = build_mode(ExecutionMode::Chunk);
+    println!("rows: {N}");
+    for (mode, db) in [("volcano", &volcano), ("chunk", &chunk)] {
+        let elapsed = per_op(20, || {
+            db.execute_sql("select sum(tag) from t;").unwrap();
+        });
+        let ns = elapsed.as_secs_f64() * 1e9 / N as f64;
+        println!("{mode:<8} sum(tag) {elapsed:>12?}   {ns:>6.2} ns/row");
+    }
+}
+
 /// Hash join: streaming (chunk) vs materialized (volcano) on 50k x 50k rows.
 #[test]
 #[ignore = "micro-benchmark; run with --ignored --nocapture"]
