@@ -359,9 +359,23 @@ pub(crate) fn chunk_global_aggregate(
     }
 
     let mut states: Vec<AggState> = kinds.iter().map(|k| new_state(*k)).collect();
-    while let Some(chunk) = child.next_chunk(ctx)? {
+    // A scan can hand decoded rows straight to the accumulators, skipping
+    // chunk materialization entirely.
+    let fused = child.for_each_row(ctx, &mut |row| {
         for (kind, state) in kinds.iter().zip(states.iter_mut()) {
-            update_state(kind, state, &chunk)?;
+            let value = match kind.column_index() {
+                Some(index) => row[index].clone(),
+                None => Value::Null,
+            };
+            update_value(kind, state, value)?;
+        }
+        Ok(())
+    })?;
+    if !fused {
+        while let Some(chunk) = child.next_chunk(ctx)? {
+            for (kind, state) in kinds.iter().zip(states.iter_mut()) {
+                update_state(kind, state, &chunk)?;
+            }
         }
     }
 
@@ -377,6 +391,20 @@ enum AggKind {
     Avg(usize),
     Min(usize),
     Max(usize),
+}
+
+impl AggKind {
+    /// The base column this aggregate reads; `count(*)` reads none.
+    fn column_index(self) -> Option<usize> {
+        match self {
+            AggKind::Count(None) => None,
+            AggKind::Count(Some(i))
+            | AggKind::Sum(i)
+            | AggKind::Avg(i)
+            | AggKind::Min(i)
+            | AggKind::Max(i) => Some(i),
+        }
+    }
 }
 
 enum AggState {
@@ -595,19 +623,27 @@ fn update_row(
     chunk: &Chunk,
     i: usize,
 ) -> Result<()> {
+    match kind.column_index() {
+        Some(index) => update_value(kind, state, chunk.column(index).value(i)),
+        None => update_value(kind, state, Value::Null),
+    }
+}
+
+/// Folds one value into its accumulator. Shared by the chunk kernels, the
+/// fused scan, and the grouped path so all match [`eval_aggregate`].
+fn update_value(kind: &AggKind, state: &mut AggState, value: Value) -> Result<()> {
     match kind {
         AggKind::Count(None) => {
             let AggState::Count(n) = state else { unreachable!("count state") };
             *n += 1;
         }
-        AggKind::Count(Some(index)) => {
-            if !chunk.column(*index).is_null(i) {
+        AggKind::Count(Some(_)) => {
+            if !matches!(value, Value::Null) {
                 let AggState::Count(n) = state else { unreachable!("count state") };
                 *n += 1;
             }
         }
-        AggKind::Sum(index) => {
-            let value = chunk.column(*index).value(i);
+        AggKind::Sum(_) => {
             if !matches!(value, Value::Null) {
                 let AggState::Sum(acc) = state else { unreachable!("sum state") };
                 *acc = Some(match acc.take() {
@@ -616,7 +652,7 @@ fn update_row(
                 });
             }
         }
-        AggKind::Avg(index) => match chunk.column(*index).value(i) {
+        AggKind::Avg(_) => match value {
             Value::Null => {}
             Value::Int(n) => {
                 let AggState::Avg { total, count } = state else { unreachable!("avg state") };
@@ -630,8 +666,7 @@ fn update_row(
             }
             _ => return Err(type_mismatch()),
         },
-        AggKind::Min(index) | AggKind::Max(index) => {
-            let value = chunk.column(*index).value(i);
+        AggKind::Min(_) | AggKind::Max(_) => {
             if !matches!(value, Value::Null) {
                 let is_min = matches!(kind, AggKind::Min(_));
                 let best = match state {

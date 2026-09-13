@@ -56,6 +56,17 @@ pub trait PhysicalOperator {
         false
     }
 
+    /// Streams decoded rows to `sink` without materializing chunks, when this
+    /// operator can read storage directly. Returns `Ok(false)` if there is no
+    /// fused path, so the caller falls back to [`PhysicalOperator::next_chunk`].
+    fn for_each_row(
+        &mut self,
+        _ctx: &mut ExecContext<'_>,
+        _sink: &mut dyn FnMut(&[Value]) -> Result<()>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     fn close(&mut self) -> Result<()>;
 
     /// Commands (DML) perform their work in `open` and yield no rows.
@@ -75,6 +86,8 @@ pub struct TableScan {
     /// Reused buffer holding the current encoded record, so scanning does not
     /// allocate per row.
     record: Vec<u8>,
+    /// Reused row buffer for the fused aggregate path.
+    row_buf: Vec<Value>,
 }
 
 impl TableScan {
@@ -102,7 +115,14 @@ impl TableScan {
                 .map(|c| ColumnDesc::plain(Some(owner.clone()), c.name, c.dtype))
                 .collect(),
         };
-        Ok(Self { table: table.to_string(), schema, scanner: None, keep, record: Vec::new() })
+        Ok(Self {
+            table: table.to_string(),
+            schema,
+            scanner: None,
+            keep,
+            record: Vec::new(),
+            row_buf: Vec::new(),
+        })
     }
 }
 
@@ -159,6 +179,34 @@ impl PhysicalOperator for TableScan {
 
     fn chunk_native(&self) -> bool {
         true
+    }
+
+    fn for_each_row(
+        &mut self,
+        ctx: &mut ExecContext<'_>,
+        sink: &mut dyn FnMut(&[Value]) -> Result<()>,
+    ) -> Result<bool> {
+        loop {
+            let found = {
+                let scanner = self.scanner.as_mut().expect("table scan not opened");
+                scanner.next_into(&ctx.db.pool, &mut self.record)?
+            };
+            if found.is_none() {
+                break;
+            }
+            let (creator, deleter) = crate::storage::codec::record_version(&self.record)?;
+            if !ctx.trx.visible(creator, deleter) {
+                continue;
+            }
+            crate::storage::codec::decode_row_into(
+                &self.record[8..],
+                Some(ctx.db.lobs()),
+                self.keep.as_deref(),
+                &mut self.row_buf,
+            )?;
+            sink(&self.row_buf)?;
+        }
+        Ok(true)
     }
 
     fn close(&mut self) -> Result<()> {

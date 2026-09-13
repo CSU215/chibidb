@@ -239,6 +239,21 @@ pub(crate) fn decode_row_each(
     Ok(count)
 }
 
+/// Like [`decode_row_each`], but collects the values into `out` (cleared
+/// first), reusing its allocation. Returns the column count.
+pub(crate) fn decode_row_into(
+    data: &[u8],
+    lobs: Option<&dyn LobResolver>,
+    keep: Option<&[bool]>,
+    out: &mut Vec<Value>,
+) -> Result<usize> {
+    out.clear();
+    decode_row_each(data, lobs, keep, |_, value| {
+        out.push(value);
+        Ok(())
+    })
+}
+
 /// Decodes one tagged value at `*pos`, advancing it past the value. When
 /// `keep[index]` is `false` the value is skipped without being built (a column
 /// the query never reads becomes NULL, and its LOB is not resolved).
