@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, DataType, Expr, ExplainStmt, SelectStmt, Stmt};
+use crate::ast::{BinOp, DataType, Expr, ExplainStmt, SelectItem, SelectStmt, Stmt};
 use crate::index::{encode_key, BTree, Bound};
 use crate::result::ResultSet;
 use crate::storage::Rid;
@@ -31,11 +31,11 @@ pub(crate) fn plan_select(db: &Database, s: &SelectStmt) -> Result<String> {
     }
     match find_sargable(db, &s.from[0].name, s.selection.as_ref())? {
         Some(sarg) => {
-            let kind = if order_by_matches(&sarg.column, &s.order_by) {
-                "OrderedIndexScan"
-            } else {
-                "IndexScan"
-            };
+            let ordered = resolved_order_column(&s.items, &s.order_by).as_deref()
+                == Some(sarg.column.as_str())
+                && s.group_by.is_empty()
+                && !super::operator::items_have_aggregate(&s.items);
+            let kind = if ordered { "OrderedIndexScan" } else { "IndexScan" };
             Ok(format!(
                 "{kind}(index={}, table={}, {}) -> Filter -> Project",
                 sarg.index,
@@ -44,7 +44,9 @@ pub(crate) fn plan_select(db: &Database, s: &SelectStmt) -> Result<String> {
             ))
         }
         None => {
-            if let Some(col) = single_asc_order_column(&s.order_by)
+            if let Some(col) = resolved_order_column(&s.items, &s.order_by)
+                && s.group_by.is_empty()
+                && !super::operator::items_have_aggregate(&s.items)
                 && db.catalog().view(&s.from[0].name).is_none()
                 && let Some(ix) = db
                     .catalog()
@@ -63,34 +65,39 @@ pub(crate) fn plan_select(db: &Database, s: &SelectStmt) -> Result<String> {
     }
 }
 
-/// The plain column of a single ascending ORDER BY key, if any.
-pub(crate) fn single_asc_order_column(order_by: &[(Expr, bool)]) -> Option<String> {
+/// The plain column of a single ascending ORDER BY key, after resolving SELECT
+/// aliases. `SELECT b AS id ... ORDER BY id` therefore resolves to `b`, so an
+/// index on the base column `id` is not mistaken for satisfying the order.
+pub(crate) fn resolved_order_column(
+    items: &[SelectItem],
+    order_by: &[(Expr, bool)],
+) -> Option<String> {
     let [(e, desc)] = order_by else {
         return None;
     };
     if *desc {
         return None;
     }
-    match e {
+    match resolve_alias(items, e) {
         Expr::Column(n) => Some(n.clone()),
         Expr::QualifiedColumn(_, n) => Some(n.clone()),
         _ => None,
     }
 }
 
-/// True when ORDER BY is a single ascending key on `column`, so an index
-/// scan over that column already yields the requested order.
-pub(crate) fn order_by_matches(column: &str, order_by: &[(Expr, bool)]) -> bool {
-    let [(e, desc)] = order_by else {
-        return false;
-    };
-    if *desc {
-        return false;
+/// Replaces an unqualified column reference that names a SELECT alias with the
+/// aliased expression.
+fn resolve_alias<'a>(items: &'a [SelectItem], expr: &'a Expr) -> &'a Expr {
+    if let Expr::Column(name) = expr {
+        for item in items {
+            if let SelectItem::Aliased(inner, alias) = item
+                && alias == name
+            {
+                return inner;
+            }
+        }
     }
-    match e {
-        Expr::Column(n) | Expr::QualifiedColumn(_, n) => n == column,
-        _ => false,
-    }
+    expr
 }
 
 fn describe_sarg(s: &Sargable) -> String {

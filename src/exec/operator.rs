@@ -1698,7 +1698,7 @@ pub fn build_select(
                     if select.group_by.is_empty()
                         && !items_have_aggregate(&select.items)
                         && let Some(column) =
-                            crate::exec::plan::single_asc_order_column(&select.order_by)
+                            crate::exec::plan::resolved_order_column(&select.items, &select.order_by)
                         && let Some(scan) =
                             IndexScan::ordered(db, &tref.name, owner, &column)?
                     {
@@ -1774,9 +1774,10 @@ pub fn build_select(
 
     if !select.order_by.is_empty() {
         // an ascending scan on the ordering column already yields the order
-        let skip = ordered_by
-            .as_deref()
-            .is_some_and(|column| crate::exec::plan::order_by_matches(column, &select.order_by));
+        let skip = ordered_by.as_deref().is_some_and(|column| {
+            crate::exec::plan::resolved_order_column(&select.items, &select.order_by).as_deref()
+                == Some(column)
+        });
         if !skip {
             op = Box::new(Sort::new(op, select.order_by.clone(), select.items.clone()));
         }
@@ -1946,7 +1947,7 @@ fn collect_column_refs(expr: &Expr, owner: &str, table: &str, needed: &mut HashS
     }
 }
 
-fn items_have_aggregate(items: &[SelectItem]) -> bool {
+pub(crate) fn items_have_aggregate(items: &[SelectItem]) -> bool {
     items.iter().any(|item| match item {
         SelectItem::Expr(e) | SelectItem::Aliased(e, _) => expr_has_aggregate(e),
         SelectItem::Star => false,
