@@ -130,7 +130,7 @@ SQL 字符串
   → TableStorage   表存储接缝（`insert/delete/delete_mark/scan/get`，带 MVCC 语义）
   → HeapEngine     `TableStorage` 的堆实现（Rid 寻址、多页 first-fit）
   → BufferPool     8KB 帧、可配置淘汰（lru/clock/fifo）、pin 引用计数、脏页写回（元数据锁 + 每帧页闩）
-  → DiskManager    分页文件 IO
+  → DiskManager    分页文件 IO（按文件加锁：注册表 `RwLock` + 每文件 `Mutex`）
 ```
 
 ### 源码结构
@@ -179,6 +179,9 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
 - 淘汰策略可配置：`storage.eviction = "lru" | "clock" | "fifo"`，默认 **LRU**。
   策略只决定"换出哪一帧"，不影响任何可观测结果（换出的脏页会先写回）；
   默认值保证行为与引入此键之前逐位一致
+- 磁盘 I/O 按文件并行：`DiskManager` 用注册表 `RwLock` + **每文件** `Mutex`，
+  不同文件的读写互不阻塞（`with_file` 提供"持单文件锁跑闭包"的原语，
+  `alloc_page` 的"取页数 + 写零页"因此在同一把锁内完成）
 - 冲突策略可配置：`transaction.conflict = "fcw" | "2pl"`。默认 **FCW**
   （first-committer-wins）：提交时比对被改写基版本的 `prev_deleter` 与当前标记，
   若其间有后提交的事务改过同一行则回滚失败方
