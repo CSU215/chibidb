@@ -119,6 +119,51 @@ fn scanner_next_into_matches_next() {
 }
 
 #[test]
+fn hinted_insert_matches_full_scan_inserts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp_hint, f_hint) = setup(&dir, "hint.dbf");
+    HeapFile::init(&bp_hint, f_hint).unwrap();
+    let engine = HeapEngine::new(f_hint);
+    let (bp_scan, f_scan) = setup(&dir, "noscan.dbf");
+    let heap = HeapFile::init(&bp_scan, f_scan).unwrap();
+
+    for i in 0..2000u32 {
+        let rec = format!("row{i:05}").into_bytes();
+        let hinted = engine.insert(&bp_hint, &rec).unwrap();
+        let scanned = heap.insert(&bp_scan, &rec).unwrap();
+        assert_eq!(hinted, scanned, "rid diverged at row {i}");
+    }
+    let hinted = drain(&bp_hint, f_hint);
+    assert_eq!(hinted, drain(&bp_scan, f_scan));
+    assert_eq!(hinted.len(), 2000);
+}
+
+#[test]
+fn hinted_insert_wraps_to_reuse_freed_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = setup(&dir, "reuse.dbf");
+    HeapFile::init(&bp, f).unwrap();
+    let engine = HeapEngine::new(f);
+
+    let rids: Vec<Rid> = (0..600u32)
+        .map(|i| engine.insert(&bp, &[b'a' + (i % 26) as u8; 60]).unwrap())
+        .collect();
+    // free half the records, leaving holes across the pages
+    for (i, rid) in rids.iter().enumerate() {
+        if i % 2 == 0 {
+            engine.delete(&bp, *rid).unwrap();
+        }
+    }
+    // leftovers plus fresh inserts must all be readable
+    for _ in 0..300 {
+        engine.insert(&bp, &[b'0'; 60]).unwrap();
+    }
+    let rows = drain(&bp, f);
+    assert_eq!(rows.len(), 300 + 300);
+    assert_eq!(rows.iter().filter(|r| r.starts_with('0')).count(), 300);
+}
+
+#[test]
 fn table_storage_supports_the_mvcc_version_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let (bp, f) = setup(&dir, "e.dbf");

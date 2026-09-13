@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::config::PageLayout;
 use crate::storage::buffer::BufferPool;
 use crate::storage::codec::{decode_row_with_want, decode_tagged_value, LobResolver};
@@ -125,15 +127,18 @@ pub trait TableStorage: TableEngine + std::fmt::Debug {
 pub struct HeapEngine {
     file: FileId,
     layout: PageLayout,
+    /// Page that accepted the last insert, tried first so appending does not
+    /// rescan every page. Zero means "unknown" (e.g. after opening a file).
+    last_page: AtomicU32,
 }
 
 impl HeapEngine {
     pub fn new(file: FileId) -> Self {
-        Self { file, layout: PageLayout::Row }
+        Self { file, layout: PageLayout::Row, last_page: AtomicU32::new(0) }
     }
 
     pub fn with_layout(file: FileId, layout: PageLayout) -> Self {
-        Self { file, layout }
+        Self { file, layout, last_page: AtomicU32::new(0) }
     }
 }
 
@@ -215,7 +220,11 @@ impl TableEngine for HeapEngine {
 
 impl TableStorage for HeapEngine {
     fn insert(&self, bp: &BufferPool, record: &[u8]) -> Result<Rid> {
-        HeapFile::at(self.file, self.layout).insert(bp, record)
+        let hint = self.last_page.load(Ordering::Relaxed);
+        let (rid, page) =
+            HeapFile::at(self.file, self.layout).insert_with_hint(bp, hint, record)?;
+        self.last_page.store(page, Ordering::Relaxed);
+        Ok(rid)
     }
 
     fn delete(&self, bp: &BufferPool, rid: Rid) -> Result<()> {

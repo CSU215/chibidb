@@ -112,10 +112,25 @@ impl HeapFile {
     }
 
     pub fn insert(&self, bp: &BufferPool, record: &[u8]) -> Result<Rid> {
+        Ok(self.insert_with_hint(bp, 0, record)?.0)
+    }
+
+    /// Inserts `record`, trying `hint` (the page that accepted the previous
+    /// record) first so appends do not rescan every earlier page. If the hinted
+    /// page is full the remaining pages are still tried (wrapping around), so
+    /// space freed by deletes is reused. Returns the rid and the page that
+    /// accepted the record, for the caller to pass as the next hint.
+    pub fn insert_with_hint(
+        &self,
+        bp: &BufferPool,
+        hint: PageNo,
+        record: &[u8],
+    ) -> Result<(Rid, PageNo)> {
         let pages = bp.page_count(self.file)?;
-        for no in 1..pages {
+        let start = if (1..pages).contains(&hint) { hint } else { 1 };
+        for no in [start..pages, 1..start].into_iter().flatten() {
             if let Some(slot) = self.try_insert(bp, no, record)? {
-                return Ok(Rid::new(no, slot));
+                return Ok((Rid::new(no, slot), no));
             }
         }
         let no = bp.alloc_page(self.file)?;
@@ -125,7 +140,7 @@ impl HeapFile {
                 record_len = record.len()
             ))
         })?;
-        Ok(Rid::new(no, slot))
+        Ok((Rid::new(no, slot), no))
     }
 
     /// Attempts to place `record` on page `no`; `None` when the page is full.
