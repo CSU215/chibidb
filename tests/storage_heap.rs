@@ -1,7 +1,7 @@
 use chibidb::storage::{BufferPool, DiskManager, HeapFile, PAGE_SIZE};
 
 fn setup(dir: &tempfile::TempDir, name: &str) -> (BufferPool, u32) {
-    let mut disk = DiskManager::new();
+    let disk = DiskManager::new();
     let file = disk.create_file(&dir.path().join(name)).unwrap();
     (BufferPool::new(disk, 8), file)
 }
@@ -74,14 +74,14 @@ fn data_survives_pool_restart() {
     let path = dir.path().join("d.dbf");
 
     {
-        let mut disk = DiskManager::new();
+        let disk = DiskManager::new();
         let f = disk.create_file(&path).unwrap();
         let bp = BufferPool::new(disk, 4);
         let heap = HeapFile::init(&bp, f).unwrap();
         heap.insert(&bp, b"persist me").unwrap();
     }
 
-    let mut disk = DiskManager::new();
+    let disk = DiskManager::new();
     let f = disk.open_file(&path).unwrap();
     let bp = BufferPool::new(disk, 4);
     let heap = HeapFile::open(&bp, f).unwrap();
@@ -98,12 +98,12 @@ fn data_survives_pool_restart() {
 fn open_rejects_foreign_files() {
     let dir = tempfile::tempdir().unwrap();
 
-    let mut disk = DiskManager::new();
+    let disk = DiskManager::new();
     let f1 = disk.create_file(&dir.path().join("empty.dbf")).unwrap();
     let (bp, f) = (BufferPool::new(disk, 4), f1);
     assert!(HeapFile::open(&bp, f).is_err(), "empty file has no header");
 
-    let mut disk2 = DiskManager::new();
+    let disk2 = DiskManager::new();
     let f2 = disk2.create_file(&dir.path().join("garbage.dbf")).unwrap();
     let (bp2, f) = (BufferPool::new(disk2, 4), f2);
     bp2.alloc_page(f).unwrap();

@@ -22,7 +22,7 @@ SQL 字符串
    → WAL（提交时 fsync、崩溃后重放已提交事务、干净关闭即 checkpoint）
   → slotted page（8KB、槽目录、删除压实）
   → HeapFile（Rid 寻址、多页 first-fit）
-  → BufferPool（8KB 帧、LRU、脏页写回、Drop 落盘）
+  → BufferPool（8KB 帧、可配置淘汰 lru/clock/fifo、pin 引用计数、脏页写回、Drop 落盘）
   → DiskManager（分页文件 IO）
   → 文件布局：catalog.bin + tables/*.dbf + indexes/*.idxf
   → 两种前端：本地 REPL（tokio stdin/stdout）与 TCP server + client（长度前缀二进制协议）
@@ -54,7 +54,8 @@ python3 scripts/smoke.py     # Windows: python scripts\smoke.py；期望输出 S
 ```
 
 启动时会在**当前工作目录**读取 `config.toml`（缺失即全用默认值）。已生效条目：
-`storage.buffer_pool_frames`、`storage.double_write`、`storage.default_engine`、`storage.inline_lob_limit`、
+`storage.buffer_pool_frames`、`storage.eviction`、`storage.double_write`、`storage.default_engine`、
+`storage.inline_lob_limit`、
 `storage.lsm_compaction_trigger`、`wal.checkpoint_threshold`、`server.addr`/`http_addr`/`mysql_addr`、
 `server.thread_model`/`worker_threads`、`execution.mode`、`auth.enabled`、`transaction.conflict`/`lock_timeout_ms`。
 页大小（`PAGE_SIZE=8192`）是编译期常量，**不是**配置项（动态页大小属 P6 存储抽象）。
@@ -95,15 +96,16 @@ python3 scripts/smoke.py     # Windows: python scripts\smoke.py；期望输出 S
 | `net/wire.rs` | ResultSet/帧二进制编解码 | `encode_result_frame` / `decode_frame` |
 | `net/protocol.rs` | 前端编解码接缝：`Protocol` trait + `TextProtocol`（`[u32 len][sql]` 请求 / 帧响应） | `decode_request` / `encode_success` / `encode_failure` |
 | `sql/pipeline.rs` | SQL 阶段：`Stage`/`Pipeline`/`SqlEvent`；`ResolveStage`（表/视图存在性）、`OptimizeStage`（记录 `plan` 文本 + 建单表算子物理计划）、`ExecuteStage`（优先跑算子，否则 `exec::execute`） | `Pipeline::run` |
-| `db/instance.rs` | 单实例多库：数据根 `<db>/` + 系统库 `chibi_meta/`；每库一个 `parking_lot::Mutex<Database>`（**跨库并行、库内串行**），系统库同样受锁保护；`execute_with` 顶层入口（拦截库/用户/权限语句，其余路由到 current_db） | `Instance::open` / `execute_with` / `with_database_mut` |
-| `config.rs` | 全局配置中心：`Config`（storage/wal/server/execution/auth），`config.toml` 加载、默认值、校验 | `Config::load` / `from_toml_str` / `validate` |
+| `db/instance.rs` | 单实例多库：数据根 `<db>/` + 系统库 `chibi_meta/`；每个数据库一个 `Arc<RwLock<Database>>`（**跨库并行、库内读共享/写独占**），映射本身也在 `RwLock` 下，系统库同样受锁保护；`execute_with` 顶层入口（拦截库/用户/权限语句，其余路由到 current_db） | `Instance::open` / `execute_with` / `with_database_mut` |
+| `config.rs` | 全局配置中心：`Config`（storage/wal/server/execution/auth/transaction），`config.toml` 加载、默认值、校验 | `Config::load` / `from_toml_str` / `validate` |
 | `catalog/mod.rs` | `Catalog`：`Table`/`HeapStore`/`IndexEntry`、`Schema`/`ColumnDesc`（带 `owner`）、`resolve()` 歧义检测 | |
-| `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT6** + 统一文件头（事务簿记 + 视图定义 + 列约束 + 唯一索引标记） | `CatalogSnapshot` |
+| `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT8** + 统一文件头（事务簿记 + 视图定义 + 列约束 + 唯一索引标记） | `CatalogSnapshot` |
 | `storage/page.rs` | 页常量：`PAGE_SIZE=8192`、`FileId=u32`、`PageNo=u32`、`zeroed_page` | |
-| `storage/disk.rs` | `DiskManager`：分页文件读写、建文件、可选 Double-Write Buffer 的 stage/sync/reset | |
+| `storage/disk.rs` | `DiskManager`：分页文件读写、建文件、可选 Double-Write Buffer 的 stage/sync/reset；**按文件加锁**（`RwLock<BTreeMap<FileId, Arc<FileSlot>>>` 注册表 + 每文件 `Mutex<Option<File>>`，方法全 `&self`），`with_file` 提供"持单文件锁跑闭包"的原语，`alloc_page` 把"取页数 + 写零页"做成原子的；`write_page` 不再调 `File::flush`（对 `File` 是 no-op） | `with_file` / `alloc_page` |
 | `storage/header.rs` | 统一文件头 `[magic8][version u16][kind u8][page_size u32]`；`write_header`/`read_header` 校验版本/类型/页大小 | `FORMAT_VERSION` |
 | `storage/dwb.rs` | Double-Write Buffer：flush 前 stage + sync，崩溃后 `recover` 按路径回写再截断 | `DoubleWrite` / `recover` |
-| `storage/buffer.rs` | `BufferPool`：帧数来自 config、LRU `VecDeque`、脏页写回（`flush_all` 走 DWB）、Drop flush；`with_page(file,no,f)` 闭包式访问（访问即脏）、`read_page`（只读不脏） | |
+| `storage/buffer.rs` | `BufferPool`：帧数来自 config、**淘汰顺序委托给 `replacer.rs`**、**帧 pin 计数（`Frame::pins` + RAII `PinnedFrame`，闭包期内不可淘汰；全被 pin 时报 `buffer pool exhausted`）**、脏页写回（`flush_all` 走 DWB）、Drop flush；`with_page(file,no,f)` 闭包式访问（访问即脏）、`read_page`（只读不脏） | |
+| `storage/replacer.rs` | 淘汰策略接缝：`Replacer`/`FrameVitals` + `lru`（默认）/ `clock`（二次机会）/ `fifo` 三个纯逻辑实现，由 `storage.eviction` 选择；策略只存"顺序/环"，pin 数与引用位留在帧上 | `from_policy` |
 | `storage/slotted.rs` | slotted 页纯函数：槽目录、变长条目、`page_insert`（空槽复用+压实）、`page_get/iter/delete/write` | |
 | `storage/engine.rs` | 存储读接缝：`TableEngine`/`RowScanner` trait + `HeapEngine`（流式逐页扫描） | `HeapEngine::scan` |
 | `storage/heap.rs` | `HeapFile`：page 0 文件头（魔数 **CHIDHEAP** + 统一头；行带 MVCC 字段）、first-fit 多页、`insert/get/delete(物理)/delete_mark(MVCC)/for_each` | `Rid{page_no,slot}` |
@@ -336,6 +338,9 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 - VACUUM 回收的空页不归还文件系统（页留给 first-fit 复用）；空页只在该表变小时浪费
 - 单 Mutex 单 writer 串行化；无死锁检测；vacuum 之外长事务 + 未提交孤儿版本仍会占空间
 - BufferPool 无预读；WAL checkpoint 是全量截断（有预算护栏但无模糊检查点）；first-fit 插入是 O(页数)，建 5 万行表的主要耗时即在此（基准测试因此偏慢）
+- `Replacer` 的登记/查找与 `choose_victim` 都是 `VecDeque`/`Vec` 上的线性扫描，O(缓冲池容量)；容量 64 时无感，上千时是明确的债（已关进 `storage/replacer.rs` 一个模块，换实现不影响其它层）
+- `DiskManager` 已按文件加锁（`RwLock` 注册表 + 每文件 `Mutex<Option<File>>`），不同文件的 I/O 完全并行；**仍存的粗粒度在 `BufferPool` 侧**：缺页读盘与淘汰回写都在 `state` 锁内进行，所以一次缺页/淘汰阻塞所有页查找（`os_storage.md` §6.1/§19.2）
+- 无页面换入/换出流水日志（命中/未命中/淘汰计数已有，缺的是格式化事件日志）；无空闲页链表，页只追加不释放
 - DDL 隔离：其它会话持有开事务时任何 CREATE/DROP 都被拒绝（M24，`schema is locked by an open transaction`）；这是粗粒度全库锁，无按表锁
 - `exec/` 已按职责拆分（mod/eval/aggregate/join/plan/subquery，见 §3.1）；跨模块共享项用 `pub(crate)`，`eval_const` 经 `exec::eval_const` 重导出
 - 索引访问路径已修：单表 SELECT 命中索引时不再先全表扫；`id >= a and id < b` 合并成一段范围扫。基准（release/5 万行）：点查 ~19µs vs ~27ms，单边范围 ~54µs vs ~24ms，双边范围 ~0.11ms vs ~29ms
@@ -384,6 +389,11 @@ BufferPool 页闩 + WAL 组提交 → P10.3 库内多写者，冲突策略**可�
 （实现采 `RwLock<Catalog>`，未引入 `arc-swap`：读路径 `clone` committed 快照，后续可换 arc-swap 免拷贝）。
 DML 先算子化（P5.5），使执行层统一走算子。
 
+P10 收尾（P10.4/P10.5）：补齐课程验收点名的两块缓存机制——**pin 引用计数**（P10.4）
+与**可配置置换策略**（P10.5）。P10.5 把 LRU 从"池里硬编码一个 `VecDeque`"抽成
+`storage/replacer.rs` 的 `Replacer` 接缝，一次给出 `lru`（默认）/ `clock` / `fifo` 三种，
+由 `storage.eviction` 选择；默认值保证行为与之前逐位一致。
+
 物化执行基准（release，5 万行，`cargo test --release --test bench -- --ignored --nocapture`）：
 算子路径下 scan+project 19.0ms、filter tag=3 13.7ms、count(*) 9.9ms、group by tag 20.8ms
 （P5 前物化基线分别为 31.1/23.8/18.9/27.2ms）；等值 `HashJoin` 50k×50k + count(*) 93.7ms。
@@ -407,7 +417,7 @@ DML 先算子化（P5.5），使执行层统一走算子。
 **可观测性与性能探针（`aacb920`）**：`BufferPool` 增 `PoolStats { hits, misses, evictions }` 原子计数与 `BufferPool::stats()`，`Database::buffer_pool_stats()` 对外暴露。`tests/perf_stats.rs` 为 `#[ignore]` 探针（`cargo test --test perf_stats -- --ignored --nocapture`）：分级 LSM 的活跃表数随 flush 呈对数增长（64 次 flush 后 ≤9 张）；16 帧池下 1500 次主键点查命中率约 99%、有淘汰。 |
 | P8 | LOB（外存 + `LobReader` 流式） | ✅ P8.1：`src/storage/lob.rs`——`LobStore`（每对象一个 `<id>.lob` 文件，id 打开时按现存最大文件续号、删除不复用；`write/read/len/is_empty/reader/delete`）与 `LobReader`（`read` 小缓冲 / `next_chunk` 64KB 流式）；`tests/storage_lob.rs` 覆盖空/小/1MB 往返、小缓冲流式、跨 chunk、删除、重开续号（`0d48d50`）。P8.2 完成：行编解码接入 LOB——`Database` 增 `lobs: LobStore`（`<db>/lobs`）；`codec` 增 `LobResolver` trait、`TAG_LOB` 与 `encode_record/decode_record`（带 resolver）及 `encoded_row_size`；超过 `storage.inline_lob_limit` 的字符串编码为 LOB 引用、解码时解析回 `Value::Str`（`Value` 模型不变）；插入大小检查改用外存后尺寸，故超页文本也可存；WAL 记录存的是含引用的记录字节，恢复无需解析；`tests/lob_db.rs` 覆盖外存/读回、超页文本、checkpoint 重开、崩溃 WAL 恢复（`caef3e6`）。P8.3 完成：`codec::collect_lob_ids`（不解析、尽力扫描 `TAG_LOB` id）；`Database::free_lob_refs` 在物理删除记录时删除其 LOB——`rollback_trx`（Insert/Update 的新版本）与 `vacuum` 均调用；`tests/lob_db.rs` 增 vacuum 回收、回滚回收、更新后 vacuum 回收三例（`16ea4b8`）。DROP TABLE 亦在删表前扫描记录回收其 LOB（`27a2e85`）。P8.3b 完成：LOB 列剪裁——`codec::decode_record_pruned` + `TableScan` 的 `keep` 掩码，`build_select` 对单表无子查询查询做保守列引用分析，未被引用的 LOB 列跳过读取（`SELECT count(*)`/未投影列不读大对象；遇到 `*`/子查询/外部限定名则回退全量解码），`tests/lob_db.rs` 用「删掉 LOB 文件后查 count/id 仍成功、查 body 报错」证明（`d11e46c`）。**已知限制**：`LobReader` 单值仍整体物化为字符串（剪裁避免了不必要的读，但不做真正的流式消费） |
 | P9 | 多前端（MySQL/HTTP/Text TCP） | 🟡 HTTP/JSON 前端落地（`c17c8cf`）：`src/net/http.rs` 手写 HTTP/1.1（无新依赖），`POST /query`（JSON `{"sql":...}` → `{"results":[...]}`）、`GET /health`；每连接一个 `Session`（`LOGIN`/事务跨请求），keep-alive；由 `server.http_addr` 决定是否同时开第二个监听；`tests/http_frontend.rs` 覆盖查询/消息+错误/health。Text TCP 已有；MySQL wire 完成（`b09fd78`）：`src/net/mysql.rs` 手写 protocol 4.1（含内置 SHA-1），Handshake V10 + `mysql_native_password`（用户表增 `native` 列存 `SHA1(SHA1(pw))`，`auth.enabled` 时校验，否则放行）、`COM_QUERY` 文本结果集（列数/列定义/EOF/行/EOF，多结果集用 `SERVER_MORE_RESULTS_EXISTS`）、`COM_PING`/`COM_INIT_DB`/`COM_QUIT`；由 `server.mysql_addr` 选择监听；`tests/mysql_frontend.rs` 用最小客户端跑通握手+查询/错误+ping。预处理语句（`5e43f87`）：`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`，`?` 占位符按参数类型（int/float/string/null）绑定为字面量后执行。**限制**：仅文本结果集、列类型统一 `VAR_STRING`、无 SSL/二进制结果集 |
-| P10 | 并发：`ThreadHandler`（per-connection/thread-pool）+ 去全局锁 + 可配置冲突策略（FCW/2PL） | 🟡 P10.1：分库锁 + 去全局锁（`4984822`）+ `ThreadHandler` 双后端（`a1acc25`）。P10.2a：只读 autocommit 走本地快照事务，不写 `next_trx_id`/`open_trxs`/`committed_trxs`（`879c39e`）。P10.2b：`BufferPool` 元数据锁 + 每帧 `Mutex<PageData>`/`AtomicBool` 脏位，方法 `&self`（`f56694b`）。P10.2c：WAL 内部 `Mutex`（`f56c78d`）、Catalog `RwLock`（`9f8e801`）、事务簿记 `Atomic*`/`RwLock`（`64b52c1`）。P10.2d：`Database` 方法全 `&self`、读路径 `&Database`、`Instance` 每库 `RwLock<Database>`（读并发、写独占）（`2c70856`）。P10.3：`transaction.conflict = "fcw" | "2pl"`（`e068598`）。FCW：提交时按 `prev_deleter`/当前标记检测写写冲突并回滚失败方。2PL：每库悲观写锁（`Arc<DatabaseWriteLock>`，`Condvar` 等待 + `lock_timeout_ms`），显式事务在 `BEGIN`（取快照前）持锁至 `COMMIT/ROLLBACK`，自动提交写在语句内持锁；`Instance` 在取库锁前先取写锁，避免与 COMMIT 形成锁序死锁（`80596c1`）；`rollback_session` 释放。**P10 阶段完成** |
+| P10 | 并发：`ThreadHandler`（per-connection/thread-pool）+ 去全局锁 + 可配置冲突策略（FCW/2PL） | 🟡 P10.1：分库锁 + 去全局锁（`4984822`）+ `ThreadHandler` 双后端（`a1acc25`）。P10.2a：只读 autocommit 走本地快照事务，不写 `next_trx_id`/`open_trxs`/`committed_trxs`（`879c39e`）。P10.2b：`BufferPool` 元数据锁 + 每帧 `Mutex<PageData>`/`AtomicBool` 脏位，方法 `&self`（`f56694b`）。P10.2c：WAL 内部 `Mutex`（`f56c78d`）、Catalog `RwLock`（`9f8e801`）、事务簿记 `Atomic*`/`RwLock`（`64b52c1`）。P10.2d：`Database` 方法全 `&self`、读路径 `&Database`、`Instance` 每库 `RwLock<Database>`（读并发、写独占）（`2c70856`）。P10.3：`transaction.conflict = "fcw" | "2pl"`（`e068598`）。FCW：提交时按 `prev_deleter`/当前标记检测写写冲突并回滚失败方。2PL：每库悲观写锁（`Arc<DatabaseWriteLock>`，`Condvar` 等待 + `lock_timeout_ms`），显式事务在 `BEGIN`（取快照前）持锁至 `COMMIT/ROLLBACK`，自动提交写在语句内持锁；`Instance` 在取库锁前先取写锁，避免与 COMMIT 形成锁序死锁（`80596c1`）；`rollback_session` 释放。**P10 阶段完成**。P10.4（pin 引用计数，`5300b48`）：`Frame::pins: AtomicU32` + RAII `PinnedFrame`，`frame_for` **在 `state` 锁内**加一，淘汰器只挑 `pins == 0` 的帧、被 pin 的键留在登记里；`dirty_frames` 快照也 pin。关闭了 `os_storage.md` §6.7 记录的丢失更新窗口（容量 1 的探针实测丢 428/2000），代价是新增可达错误 `buffer pool exhausted: every frame is pinned`。P10.5（可配置置换策略，`051d72a`）：新增 `storage/replacer.rs`（`Replacer`/`FrameVitals` + `lru`/`clock`/`fifo` 纯逻辑实现）+ `storage.eviction` 配置，`BufferPool::new_with_eviction` 成为唯一生产构造路径；`Frame::accessed` 承载 CLOCK 的引用位。P10.6（`DiskManager` 去全局锁，`76afe19`）：`files` 改 `RwLock<BTreeMap<FileId, Arc<FileSlot>>>` + 每文件 `Mutex<Option<File>>`、`next_file_id` 改 `AtomicU32`，全部方法 `&self`；`Arc` 让注册表锁与文件锁**不再嵌套**（不再需要论证全局锁序）；新增 `with_file` 与 `DiskManager::alloc_page`（"取页数 + 写零页"同锁，修掉并发追加拿到重复页号的隐患）；`write_page` 删掉照抄来的 `File::flush`（no-op） |
 
 工作纪律：每步先写失败测试（红）再最小实现（绿），提交粒度对齐 chibicc（一次一件事），
 提交前全量 `cargo test` + clippy 零警告，并同步本文档与 README。

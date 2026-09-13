@@ -1,6 +1,8 @@
 use std::io::Write;
 
-use chibidb::config::{Config, ConflictStrategy, EngineKind, ExecutionMode, PageLayout, ThreadModel};
+use chibidb::config::{
+    Config, ConflictStrategy, EngineKind, EvictionPolicy, ExecutionMode, PageLayout, ThreadModel,
+};
 use chibidb::value::Value;
 use chibidb::{Database, ResultSet};
 
@@ -12,6 +14,7 @@ fn defaults_are_sane() {
     assert_eq!(c.storage.page_layout, PageLayout::Row);
     assert!(!c.storage.double_write);
     assert_eq!(c.storage.inline_lob_limit, 4096);
+    assert_eq!(c.storage.eviction, EvictionPolicy::Lru);
     assert_eq!(c.wal.checkpoint_threshold, 8 * 1024 * 1024);
     assert_eq!(c.server.addr, "127.0.0.1:5678");
     assert_eq!(c.server.protocols, ["text"]);
@@ -26,6 +29,19 @@ fn transaction_conflict_strategy_parses() {
     assert_eq!(c.transaction.conflict, ConflictStrategy::TwoPl);
     let c = Config::from_toml_str("[transaction]\nconflict = \"fcw\"\n").unwrap();
     assert_eq!(c.transaction.conflict, ConflictStrategy::Fcw);
+}
+
+#[test]
+fn eviction_policy_parses() {
+    let c = Config::from_toml_str("[storage]\neviction = \"lru\"\n").unwrap();
+    assert_eq!(c.storage.eviction, EvictionPolicy::Lru);
+    let c = Config::from_toml_str("[storage]\neviction = \"clock\"\n").unwrap();
+    assert_eq!(c.storage.eviction, EvictionPolicy::Clock);
+    let c = Config::from_toml_str("[storage]\neviction = \"fifo\"\n").unwrap();
+    assert_eq!(c.storage.eviction, EvictionPolicy::Fifo);
+    // 大小写敏感，拼错即报错（枚举没有 fallback）。
+    assert!(Config::from_toml_str("[storage]\neviction = \"LRU\"\n").is_err());
+    assert!(Config::from_toml_str("[storage]\neviction = \"random\"\n").is_err());
 }
 
 #[test]
@@ -46,6 +62,7 @@ page_layout = "pax"
 buffer_pool_frames = 128
 double_write = true
 inline_lob_limit = 2048
+eviction = "clock"
 
 [wal]
 checkpoint_threshold = 1048576
@@ -66,6 +83,7 @@ enabled = true
     assert_eq!(c.storage.buffer_pool_frames, 128);
     assert!(c.storage.double_write);
     assert_eq!(c.storage.inline_lob_limit, 2048);
+    assert_eq!(c.storage.eviction, EvictionPolicy::Clock);
     assert_eq!(c.wal.checkpoint_threshold, 1048576);
     assert_eq!(c.server.addr, "0.0.0.0:4000");
     assert_eq!(c.server.protocols, ["text", "mysql"]);
@@ -174,6 +192,32 @@ fn open_in_memory_honors_config() {
     let cfg = Config::from_toml_str("[storage]\nbuffer_pool_frames = 1\n").unwrap();
     let db = Database::open_in_memory_with_config(&cfg).unwrap();
     assert_eq!(db.config().storage.buffer_pool_frames, 1);
+}
+
+/// `storage.eviction` 必须在 `Database::open_with_config` 里真正接到缓冲池上
+/// （唯一生产构造点）。策略本身只影响"淘汰谁"，所以这里断言的是一份真实负载
+/// 在三种策略下端到端跑通、结果一致 —— 接错了会在别处炸，但至少这条路径被覆盖。
+#[test]
+fn database_applies_config_eviction_policy() {
+    for policy in ["lru", "clock", "fifo"] {
+        let cfg =
+            Config::from_toml_str(&format!("[storage]\neviction = \"{policy}\"\n")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_config(dir.path(), &cfg).unwrap();
+        db.execute_sql("create table t (id int, v char(200));").unwrap();
+        for i in 0..200 {
+            db.execute_sql(&format!("insert into t values ({i}, 'v{i}');")).unwrap();
+        }
+        // 逼出实际淘汰：容量 64 帧、每页容纳不了几行。
+        let rs = db.execute_sql("select count(*), sum(id) from t;").unwrap();
+        match &rs[0] {
+            ResultSet::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int(200), "{policy}");
+                assert_eq!(rows[0][1], Value::Int((0..200).sum()), "{policy}");
+            }
+            other => panic!("{policy}: expected rows, got {other:?}"),
+        }
+    }
 }
 
 #[test]

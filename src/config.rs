@@ -59,6 +59,20 @@ pub enum ThreadModel {
     ThreadPool,
 }
 
+/// Which frame the buffer pool evicts to make room for a miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EvictionPolicy {
+    /// Least recently used. The historical default; keeps behaviour identical
+    /// to the build before this key existed.
+    #[default]
+    Lru,
+    /// Second-chance clock: a referenced frame survives one sweep.
+    Clock,
+    /// First in, first out: a hit does not change the order.
+    Fifo,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -81,6 +95,8 @@ pub struct StorageConfig {
     pub inline_lob_limit: usize,
     /// Live SSTable count that triggers an automatic LSM compaction.
     pub lsm_compaction_trigger: usize,
+    /// Which frame the buffer pool evicts on a miss.
+    pub eviction: EvictionPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -137,6 +153,7 @@ impl Default for StorageConfig {
             double_write: false,
             inline_lob_limit: 4096,
             lsm_compaction_trigger: 4,
+            eviction: EvictionPolicy::Lru,
         }
     }
 }
