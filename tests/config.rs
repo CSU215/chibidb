@@ -14,7 +14,7 @@ fn defaults_are_sane() {
     assert_eq!(c.wal.checkpoint_threshold, 8 * 1024 * 1024);
     assert_eq!(c.server.addr, "127.0.0.1:5678");
     assert_eq!(c.server.protocols, ["text"]);
-    assert_eq!(c.execution.mode, ExecutionMode::Volcano);
+    assert_eq!(c.execution.mode, ExecutionMode::Chunk);
     assert!(!c.auth.enabled);
     assert_eq!(c.transaction.conflict, ConflictStrategy::Fcw);
 }

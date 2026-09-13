@@ -14,13 +14,14 @@ pub enum EngineKind {
     Lsm,
 }
 
-/// Default execution model. Volcano is the baseline; Chunk is an
-/// optimization layer added later.
+/// Default execution model. Chunk (columnar batches) is the default; Volcano
+/// (row-at-a-time) remains selectable and is the reference the differential
+/// tests compare against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionMode {
-    #[default]
     Volcano,
+    #[default]
     Chunk,
 }
 

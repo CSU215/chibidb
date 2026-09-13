@@ -50,9 +50,9 @@ thread_model = "per-connection"
 worker_threads = 4
 
 [execution]
-# 执行模型：volcano（行式火山算子，默认）或 chunk（列式批处理：扫描/过滤/投影/全局聚合，
-# 其余算子自动回退行路径；两模式结果一致）。
-mode = "volcano"
+# 执行模型：chunk（列式批处理：扫描/过滤/投影/聚合/连接，默认）或 volcano
+# （行式火山算子；其余算子自动回退行路径，两模式结果一致）。
+mode = "chunk"
 
 [auth]
 # 是否强制认证/授权。开启后需先 LOGIN，SELECT/EXPLAIN 需 read，DML/DDL 需 write。
