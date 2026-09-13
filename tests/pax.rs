@@ -108,6 +108,35 @@ fn column_native_aggregates_match_row() {
     assert_eq!(run(PageLayout::Row), run(PageLayout::Pax));
 }
 
+#[test]
+fn multi_column_aggregates_match_row() {
+    fn run(layout: PageLayout) -> Vec<Vec<Value>> {
+        let db = Database::open_in_memory().unwrap();
+        db.execute_sql(&format!(
+            "create table t (id int, a int, b int, c int) page_layout = {};",
+            kw(layout)
+        ))
+        .unwrap();
+        for i in 0..300 {
+            let a = if i % 7 == 0 { "null".into() } else { (i % 5).to_string() };
+            let b = if i % 11 == 0 { "null".into() } else { (i * 3).to_string() };
+            db.execute_sql(&format!("insert into t values ({i}, {a}, {b}, {i});")).unwrap();
+        }
+        let mut out = Vec::new();
+        for sql in [
+            "select sum(a), sum(b), sum(c) from t;",
+            "select count(*), count(a), avg(a), min(b), max(a) from t;",
+            "select sum(a)+sum(b) from t;",
+            "select count(*) from t;",
+        ] {
+            let rs = db.execute_sql(sql).unwrap();
+            out.extend(rows(&rs).iter().cloned());
+        }
+        out
+    }
+    assert_eq!(run(PageLayout::Row), run(PageLayout::Pax));
+}
+
 /// A wide table stresses the column-major scan the layout exists for.
 #[test]
 fn wide_pax_matches_row() {

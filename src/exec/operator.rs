@@ -26,6 +26,9 @@ pub struct ExecContext<'a> {
     pub(crate) outer: Option<&'a EvalCtx<'a>>,
 }
 
+/// Receives `(creator, deleter, projected values)` for one row.
+pub(crate) type ProjectedSink<'a> = dyn FnMut(u32, u32, &[Value]) -> Result<()> + 'a;
+
 /// Whether a plan streams rows or is a side-effecting command (DML).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputKind {
@@ -67,15 +70,16 @@ pub trait PhysicalOperator {
         Ok(false)
     }
 
-    /// Streams `(creator, deleter, value)` for one base column (`None` for a
-    /// count-only scan) when this operator is a bare scan, so single-column
-    /// aggregates need not rebuild rows. `Ok(None)` means no columnar path;
-    /// the caller falls back to [`PhysicalOperator::for_each_row`].
-    fn for_each_column_value(
+    /// Streams one row's requested base columns (`values[i]` is column
+    /// `cols[i]`; empty `cols` streams versions only) when this operator is a
+    /// bare scan, so aggregates need not rebuild rows. `Ok(None)` means no
+    /// columnar path; the caller falls back to
+    /// [`PhysicalOperator::for_each_row`].
+    fn for_each_projected_row(
         &mut self,
         _ctx: &mut ExecContext<'_>,
-        _col: Option<usize>,
-        _sink: &mut dyn FnMut(u32, u32, Value) -> Result<()>,
+        _cols: &[usize],
+        _sink: &mut ProjectedSink<'_>,
     ) -> Result<Option<bool>> {
         Ok(None)
     }
@@ -226,22 +230,16 @@ impl PhysicalOperator for TableScan {
         Ok(true)
     }
 
-    fn for_each_column_value(
+    fn for_each_projected_row(
         &mut self,
         ctx: &mut ExecContext<'_>,
-        col: Option<usize>,
-        sink: &mut dyn FnMut(u32, u32, Value) -> Result<()>,
+        cols: &[usize],
+        sink: &mut ProjectedSink<'_>,
     ) -> Result<Option<bool>> {
         let engine = ctx.db.catalog().table(&self.table)?.engine();
         // The engine scans pages in place; filter to visible versions here.
-        let trx = &*ctx.trx;
-        let mut visible = |creator, deleter, value| {
-            if trx.visible(creator, deleter) {
-                sink(creator, deleter, value)?;
-            }
-            Ok(())
-        };
-        if engine.for_each_column(&ctx.db.pool, col, ctx.db.lobs(), &mut visible)? {
+        let mut sink = VisibleSink { trx: &*ctx.trx, sink };
+        if engine.for_each_projected(&ctx.db.pool, cols, ctx.db.lobs(), &mut sink)? {
             return Ok(Some(true));
         }
         Ok(None)
@@ -249,6 +247,22 @@ impl PhysicalOperator for TableScan {
 
     fn close(&mut self) -> Result<()> {
         self.scanner = None;
+        Ok(())
+    }
+}
+
+/// Forwards projected rows to a downstream sink, dropping versions the active
+/// transaction cannot see.
+struct VisibleSink<'a> {
+    trx: &'a crate::trx::TrxState,
+    sink: &'a mut ProjectedSink<'a>,
+}
+
+impl crate::storage::engine::RowSink for VisibleSink<'_> {
+    fn row(&mut self, creator: u32, deleter: u32, values: &[Value]) -> Result<()> {
+        if self.trx.visible(creator, deleter) {
+            (self.sink)(creator, deleter, values)?;
+        }
         Ok(())
     }
 }

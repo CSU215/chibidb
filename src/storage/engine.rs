@@ -1,6 +1,6 @@
 use crate::config::PageLayout;
 use crate::storage::buffer::BufferPool;
-use crate::storage::codec::{decode_column, decode_tagged_value, LobResolver};
+use crate::storage::codec::{decode_row_with_want, decode_tagged_value, LobResolver};
 use crate::storage::heap::{HeapFile, Rid};
 use crate::storage::page::{FileId, PageNo, PAGE_SIZE};
 use crate::storage::slotted::{page_get, page_iter, page_put_at, page_slots};
@@ -59,22 +59,31 @@ pub trait TableEngine: Send + Sync {
         self.scan(bp)
     }
 
-    /// Pushes one base column's `(creator, deleter, value)` for every row,
-    /// reading each page in place so no page image is copied. `col` `None`
-    /// streams versions only (for `count(*)`). Returns `Ok(false)` when the
-    /// engine has no columnar path. The caller applies MVCC visibility.
-    fn for_each_column(
+    /// Pushes each row's requested base columns as `(creator, deleter,
+    /// values)`, where `values[i]` is column `cols[i]`. Reading happens in
+    /// place (no page image is copied) and unrequested columns are never
+    /// built. An empty `cols` streams versions only (for `count(*)`). Returns
+    /// `Ok(false)` when the engine has no columnar path; the caller applies
+    /// MVCC visibility.
+    fn for_each_projected(
         &self,
         _bp: &BufferPool,
-        _col: Option<usize>,
+        _cols: &[usize],
         _lobs: &dyn LobResolver,
-        _sink: &mut dyn FnMut(u32, u32, Value) -> Result<()>,
+        _sink: &mut dyn RowSink,
     ) -> Result<bool> {
         Ok(false)
     }
 
     /// Point fetch of one encoded record by row id.
     fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>>;
+}
+
+/// Sink for [`TableEngine::for_each_projected`]. A trait rather than an
+/// `FnMut` so the borrowed `values` slice does not trip higher-ranked-lifetime
+/// inference when a caller wraps another closure.
+pub trait RowSink {
+    fn row(&mut self, creator: u32, deleter: u32, values: &[Value]) -> Result<()>;
 }
 
 /// Full table-storage seam: MVCC version writes plus the read cursor. The
@@ -143,13 +152,22 @@ impl TableEngine for HeapEngine {
         }
     }
 
-    fn for_each_column(
+    fn for_each_projected(
         &self,
         bp: &BufferPool,
-        col: Option<usize>,
+        cols: &[usize],
         lobs: &dyn LobResolver,
-        sink: &mut dyn FnMut(u32, u32, Value) -> Result<()>,
+        sink: &mut dyn RowSink,
     ) -> Result<bool> {
+        // Column -> output slot, built once; `usize::MAX` marks a skipped one.
+        let max = cols.iter().copied().max().map_or(0, |m| m + 1);
+        let mut want = vec![usize::MAX; max];
+        for (slot, &c) in cols.iter().enumerate() {
+            if c < max {
+                want[c] = slot;
+            }
+        }
+        let mut out: Vec<Value> = vec![Value::Null; cols.len()];
         let pages = bp.page_count(self.file)?;
         for no in 1..pages {
             // The page latch is held only for this page's rows; nothing is
@@ -163,25 +181,24 @@ impl TableEngine for HeapEngine {
                             }
                             let creator = u32::from_le_bytes(rec[0..4].try_into().unwrap());
                             let deleter = u32::from_le_bytes(rec[4..8].try_into().unwrap());
-                            let value = match col {
-                                Some(c) => decode_column(&rec[8..], c, lobs)?,
-                                None => Value::Null,
-                            };
-                            sink(creator, deleter, value)?;
+                            if !cols.is_empty() {
+                                out.iter_mut().for_each(|v| *v = Value::Null);
+                                decode_row_with_want(&rec[8..], &want, lobs, &mut out)?;
+                            }
+                            sink.row(creator, deleter, &out)?;
                         }
                     }
                     PageLayout::Pax => {
                         for slot in crate::storage::pax::alive_slots(page) {
                             let (creator, deleter) =
                                 crate::storage::pax::version_at(page, slot);
-                            let value = match col {
-                                Some(c) => decode_tagged_value(
+                            for (pos, &c) in cols.iter().enumerate() {
+                                out[pos] = decode_tagged_value(
                                     crate::storage::pax::column_bytes(page, c, slot),
                                     lobs,
-                                )?,
-                                None => Value::Null,
-                            };
-                            sink(creator, deleter, value)?;
+                                )?;
+                            }
+                            sink.row(creator, deleter, &out)?;
                         }
                     }
                 }

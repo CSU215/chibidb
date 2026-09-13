@@ -383,29 +383,28 @@ fn skip_payload(data: &[u8], pos: &mut usize, tag: u8) -> Result<()> {
     Ok(())
 }
 
-/// Decodes only column `index` of a row encoding, skipping the other columns
-/// without building them. Used by single-column scans.
-pub(crate) fn decode_column(
+/// Decodes the columns selected by `want` into the pre-sized `out`. `want[i]`
+/// is the output slot for column `i`, or `usize::MAX` to skip it (skipped
+/// columns are advanced over without being built). Used by projected scans.
+pub(crate) fn decode_row_with_want(
     data: &[u8],
-    index: usize,
+    want: &[usize],
     lobs: &dyn LobResolver,
-) -> Result<Value> {
+    out: &mut [Value],
+) -> Result<()> {
     let mut pos = 0;
     let hb = take(data, &mut pos, 2)?;
     let count = u16::from_le_bytes(hb.try_into().unwrap()) as usize;
-    if index >= count {
-        return Err(Error::Runtime("column index out of range".into()));
-    }
-    let mut target = Value::Null;
     for i in 0..count {
-        if i == index {
-            target = decode_value(data, &mut pos, i, Some(lobs), None)?;
-        } else {
-            let tag = take(data, &mut pos, 1)?[0];
-            skip_payload(data, &mut pos, tag)?;
+        match want.get(i).copied().unwrap_or(usize::MAX) {
+            usize::MAX => {
+                let tag = take(data, &mut pos, 1)?[0];
+                skip_payload(data, &mut pos, tag)?;
+            }
+            slot => out[slot] = decode_value(data, &mut pos, i, Some(lobs), None)?,
         }
     }
-    Ok(target)
+    Ok(())
 }
 
 /// Decodes a single tagged value that stands alone (no row count header), as
