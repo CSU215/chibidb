@@ -110,6 +110,13 @@ pub struct Database {
     /// The per-database 2PL write lock, shared with the instance layer so it
     /// can be acquired before the database lock.
     writer: Arc<DatabaseWriteLock>,
+    /// Serializes a whole checkpoint (`flush_inner`): the buffer-pool flush,
+    /// each engine's flush, the catalog save and the WAL truncation. Per-
+    /// statement checkpoints already hold the database write lock, so this is
+    /// for callers that do not: concurrent `Instance::flush` threads, or a
+    /// direct `Database::flush`. The pool guards its own double-write
+    /// protocol; the later steps need the same exclusion to stay one unit.
+    checkpoint_lock: Mutex<()>,
     _temp: Option<tempfile::TempDir>,
 }
 
@@ -256,6 +263,7 @@ impl Database {
             wal_checkpoint_threshold: AtomicU64::new(config.wal.checkpoint_threshold),
             conflict: config.transaction.conflict,
             writer: Arc::new(DatabaseWriteLock::new(config.transaction.lock_timeout_ms)),
+            checkpoint_lock: Mutex::new(()),
             _temp: None,
         };
         db.recover_from_wal(&plan, &mut touched)?;
@@ -298,6 +306,7 @@ impl Database {
     }
 
     pub(crate) fn flush_inner(&self) -> Result<()> {
+        let _serial = self.checkpoint_lock.lock();
         self.pool.flush_all()?;
         // LSM tables flush their memtable to a durable SSTable; heap tables
         // are covered by the buffer-pool flush above.

@@ -304,6 +304,44 @@ fn rollback_leaves_no_redo() {
 }
 
 #[test]
+fn concurrent_checkpoints_keep_every_commit_durable() {
+    // Auto-checkpoint fires after every commit, so concurrent writers make
+    // `flush_inner` run concurrently. The whole checkpoint must be atomic, or
+    // one thread can truncate the log between another's engine flush and its
+    // own write, losing redo that a later COMMIT depends on.
+    let dir = tempfile::tempdir().unwrap();
+    let db = std::sync::Arc::new(Database::open(dir.path()).unwrap());
+    db.set_wal_checkpoint_threshold(1);
+    db.execute_sql("create table t (id int);").unwrap();
+
+    const THREADS: usize = 4;
+    const PER_THREAD: usize = 25;
+    let threads: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let db = std::sync::Arc::clone(&db);
+            std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    let id = t * PER_THREAD + i;
+                    db.execute_sql(&format!("insert into t values ({id});")).unwrap();
+                }
+            })
+        })
+        .collect();
+    for handle in threads {
+        handle.join().unwrap();
+    }
+
+    let expected = THREADS * PER_THREAD;
+    assert_eq!(rows(&db, "select id from t;").len(), expected);
+
+    // every committed row is durable: reopen replays whatever the checkpoints
+    // left in the log
+    drop(db);
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(rows(&db, "select id from t;").len(), expected);
+}
+
+#[test]
 fn index_lookup_works_after_crash_recovery() {
     let dir = tempfile::tempdir().unwrap();
     {
