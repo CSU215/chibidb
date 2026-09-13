@@ -461,24 +461,30 @@ impl Database {
         if wrote && self.conflict == ConflictStrategy::Fcw {
             self.check_conflicts(trx)?;
         }
-        self.trx.commit(trx_id);
         if !wrote {
             // A read-only transaction created no versioned rows, so no future
             // snapshot needs its id and its bookkeeping need not hit disk.
             // Skipping the catalog rewrite keeps SELECT cheap.
+            self.trx.commit(trx_id);
             return Ok(());
         }
-        // log durability first: after this point the transaction commits
-        // even if the process dies before its pages are flushed
+        // The synced commit record is the durability point. Append and sync it
+        // *before* marking the transaction committed in memory, so a logging
+        // failure cannot leave a "committed" id whose record is not durable.
         self.wal.append(trx_id, &Record::Commit)?;
         self.wal.sync()?;
-        self.save_catalog()?;
-        // opportunistic checkpoint once the log outgrew its budget and no
-        // open transaction is counting on its contents
-        if self.wal.len()? > self.wal_checkpoint_threshold.load(Ordering::Relaxed)
+        self.trx.commit(trx_id);
+        // From here the transaction is durable: recovery can replay it from the
+        // WAL even if the catalog is stale, so post-commit bookkeeping failures
+        // are reported but must not roll the transaction back.
+        if let Err(e) = self.save_catalog() {
+            eprintln!("commit: saving catalog failed: {e}");
+        }
+        if self.wal.len().unwrap_or(0) > self.wal_checkpoint_threshold.load(Ordering::Relaxed)
             && self.trx.no_open_transactions()
+            && let Err(e) = self.flush()
         {
-            self.flush()?;
+            eprintln!("commit: opportunistic checkpoint failed: {e}");
         }
         Ok(())
     }
