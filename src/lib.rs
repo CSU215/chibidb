@@ -664,6 +664,7 @@ impl Database {
                         self.trx.insert_open(id);
                     }
                 }
+                let undo_mark = session.trx.as_ref().map(|t| t.undo.len()).unwrap_or(0);
                 let mut event = SqlEvent::new(other);
                 let outcome = match pipeline.run(self, session, &mut event) {
                     Ok(()) => {
@@ -685,17 +686,24 @@ impl Database {
                         }
                     }
                     Err(e) => {
-                        // undo partial statement work; an explicit
-                        // transaction stays open for retry or rollback
-                        if let Some(mut trx) = session.trx.take()
-                            && !read_only
-                        {
-                            self.rollback_trx(&mut trx)?;
-                            if !autocommit {
-                                session.trx = Some(trx);
-                            } else {
+                        // Undo only what the failed statement changed. A
+                        // read-only autocommit pseudo-transaction is simply
+                        // discarded; an explicit transaction stays open for
+                        // retry or rollback with its earlier work intact.
+                        if autocommit {
+                            if let Some(mut trx) = session.trx.take() {
+                                let undone = if read_only {
+                                    Ok(())
+                                } else {
+                                    self.rollback_trx_to(&mut trx, undo_mark)
+                                };
                                 self.trx.remove_open(trx.id);
+                                undone?;
                             }
+                        } else if !read_only
+                            && let Some(trx) = session.trx.as_mut()
+                        {
+                            self.rollback_trx_to(trx, undo_mark)?;
                         }
                         Err(e)
                     }
@@ -758,7 +766,14 @@ impl Database {
     }
 
     fn rollback_trx(&self, trx: &mut TrxState) -> Result<()> {
-        while let Some(undo) = trx.undo.pop() {
+        self.rollback_trx_to(trx, 0)
+    }
+
+    /// Undoes only the undo entries above `mark`. Used for a statement-level
+    /// rollback inside an explicit transaction, so earlier statements survive.
+    fn rollback_trx_to(&self, trx: &mut TrxState, mark: usize) -> Result<()> {
+        while trx.undo.len() > mark {
+            let undo = trx.undo.pop().expect("len > mark checked");
             match undo {
                 Undo::Insert { table, rid, row } => {
                     let engine = self.catalog().table(&table)?.engine();

@@ -304,3 +304,40 @@ fn two_pl_lock_also_covers_autocommit_writers() {
     assert_eq!(rows(&db, &mut b, "select count(*) from t;"), [[Value::Int(2)]]);
 }
 
+#[test]
+fn readonly_error_in_explicit_transaction_keeps_the_transaction() {
+    let db = Database::open_in_memory().unwrap();
+    let mut s = Session::new();
+    setup(&db, &mut s);
+
+    db.execute_sql_with(&mut s, "begin;").unwrap();
+    db.execute_sql_with(&mut s, "insert into t values (1, 'x');").unwrap();
+
+    // a failing read-only statement must not drop the transaction handle
+    err(&db, &mut s, "select * from no_such_table;");
+
+    // the transaction is still open and its earlier work commits
+    db.execute_sql_with(&mut s, "commit;").unwrap();
+    assert_eq!(rows(&db, &mut s, "select count(*) from t;"), [[Value::Int(1)]]);
+
+    // bookkeeping is clean: an open-trx guard would block this DDL
+    db.execute_sql_with(&mut s, "create table u (id int);").unwrap();
+}
+
+#[test]
+fn failed_statement_preserves_earlier_transaction_work() {
+    let db = Database::open_in_memory().unwrap();
+    let mut s = Session::new();
+    setup(&db, &mut s);
+
+    db.execute_sql_with(&mut s, "begin;").unwrap();
+    db.execute_sql_with(&mut s, "insert into t values (1, 'ok');").unwrap();
+
+    // the second insert fails: 'way-too-long' exceeds char(8)
+    err(&db, &mut s, "insert into t values (2, 'way-too-long');");
+
+    // a statement-level failure must not roll back the earlier insert
+    db.execute_sql_with(&mut s, "commit;").unwrap();
+    assert_eq!(rows(&db, &mut s, "select id from t;"), [[Value::Int(1)]]);
+}
+
