@@ -139,6 +139,9 @@ impl Instance {
         self.meta
             .write()
             .execute_sql(&format!("delete from databases where name = '{name}';"))?;
+        // Remove grants on this database so a same-named one cannot inherit them.
+        let meta = self.meta.write();
+        delete_privileges(&meta, &format!("dbname = '{name}'"))?;
         Ok(())
     }
 
@@ -489,6 +492,8 @@ impl Instance {
             return Err(Error::Runtime(format!("no such user: {name}")));
         }
         meta.execute_sql(&format!("delete from users where name = '{name}';"))?;
+        // Drop the user's grants too, so recreating the name cannot inherit them.
+        delete_privileges(&meta, &format!("username = '{name}'"))?;
         Ok(())
     }
 
@@ -589,6 +594,12 @@ fn revoke(meta: &Database, user: &str, database: &str, kind: &str) -> Result<()>
     meta.execute_sql(&format!(
         "delete from privileges where username = '{user}' and dbname = '{database}' and kind = '{kind}';"
     ))?;
+    Ok(())
+}
+
+/// Deletes every privilege row matching `predicate` (already SQL-escaped).
+fn delete_privileges(meta: &Database, predicate: &str) -> Result<()> {
+    meta.execute_sql(&format!("delete from privileges where {predicate};"))?;
     Ok(())
 }
 
