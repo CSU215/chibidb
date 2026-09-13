@@ -233,15 +233,18 @@ impl PhysicalOperator for TableScan {
         sink: &mut dyn FnMut(u32, u32, Value) -> Result<()>,
     ) -> Result<Option<bool>> {
         let engine = ctx.db.catalog().table(&self.table)?.engine();
-        let Some(mut scanner) = engine.scan_column(&ctx.db.pool, col)? else {
-            return Ok(None);
-        };
-        while let Some((creator, deleter, value)) = scanner.next(&ctx.db.pool, ctx.db.lobs())? {
-            if ctx.trx.visible(creator, deleter) {
+        // The engine scans pages in place; filter to visible versions here.
+        let trx = &*ctx.trx;
+        let mut visible = |creator, deleter, value| {
+            if trx.visible(creator, deleter) {
                 sink(creator, deleter, value)?;
             }
+            Ok(())
+        };
+        if engine.for_each_column(&ctx.db.pool, col, ctx.db.lobs(), &mut visible)? {
+            return Ok(Some(true));
         }
-        Ok(Some(true))
+        Ok(None)
     }
 
     fn close(&mut self) -> Result<()> {
