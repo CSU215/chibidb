@@ -1050,6 +1050,27 @@ fn extract_hash_keys(
     (left_keys, right_keys, kept)
 }
 
+/// The join kind and optional ON clause for every table after the first, in
+/// order. A comma join is `Cross` with no ON; an explicit join consumes the
+/// next entry of `select.on`, keeping both vectors aligned even when commas
+/// and explicit joins are mixed.
+fn join_clauses(select: &SelectStmt) -> Vec<(JoinKind, Option<Expr>)> {
+    let mut out = Vec::new();
+    let mut on_index = 0usize;
+    for i in 1..select.from.len() {
+        let kind = select.joins.get(i).copied().unwrap_or(JoinKind::Cross);
+        let on = if kind == JoinKind::Cross {
+            None
+        } else {
+            let on = select.on.get(on_index).cloned();
+            on_index += 1;
+            on
+        };
+        out.push((kind, on));
+    }
+    out
+}
+
 /// Whether the left-deep join chain hashes at least one pair. Lets `EXPLAIN`
 /// report a comma join rewritten onto WHERE equi-keys as a `HashJoin`.
 pub(crate) fn select_uses_hash_join(db: &Database, s: &SelectStmt) -> Result<bool> {
@@ -1063,13 +1084,12 @@ pub(crate) fn select_uses_hash_join(db: &Database, s: &SelectStmt) -> Result<boo
     let mut where_conjuncts: Vec<Expr> =
         s.selection.as_ref().map(split_conjuncts).unwrap_or_default()
             .into_iter().cloned().collect();
-    for i in 1..s.from.len() {
-        let Some(right) = build_from_source(db, &s.from[i])? else {
+    for (i, (kind, on)) in join_clauses(s).into_iter().enumerate() {
+        let Some(right) = build_from_source(db, &s.from[i + 1])? else {
             return Ok(false);
         };
         let right_schema = right.schema().clone();
-        let kind = s.joins.get(i).copied().unwrap_or(JoinKind::Cross);
-        let hashed = match s.on.get(i - 1) {
+        let hashed = match on.as_ref() {
             Some(on) => analyze_hash_join(kind, Some(on), &left_schema, &right_schema).is_some(),
             None if kind == JoinKind::Cross => {
                 let (left_keys, _, kept) =
@@ -1727,13 +1747,11 @@ pub fn build_select(
             select.selection.as_ref().map(split_conjuncts).unwrap_or_default()
                 .into_iter().cloned().collect();
         let mut where_reduced = false;
-        for i in 1..select.from.len() {
-            let Some(right) = build_from_source(db, &select.from[i])? else {
+        for (i, (kind, on)) in join_clauses(select).into_iter().enumerate() {
+            let Some(right) = build_from_source(db, &select.from[i + 1])? else {
                 return Ok(None);
             };
-            let kind = select.joins.get(i).copied().unwrap_or(JoinKind::Cross);
-            let on = select.on.get(i - 1);
-            let keys = match on {
+            let keys = match on.as_ref() {
                 Some(on) => analyze_hash_join(kind, Some(on), op.schema(), right.schema()),
                 None if kind == JoinKind::Cross => {
                     let (left_keys, right_keys, kept) =
@@ -1750,7 +1768,7 @@ pub fn build_select(
             };
             match keys {
                 Some(keys) => op = Box::new(HashJoin::new(op, right, kind, keys)),
-                None => op = Box::new(NestedLoopJoin::new(op, right, kind, on.cloned())?),
+                None => op = Box::new(NestedLoopJoin::new(op, right, kind, on)?),
             }
         }
         if where_reduced {
