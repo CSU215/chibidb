@@ -211,8 +211,10 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
   `snapshot()` 从 O(committed) 降到 O(in-progress)。
   *注*：实际 Snapshot 未保留单独的 `xmin` —— 有精确 clog 时 `x < xmin` 与 `[xmin,xmax)`
   的判定合流，`xmin` 只在"用区间近似 clog"（Step 7 的 horizon）时才需要。
-- **Step 3｜行级锁管理器**（下一步）：原语化 `LockManager`（tuple 锁 + 等待队列 + 超时 + 死锁检测），
-  替换整库 `DatabaseWriteLock`。验收：不同行不阻塞 / 同行按序等待 / 超时 / 死锁回退用例。
+- **Step 3｜行级锁管理器**（进行中）：原语 `LockManager` ✅（`14ee18a`，`src/db/lockmgr.rs`）
+  —— `(table, rid)` 元组锁 + FIFO 交接 + `lock_timeout` + 等待图死锁自检，含单测
+  （重入 / 超时 / 交接 / 双持有者死锁）。**待办**：接到写路径并替换整库 `DatabaseWriteLock`
+  （当前整库写锁仍在，所以真实写路径尚不会争用）。验收：不同行不阻塞 / 同行按序等待 / 超时 / 死锁回退。
 - **Step 4｜RC + EPQ**（默认档先做对）：记录头加 `next_rid`；等锁后 EPQ 重读最新版本。
   验收：RC 下「后写者看到前者结果而非 abort」用例。
 - **Step 5｜RR / SI**：事务级快照固定；冲突报 40001（不再 FCW）。撤掉 Instance 的整库写独占。
