@@ -1,16 +1,24 @@
 <script setup lang="ts">
-import { nextTick, onMounted, ref } from 'vue'
+import { nextTick, onMounted, ref, watch } from 'vue'
 
 import { ApiError, query } from '../api/client'
 import type { ResultSet } from '../api/types'
 import ResultGrid from '../components/ResultGrid.vue'
 import SchemaTree from '../components/SchemaTree.vue'
+import { loadDraft, saveDraft } from '../draft'
 import { useSession } from '../stores/session'
 
 const session = useSession()
 const tree = ref<InstanceType<typeof SchemaTree> | null>(null)
 
-const sql = ref('select 1 as one;')
+/// Shown the first time this tab opens the console; after that the draft wins.
+const SAMPLE = 'select 1 as one;'
+const DRAFT_KEY = 'chibidb.draft.sql'
+
+const sql = ref(loadDraft(DRAFT_KEY, SAMPLE))
+// Saved on every change rather than on unload: a reload is not the only way to
+// lose the text, and the string is tiny.
+watch(sql, (text) => saveDraft(DRAFT_KEY, text))
 const results = ref<ResultSet[]>([])
 const error = ref('')
 const running = ref(false)

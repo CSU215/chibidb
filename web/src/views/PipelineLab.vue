@@ -5,13 +5,18 @@ import { ApiError, parseSql } from '../api/client'
 import type { ParseTrace } from '../api/types'
 import AstDump from '../components/AstDump.vue'
 import TokenStream from '../components/TokenStream.vue'
+import { loadDraft, saveDraft } from '../draft'
 
 /// How long to wait after the last keystroke before asking the engine. The
 /// point is to answer while the query is still being written, without sending a
 /// request per character.
 const DEBOUNCE_MS = 300
 
-const sql = ref('select id, name from t where id > 1 order by id;')
+/// Shown the first time this tab opens the lab; after that the draft wins.
+const SAMPLE = 'select id, name from t where id > 1 order by id;'
+const DRAFT_KEY = 'chibidb.draft.pipeline'
+
+const sql = ref(loadDraft(DRAFT_KEY, SAMPLE))
 const trace = ref<ParseTrace | null>(null)
 const error = ref('')
 const parsing = ref(false)
@@ -40,7 +45,8 @@ async function run(): Promise<void> {
   }
 }
 
-watch(sql, () => {
+watch(sql, (text) => {
+  saveDraft(DRAFT_KEY, text)
   window.clearTimeout(timer)
   timer = window.setTimeout(run, DEBOUNCE_MS)
 })
