@@ -277,7 +277,7 @@ impl Database {
         let committed_repaired = plan
             .committed_ids
             .iter()
-            .any(|id| !db.trx.contains_committed(*id));
+            .any(|id| !db.trx.is_committed(*id));
         if committed_repaired {
             db.trx.extend_committed(plan.committed_ids.iter().copied());
         }
@@ -343,15 +343,18 @@ impl Database {
     /// open transactions (the VACUUM statement enforces this).
     pub(crate) fn vacuum(&self) -> Result<usize> {
         let mut purged = 0;
-        let committed = self.trx.snapshot();
+        // VACUUM runs with no open transaction, so the clog is final for every
+        // xid: a version is dead if its creator never committed, or its deleter
+        // did commit.
+        let clog = self.trx.commit_status();
         let metas = self.catalog().table_metas();
         for meta in metas {
             let ops = self.index_ops(&meta.name)?;
             let engine = self.catalog().table(&meta.name)?.engine();
             for (rid, rec) in self.store_scan_raw(&meta.name)? {
                 let (creator, deleter, row) = crate::storage::codec::decode_record(&rec, &self.lobs)?;
-                let dead = !committed.contains(&creator)
-                    || (deleter != 0 && committed.contains(&deleter));
+                let dead = !clog.is_committed(creator)
+                    || (deleter != 0 && clog.is_committed(deleter));
                 if !dead {
                     continue;
                 }
@@ -522,8 +525,8 @@ impl Database {
     fn conflicting_committer(&self, trx: &TrxState, id: u32) -> bool {
         id != 0
             && id != trx.id
-            && !trx.snapshot.contains(&id)
-            && self.trx.contains_committed(id)
+            && !trx.committed_before(id)
+            && self.trx.is_committed(id)
     }
 
     /// Emulates a process crash: dirty buffer-pool pages are lost while
@@ -553,12 +556,12 @@ impl Database {
             && plan.output_kind() == crate::exec::operator::OutputKind::Rows;
         if autocommit {
             if read_only {
-                let committed = self.trx.snapshot();
-                session.begin_readonly(&committed);
+                let (snapshot, clog) = self.trx.begin_snapshot();
+                session.begin_readonly(snapshot, clog);
             } else {
                 let id = self.trx.begin_open();
-                let committed = self.trx.snapshot();
-                session.begin(id, &committed, false);
+                let (snapshot, clog) = self.trx.begin_snapshot();
+                session.begin(id, snapshot, clog, false);
             }
         }
         let mut out = Vec::new();
@@ -619,8 +622,8 @@ impl Database {
                     session.set_holds_writer(true);
                 }
                 let id = self.trx.begin_open();
-                let committed = self.trx.snapshot();
-                session.begin(id, &committed, true);
+                let (snapshot, clog) = self.trx.begin_snapshot();
+                session.begin(id, snapshot, clog, true);
                 Ok(None)
             }
             crate::ast::Stmt::Trx(crate::ast::TrxCtl::Commit) => {
@@ -666,12 +669,12 @@ impl Database {
                 }
                 if autocommit {
                     if read_only {
-                        let committed = self.trx.snapshot();
-                        session.begin_readonly(&committed);
+                        let (snapshot, clog) = self.trx.begin_snapshot();
+                        session.begin_readonly(snapshot, clog);
                     } else {
                         let id = self.trx.begin_open();
-                        let committed = self.trx.snapshot();
-                        session.begin(id, &committed, false);
+                        let (snapshot, clog) = self.trx.begin_snapshot();
+                        session.begin(id, snapshot, clog, false);
                     }
                 }
                 let (undo_mark, wal_mark) = session
@@ -1234,7 +1237,7 @@ mod tests {
         db.execute_sql("insert into t values (1);").unwrap();
 
         assert!(db.trx.next_id() > before, "write must allocate a trx id");
-        assert!(db.trx.contains_committed(before), "write must be committed");
+        assert!(db.trx.is_committed(before), "write must be committed");
         assert!(db.trx.no_open_transactions(), "write must not stay open");
     }
 }

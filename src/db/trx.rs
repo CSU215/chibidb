@@ -1,6 +1,8 @@
-use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::db::clog::CommitStatus;
+use crate::db::transaction::Snapshot;
 use crate::storage::Rid;
 
 /// Source of process-unique session ids, used to attribute the 2PL write lock.
@@ -64,10 +66,17 @@ impl Session {
         self.holds_writer = held;
     }
 
-    pub(crate) fn begin(&mut self, id: u32, committed: &HashSet<u32>, explicit: bool) {
+    pub(crate) fn begin(
+        &mut self,
+        id: u32,
+        snapshot: Snapshot,
+        clog: Arc<CommitStatus>,
+        explicit: bool,
+    ) {
         self.trx = Some(TrxState {
             id,
-            snapshot: committed.clone(),
+            snapshot,
+            clog,
             undo: Vec::new(),
             wal: Vec::new(),
             explicit,
@@ -79,10 +88,11 @@ impl Session {
     /// registered in the database's bookkeeping, so readers do not mutate
     /// shared state. The id is `READ_ONLY_TRX_ID`, which no real transaction
     /// uses (ids start at 1).
-    pub(crate) fn begin_readonly(&mut self, committed: &HashSet<u32>) {
+    pub(crate) fn begin_readonly(&mut self, snapshot: Snapshot, clog: Arc<CommitStatus>) {
         self.trx = Some(TrxState {
             id: READ_ONLY_TRX_ID,
-            snapshot: committed.clone(),
+            snapshot,
+            clog,
             undo: Vec::new(),
             wal: Vec::new(),
             explicit: false,
@@ -102,8 +112,12 @@ impl Default for Session {
 
 pub(crate) struct TrxState {
     pub id: u32,
-    /// Transactions that were committed when this transaction began.
-    pub snapshot: HashSet<u32>,
+    /// PostgreSQL-style snapshot: an xid is visible if the clog says it
+    /// committed and it was neither in flight nor allocated after this
+    /// snapshot.
+    pub snapshot: Snapshot,
+    /// The shared commit-status bitmap this snapshot consults.
+    pub clog: Arc<CommitStatus>,
     pub undo: Vec<Undo>,
     /// Redo frames for this transaction's writes, buffered until commit so the
     /// whole statement reaches the log in one write. Rolled back by truncating.
@@ -116,12 +130,21 @@ impl TrxState {
     /// Snapshot-isolation visibility of a row version.
     pub fn visible(&self, creator: u32, deleter: u32) -> bool {
         let creator_visible =
-            creator == 0 || creator == self.id || self.snapshot.contains(&creator);
+            creator == 0 || creator == self.id || self.committed_before(creator);
         // a row is gone for me if I deleted it myself, or the deleter
         // committed before my snapshot
         let deleted_for_me =
-            deleter != 0 && (deleter == self.id || self.snapshot.contains(&deleter));
+            deleter != 0 && (deleter == self.id || self.committed_before(deleter));
         creator_visible && !deleted_for_me
+    }
+
+    /// Whether `xid` had already committed when this transaction's snapshot was
+    /// taken. An xid that was in flight then, or was allocated after, does not
+    /// count even if it has since committed.
+    pub(crate) fn committed_before(&self, xid: u32) -> bool {
+        xid < self.snapshot.xmax
+            && self.snapshot.xip.binary_search(&xid).is_err()
+            && self.clog.is_committed(xid)
     }
 }
 
