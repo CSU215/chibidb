@@ -13,7 +13,7 @@ use crate::storage::page::{zeroed_page, FileId, PageData, PageNo, PAGE_SIZE};
 use crate::storage::Rid;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"CHIDBIV";
+const MAGIC: [u8; 8] = *b"CHIDBIV1";
 /// Root page number in the file header.
 const ROOT_OFF: usize = header::HEADER_LEN;
 /// First leaf page number in the file header.
