@@ -150,7 +150,46 @@ fn randomized_model_matches() {
             let mut want = model_range(&model, &Bound::Unbounded, &Bound::Unbounded);
             want.sort();
             assert_eq!(got, want, "full scan mismatch at step {step}");
+            tree.check_invariants(&bp).unwrap();
         }
+    }
+}
+
+#[test]
+fn b_link_invariants_survive_random_splits_and_merges() {
+    // Same model in lockstep, but the B-link invariants are checked after every
+    // operation so a wrong high key or right link is caught immediately.
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = setup(&dir);
+    let tree = BTree::init(&bp, f).unwrap();
+    let mut rng = Rng(0xBEEF);
+    let pool = make_pool(&mut rng, 20);
+    let mut model: BTreeMap<Vec<u8>, BTreeSet<Rid>> = BTreeMap::new();
+
+    for step in 0..4000u32 {
+        let key = pool[rng.below(pool.len() as u64) as usize].clone();
+        let rid = Rid::new(rng.below(3) as u32, rng.below(6) as u16);
+        match rng.below(100) {
+            0..=54 => {
+                if !model.get(&key).is_some_and(|s| s.contains(&rid)) {
+                    tree.insert(&bp, &key, rid).unwrap();
+                    model.entry(key).or_default().insert(rid);
+                }
+            }
+            _ => {
+                if model.get(&key).is_some_and(|s| s.contains(&rid)) {
+                    tree.delete(&bp, &key, rid).unwrap();
+                    let set = model.get_mut(&key).unwrap();
+                    set.remove(&rid);
+                    if set.is_empty() {
+                        model.remove(&key);
+                    }
+                }
+            }
+        }
+        tree.check_invariants(&bp).unwrap_or_else(|e| {
+            panic!("invariant broken at step {step}: {e}");
+        });
     }
 }
 

@@ -298,8 +298,12 @@ Repeatable Read 行为一致。
 - **C1a**｜节点格式 ✅（本提交）：leaf/internal 预留 B-link 字段（internal 的 `next` 右兄弟 +
   两类节点的 high-key 区），entry 区起点从 11 移到 `13 + hk_len`；升索引 magic 到 `CHIDBITZ`。
   **high-key 暂不写入（长度恒为 0，无界）故不参与查找**——纯格式步,单线程行为不变。
-- **C1b**｜在 build/分裂/删除合并与借用中正确**维护** right-link 与 high-key（含不变量测试：
-  节点内 key < high_key ≤ 右兄弟最小 key）。验收：`index_btree`、`index_node`、`index_model` 全绿。
+- **C1b**｜维护 right-link 与 high-key ✅（本提交）：`build_leaf/internal` 写入两者；叶子/内部
+  **分裂**设置 `left.next=右半, left.hk=分隔键; right.hk=原 hk, right.next=原 next`；删除的
+  **借用/合并**与**根坍缩**同步更新 hk/next（`set_leaf_high_key`/`set_internal_high_key` 重建页）。
+  新增公开的 `BTree::check_invariants`（节点内 key < hk、hk = 右兄弟最小 key、最右节点 hk 为空、
+  叶链与树一致），随机模型测试每个操作后校验。验收：全绿。
+- **C2**（下一步）：查找/下降改 lock-fetch（`key >= high_key` 沿 `next` 右移）。
 - **C2**｜查找改 lock-fetch（right-link 右移）。验收：并发「读 + 插入」压力下结果与模型一致。
 - **C3**｜插入改 top-down + latch coupling + 预分裂。验收：`tests/index_model.rs` 的随机
   模型在**并发**插入/删除下与 `BTreeMap` 模型一致；无损坏。
