@@ -4,7 +4,11 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["vite/client"],
+    // `node` is here for `vite.config.ts` (it reads `process.env` and uses
+    // `node:url`), and it does leak Node globals into `src/`. Accepted: the
+    // alternative is a second tsconfig just for one config file, and a stray
+    // `process` in app code is caught by review or by the browser.
+    "types": ["vite/client", "node"],
     "strict": true,
     "noEmit": true,
     "isolatedModules": true,

@@ -1,19 +1,12 @@
 <script setup lang="ts">
 import { onMounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
 
 import { shortId } from './format'
 import { useSession } from './stores/session'
 
 const session = useSession()
-const route = useRoute()
-const router = useRouter()
 
 onMounted(session.bootstrap)
-
-function go(path: string): void {
-  void router.push(path)
-}
 </script>
 
 <template>
@@ -23,10 +16,7 @@ function go(path: string): void {
         <strong>chibidb</strong>
         <span class="subtitle">控制台</span>
       </div>
-      <el-menu :default-active="route.path" mode="horizontal" class="menu" @select="go">
-        <el-menu-item index="/">SQL</el-menu-item>
-        <el-menu-item index="/pipeline">解析</el-menu-item>
-      </el-menu>
+      <div class="spacer" />
       <div class="session">
         <el-tag size="small" type="info">会话 {{ shortId(session.id) }}</el-tag>
         <el-tag v-if="session.currentDb" size="small">{{ session.currentDb }}</el-tag>
@@ -72,9 +62,8 @@ function go(path: string): void {
   font-size: 12px;
 }
 
-.menu {
+.spacer {
   flex: 1;
-  border-bottom: none;
 }
 
 .session {

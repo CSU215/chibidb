@@ -11,7 +11,14 @@ export type ResultSet =
 /// `lex` failure has no token stream to show.
 export type ParseStage = 'lex' | 'parse'
 
-export type ParseError = { stage: ParseStage; message: string }
+export type ParseError = {
+  stage: ParseStage
+  message: string
+  /// UTF-8 byte offset of the offending token, or null when the engine has no
+  /// position to give -- runtime complaints like `no such column` have none,
+  /// and are shown in a banner rather than marked in the editor.
+  pos: number | null
+}
 
 export type Token = { kind: string; text: string; pos: number }
 
