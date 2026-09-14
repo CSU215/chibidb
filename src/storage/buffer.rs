@@ -328,7 +328,7 @@ impl BufferPool {
         let key = (file, no);
         // 本轮淘汰的帧，锁外再上报（替换日志不能在持 `state` 锁时做 I/O）。
         let mut evicted: Vec<(Key, bool)> = Vec::new();
-        let frame = {
+        let pinned = {
             let mut state = self.state.lock();
             // `frames` 可变借用于淘汰，`replacer` 可变借用于重排；拆开字段让两者并存。
             let PoolState { frames, replacer } = &mut *state;
@@ -377,7 +377,12 @@ impl BufferPool {
             frames.insert(key, frame.clone());
             replacer.push(key);
             debug_assert_eq!(frames.len(), replacer.len(), "invariant Ⅳ: the replacer mirrors the page table");
-            frame
+            // pin 必须在**这个临界区里**就加上（不变式 ⅩⅤ 的另一半，见 §6.3）。
+            // 否则新帧会以 `pins == 0` 的姿态短暂留在页表里：池满且其余帧都被 pin 时，
+            // 别的线程恰好只会挑中它淘汰，本线程随后 pin 到的是一个已经离开页表的
+            // 孤儿帧 —— 它写下的内容永远不会回盘，就是一次静默丢写。
+            // `tests/storage_buffer.rs` 的并发 hammer 用例抓的正是这条。
+            PinnedFrame::new(frame)
         };
         if self.observability.eviction_log && !evicted.is_empty() {
             let stats = self.stats();
@@ -385,7 +390,7 @@ impl BufferPool {
                 self.reporter.evict(victim_key, dirty, &stats);
             }
         }
-        Ok(PinnedFrame::new(frame))
+        Ok(pinned)
     }
 
     /// 追加一张零页（不变式 Ⅴ）。真正的"取页数 + 写零页"在 `DiskManager`
