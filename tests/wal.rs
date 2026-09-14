@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use chibidb::value::Value;
 use chibidb::{Database, ResultSet, Session};
 
@@ -339,6 +342,57 @@ fn concurrent_checkpoints_keep_every_commit_durable() {
     drop(db);
     let db = Database::open(dir.path()).unwrap();
     assert_eq!(rows(&db, "select id from t;").len(), expected);
+}
+
+#[test]
+fn explicit_flush_does_not_drop_a_concurrent_commits_redo() {
+    // A direct `Database::flush` takes no database lock, so it can run while a
+    // writer commits through the same `&Database`. If the flush truncates the
+    // log after the commit but before the commit's pages are written back, a
+    // crash loses a committed row. The flush must notice the commit and keep
+    // the log.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(dir.path()).unwrap());
+    db.execute_sql("create table t (id int);").unwrap();
+
+    const ROWS: usize = 200;
+    let stop = Arc::new(AtomicBool::new(false));
+    let flusher = {
+        let db = Arc::clone(&db);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match db.flush() {
+                    Ok(()) => {}
+                    // the writer keeps transactions in flight; that is expected
+                    Err(e) if e.to_string().contains("transaction") => {}
+                    Err(e) => panic!("unexpected flush error: {e}"),
+                }
+                std::thread::yield_now();
+            }
+        })
+    };
+
+    {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            for i in 0..ROWS {
+                db.execute_sql(&format!("insert into t values ({i});")).unwrap();
+            }
+        })
+    }
+    .join()
+    .unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    flusher.join().unwrap();
+
+    // crash on purpose: only the WAL plus whatever the flushes persisted remain
+    let db = Arc::try_unwrap(db).ok().expect("no other Arc holders remain");
+    db.simulate_crash();
+
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(rows(&db, "select id from t;").len(), ROWS);
 }
 
 #[test]

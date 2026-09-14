@@ -117,6 +117,9 @@ pub struct Database {
     /// direct `Database::flush`. The pool guards its own double-write
     /// protocol; the later steps need the same exclusion to stay one unit.
     checkpoint_lock: Mutex<()>,
+    /// Serializes catalog saves: a commit and a checkpoint can run at the same
+    /// time and would otherwise race on the shared `catalog.tmp` staging path.
+    catalog_lock: Mutex<()>,
     _temp: Option<tempfile::TempDir>,
 }
 
@@ -264,6 +267,7 @@ impl Database {
             conflict: config.transaction.conflict,
             writer: Arc::new(DatabaseWriteLock::new(config.transaction.lock_timeout_ms)),
             checkpoint_lock: Mutex::new(()),
+            catalog_lock: Mutex::new(()),
             _temp: None,
         };
         db.recover_from_wal(&plan, &mut touched)?;
@@ -302,11 +306,16 @@ impl Database {
                 "cannot flush while transactions are open".into(),
             ));
         }
-        self.flush_inner()
+        self.flush_inner(None)
     }
 
-    pub(crate) fn flush_inner(&self) -> Result<()> {
+    /// Runs a checkpoint. `exclude` is the id of the statement's own
+    /// (autocommit) transaction, which must not count as an open one.
+    pub(crate) fn flush_inner(&self, exclude: Option<u32>) -> Result<()> {
         let _serial = self.checkpoint_lock.lock();
+        // Writing pages back is safe while transactions are open; only
+        // dropping the log needs the no-open guarantee below.
+        let commits = self.trx.committed_count();
         self.pool.flush_all()?;
         // LSM tables flush their memtable to a durable SSTable; heap tables
         // are covered by the buffer-pool flush above.
@@ -314,8 +323,17 @@ impl Database {
             self.catalog().table(&meta.name)?.engine().flush()?;
         }
         self.save_catalog()?;
-        // checkpoint: every page is on disk, so the log has nothing left to redo
-        self.wal.truncate()
+        // Truncate only if no transaction committed while we flushed (its
+        // pages may not be in our snapshot) and none is open (its redo is
+        // still needed). Holding the open set across the check and the
+        // truncate keeps a begin or a commit from slipping between them.
+        self.trx.with_open_set(|open| {
+            let others_open = open.iter().any(|&id| Some(id) != exclude);
+            if !others_open && self.trx.committed_count() == commits {
+                self.wal.truncate()?;
+            }
+            Ok(())
+        })
     }
 
     /// Physically removes rows no transaction can ever see again:
@@ -539,10 +557,9 @@ impl Database {
                 let committed = self.trx.snapshot();
                 session.begin_readonly(&committed);
             } else {
-                let id = self.trx.allocate();
+                let id = self.trx.begin_open();
                 let committed = self.trx.snapshot();
                 session.begin(id, &committed, false);
-                self.trx.insert_open(id);
             }
         }
         let mut out = Vec::new();
@@ -602,10 +619,9 @@ impl Database {
                     self.acquire_writer(session.id())?;
                     session.set_holds_writer(true);
                 }
-                let id = self.trx.allocate();
+                let id = self.trx.begin_open();
                 let committed = self.trx.snapshot();
                 session.begin(id, &committed, true);
-                self.trx.insert_open(id);
                 Ok(None)
             }
             crate::ast::Stmt::Trx(crate::ast::TrxCtl::Commit) => {
@@ -654,10 +670,9 @@ impl Database {
                         let committed = self.trx.snapshot();
                         session.begin_readonly(&committed);
                     } else {
-                        let id = self.trx.allocate();
+                        let id = self.trx.begin_open();
                         let committed = self.trx.snapshot();
                         session.begin(id, &committed, false);
-                        self.trx.insert_open(id);
                     }
                 }
                 let (undo_mark, wal_mark) = session
@@ -893,6 +908,7 @@ impl Database {
     }
 
     pub(crate) fn save_catalog(&self) -> Result<()> {
+        let _serial = self.catalog_lock.lock();
         let snap = CatalogSnapshot {
             next_table_file: self.next_table_file.load(Ordering::SeqCst),
             next_index_file: self.next_index_file.load(Ordering::SeqCst),

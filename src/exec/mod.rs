@@ -216,7 +216,7 @@ fn execute_checkpoint(db: &Database, trx: &TrxState) -> Result<ResultSet> {
     }
     // verified no one else is open; skip flush()'s blanket open-trx guard
     // because the statement's own temp transaction is still registered
-    db.flush_inner()?;
+    db.flush_inner(Some(trx.id))?;
     Ok(ResultSet::Message("SUCCESS".into()))
 }
 
