@@ -13,7 +13,7 @@ cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
 # HTTP/JSON 前端：配置 server.http_addr 后，POST /query {"sql":"..."} → {"results":[...]}
 # MySQL 前端：配置 server.mysql_addr 后，可用 mysql 客户端连接（mysql_native_password、文本结果集、预处理语句）
-cargo test                      # 全量回归（619 tests，另有 9 个 #[ignore] 性能探针）
+cargo test                      # 全量回归（624 tests，另有 9 个 #[ignore] 性能探针）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -185,6 +185,9 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
   `alloc_page` 的"取页数 + 写零页"因此在同一把锁内完成）
 - 写并发统一走**行级锁**：写前对元组 `(table, rid)` 加锁，事务结束释放；不同行并发、
   同行排队，等待超过 `transaction.lock_timeout_ms` 报 `lock wait timeout`
+- **UNIQUE / PRIMARY KEY 在并发下成立**：唯一性检查按索引键加锁（同样的行级锁管理器，
+  持至事务结束），再以"当前已提交状态"判定是否占用——并发插同一键时后到者等在锁上，
+  前者提交后即看到已提交行并报 `duplicate key`（各隔离级一致）
 - 冲突处理由**隔离级别**决定（`transaction.isolation`）：
   - `read_committed`（默认）：每条语句取新快照；等锁后发现目标行已被并发提交改动，则以
     新快照重启该语句（EPQ），重跑 WHERE/SET，不 abort
@@ -198,7 +201,7 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
 
 ## 测试
 
-`cargo test` 跑 619 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
+`cargo test` 跑 624 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
 表约束（PK/UNIQUE/NOT NULL/DEFAULT）/索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等，
 另有 `tests/miniob_compat.rs` 用经典 student/course/sc 场景做端到端回归，`tests/engine_equivalence.rs`
 用确定性随机脚本对 heap/LSM 两引擎做差分等价（含中途重开）。`tests/perf_stats.rs` 为 `#[ignore]` 性能探针

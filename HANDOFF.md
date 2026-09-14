@@ -230,7 +230,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 - JOIN 中同名非限定列报 `ambiguous column`，用 `alias.col` 限定
 - LIMIT 只接受非负整数字面量
 - 显式事务内执行 DDL 报错（`DDL inside a transaction is not supported`）
-- 列约束：`primary key` 隐含 `not null` + `unique`；PK/UNIQUE 各自动建名为 `__unique_<table>_<column>` 的唯一索引（约束索引不可单独 DROP）；UNIQUE 允许多个 NULL，PK 因 NOT NULL 不允许；INSERT/UPDATE 走索引查重并过 MVCC 可见性，报 `duplicate key`；同语句内多行用 claimed-key 集合查重；`INSERT INTO t (cols) VALUES` 省略列取 DEFAULT，否则 NULL；DEFAULT 在建表时按列类型 coerce 成 `Value` 存 catalog
+- 列约束：`primary key` 隐含 `not null` + `unique`；PK/UNIQUE 各自动建名为 `__unique_<table>_<column>` 的唯一索引（约束索引不可单独 DROP）；UNIQUE 允许多个 NULL，PK 因 NOT NULL 不允许；INSERT/UPDATE 走索引查重：先按索引键加锁（复用行锁管理器、持至事务结束），再以**当前已提交状态**判定键是否被占用并报 `duplicate key`（并发插同一键时后到者等待前者提交）；同语句内多行用 claimed-key 集合查重；`INSERT INTO t (cols) VALUES` 省略列取 DEFAULT，否则 NULL；DEFAULT 在建表时按列类型 coerce 成 `Value` 存 catalog
 
 ---
 

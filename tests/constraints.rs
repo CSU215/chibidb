@@ -1,7 +1,11 @@
 //! M20 column constraints: NOT NULL, DEFAULT, and INSERT column lists.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use chibidb::config::{Config, Isolation};
 use chibidb::value::Value;
-use chibidb::{Database, ResultSet};
+use chibidb::{Database, ResultSet, Session};
 
 fn rows(rs: &[ResultSet]) -> Vec<Vec<Value>> {
     match &rs[0] {
@@ -168,4 +172,94 @@ fn unique_survives_reopen() {
     let e = err(&db, "insert into t values (1);");
     assert!(e.contains("duplicate key"), "{e}");
     db.execute_sql("insert into t values (2);").unwrap();
+}
+
+/// One winner, seven duplicate-key errors: the per-key lock serializes the
+/// uniqueness check, so the losers see the winner's committed row.
+fn concurrent_duplicate_key_race(isolation: Isolation) {
+    let mut cfg = Config::default();
+    cfg.transaction.isolation = isolation;
+    let db = Arc::new(Database::open_in_memory_with_config(&cfg).unwrap());
+    db.execute_sql("create table t (id int primary key, n int);").unwrap();
+
+    let rejected = Arc::new(AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let db = Arc::clone(&db);
+            let rejected = Arc::clone(&rejected);
+            scope.spawn(move || {
+                let mut session = Session::new();
+                if db.execute_sql_with(&mut session, "insert into t values (1, 0);").is_err() {
+                    rejected.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+
+    assert_eq!(q(&db, "select count(*) from t;"), [[Value::Int(1)]], "{isolation:?} duplicated");
+    assert_eq!(rejected.load(Ordering::SeqCst), 7, "{isolation:?}: losing inserts must be rejected");
+}
+
+#[test]
+fn concurrent_duplicate_keys_are_rejected_read_committed() {
+    concurrent_duplicate_key_race(Isolation::ReadCommitted);
+}
+
+#[test]
+fn concurrent_duplicate_keys_are_rejected_repeatable_read() {
+    concurrent_duplicate_key_race(Isolation::RepeatableRead);
+}
+
+#[test]
+fn concurrent_duplicate_keys_are_rejected_serializable() {
+    concurrent_duplicate_key_race(Isolation::Serializable);
+}
+
+#[test]
+fn concurrent_distinct_keys_all_succeed() {
+    let db = Arc::new(Database::open_in_memory().unwrap());
+    db.execute_sql("create table t (id int primary key);").unwrap();
+
+    std::thread::scope(|scope| {
+        for i in 0..8u64 {
+            let db = Arc::clone(&db);
+            scope.spawn(move || {
+                let mut session = Session::new();
+                db.execute_sql_with(&mut session, &format!("insert into t values ({i});")).unwrap();
+            });
+        }
+    });
+    assert_eq!(q(&db, "select count(*) from t;"), [[Value::Int(8)]]);
+}
+
+#[test]
+fn concurrent_unique_column_update_is_rejected() {
+    // two sessions race to move different rows onto the same unique value
+    let db = Arc::new(Database::open_in_memory().unwrap());
+    db.execute_sql("create table t (id int primary key, v int unique);").unwrap();
+    db.execute_sql("insert into t values (1, 10), (2, 20);").unwrap();
+
+    let rejected = Arc::new(AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        for id in [1, 2] {
+            let db = Arc::clone(&db);
+            let rejected = Arc::clone(&rejected);
+            scope.spawn(move || {
+                let mut session = Session::new();
+                if db
+                    .execute_sql_with(&mut session, &format!("update t set v = 99 where id = {id};"))
+                    .is_err()
+                {
+                    rejected.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+
+    assert_eq!(
+        q(&db, "select count(*) from t where v = 99;"),
+        [[Value::Int(1)]],
+        "only one update may take the unique value"
+    );
+    assert_eq!(rejected.load(Ordering::SeqCst), 1);
 }

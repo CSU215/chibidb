@@ -275,6 +275,15 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
 
 风险最高的是 Step 5（撤整库写锁），其替代（Step 3–4）必须先到位。
 
+**收尾（路线图之外）**：
+- 删除遗留的 `transaction.conflict = fcw | 2pl` 轴与整库 `DatabaseWriteLock`：冲突行为统一由
+  `isolation` 决定，写并发统一走行级锁（`check_conflicts` 仅在 `isolation != read_committed` 时执行）。
+- **唯一约束并发安全**：此前 `check_unique` 是"按快照读索引、且不加锁"，并发插入同一键会重复
+  （默认 read_committed 下实测 8/8 成功）。现改为：对索引键加锁（复用行锁管理器、持至事务结束），
+  再以**当前已提交状态**（而非快照）判定键是否被占用；后到者在锁上等待，前者提交后即见其已提交行并报
+  `duplicate key`。UNIQUE/PK 因此在 RC/RR/Serializable 下均成立。验收：`tests/constraints.rs`
+  三个隔离级各一个并发竞态用例 + 不同键全成功 + 并发 UPDATE 抢同一唯一值。
+
 ---
 
 ## 10. 测试策略
