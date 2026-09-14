@@ -569,11 +569,12 @@ fn static_file(config: &Config, path: &str) -> Response {
 fn missing_web_root_page(looked_in: &str) -> Response {
     let origin = "POST /query {\"sql\":\"...\"}";
     let body = format!(
-        "<!doctype html>\n<meta charset=\"utf-8\">\n<title>chibidb</title>\n\
-         <h1>chibidb</h1>\n\
-         <p>The web console is not built. Expected it at\n<code>{}</code>.</p>\n\
-         <p>Build it with <code>scripts/build_web.sh</code> (needs Node), or run the\n\
-         dev server with <code>cd web &amp;&amp; npm run dev</code>.</p>\n\
+        "<!doctype html>\n<meta charset=\"utf-8\">\n<title>chaoticdb</title>\n\
+         <h1>chaoticdb</h1>\n\
+         <p>No frontend is served: <code>server.web_root</code> points at\n\
+         <code>{}</code>, which does not exist.</p>\n\
+         <p>Set <code>[web] enabled = true</code> in <code>config.toml</code> to use the\n\
+         built-in console (no build step), or put a built SPA in that directory.</p>\n\
          <p>The SQL endpoints work either way: <code>GET /health</code>,\n\
          <code>{origin}</code>.</p>\n",
         escape_html(looked_in)

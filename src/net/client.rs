@@ -17,7 +17,7 @@ pub async fn run_client(
     let mut line = String::new();
     loop {
         if interactive {
-            output.write_all(b"chibidb> ").await?;
+            output.write_all(b"chaoticdb> ").await?;
             output.flush().await?;
         }
         line.clear();

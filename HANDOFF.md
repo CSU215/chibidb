@@ -162,8 +162,8 @@ information_schema/constraints/correlated/miniob_compat/engine_equivalence/concu
 - `BufferPool` 的页查找与淘汰共用一把 `state` 锁，一次缺页/淘汰会阻塞所有页查找；
   `DiskManager` 已按文件加细锁。
 - 行锁持至事务结束、无锁升级；RR/Serializable 冲突直接 abort 而非重读。
-- 命名遗留：`main.rs` 的 usage 文本仍写 `chibidb`，HTTP 会话头为 `X-Chibi-Session`，
-  系统库目录为 `chibi_meta`，缓冲池日志前缀为 `chibidb[buffer]`。
-- 仓库内没有 `web/` 源码与 `scripts/build_web.sh`；静态托管只期望一个预先构建好的
-  `server.web_root`（默认 `web/dist`）。
+- 命名遗留：HTTP 会话头仍为 `X-Chibi-Session`，系统库目录为 `chibi_meta`（兼容既有配置/客户端）。
+- 内置演示前端在 `web/demo/`（纯 HTML/CSS/JS，`include_str!` 内嵌，无构建），
+  `[web] enabled = true` 时在 `/` 托管并优先于 `server.web_root`（默认 `web/dist`）；
+  没有 Vue/`scripts/build_web.sh`，`web_root` 仅用于外置构建产物。
 - `config.example.toml` 未列出 `server.admin_api`（代码已支持）。

@@ -164,7 +164,7 @@ impl StderrReporter {
 impl CacheReporter for StderrReporter {
     fn evict(&self, key: Key, dirty: bool, stats: &PoolStats) {
         eprintln!(
-            "chibidb[buffer]: evict (file={},page={}) policy={} dirty={} resident={}/{} hit={:.1}%",
+                "chaoticdb[buffer]: evict (file={},page={}) policy={} dirty={} resident={}/{} hit={:.1}%",
             key.0,
             key.1,
             policy_label(self.policy),
@@ -177,7 +177,7 @@ impl CacheReporter for StderrReporter {
 
     fn stats(&self, stats: &PoolStats) {
         eprintln!(
-            "chibidb[buffer]: stats hits={} misses={} evictions={} clean={} dirty={} resident={}/{} hit_rate={:.1}%",
+                "chaoticdb[buffer]: stats hits={} misses={} evictions={} clean={} dirty={} resident={}/{} hit_rate={:.1}%",
             stats.hits,
             stats.misses,
             stats.evictions,

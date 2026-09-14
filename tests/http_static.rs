@@ -154,8 +154,8 @@ fn a_missing_web_root_explains_how_to_build_the_spa() {
     // 200, not 404: browsers hide the body of a 404, and this body is the point.
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.contains("Content-Type: text/html"), "{response}");
-    // It must say what to do, and where it looked.
-    assert!(response.contains("build_web.sh"), "{response}");
+    // It must say what to do (enable the built-in console), and where it looked.
+    assert!(response.contains("[web] enabled"), "{response}");
     assert!(response.contains("no-such-web-root"), "{response}");
 
     // There is no site, so assets are still missing rather than a hint page.

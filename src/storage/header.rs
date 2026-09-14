@@ -47,7 +47,7 @@ pub fn write_header(page: &mut [u8], magic: &[u8; 8], kind: FileKind) {
 /// silently misread them.
 pub fn read_header(page: &[u8], magic: &[u8; 8], kind: FileKind) -> Result<()> {
     if page.len() < HEADER_LEN || &page[0..8] != magic {
-        return Err(Error::Runtime("not a chibidb data file".into()));
+        return Err(Error::Runtime("not a chaoticdb data file".into()));
     }
     let version = u16::from_le_bytes(page[8..10].try_into().unwrap());
     if version != FORMAT_VERSION {

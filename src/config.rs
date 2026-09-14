@@ -258,7 +258,8 @@ impl Config {
     /// the fix. Hence the check. Deliberately false when there is no built
     /// console, so a backend-only setup stays quiet.
     pub fn web_console_unreachable(&self) -> bool {
-        self.server.http_addr.is_none() && matches!(self.web_root_state(), WebRootState::Ready(_))
+        self.server.http_addr.is_none()
+            && (self.web.enabled || matches!(self.web_root_state(), WebRootState::Ready(_)))
     }
 
     pub fn validate(&self) -> Result<()> {

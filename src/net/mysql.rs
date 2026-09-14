@@ -422,7 +422,7 @@ fn read_lenenc_bytes(data: &[u8], mut pos: usize) -> Option<(Vec<u8>, usize)> {
 fn handshake_packet(connection_id: u32, scramble: &[u8; 20]) -> Vec<u8> {
     let mut p = Vec::new();
     p.push(10); // protocol version
-    p.extend_from_slice(b"8.0.0-chibidb\0");
+    p.extend_from_slice(b"8.0.0-chaoticdb\0");
     p.extend_from_slice(&connection_id.to_le_bytes());
     p.extend_from_slice(&scramble[0..8]);
     p.push(0);
@@ -867,7 +867,7 @@ mod compat {
     use crate::value::Value;
 
     /// The server version string reported to clients.
-    pub(crate) const SERVER_VERSION: &str = "8.0.0-chibidb";
+    pub(crate) const SERVER_VERSION: &str = "8.0.0-chaoticdb";
 
     /// Answers a housekeeping statement locally. `Some(vec![])` means "handled,
     /// reply with OK and no result set" (e.g. `SET ...`); `None` means the
@@ -997,7 +997,7 @@ mod compat {
 
     fn variable_value(name: &str, isolation: &str) -> Value {
         match name {
-            "version_comment" => Value::Str("chibidb".into()),
+            "version_comment" => Value::Str("chaoticdb".into()),
             "version" => Value::Str(SERVER_VERSION.into()),
             "sql_mode" => Value::Str(String::new()),
             "autocommit" => Value::Int(1),
@@ -1161,7 +1161,7 @@ mod compat {
 
         #[test]
         fn system_variables_are_answered() {
-            assert_eq!(one_value("select @@version_comment limit 1"), Value::Str("chibidb".into()));
+            assert_eq!(one_value("select @@version_comment limit 1"), Value::Str("chaoticdb".into()));
             assert_eq!(one_value("SELECT @@sql_mode"), Value::Str(String::new()));
             assert_eq!(
                 one_value("select @@session.transaction_isolation"),

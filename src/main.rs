@@ -8,7 +8,7 @@ use chaoticdb::{client, run_repl, server};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  chibidb [dir]            interactive REPL (in-memory without dir)\n  chibidb serve <dir> [addr]  start TCP server (addr defaults to config.toml)\n  chibidb client [addr]    connect to a running server"
+        "usage:\n  chaoticdb [dir]             interactive REPL (in-memory without dir)\n  chaoticdb serve <dir> [addr]  start TCP server (addr defaults to config.toml)\n  chaoticdb client [addr]     connect to a running server"
     );
     std::process::exit(2);
 }
@@ -45,14 +45,18 @@ async fn main() -> std::io::Result<()> {
             let instance = Arc::new(open(&args[2], &config));
             if let Some(http_addr) = config.server.http_addr.clone() {
                 let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
-                eprintln!("chibidb http listening on {http_addr}");
-                // A fresh clone has no built SPA, so this is the common case.
-                // Say it once at startup, with the path actually looked at,
-                // rather than leaving the browser to show a bare 404.
-                if let WebRootState::Missing(path) = config.web_root_state() {
+                eprintln!("chaoticdb http listening on {http_addr}");
+                if config.web.enabled {
+                    // The built-in, no-build console wins over web_root, so the
+                    // missing-directory note below does not apply.
+                    eprintln!("note: built-in demo console enabled at http://{http_addr}/");
+                } else if let WebRootState::Missing(path) = config.web_root_state() {
+                    // No built SPA and no embedded console: say it once at
+                    // startup, with the path actually looked at, rather than
+                    // leaving the browser to show a bare 404.
                     eprintln!(
-                        "note: web root {path} not found; the built frontend will not be \
-                         served (run scripts/build_web.sh, or cd web && npm run dev)"
+                        "note: web root {path} not found; no frontend will be served at / \
+                         (set [web] enabled = true for the built-in console, or build the SPA)"
                     );
                 }
                 let http_instance = instance.clone();
@@ -64,7 +68,7 @@ async fn main() -> std::io::Result<()> {
             }
             if let Some(mysql_addr) = config.server.mysql_addr.clone() {
                 let mysql_listener = tokio::net::TcpListener::bind(&mysql_addr).await?;
-                eprintln!("chibidb mysql listening on {mysql_addr}");
+                eprintln!("chaoticdb mysql listening on {mysql_addr}");
                 let mysql_instance = instance.clone();
                 tokio::spawn(async move {
                     if let Err(e) = chaoticdb::mysql::serve(mysql_instance, mysql_listener).await {
@@ -73,14 +77,14 @@ async fn main() -> std::io::Result<()> {
                 });
             }
             let listener = tokio::net::TcpListener::bind(&addr).await?;
-            eprintln!("chibidb server listening on {addr}");
+            eprintln!("chaoticdb server listening on {addr}");
             // The console is built but there is no HTTP listener to serve it
             // from. Nothing else would say so: the text protocol works, and the
             // browser only reports a 5xx from whatever is proxying to a port
             // nobody is listening on.
             if config.web_console_unreachable() {
                 eprintln!(
-                    "note: the web console is built but no HTTP listener is configured, so \
+                    "note: a web console is available but no HTTP listener is configured, so \
                      it cannot be opened; set server.http_addr in config.toml (e.g. \
                      \"127.0.0.1:8080\") and restart"
                 );
