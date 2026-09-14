@@ -23,6 +23,10 @@ impl PhysicalOperator for InsertOp {
         &self.schema
     }
 
+    fn label(&self) -> String {
+        format!("Insert {}", self.stmt.table)
+    }
+
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         self.affected = super::execute_insert(ctx.db, ctx.trx, &self.stmt)?;
         Ok(())
@@ -63,6 +67,10 @@ impl PhysicalOperator for UpdateOp {
         &self.schema
     }
 
+    fn label(&self) -> String {
+        format!("Update {}", self.stmt.table)
+    }
+
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         self.affected = super::execute_update(ctx.db, ctx.trx, &self.stmt)?;
         Ok(())
@@ -101,6 +109,10 @@ impl DeleteOp {
 impl PhysicalOperator for DeleteOp {
     fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    fn label(&self) -> String {
+        format!("Delete {}", self.stmt.table)
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {

@@ -119,6 +119,34 @@ pub trait PhysicalOperator {
     fn affected_rows(&self) -> Option<u64> {
         None
     }
+
+    /// A short one-line label for this node (for EXPLAIN / visualisation).
+    fn label(&self) -> String {
+        "Operator".to_string()
+    }
+
+    /// Child operators in execution order (empty for leaves).
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        Vec::new()
+    }
+}
+
+/// Renders an indented tree of `plan`, two spaces per depth, one line per
+/// operator, newline-terminated.
+pub fn physical_tree(plan: &dyn PhysicalOperator) -> String {
+    fn walk(op: &dyn PhysicalOperator, depth: usize, out: &mut String) {
+        for _ in 0..depth {
+            out.push_str("  ");
+        }
+        out.push_str(&op.label());
+        out.push('\n');
+        for child in op.children() {
+            walk(child, depth + 1, out);
+        }
+    }
+    let mut out = String::new();
+    walk(plan, 0, &mut out);
+    out
 }
 
 /// Sequential scan of a table, filtering by MVCC visibility.
@@ -285,6 +313,10 @@ impl PhysicalOperator for TableScan {
         self.scanner = None;
         Ok(())
     }
+
+    fn label(&self) -> String {
+        format!("TableScan table={}", self.table)
+    }
 }
 
 /// Forwards projected rows to a downstream sink, dropping versions the active
@@ -339,6 +371,14 @@ impl PhysicalOperator for ViewScan {
         &self.schema
     }
 
+    fn label(&self) -> String {
+        "ViewScan".to_string()
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
+    }
+
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         self.child.open(ctx)?;
         self.rows.clear();
@@ -382,6 +422,10 @@ impl ConstantScan {
 impl PhysicalOperator for ConstantScan {
     fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    fn label(&self) -> String {
+        "ConstantScan".to_string()
     }
 
     fn open(&mut self, _ctx: &mut ExecContext<'_>) -> Result<()> {
@@ -498,6 +542,14 @@ impl PhysicalOperator for Filter {
         self.child.schema()
     }
 
+    fn label(&self) -> String {
+        format!("Filter {}", self.predicate)
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
+    }
+
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         self.child.open(ctx)
     }
@@ -588,6 +640,14 @@ impl PhysicalOperator for Project {
         &self.schema
     }
 
+    fn label(&self) -> String {
+        format!("Project cols={}", self.exprs.len())
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
+    }
+
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         self.child.open(ctx)
     }
@@ -659,6 +719,14 @@ impl PhysicalOperator for Limit {
         self.child.schema()
     }
 
+    fn label(&self) -> String {
+        format!("Limit offset={} count={:?}", self.offset, self.count)
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
+    }
+
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         self.skipped = 0;
         self.emitted = 0;
@@ -709,6 +777,14 @@ impl PhysicalOperator for Distinct {
         self.child.schema()
     }
 
+    fn label(&self) -> String {
+        "Distinct".to_string()
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
+    }
+
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         self.seen.clear();
         self.child.open(ctx)
@@ -752,6 +828,14 @@ impl Sort {
 impl PhysicalOperator for Sort {
     fn schema(&self) -> &Schema {
         self.child.schema()
+    }
+
+    fn label(&self) -> String {
+        format!("Sort keys={}", self.order_by.len())
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
@@ -824,6 +908,14 @@ impl GroupBy {
 impl PhysicalOperator for GroupBy {
     fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    fn label(&self) -> String {
+        format!("GroupBy groups={}", self.exprs.len())
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
@@ -942,6 +1034,14 @@ impl NestedLoopJoin {
 impl PhysicalOperator for NestedLoopJoin {
     fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    fn label(&self) -> String {
+        format!("NestedLoopJoin kind={:?}", self.kind)
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.left.as_ref(), self.right.as_ref()]
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
@@ -1474,6 +1574,14 @@ impl PhysicalOperator for HashJoin {
         &self.schema
     }
 
+    fn label(&self) -> String {
+        format!("HashJoin kind={:?}", self.kind)
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.left.as_ref(), self.right.as_ref()]
+    }
+
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         self.pending.clear();
         self.table.clear();
@@ -1686,6 +1794,14 @@ impl PhysicalOperator for Union {
         &self.schema
     }
 
+    fn label(&self) -> String {
+        format!("Union arms={}", self.inputs.len())
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        self.inputs.iter().map(|(_, op)| op.as_ref()).collect()
+    }
+
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         let columns: Vec<String> =
             self.schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -1833,6 +1949,10 @@ impl IndexScan {
 impl PhysicalOperator for IndexScan {
     fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    fn label(&self) -> String {
+        format!("IndexScan table={} column={}", self.table, self.column)
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
