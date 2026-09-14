@@ -1,14 +1,15 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：**Web 前端 F0–F2 前半完成**——HTTP 前端同源托管 `web/dist`
-> （`src/net/admin.rs` + `server.web_root`），`X-Chibi-Session` 会话注册表让事务跨请求
-> （`src/net/session.rs`），`POST /api/parse` 返回 Token 流与 AST（受 `server.admin_api` 门控），
-> 手写 JSON 值解析器替换 `json_string_field`（新增 `src/net/json.rs`），
-> 以及 Vue 3 控制台（`web/`，SQL 控制台 + 解析实验台）。详见 §10 的 F 系列。
+> 最后更新：**Web 前端 F0–F4 完成**（F4 = 缓冲池面板，课程点名项）——HTTP 前端同源托管
+> `web/dist`（`src/net/admin.rs` + `server.web_root`），`X-Chibi-Session` 会话注册表让事务跨请求
+> （`src/net/session.rs`），`POST /api/parse` 返回 Token 流与 AST、`POST /api/plan` 返回
+> **真实算子树**与绑定信息（受 `server.admin_api` 门控），`GET /api/metrics` 与
+> `/api/bufferpool/{frames,events}` 驱动缓冲池面板；Vue 3 控制台有「SQL 控制台」与
+> 「缓冲池」两页。详见 §10 的 F 系列。
 > 此前：src 按层重组为 `sql/`/`db/`/`net/`（`lib.rs` 用 `pub use` 保留旧扁平路径）、
 > catalog 原子写（temp+rename）、P10/P7/P8/P3 + P9（HTTP+MySQL 含预处理）、LSM 分级压实/流式、
-> 堆/LSM 差分等价与性能探针。**658 Rust tests + 17 前端测试全绿、clippy 零警告**
+> 堆/LSM 差分等价与性能探针。**692 Rust tests + 60 前端测试全绿、clippy 零警告，smoke OK**
 > （测试数会被后续提交改变，以 `cargo test` 输出为准；本文档其余数字同理）。
 
 ---
@@ -452,15 +453,26 @@ P10 收尾（P10.4/P10.5）：补齐课程验收点名的两块缓存机制—�
 | F1 + F2 前半 | ③ 解析接口 + 前端 | `POST /api/parse`（Token 流 + AST，受 `server.admin_api` 门控）+ Vue 控制台（同源托管，含库表树与结果表）；JSON 值解析器替换 `json_string_field` | ✅ `fb61689`、`c089516`、`f977bdb` |
 | F2 后半 | ④ 编辑器内标错 | `Error::Syntax { message, pos }` 带字节偏移（11 处构造点）+ `/api/parse` 透出 `error.pos`；前端换 CodeMirror 6，实时红色波浪线 + 悬停气泡；解析页并入控制台成为可折叠面板 | ✅ `2185f45`、`063eb46` |
 | F3 | — | 计划可视化（从**真实算子树**渲染 + 漂移检测测试，见 `docs/web_frontend.md` §4.3d） | ✅ 本轮：`plan.rs` 访问路径结构化（`90e62c7`）+ 算子自描述 `name()`/`details()`/`children()`（`69411e0`）+ `src/introspect/{mod,plan}.rs`（`PlanNode` 树、`bind` 绑定信息、选定/否决记录）与 `POST /api/plan`（`bc49a77`，与 `/api/parse` 同为 200 语义）+ `tests/plan_api.rs`（访问路径各形态、被否决理由、**漂移检测**、绑定解析）+ 控制台计划面板（`7c0940d`，`PlanTree.vue`/`PlanPanel.vue`） |
-| F4 | — | 缓冲池面板（替换日志已在主线：`[observability]`，见 `docs/os_storage.md` §6.10；面板本身待接） | ⬜ |
+| F4 | — | 缓冲池面板（**课程第一优先项**，见 `docs/os_storage.md` §6.10/§6.11） | ✅ 本轮：`PoolEvent` 事件环 + `PoolEventKind`（Load/Evict/**EvictSkipped**/Flush/Discard）+ `events(since)` 游标 + `frames()` 快照 + `TableStorage::lsm_stats` + `GET /api/metrics`、`/api/bufferpool/{frames,events}` + 控制台「缓冲池」页（命中率走势/常驻帧表/替换日志，可见时轮询） |
 | F5–F9 | — | 空间图/页检视、索引、LSM、运行时旋钮、管理台 | ⬜ |
+
+**缓冲池面板的数据源（F4）**：池里新增一份**永远在记**的事件环（`PoolEvent` +
+`Mutex<VecDeque>` + 原子序号，默认 4096 条），与 §6.10 的 stderr 日志分工明确 ——
+人看 stderr、机器看环，两个开关管的是前者。`EvictSkipped` 是最有信息量的一类：
+策略每问一次 `pins(key)` 就在 `PoolVitals` 里留一笔，选中的划掉，剩下的就是
+"看过、没选"的帧（`pins > 0` = 被占用，`pins == 0` = CLOCK 的第二次机会）——
+**这没有改动 `replacer.rs` 一行**。记录全部在 `state` 锁**之外**做，环有自己的锁；
+`frames()` 按 `(file, page)` 排序且不取 pin、不动淘汰顺序（观测不改被观测者）。
+接口：`/api/metrics`（累计计数 + WAL + LSM 摘要，累计值由前端做差算区间命中率）、
+`/api/bufferpool/frames`、`/api/bufferpool/events?since=N`。前端「缓冲池」页在有二条路由
+（控制台 / 缓冲池），可见时轮询、隐藏即停。详见 `docs/os_storage.md` §6.11。
 
 本轮前端已落地的两处**设计取舍**（细节见 `docs/web_frontend.md` §3 与各提交说明）：
 **不做 CORS**（同源托管 + dev 代理已足够，且浏览器可向回环地址发简单跨源 POST，
 不需要就不加）；**会话为混合制**——不带 `X-Chibi-Session` 的请求保持每连接会话与
 关闭即回滚，带头的才走注册表，因此既有客户端行为逐位不变。
 
-前端 `web/` 有独立的测试：`cd web && npm test`（vitest，46 个用例，
+前端 `web/` 有独立的测试：`cd web && npm test`（vitest，60 个用例，
 覆盖请求构造、错误映射与会话 id 的接管）。`web/dist` 不入库，
 新 clone 需先跑 `scripts/build_web.sh`。
 

@@ -18,7 +18,7 @@ cargo run -q -- client [addr]   # 连接 server 的交互式客户端
 #   设 server.admin_api = true 后，编辑器里会实时标出词法/语法错误（红色波浪线 + 悬停气泡），
 #   并可展开「编译详情 / 执行计划」查看 Token 流、AST 与执行计划；关掉则退化为只有错误横幅
 # MySQL 前端：配置 server.mysql_addr 后，可用 mysql 客户端连接（mysql_native_password、文本结果集、预处理语句）
-cargo test                      # 全量回归（682 tests，另有 9 个 #[ignore] 性能探针）
+cargo test                      # 全量回归（692 tests，另有 9 个 #[ignore] 性能探针）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -31,8 +31,10 @@ REPL / client 中输入 `exit` 或 `quit` 退出。
 `server.http_addr`（可选，HTTP/JSON 监听）、`server.mysql_addr`（可选，MySQL wire 监听）、
 `server.web_root`（默认 `"web/dist"`；托管在 `http_addr` 上的前端产物目录，
 相对路径按当前工作目录解析，`""` 表示关闭托管）、
-`server.admin_api`（默认 `false`；开启后 `/api/*` 才可用，目前提供 `POST /api/parse`（Token 流 + AST）
-与 `POST /api/plan`（执行计划：**真实算子树** + 选定/被否决的访问路径与理由 + 表/列绑定信息））、
+`server.admin_api`（默认 `false`；开启后 `/api/*` 才可用，目前提供
+`POST /api/parse`（Token 流 + AST）、`POST /api/plan`（执行计划：**真实算子树** + 选定/被否决的
+访问路径与理由 + 表/列绑定信息）、`GET /api/metrics`（缓冲池累计计数 + WAL + LSM 摘要）、
+`GET /api/bufferpool/frames`（常驻帧）、`GET /api/bufferpool/events?since=N`（替换日志，按游标增量拉取））、
 `server.thread_model`/`worker_threads`、
 `execution.mode`（`"volcano"` 默认 / `"chunk"` 列式批处理，见下）、
 `transaction.isolation`（`"read_committed"` 默认 / `"repeatable_read"` / `"serializable"`）、
@@ -165,6 +167,12 @@ src/
 `web/dist/` 是 `scripts/build_web.sh` 的构建产物（**不入库**），由 `server.web_root` 指定。
 控制台通过 `X-Chibi-Session` 让事务跨越多次 HTTP 请求——浏览器会自由复用连接，
 没有这个头的话 `BEGIN` 之后的 `INSERT` 可能落到另一条连接上。
+
+控制台顶部有两个页面：**SQL 控制台**（写语句、看结果、展开「编译详情 / 执行计划」看
+Token 流、AST 与计划）与**缓冲池**（命中率走势、常驻帧表、替换日志；面板可见时轮询，
+切走即停）。后者是课程点名的「缓存命中率 + 页面换入/换出日志」那一块的可视化：
+引擎侧的数据源是池里的**事件环**（详见 `docs/os_storage.md` §6.11），
+它把载入、淘汰、**被跳过的候选**、回写、摘帧都记成带序号的事件，前端按游标增量读。
 
 控制台的「执行计划」面板走 `POST /api/plan`，它渲染的是**执行器刚构建的那棵算子树**
 （`build_statement` 建好后不执行、直接丢弃），而不是 `exec/plan.rs` 的 EXPLAIN 文本——
