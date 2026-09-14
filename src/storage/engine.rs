@@ -79,6 +79,12 @@ pub trait TableEngine: Send + Sync {
 
     /// Point fetch of one encoded record by row id.
     fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>>;
+
+    /// Like [`get`](Self::get), but `Ok(None)` when the row is gone. A reader
+    /// that reached this rid through an index must tolerate that: a concurrent
+    /// rollback can physically remove the row while a stale index entry still
+    /// points at it, and the reader should skip it, not fail.
+    fn try_get(&self, bp: &BufferPool, rid: Rid) -> Result<Option<Vec<u8>>>;
 }
 
 /// Sink for [`TableEngine::for_each_projected`]. A trait rather than an
@@ -216,6 +222,10 @@ impl TableEngine for HeapEngine {
 
     fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>> {
         HeapFile::at(self.file, self.layout).get(bp, rid)
+    }
+
+    fn try_get(&self, bp: &BufferPool, rid: Rid) -> Result<Option<Vec<u8>>> {
+        HeapFile::at(self.file, self.layout).try_get(bp, rid)
     }
 }
 

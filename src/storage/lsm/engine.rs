@@ -107,10 +107,12 @@ impl TableEngine for LsmEngine {
     }
 
     fn get(&self, _bp: &BufferPool, rid: Rid) -> Result<Vec<u8>> {
-        self.inner
-            .lock()
-            .get(&rid_key(rid))?
+        self.try_get(_bp, rid)?
             .ok_or_else(|| Error::Runtime(format!("no record at {rid:?}")))
+    }
+
+    fn try_get(&self, _bp: &BufferPool, rid: Rid) -> Result<Option<Vec<u8>>> {
+        self.inner.lock().get(&rid_key(rid))
     }
 }
 

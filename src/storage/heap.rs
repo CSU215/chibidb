@@ -160,17 +160,17 @@ impl HeapFile {
     }
 
     pub fn get(&self, bp: &BufferPool, rid: Rid) -> Result<Vec<u8>> {
+        self.try_get(bp, rid)?
+            .ok_or_else(|| Error::Runtime(format!("no record at {rid:?}")))
+    }
+
+    /// Like [`get`](Self::get), but `Ok(None)` when the slot is empty.
+    pub fn try_get(&self, bp: &BufferPool, rid: Rid) -> Result<Option<Vec<u8>>> {
         bp.read_page(self.file, rid.page_no, |page| match self.layout {
-            PageLayout::Row => page_get(page, rid.slot)?
-                .map(|r| r.to_vec())
-                .ok_or_else(|| Error::Runtime(format!("no record at {rid:?}"))),
+            PageLayout::Row => Ok(page_get(page, rid.slot)?.map(|r| r.to_vec())),
             PageLayout::Pax => {
                 let mut out = Vec::new();
-                if pax::read_record(page, rid.slot, None, &mut out) {
-                    Ok(out)
-                } else {
-                    Err(Error::Runtime(format!("no record at {rid:?}")))
-                }
+                Ok(pax::read_record(page, rid.slot, None, &mut out).then_some(out))
             }
         })
     }

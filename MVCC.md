@@ -289,6 +289,16 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
   `unlock_all`，把刚拿到的行锁放掉，在单行高并发下被对手抢走导致饥饿（实测 8×50 自增只有 51/400 成功，
   其余 40001）。持锁重试后同为 **400/400 成功且无丢失更新**。验收：`tests/concurrency.rs` 的
   `concurrent_increments_do_not_lose_updates`。
+- **随机并发调度测试器**（`tests/concurrency_fuzz.rs`）：多会话随机交错"原子转账 / 重复键插入（必须失败）/
+  读取"，固定种子可复现，断言**任何可观测快照余额守恒**且主键唯一。它抓出两个真实缺陷：
+  1. **回滚先解锁、后 undo**：`rollback_trx_to` 在 undo 之前 `unlock_all`，undo 进行时事务的删除标记还在、
+     锁却已释放，别的写者据此在其上继续写，产生**同一主键的两个存活版本**（余额漂移）。改为**先 undo 完
+     再解锁**。
+  2. **UPDATE 的 undo 入账太晚**：`store_update_versions` 在（可能失败的）索引插入之后才 push undo，
+     一旦索引步骤出错，回滚就没有该条目可撤，新的版本与旧版本的标记都会残留。改为在写旧版本标记后**立即
+     入账**（与 `store_insert`/`store_delete_mark` 一致）。
+  另将索引扫描与唯一检查的按 rid 读取改为容错（`TableEngine::try_get`）：并发回滚可能物理删行，而索引里
+  的条目还在，读不到就当跳过而不是报错。
 
 ---
 

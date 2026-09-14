@@ -776,11 +776,14 @@ impl Database {
         undo_mark: usize,
         wal_mark: usize,
     ) -> Result<()> {
+        // Reverse the writes *before* releasing locks: while the undo runs the
+        // transaction's marks are still on the rows, and another writer must not
+        // be able to observe (and build on) them.
+        let undone = self.undo_to(trx, undo_mark, wal_mark);
         if undo_mark == 0 {
-            // full rollback: release the transaction's row locks
             self.locks.unlock_all(trx.id);
         }
-        self.undo_to(trx, undo_mark, wal_mark)
+        undone
     }
 
     /// Undoes the entries above `undo_mark` and drops the redo frames buffered
@@ -800,34 +803,39 @@ impl Database {
         trx.wal.truncate(wal_mark);
         while trx.undo.len() > undo_mark {
             let undo = trx.undo.pop().expect("len > mark checked");
-            match undo {
-                Undo::Insert { table, rid, row } => {
-                    let engine = self.catalog().table(&table)?.engine();
-                    if let Ok(record) = engine.get(&self.pool, rid) {
-                        self.free_lob_refs(&record);
-                    }
-                    engine.delete(&self.pool, rid)?;
-                    for (ci, ix_file) in self.index_ops(&table)? {
-                        let key = encode_key(&row[ci])?;
-                        BTree::at(ix_file).delete(&self.pool, &key, rid)?;
-                    }
+            self.undo_one(&undo)?;
+        }
+        Ok(())
+    }
+
+    fn undo_one(&self, undo: &Undo) -> Result<()> {
+        match undo {
+            Undo::Insert { table, rid, row } => {
+                let engine = self.catalog().table(table)?.engine();
+                if let Ok(record) = engine.get(&self.pool, *rid) {
+                    self.free_lob_refs(&record);
                 }
-                Undo::DeleteMark { table, rid, prev_deleter, prev_next_rid } => {
-                    let engine = self.catalog().table(&table)?.engine();
-                    engine.delete_mark(&self.pool, rid, prev_deleter, prev_next_rid)?;
+                engine.delete(&self.pool, *rid)?;
+                for (ci, ix_file) in self.index_ops(table)? {
+                    let key = encode_key(&row[ci])?;
+                    BTree::at(ix_file).delete(&self.pool, &key, *rid)?;
                 }
-                Undo::Update { table, old_rid, new_rid, new_row, prev_deleter, prev_next_rid } => {
-                    let engine = self.catalog().table(&table)?.engine();
-                    if let Ok(record) = engine.get(&self.pool, new_rid) {
-                        self.free_lob_refs(&record);
-                    }
-                    engine.delete(&self.pool, new_rid)?;
-                    for (ci, ix_file) in self.index_ops(&table)? {
-                        let key = encode_key(&new_row[ci])?;
-                        BTree::at(ix_file).delete(&self.pool, &key, new_rid)?;
-                    }
-                    engine.delete_mark(&self.pool, old_rid, prev_deleter, prev_next_rid)?;
+            }
+            Undo::DeleteMark { table, rid, prev_deleter, prev_next_rid } => {
+                let engine = self.catalog().table(table)?.engine();
+                engine.delete_mark(&self.pool, *rid, *prev_deleter, *prev_next_rid)?;
+            }
+            Undo::Update { table, old_rid, new_rid, new_row, prev_deleter, prev_next_rid } => {
+                let engine = self.catalog().table(table)?.engine();
+                if let Ok(record) = engine.get(&self.pool, *new_rid) {
+                    self.free_lob_refs(&record);
                 }
+                engine.delete(&self.pool, *new_rid)?;
+                for (ci, ix_file) in self.index_ops(table)? {
+                    let key = encode_key(&new_row[ci])?;
+                    BTree::at(ix_file).delete(&self.pool, &key, *new_rid)?;
+                }
+                engine.delete_mark(&self.pool, *old_rid, *prev_deleter, *prev_next_rid)?;
             }
         }
         Ok(())
@@ -1057,7 +1065,9 @@ impl Database {
                 if Some(rid) == exclude {
                     continue;
                 }
-                let rec = engine.get(&self.pool, rid)?;
+                let Some(rec) = engine.try_get(&self.pool, rid)? else {
+                    continue; // stale index entry (row removed by a rollback)
+                };
                 let (creator, deleter, _) = decode_record(&rec, &self.lobs)?;
                 if !self.unique_key_taken(creator, deleter, trx.id) {
                     continue;
@@ -1087,7 +1097,9 @@ impl Database {
     fn chain_reaches(&self, engine: &dyn TableStorage, from: Rid, target: Rid) -> Result<bool> {
         let mut cur = from;
         for _ in 0..4096 {
-            let rec = engine.get(&self.pool, cur)?;
+            let Some(rec) = engine.try_get(&self.pool, cur)? else {
+                return Ok(false);
+            };
             let next = record_next_rid(&rec)?;
             if next == 0 {
                 return Ok(false);
@@ -1237,6 +1249,17 @@ impl Database {
             let next_rid = crate::storage::codec::pack_rid(new_rid.page_no, new_rid.slot);
             let (prev_deleter, prev_next_rid) =
                 engine.delete_mark(&self.pool, *rid, trx_id, next_rid)?;
+            // Record the undo before the index step: if an index insert fails,
+            // the transaction's rollback must still remove the new version and
+            // restore the old one, or both would stay live.
+            trx.undo.push(Undo::Update {
+                table: name.to_string(),
+                old_rid: *rid,
+                new_rid,
+                new_row: new_row.clone(),
+                prev_deleter,
+                prev_next_rid,
+            });
             crate::wal::encode_frame_into(
                 &mut trx.wal,
                 trx_id,
@@ -1246,14 +1269,6 @@ impl Database {
                 let key = encode_key(&new_row[*ci])?;
                 BTree::at(*ix_file).insert(&self.pool, &key, new_rid)?;
             }
-            trx.undo.push(Undo::Update {
-                table: name.to_string(),
-                old_rid: *rid,
-                new_rid,
-                new_row: new_row.clone(),
-                prev_deleter,
-                prev_next_rid,
-            });
         }
         Ok(())
     }

@@ -1837,7 +1837,10 @@ impl PhysicalOperator for IndexScan {
 
     fn next(&mut self, ctx: &mut ExecContext<'_>) -> Result<Option<Vec<Value>>> {
         while let Some(rid) = self.next_rid(&ctx.db.pool)? {
-            let record = self.engine.get(&ctx.db.pool, rid)?;
+            // a stale index entry may outlive its row (concurrent rollback)
+            let Some(record) = self.engine.try_get(&ctx.db.pool, rid)? else {
+                continue;
+            };
             let (creator, deleter, row) = decode_record(&record, ctx.db.lobs())?;
             if ctx.trx.visible(creator, deleter) {
                 return Ok(Some(row));
@@ -1852,7 +1855,9 @@ impl PhysicalOperator for IndexScan {
             let Some(rid) = self.next_rid(&ctx.db.pool)? else {
                 break;
             };
-            let record = self.engine.get(&ctx.db.pool, rid)?;
+            let Some(record) = self.engine.try_get(&ctx.db.pool, rid)? else {
+                continue;
+            };
             let (creator, deleter, row) = decode_record(&record, ctx.db.lobs())?;
             if ctx.trx.visible(creator, deleter) {
                 chunk.push_row(&row)?;
