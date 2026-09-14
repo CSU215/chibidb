@@ -309,7 +309,13 @@ Repeatable Read 行为一致。
   每条唯一，从而消除非唯一索引的重复串歧义——B-link 无需 `prev` 回溯。分隔键与 high-key 都携带
   rid；`search`/范围扫描用 sentinel rid（`(k,0)` / `(k,MAX)`）映射区间；删除不再需要多候选子节点。
   分裂点选择把 high-key 的 rid 字节计入容量；索引 magic 升到 `CHIDBITY`。不变量测试全绿。
-- **C3**（下一步）：插入改 top-down + latch coupling + 预分裂（这才是真正让并发写安全的机制）。
+- **C3｜并发插入** ✅（本提交）：插入改**顶向下**——下降时持父闩取子闩（嵌套 `with_page` 实现
+  crabbing），进入前对子节点**预分裂**，取消底向上回传分隔键；**根分裂**用页 0 当根锁；文件头记录
+  `max_key_len` 作内部节点预分裂预留；入口节点被并发分裂时**从根重试**；并在持闩后**自检本节点是否
+  还有空间**，避免"闩外预检"的竞态。索引 magic 升 `CHIDBIV`。并发压力测试（4 线程 × 2000 插入）
+  稳定通过，压 60 次无失败/挂起。
+  *注*：`prev` 链不再维护（读端已不用它，改为 B-link `next` 链校验）。**删除仍未并发化（C4）**。
+- **C4**（下一步）：删除/合并的并发化（redistribute/merge 走 right-link 协议）。
 - **C2**｜查找改 lock-fetch（right-link 右移）。验收：并发「读 + 插入」压力下结果与模型一致。
 - **C3**｜插入改 top-down + latch coupling + 预分裂。验收：`tests/index_model.rs` 的随机
   模型在**并发**插入/删除下与 `BTreeMap` 模型一致；无损坏。

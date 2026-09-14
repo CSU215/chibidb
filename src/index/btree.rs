@@ -13,11 +13,14 @@ use crate::storage::page::{zeroed_page, FileId, PageData, PageNo, PAGE_SIZE};
 use crate::storage::Rid;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"CHIDBITY";
+const MAGIC: [u8; 8] = *b"CHIDBIV";
 /// Root page number in the file header.
 const ROOT_OFF: usize = header::HEADER_LEN;
 /// First leaf page number in the file header.
 const FIRST_LEAF_OFF: usize = header::HEADER_LEN + 4;
+/// Longest encoded key inserted so far (u16), used to reserve separator space
+/// when pre-splitting internal nodes top-down.
+const MAX_KEY_OFF: usize = header::HEADER_LEN + 8;
 
 /// A composite index key: the encoded value and the row id that makes it unique.
 type Key = (Vec<u8>, Rid);
@@ -177,6 +180,7 @@ impl BTree {
             header::write_header(page, &MAGIC, FileKind::Index);
             u32_put(page, ROOT_OFF, 0); // root: empty tree
             u32_put(page, FIRST_LEAF_OFF, 0); // first leaf
+            u16_put(page, MAX_KEY_OFF, 0);
             Ok(())
         })?;
         Ok(Self { file })
@@ -209,6 +213,7 @@ impl BTree {
             header::write_header(page, &MAGIC, FileKind::Index);
             u32_put(page, ROOT_OFF, 0); // root: empty tree
             u32_put(page, FIRST_LEAF_OFF, 0); // first leaf
+            u16_put(page, MAX_KEY_OFF, 0);
             Ok(())
         })?;
         Ok(true)
@@ -233,6 +238,20 @@ impl BTree {
         })
     }
 
+    /// Longest encoded key inserted so far, for the internal pre-split reserve.
+    fn max_key_len(&self, bp: &BufferPool) -> Result<usize> {
+        bp.read_page(self.file, 0, |page| Ok(u16_get(page, MAX_KEY_OFF)))
+    }
+
+    fn note_key_len(&self, bp: &BufferPool, len: usize) -> Result<()> {
+        bp.with_page(self.file, 0, |page| {
+            if len > u16_get(page, MAX_KEY_OFF) {
+                u16_put(page, MAX_KEY_OFF, len);
+            }
+            Ok(())
+        })
+    }
+
     pub fn height(&self, bp: &BufferPool) -> Result<u32> {
         let mut no = self.root(bp)?;
         if no == 0 {
@@ -250,179 +269,94 @@ impl BTree {
     }
 
     pub fn insert(&self, bp: &BufferPool, key: &[u8], rid: Rid) -> Result<()> {
-        let root = self.root(bp)?;
-        if root == 0 {
-            let no = bp.alloc_page(self.file)?;
-            bp.with_page(self.file, no, |page| {
-                leaf_init(page, 0, 0);
+        self.note_key_len(bp, key.len())?;
+        loop {
+            // Read the reserve before taking any page latch: page 0 must never be
+            // acquired while a node latch is held (it is the root-split lock).
+            let maxk = self.max_key_len(bp)?;
+            let full = |p: &[u8]| {
+                if node_type(p) == LEAF {
+                    leaf_bytes_used(p) + leaf_entry_size(key.len()) > PAGE_SIZE
+                } else {
+                    internal_bytes_used(p) + internal_entry_size(maxk) > PAGE_SIZE
+                }
+            };
+            let root = self.root(bp)?;
+            if root == 0 {
+                // Create the first leaf; page 0's latch serializes the header.
+                bp.with_page(self.file, 0, |hdr| {
+                    if u32_get(hdr, ROOT_OFF) != 0 {
+                        return Ok(());
+                    }
+                    let no = bp.alloc_page(self.file)?;
+                    bp.with_page(self.file, no, |page| {
+                        leaf_init(page, 0, 0);
+                        Ok(())
+                    })?;
+                    u32_put(hdr, ROOT_OFF, no);
+                    u32_put(hdr, FIRST_LEAF_OFF, no);
+                    Ok(())
+                })?;
+                continue;
+            }
+            if !bp.read_page(self.file, root, |p| Ok(full(p)))? {
+                if !self.insert_descend(bp, root, key, rid, maxk)? {
+                    return Ok(());
+                }
+                // The entry node was split under us: re-read the root and retry,
+                // which goes through the pre-split descent.
+                continue;
+            }
+            // Split the root under page 0's latch so two threads cannot both
+            // grow the tree.
+            bp.with_page(self.file, 0, |hdr| {
+                let cur = u32_get(hdr, ROOT_OFF);
+                if bp.read_page(self.file, cur, |p| Ok(full(p)))? {
+                    let new_root = self.split_root(bp, cur)?;
+                    u32_put(hdr, ROOT_OFF, new_root);
+                }
                 Ok(())
             })?;
-            self.set_header_u32(bp, ROOT_OFF, no)?;
-            self.set_header_u32(bp, FIRST_LEAF_OFF, no)?;
-            return self.insert_leaf_entry(bp, no, key, rid).map(|_| ());
-        }
-        match self.insert_rec(bp, root, key, rid)? {
-            None => Ok(()),
-            Some((sep, sep_rid, new_child)) => {
-                let new_root = bp.alloc_page(self.file)?;
-                bp.with_page(self.file, new_root, |page| {
-                    internal_init(page, root);
-                    internal_insert_entry(page, 0, &sep, sep_rid, new_child)
-                })?;
-                self.set_header_u32(bp, ROOT_OFF, new_root)?;
-                Ok(())
-            }
         }
     }
 
-    fn insert_rec(
-        &self,
-        bp: &BufferPool,
-        page_no: PageNo,
-        key: &[u8],
-        rid: Rid,
-    ) -> Result<Option<Sep>> {
-        let ty = bp.read_page(self.file, page_no, |page| Ok(node_type(page)))?;
-        if ty == LEAF {
-            self.insert_leaf(bp, page_no, key, rid)
-        } else if ty == INTERNAL {
-            let child =
-                bp.read_page(self.file, page_no, |page| Ok(internal_child_for(page, key, rid)))?;
-            match self.insert_rec(bp, child, key, rid)? {
-                None => Ok(None),
-                Some((sep, sep_rid, new_child)) => {
-                    self.insert_separator(bp, page_no, child, sep, sep_rid, new_child)
-                }
-            }
-        } else {
-            Err(Error::Runtime(format!("corrupt index page {page_no}")))
-        }
-    }
-
-    fn insert_leaf_entry(
-        &self,
-        bp: &BufferPool,
-        page_no: PageNo,
-        key: &[u8],
-        rid: Rid,
-    ) -> Result<()> {
-        let idx = bp.read_page(self.file, page_no, |page| Ok(leaf_lower_bound(page, key, rid)))?;
-        bp.with_page(self.file, page_no, |page| match leaf_insert_at(page, idx, key, rid) {
-            Ok(()) => Ok(()),
-            // an empty leaf that cannot hold the key means it never will
-            Err(Error::PageFull) if leaf_num(page) == 0 => {
-                Err(Error::Runtime("index key too large".into()))
-            }
-            Err(e) => Err(e),
-        })
-    }
-
-    fn insert_leaf(
-        &self,
-        bp: &BufferPool,
-        page_no: PageNo,
-        key: &[u8],
-        rid: Rid,
-    ) -> Result<Option<Sep>> {
-        match self.insert_leaf_entry(bp, page_no, key, rid) {
-            Ok(()) => Ok(None),
-            Err(Error::PageFull) => {
-                let mut all: Vec<Key> =
-                    bp.read_page(self.file, page_no, |page| Ok(leaf_entries(page).collect()))?;
-                let pos = all.partition_point(|(k, r)| {
-                    crate::index::node::cmp_key(k, *r, key, rid) == std::cmp::Ordering::Less
-                });
-                all.insert(pos, (key.to_vec(), rid));
-
-                let old_prev = bp.read_page(self.file, page_no, |page| Ok(leaf_prev(page)))?;
-                let old_next = bp.read_page(self.file, page_no, |page| Ok(leaf_next(page)))?;
-                let old_hk = bp.read_page(self.file, page_no, |page| Ok(leaf_high_key(page)))?;
+    /// Splits the root into two halves under a new root; returns the new root.
+    fn split_root(&self, bp: &BufferPool, root: PageNo) -> Result<PageNo> {
+        let new_no = bp.alloc_page(self.file)?;
+        let (sep_key, sep_rid) = bp.with_page(self.file, root, |page| {
+            if node_type(page) == LEAF {
+                let all: Vec<Key> = leaf_entries(page).collect();
+                let old_hk = leaf_high_key(page);
                 let Some(m) = choose_leaf_split(&all, old_hk.as_ref()) else {
                     return Err(Error::Runtime("index entry too large to split".into()));
                 };
                 let sep = all[m].clone();
-                let new_no = bp.alloc_page(self.file)?;
-                // Build both halves in scratch first, so a page is never left
-                // partially rewritten if a half does not fit. The left half's
-                // B-link points at the new right half; the right half keeps the
-                // old sibling and high key.
-                let Some(left) = build_leaf(&all[..m], old_prev, new_no, Some(&sep)) else {
+                let old_next = leaf_next(page);
+                let Some(left) = build_leaf(&all[..m], 0, new_no, Some(&sep)) else {
                     return Err(Error::Runtime("index entry too large to split".into()));
                 };
-                let Some(right) = build_leaf(&all[m..], page_no, old_next, old_hk.as_ref()) else {
+                let Some(right) = build_leaf(&all[m..], root, old_next, old_hk.as_ref()) else {
                     return Err(Error::Runtime("index entry too large to split".into()));
                 };
-                write_image(bp, self.file, page_no, &left)?;
+                page.copy_from_slice(&left[..]);
                 write_image(bp, self.file, new_no, &right)?;
-                if old_next != 0 {
-                    bp.with_page(self.file, old_next, |page| {
-                        crate::index::node::leaf_set_prev(page, new_no);
-                        Ok(())
-                    })?;
-                }
-                Ok(Some((sep.0, sep.1, new_no)))
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn insert_separator(
-        &self,
-        bp: &BufferPool,
-        page_no: PageNo,
-        child: PageNo,
-        sep: Vec<u8>,
-        sep_rid: Rid,
-        new_child: PageNo,
-    ) -> Result<Option<Sep>> {
-        let idx = bp.read_page(self.file, page_no, |page| {
-            if child == internal_first_child(page) {
-                return Ok(0usize);
-            }
-            for (i, (_, _, c)) in internal_entries(page).enumerate() {
-                if c == child {
-                    return Ok(i + 1);
-                }
-            }
-            Err(Error::Runtime(format!("corrupt index: child {child} not found")))
-        })?;
-        let inserted = bp.with_page(self.file, page_no, |page| {
-            match internal_insert_entry(page, idx, &sep, sep_rid, new_child) {
-                Ok(()) => Ok(()),
-                Err(Error::PageFull) if internal_num(page) == 0 => {
-                    Err(Error::Runtime("index key too large".into()))
-                }
-                Err(e) => Err(e),
-            }
-        });
-        match inserted {
-            Ok(()) => Ok(None),
-            Err(Error::PageFull) => {
-                let mut keys: Vec<Key> = bp.read_page(self.file, page_no, |page| {
-                    Ok(internal_entries(page).map(|(k, r, _)| (k, r)).collect())
-                })?;
-                let mut children: Vec<PageNo> = bp.read_page(self.file, page_no, |page| {
-                    let mut v = vec![internal_first_child(page)];
-                    v.extend(internal_entries(page).map(|(_, _, c)| c));
-                    Ok(v)
-                })?;
-                keys.insert(idx, (sep, sep_rid));
-                children.insert(idx + 1, new_child);
-
-                let k = keys.len();
-                let old_hk = bp.read_page(self.file, page_no, |page| Ok(internal_high_key(page)))?;
-                let old_next = bp.read_page(self.file, page_no, |page| Ok(internal_next(page)))?;
+                Ok((sep.0, sep.1))
+            } else {
+                let first = internal_first_child(page);
+                let keys: Vec<Key> = internal_entries(page).map(|(k, r, _)| (k, r)).collect();
+                let mut children = vec![first];
+                children.extend(internal_entries(page).map(|(_, _, c)| c));
+                let old_hk = internal_high_key(page);
+                let old_next = internal_next(page);
                 let Some(m) = choose_internal_split(&keys, old_hk.as_ref()) else {
                     return Err(Error::Runtime("index entry too large to split".into()));
                 };
                 let promoted = keys[m].clone();
-                let new_no = bp.alloc_page(self.file)?;
-                // Build both halves in scratch, then swap them in: the left
-                // half links to the new right half, which keeps the old sibling.
                 let left_entries: Vec<Sep> =
                     (0..m).map(|i| (keys[i].0.clone(), keys[i].1, children[i + 1])).collect();
-                let right_entries: Vec<Sep> =
-                    ((m + 1)..k).map(|i| (keys[i].0.clone(), keys[i].1, children[i + 1])).collect();
+                let right_entries: Vec<Sep> = ((m + 1)..keys.len())
+                    .map(|i| (keys[i].0.clone(), keys[i].1, children[i + 1]))
+                    .collect();
                 let Some(left) = build_internal(children[0], &left_entries, new_no, Some(&promoted))
                 else {
                     return Err(Error::Runtime("index entry too large to split".into()));
@@ -432,12 +366,179 @@ impl BTree {
                 else {
                     return Err(Error::Runtime("index entry too large to split".into()));
                 };
-                write_image(bp, self.file, page_no, &left)?;
+                page.copy_from_slice(&left[..]);
                 write_image(bp, self.file, new_no, &right)?;
-                Ok(Some((promoted.0, promoted.1, new_no)))
+                Ok((promoted.0, promoted.1))
             }
-            Err(e) => Err(e),
-        }
+        })?;
+        let new_root = bp.alloc_page(self.file)?;
+        bp.with_page(self.file, new_root, |page| {
+            internal_init(page, root);
+            internal_insert_entry(page, 0, &sep_key, sep_rid, new_no)
+        })?;
+        Ok(new_root)
+    }
+
+    /// Top-down insert: descends with latch coupling (the parent latch is held
+    /// while the child is latched) and pre-splits any child that could not take
+    /// another entry, so no split ever propagates upward.
+    /// Returns `true` when the entry node was split by someone else and the
+    /// insert must restart from the root.
+    fn insert_descend(
+        &self,
+        bp: &BufferPool,
+        page_no: PageNo,
+        key: &[u8],
+        rid: Rid,
+        maxk: usize,
+    ) -> Result<bool> {
+        bp.with_page(self.file, page_no, |page| {
+            let ty = node_type(page);
+            // B-link: a concurrent split may have moved the key into a right
+            // sibling that did not exist when we read our parent.
+            let (hk, next) = if ty == LEAF {
+                (leaf_high_key(page), leaf_next(page))
+            } else {
+                (internal_high_key(page), internal_next(page))
+            };
+            if let Some((hk_key, hk_rid)) = hk
+                && crate::index::node::cmp_key(key, rid, &hk_key, hk_rid)
+                    != std::cmp::Ordering::Less
+            {
+                if next == 0 {
+                    return Err(Error::Runtime(
+                        "corrupt index: bounded node without a right link".into(),
+                    ));
+                }
+                return Ok(true);
+            }
+            // Self-check under the latch: between the parent's pre-split check
+            // and our acquiring the latch, a concurrent insert may have filled
+            // this node. Restart so the root pre-split / parent pre-split runs.
+            let self_full = if ty == LEAF {
+                leaf_bytes_used(page) + leaf_entry_size(key.len()) > PAGE_SIZE
+            } else {
+                internal_bytes_used(page) + internal_entry_size(maxk) > PAGE_SIZE
+            };
+            if self_full {
+                return Ok(true);
+            }
+            if ty == LEAF {
+                let idx = leaf_lower_bound(page, key, rid);
+                leaf_insert_at(page, idx, key, rid)?;
+                return Ok(false);
+            }
+            if ty != INTERNAL {
+                return Err(Error::Runtime(format!("corrupt index page {page_no}")));
+            }
+            let mut child = internal_child_for(page, key, rid);
+            let overflow = bp.read_page(self.file, child, |c| {
+                Ok(if node_type(c) == LEAF {
+                    leaf_bytes_used(c) + leaf_entry_size(key.len()) > PAGE_SIZE
+                } else {
+                    internal_bytes_used(c) + internal_entry_size(maxk) > PAGE_SIZE
+                })
+            })?;
+            if overflow {
+                let (descend, placed) = self.split_child(bp, page, child, key, rid)?;
+                if placed {
+                    return Ok(false);
+                }
+                child = descend;
+            }
+            // Recurse while still holding the parent latch (crabbing).
+            self.insert_descend(bp, child, key, rid, maxk)
+        })
+    }
+
+    /// Splits `child` and inserts the promoted separator into `parent` (held and
+    /// roomy). Returns the half to descend into and whether the new entry is
+    /// already placed (leaf split) or still has to be inserted (internal split).
+    fn split_child(
+        &self,
+        bp: &BufferPool,
+        parent: &mut [u8; PAGE_SIZE],
+        child: PageNo,
+        key: &[u8],
+        rid: Rid,
+    ) -> Result<(PageNo, bool)> {
+        let new_no = bp.alloc_page(self.file)?;
+        let (sep_key, sep_rid, descend, placed) = bp.with_page(self.file, child, |c| {
+            if node_type(c) == LEAF {
+                let mut all: Vec<Key> = leaf_entries(c).collect();
+                let pos = all.partition_point(|(k, r)| {
+                    crate::index::node::cmp_key(k, *r, key, rid) == std::cmp::Ordering::Less
+                });
+                all.insert(pos, (key.to_vec(), rid));
+                let old_hk = leaf_high_key(c);
+                let Some(m) = choose_leaf_split(&all, old_hk.as_ref()) else {
+                    return Err(Error::Runtime("index entry too large to split".into()));
+                };
+                let sep = all[m].clone();
+                let old_next = leaf_next(c);
+                let Some(left) = build_leaf(&all[..m], leaf_prev(c), new_no, Some(&sep)) else {
+                    return Err(Error::Runtime("index entry too large to split".into()));
+                };
+                let Some(right) = build_leaf(&all[m..], child, old_next, old_hk.as_ref()) else {
+                    return Err(Error::Runtime("index entry too large to split".into()));
+                };
+                c.copy_from_slice(&left[..]);
+                write_image(bp, self.file, new_no, &right)?;
+                let descend = if crate::index::node::cmp_key(key, rid, &sep.0, sep.1)
+                    == std::cmp::Ordering::Less
+                {
+                    child
+                } else {
+                    new_no
+                };
+                Ok((sep.0, sep.1, descend, true))
+            } else {
+                let first = internal_first_child(c);
+                let keys: Vec<Key> = internal_entries(c).map(|(k, r, _)| (k, r)).collect();
+                let mut children = vec![first];
+                children.extend(internal_entries(c).map(|(_, _, ch)| ch));
+                let old_hk = internal_high_key(c);
+                let old_next = internal_next(c);
+                let Some(m) = choose_internal_split(&keys, old_hk.as_ref()) else {
+                    return Err(Error::Runtime("index entry too large to split".into()));
+                };
+                let promoted = keys[m].clone();
+                let left_entries: Vec<Sep> =
+                    (0..m).map(|i| (keys[i].0.clone(), keys[i].1, children[i + 1])).collect();
+                let right_entries: Vec<Sep> = ((m + 1)..keys.len())
+                    .map(|i| (keys[i].0.clone(), keys[i].1, children[i + 1]))
+                    .collect();
+                let Some(left) = build_internal(children[0], &left_entries, new_no, Some(&promoted))
+                else {
+                    return Err(Error::Runtime("index entry too large to split".into()));
+                };
+                let Some(right) =
+                    build_internal(children[m + 1], &right_entries, old_next, old_hk.as_ref())
+                else {
+                    return Err(Error::Runtime("index entry too large to split".into()));
+                };
+                c.copy_from_slice(&left[..]);
+                write_image(bp, self.file, new_no, &right)?;
+                let descend = if crate::index::node::cmp_key(key, rid, &promoted.0, promoted.1)
+                    == std::cmp::Ordering::Less
+                {
+                    child
+                } else {
+                    new_no
+                };
+                Ok((promoted.0, promoted.1, descend, false))
+            }
+        })?;
+        let idx = if child == internal_first_child(parent) {
+            0
+        } else {
+            internal_entries(parent)
+                .position(|(_, _, c)| c == child)
+                .map(|i| i + 1)
+                .ok_or_else(|| Error::Runtime("corrupt index: child not found".into()))?
+        };
+        internal_insert_entry(parent, idx, &sep_key, sep_rid, new_no)?;
+        Ok((descend, placed))
     }
 
     pub fn scan_range(
@@ -1130,8 +1231,8 @@ impl BTree {
 
     /// Walks the whole tree checking the B-link invariants: leaves are sorted,
     /// each internal separator equals its child's minimum, every node's keys are
-    /// `< high_key`, the rightmost sibling has no high key, and the leaf chain
-    /// matches the tree. Used by the randomized model test.
+    /// `< high_key`, the rightmost sibling has no high key, and the B-link leaf
+    /// chain matches the tree. Used by the randomized model test.
     pub fn check_invariants(&self, bp: &BufferPool) -> Result<()> {
         let root = self.root(bp)?;
         if root == 0 {
@@ -1140,19 +1241,13 @@ impl BTree {
         let mut leaves = Vec::new();
         self.check_subtree(bp, root, &mut leaves)?;
 
-        // the leaf chain must visit exactly the leaves the tree reaches, in order
+        // the right-link chain must visit exactly the leaves the tree reaches
         let first = self.header_u32(bp, FIRST_LEAF_OFF)?;
         let mut chain = Vec::new();
         let mut cur = first;
-        let mut prev = 0;
         while cur != 0 {
-            let (p, n) = bp.read_page(self.file, cur, |pg| Ok((leaf_prev(pg), leaf_next(pg))))?;
-            if p != prev {
-                return Err(Error::Runtime(format!("leaf {cur} prev {p} != {prev}")));
-            }
             chain.push(cur);
-            prev = cur;
-            cur = n;
+            cur = bp.read_page(self.file, cur, |pg| Ok(leaf_next(pg)))?;
         }
         if chain != leaves {
             return Err(Error::Runtime("leaf chain does not match the tree".into()));
@@ -1293,6 +1388,14 @@ fn u32_get(page: &[u8], off: usize) -> PageNo {
 
 fn u32_put(page: &mut [u8], off: usize, v: PageNo) {
     page[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn u16_get(page: &[u8], off: usize) -> usize {
+    u16::from_le_bytes([page[off], page[off + 1]]) as usize
+}
+
+fn u16_put(page: &mut [u8], off: usize, v: usize) {
+    page[off..off + 2].copy_from_slice(&(v as u16).to_le_bytes());
 }
 
 fn leaf_entry(page: &[u8], i: usize) -> (Vec<u8>, Rid) {

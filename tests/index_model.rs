@@ -194,6 +194,49 @@ fn b_link_invariants_survive_random_splits_and_merges() {
 }
 
 #[test]
+fn concurrent_inserts_stay_consistent() {
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = setup(&dir);
+    BTree::init(&bp, f).unwrap();
+    let bp = Arc::new(bp);
+
+    const THREADS: usize = 4;
+    const PER: usize = 2000;
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let bp = Arc::clone(&bp);
+            std::thread::spawn(move || {
+                let tree = BTree::at(f);
+                for i in 0..PER {
+                    let key = format!("k{:08}", t * PER + i).into_bytes();
+                    tree.insert(&bp, &key, Rid::new(t as u32, i as u16)).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let tree = BTree::at(f);
+    tree.check_invariants(&bp).unwrap();
+    for t in 0..THREADS {
+        for i in 0..PER {
+            let key = format!("k{:08}", t * PER + i).into_bytes();
+            assert_eq!(
+                tree.search(&bp, &key).unwrap(),
+                vec![Rid::new(t as u32, i as u16)],
+                "missing {key:?}"
+            );
+        }
+    }
+    let all = tree.scan_range(&bp, Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert_eq!(all.len(), THREADS * PER);
+}
+
+#[test]
 fn oversized_key_is_rejected_without_corruption() {
     let dir = tempfile::tempdir().unwrap();
     let (bp, f) = setup(&dir);
