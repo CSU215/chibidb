@@ -39,6 +39,8 @@ fn transaction_isolation_parses() {
     assert_eq!(c.transaction.isolation, Isolation::RepeatableRead);
     let c = Config::from_toml_str("[transaction]\nisolation = \"read_committed\"\n").unwrap();
     assert_eq!(c.transaction.isolation, Isolation::ReadCommitted);
+    let c = Config::from_toml_str("[transaction]\nisolation = \"serializable\"\n").unwrap();
+    assert_eq!(c.transaction.isolation, Isolation::Serializable);
 }
 
 #[test]

@@ -67,8 +67,9 @@ mode = "chunk"
 enabled = false
 
 [transaction]
-# 隔离级别：read_committed（默认，每条语句取新快照，冲突后 EPQ 重读最新版本）或
-# repeatable_read（事务内固定快照，写写冲突报 40001）。
+# 隔离级别：read_committed（默认，每条语句取新快照，冲突后 EPQ 重读最新版本）、
+# repeatable_read（事务内固定快照，写写冲突报 40001）或
+# serializable（固定快照 + SSI 读写依赖跟踪，检测到环则报 40001）。
 isolation = "read_committed"
 
 # 写写冲突策略：fcw（先提交者胜，乐观，默认）或 2pl（悲观两阶段锁）。

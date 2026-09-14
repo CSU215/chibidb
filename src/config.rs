@@ -63,6 +63,9 @@ pub enum Isolation {
     /// The transaction sees one stable snapshot; a conflicting writer gets a
     /// serialization failure (SQLSTATE 40001).
     RepeatableRead,
+    /// Snapshot isolation plus SSI conflict tracking: a transaction that would
+    /// close a cycle of read/write dependencies is aborted (SQLSTATE 40001).
+    Serializable,
 }
 
 /// How accepted connections are mapped to execution threads.

@@ -269,6 +269,7 @@ pub(crate) fn execute_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) 
 }
 
 fn apply_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<()> {
+    db.note_read(trx.id, &u.table);
     let schema = db.catalog().table(&u.table)?.schema.clone();
     let mut assigns = Vec::new();
     for (col, expr) in &u.assignments {
@@ -311,6 +312,7 @@ pub(crate) fn execute_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) 
 }
 
 fn apply_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<()> {
+    db.note_read(trx.id, &d.table);
     let schema = db.catalog().table(&d.table)?.schema.clone();
     let records = db.store_scan_raw(&d.table)?;
     let mut victims = Vec::new();

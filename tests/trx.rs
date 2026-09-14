@@ -15,6 +15,12 @@ fn repeatable_read_config() -> Config {
     cfg
 }
 
+fn serializable_config() -> Config {
+    let mut cfg = Config::default();
+    cfg.transaction.isolation = Isolation::Serializable;
+    cfg
+}
+
 fn setup(db: &Database, session: &mut Session) {
     db.execute_sql_with(session, "create table t (id int, name char(8));")
         .unwrap();
@@ -457,5 +463,70 @@ fn failed_statement_preserves_earlier_transaction_work() {
     // a statement-level failure must not roll back the earlier insert
     db.execute_sql_with(&mut s, "commit;").unwrap();
     assert_eq!(rows(&db, &mut s, "select id from t;"), [[Value::Int(1)]]);
+}
+
+#[test]
+fn serializable_rejects_write_skew() {
+    let db = Database::open_in_memory_with_config(&serializable_config()).unwrap();
+    let mut a = Session::new();
+    let mut b = Session::new();
+    db.execute_sql_with(&mut a, "create table t (id int, on_call int);").unwrap();
+    db.execute_sql_with(&mut a, "insert into t values (1, 1), (2, 1);").unwrap();
+
+    // each transaction reads the whole table (both doctors on call), then takes
+    // a different doctor off call: a classic write skew.
+    db.execute_sql_with(&mut a, "begin;").unwrap();
+    db.execute_sql_with(&mut a, "select count(*) from t where on_call = 1;").unwrap();
+    db.execute_sql_with(&mut a, "update t set on_call = 0 where id = 1;").unwrap();
+
+    db.execute_sql_with(&mut b, "begin;").unwrap();
+    db.execute_sql_with(&mut b, "select count(*) from t where on_call = 1;").unwrap();
+    db.execute_sql_with(&mut b, "update t set on_call = 0 where id = 2;").unwrap();
+
+    // the first committer closes the rw cycle and is rejected
+    let a_err = db.execute_sql_with(&mut a, "commit;").unwrap_err();
+    assert!(a_err.to_string().contains("serialize"), "{a_err}");
+    // the other transaction survives, so one doctor stays on call
+    db.execute_sql_with(&mut b, "commit;").unwrap();
+    assert_eq!(
+        rows(&db, &mut b, "select count(*) from t where on_call = 1;"),
+        [[Value::Int(1)]]
+    );
+}
+
+#[test]
+fn serializable_allows_a_read_only_and_a_writer() {
+    let db = Database::open_in_memory_with_config(&serializable_config()).unwrap();
+    let mut reader = Session::new();
+    let mut writer = Session::new();
+    db.execute_sql_with(&mut reader, "create table t (id int);").unwrap();
+    db.execute_sql_with(&mut reader, "insert into t values (1);").unwrap();
+
+    // reader holds a snapshot and has read t, but writes nothing
+    db.execute_sql_with(&mut reader, "begin;").unwrap();
+    assert_eq!(rows(&db, &mut reader, "select count(*) from t;"), [[Value::Int(1)]]);
+
+    db.execute_sql_with(&mut writer, "insert into t values (2);").unwrap();
+
+    // a read does not conflict with a concurrent writer on its own
+    db.execute_sql_with(&mut reader, "commit;").unwrap();
+}
+
+#[test]
+fn serializable_keeps_independent_transactions() {
+    let db = Database::open_in_memory_with_config(&serializable_config()).unwrap();
+    let mut a = Session::new();
+    let mut b = Session::new();
+    setup(&db, &mut a);
+    db.execute_sql_with(&mut a, "insert into t values (1, 'x'), (2, 'y');").unwrap();
+
+    // touching different tables leaves the dependency graph acyclic
+    db.execute_sql_with(&mut a, "create table u (id int);").unwrap();
+    db.execute_sql_with(&mut a, "begin;").unwrap();
+    db.execute_sql_with(&mut a, "update t set name = 'a' where id = 1;").unwrap();
+    db.execute_sql_with(&mut b, "begin;").unwrap();
+    db.execute_sql_with(&mut b, "insert into u values (1);").unwrap();
+    db.execute_sql_with(&mut a, "commit;").unwrap();
+    db.execute_sql_with(&mut b, "commit;").unwrap();
 }
 

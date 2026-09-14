@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::RwLock;
 
 use crate::db::clog::CommitStatus;
+use crate::db::ssi::Ssi;
 
 /// A PostgreSQL-style snapshot: an upper bound plus the in-flight xids.
 #[derive(Debug, Clone)]
@@ -31,12 +32,21 @@ pub struct TransactionManager {
     commits: AtomicU64,
     committed: Arc<CommitStatus>,
     open: RwLock<HashSet<u64>>,
+    /// Serializable conflict tracking; only consulted at serializable.
+    ssi: Ssi,
+    serializable: bool,
 }
 
 impl TransactionManager {
     /// Resumes from a recovered state: the next free id, the committed ids at
-    /// or above the persisted horizon, and that horizon.
-    pub fn new(next_id: u64, committed: impl IntoIterator<Item = u64>, base: u64) -> Self {
+    /// or above the persisted horizon, that horizon, and whether the instance
+    /// runs at the serializable isolation level.
+    pub fn new(
+        next_id: u64,
+        committed: impl IntoIterator<Item = u64>,
+        base: u64,
+        serializable: bool,
+    ) -> Self {
         let status = CommitStatus::new();
         status.advance_base(base);
         for id in committed {
@@ -47,7 +57,28 @@ impl TransactionManager {
             commits: AtomicU64::new(0),
             committed: Arc::new(status),
             open: RwLock::new(HashSet::new()),
+            ssi: Ssi::new(),
+            serializable,
         }
+    }
+
+    /// Records that `id` read `table` (serializable only).
+    pub fn note_read(&self, id: u64, table: &str) {
+        if self.serializable {
+            self.ssi.note_read(id, table);
+        }
+    }
+
+    /// Records that `id` wrote `table` (serializable only).
+    pub fn note_write(&self, id: u64, table: &str) {
+        if self.serializable {
+            self.ssi.note_write(id, table);
+        }
+    }
+
+    /// Whether `id` sits on a cycle of rw-antidependencies and must abort.
+    pub fn ssi_conflict(&self, id: u64) -> bool {
+        self.serializable && self.ssi.has_cycle_through(id)
     }
 
     /// Reserves the next transaction id.
@@ -59,9 +90,15 @@ impl TransactionManager {
     /// `allocate` + `insert_open` leaves a window where a transaction owns an
     /// id but is invisible to a checkpoint's no-open check.
     pub fn begin_open(&self) -> u64 {
-        let mut open = self.open.write();
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        open.insert(id);
+        let id = {
+            let mut open = self.open.write();
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            open.insert(id);
+            id
+        };
+        if self.serializable {
+            self.ssi.begin(id);
+        }
         id
     }
 
@@ -117,10 +154,16 @@ impl TransactionManager {
 
     pub fn insert_open(&self, id: u64) {
         self.open.write().insert(id);
+        if self.serializable {
+            self.ssi.begin(id);
+        }
     }
 
     pub fn remove_open(&self, id: u64) {
         self.open.write().remove(&id);
+        if self.serializable {
+            self.ssi.abort(id);
+        }
     }
 
     /// Records a commit and clears the open marker.
@@ -130,6 +173,9 @@ impl TransactionManager {
         self.commits.fetch_add(1, Ordering::SeqCst);
         self.committed.mark_committed(id);
         self.open.write().remove(&id);
+        if self.serializable {
+            self.ssi.commit(id);
+        }
     }
 
     pub fn extend_committed(&self, ids: impl IntoIterator<Item = u64>) {
@@ -165,7 +211,7 @@ mod tests {
 
     #[test]
     fn commit_moves_a_transaction_into_the_snapshot() {
-        let tm = TransactionManager::new(1, [], 0);
+        let tm = TransactionManager::new(1, [], 0, false);
         let a = tm.allocate();
         let b = tm.allocate();
         assert!(b > a);
@@ -187,7 +233,7 @@ mod tests {
 
     #[test]
     fn begin_open_registers_the_id_before_any_work_starts() {
-        let tm = TransactionManager::new(1, [], 0);
+        let tm = TransactionManager::new(1, [], 0, false);
         let id = tm.begin_open();
         assert!(!tm.no_open_transactions(), "begin_open marks the id open");
         assert_eq!(tm.committed_count(), 0);
@@ -198,7 +244,7 @@ mod tests {
 
     #[test]
     fn with_open_set_excludes_a_concurrent_begin() {
-        let tm = TransactionManager::new(1, [], 0);
+        let tm = TransactionManager::new(1, [], 0, false);
         tm.begin_open();
         let seen = tm.with_open_set(|open| open.len());
         assert_eq!(seen, 1);
@@ -207,14 +253,14 @@ mod tests {
 
     #[test]
     fn ensure_next_id_never_reuses_a_recovered_id() {
-        let tm = TransactionManager::new(1, [], 0);
+        let tm = TransactionManager::new(1, [], 0, false);
         tm.ensure_next_id_at_least(10);
         assert!(tm.allocate() > 10);
     }
 
     #[test]
     fn has_open_excluding_ignores_the_caller() {
-        let tm = TransactionManager::new(1, [], 0);
+        let tm = TransactionManager::new(1, [], 0, false);
         tm.insert_open(1);
         assert!(!tm.has_open_excluding(1));
         tm.insert_open(2);
@@ -223,7 +269,7 @@ mod tests {
 
     #[test]
     fn recovered_committed_ids_are_visible_to_a_new_snapshot() {
-        let tm = TransactionManager::new(7, [3, 5], 0);
+        let tm = TransactionManager::new(7, [3, 5], 0, false);
         assert!(tm.is_committed(3));
         assert!(tm.is_committed(5));
         assert!(!tm.is_committed(4));

@@ -172,6 +172,8 @@ impl PhysicalOperator for TableScan {
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
+        // serializable conflict tracking: this transaction reads the table
+        ctx.db.note_read(ctx.trx.id, &self.table);
         let engine = ctx.db.catalog().table(&self.table)?.engine();
         self.scanner = Some(match &self.keep {
             // A columnar table can skip the columns the query never reads.
@@ -263,6 +265,7 @@ impl PhysicalOperator for TableScan {
         cols: &[usize],
         sink: &mut ProjectedSink<'_>,
     ) -> Result<Option<bool>> {
+        ctx.db.note_read(ctx.trx.id, &self.table);
         let engine = ctx.db.catalog().table(&self.table)?.engine();
         // The engine scans pages in place; filter to visible versions here.
         let mut sink = VisibleSink { trx: &*ctx.trx, sink };
@@ -1733,6 +1736,7 @@ impl PhysicalOperator for Union {
 
 /// Index scan: fetches exactly the row ids the access path selected.
 pub struct IndexScan {
+    table: String,
     schema: Schema,
     engine: std::sync::Arc<dyn crate::storage::engine::TableStorage>,
     column: String,
@@ -1789,7 +1793,15 @@ impl IndexScan {
                 .map(|c| ColumnDesc::plain(Some(owner.clone()), c.name, c.dtype))
                 .collect(),
         };
-        Ok(Self { schema, engine, column, rids: Vec::new(), cursor: None, pos: 0 })
+        Ok(Self {
+            table: table.to_string(),
+            schema,
+            engine,
+            column,
+            rids: Vec::new(),
+            cursor: None,
+            pos: 0,
+        })
     }
 
     /// The indexed column, which the scan yields in ascending order.
@@ -1817,7 +1829,8 @@ impl PhysicalOperator for IndexScan {
         &self.schema
     }
 
-    fn open(&mut self, _ctx: &mut ExecContext<'_>) -> Result<()> {
+    fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
+        ctx.db.note_read(ctx.trx.id, &self.table);
         self.pos = 0;
         Ok(())
     }

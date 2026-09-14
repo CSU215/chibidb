@@ -268,7 +268,12 @@ impl Database {
             data_dir: path.to_path_buf(),
             next_table_file: AtomicU32::new(next_table_file),
             next_index_file: AtomicU32::new(next_index_file),
-            trx: TransactionManager::new(next_trx_id, committed_trxs, clog_base),
+            trx: TransactionManager::new(
+                next_trx_id,
+                committed_trxs,
+                clog_base,
+                config.transaction.isolation == Isolation::Serializable,
+            ),
             wal_checkpoint_threshold: AtomicU64::new(config.wal.checkpoint_threshold),
             conflict: config.transaction.conflict,
             writer: Arc::new(DatabaseWriteLock::new(config.transaction.lock_timeout_ms)),
@@ -309,6 +314,17 @@ impl Database {
     /// committed to give each statement its own view (and by EPQ restarts).
     pub(crate) fn current_snapshot(&self) -> crate::db::transaction::Snapshot {
         self.trx.snapshot()
+    }
+
+    /// Records that transaction `id` read `table` (serializable conflict
+    /// tracking; a no-op at other isolation levels).
+    pub(crate) fn note_read(&self, id: u64, table: &str) {
+        self.trx.note_read(id, table);
+    }
+
+    /// Records that transaction `id` wrote `table`.
+    pub(crate) fn note_write(&self, id: u64, table: &str) {
+        self.trx.note_write(id, table);
     }
 
     /// Buffer-pool lookup counters, for observability and cache-behavior tests.
@@ -489,6 +505,11 @@ impl Database {
     /// any commit record is written.
     fn commit_trx(&self, trx: &TrxState, wrote: bool) -> Result<()> {
         let trx_id = trx.id;
+        // Serializable: abort a transaction that would close a cycle of
+        // rw-antidependencies. Checked before the graph is dropped for this id.
+        if self.trx.ssi_conflict(trx_id) {
+            return Err(serialization_error());
+        }
         if wrote && self.conflict == ConflictStrategy::Fcw {
             self.check_conflicts(trx)?;
         }
@@ -1090,6 +1111,9 @@ impl Database {
         if checks.is_empty() {
             return Ok(());
         }
+        // the uniqueness check reads the index: a concurrent writer of the same
+        // table is an rw-antidependency under serializable.
+        self.note_read(trx.id, table);
         for (ci, ix_file, column) in checks {
             if matches!(row[ci], Value::Null) {
                 continue; // UNIQUE permits multiple NULLs
@@ -1125,6 +1149,7 @@ impl Database {
             (t.heap.file_no, t.engine())
         };
         let creator = trx.id;
+        self.note_write(creator, name);
         let data = encode_record(creator, 0, 0, &row, &self.lobs, self.inline_lob_limit())?;
         let rid = engine.insert(&self.pool, &data)?;
         // Record the undo as soon as the row exists so that a later failure in
@@ -1156,6 +1181,7 @@ impl Database {
             (t.heap.file_no, t.engine())
         };
         let deleter = trx.id;
+        self.note_write(deleter, name);
         for rid in rids {
             // serialize writers of the same row; different rows proceed
             self.locks.lock(deleter, name, *rid)?;
@@ -1197,6 +1223,7 @@ impl Database {
             (t.heap.file_no, t.engine())
         };
         let trx_id = trx.id;
+        self.note_write(trx_id, name);
         let ops = self.index_ops(name)?;
         for (rid, new_row) in updates {
             // serialize writers of the same row; different rows proceed
@@ -1279,6 +1306,14 @@ pub(crate) fn conflict_error(table: &str) -> Error {
     Error::Runtime(format!(
         "could not serialize access due to concurrent update on {table}"
     ))
+}
+
+/// A serializable-isolation conflict (`SQLSTATE 40001`): committing this
+/// transaction would close a cycle of read/write dependencies.
+pub(crate) fn serialization_error() -> Error {
+    Error::Runtime(
+        "could not serialize access due to read/write dependencies among transactions".into(),
+    )
 }
 
 /// Drives one operator tree to completion, appending rows to `out`.

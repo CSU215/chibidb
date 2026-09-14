@@ -243,8 +243,18 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
     全量 611 项测试绿。
 - **Step 5｜RR / SI**：事务级快照固定；冲突报 40001（不再 FCW）。撤掉 Instance 的整库写独占。
   验收：丢更新回滚、可重复读、并发吞吐随线程上升。
-- **Step 6｜Serializable（SSI）**：跟踪 rw-依赖并检测危险结构，命中报 40001。
-  验收：写偏斜用例按 Serializable 被拒、按 RR 通过。
+- **Step 6｜Serializable（SSI）** ✅：新增 `isolation = "serializable"`（= 固定快照 + SSI 冲突跟踪）。
+  - 新增 `src/db/ssi.rs`：维护 rw-反依赖 `R→W`（R 读了 W 写的表）。快照隔离下的异常必然对应一条
+    环，故提交时用 DFS 检测"经过本事务的环"，命中即报 40001（`serialization_error`）。
+  - **读按表粒度跟踪**（保守谓词锁）：读某表即登记，写同表即连边，因此能捕获幻读；代价是会否决部分
+    本来可串行化的调度。**只有 serializable 事务参与**，与其他隔离级混用时不保证全局可串行（同 PG）。
+  - 生命周期挂在 `TransactionManager` 上：`begin_open`→`ssi.begin`，`commit`→`ssi.commit`（**保留其边**，
+    直到无 serializable 事务为止，以便后来者仍能发现经过它的环），`remove_open`→`ssi.abort`（**清掉触及它
+    的边**，否则被中止的事务会连累幸存者）。读钩子：`TableScan::open`/`for_each_projected_row`、`IndexScan::open`、
+    `apply_update`/`apply_delete`、`check_unique`；写钩子：`store_insert`/`store_delete_mark`/`store_update_versions`。
+  - 验收：`serializable_rejects_write_skew`（写偏斜被拒、幸存者提交且保持不变量）、
+    `serializable_allows_a_read_only_and_a_writer`、`serializable_keeps_independent_transactions`，
+    `ssi.rs` 内 5 个单测；全量 619 项测试绿。
 - **Step 7a｜xid64** ✅：事务 id 全面由 `u32` 升到 `u64`，消除 2³² 悬崖。记录版本头
   `(creator, deleter)` 由 8 字节升到 16 字节（`codec::RECORD_HEADER`）；WAL 帧头
   `[len u32][type u8][trx_id u64]`；catalog `next_trx_id`/`committed_trxs`、clog 位图、
