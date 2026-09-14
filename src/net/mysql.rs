@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use tokio::net::TcpListener;
 
+use crate::config::Isolation;
 use crate::result::ResultSet;
 use crate::server::SharedInstance;
 use crate::trx::Session;
@@ -53,6 +54,7 @@ const MYSQL_TYPE_FLOAT: u8 = 4;
 const MYSQL_TYPE_DOUBLE: u8 = 5;
 const MYSQL_TYPE_NULL: u8 = 6;
 const MYSQL_TYPE_LONGLONG: u8 = 8;
+const MYSQL_TYPE_DATE: u8 = 10;
 const MYSQL_TYPE_STRING: u8 = 0xfe;
 const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 
@@ -101,10 +103,13 @@ fn serve_connection(instance: &crate::instance::Instance, mut stream: TcpStream)
     if !hs.user.is_empty() {
         session.set_user(Some(hs.user.clone()));
     }
-    write_packet(&mut stream, 2, &ok_packet(STATUS_AUTOCOMMIT))?;
-    if let Some(db) = &hs.database {
-        let _ = instance.execute_with(&mut session, &format!("use {db};"));
+    if let Some(db) = &hs.database
+        && let Err(e) = instance.execute_with(&mut session, &format!("use {db};"))
+    {
+        write_packet(&mut stream, 2, &error_packet(&e.to_string()))?;
+        return Ok(());
     }
+    write_packet(&mut stream, 2, &ok_packet(session_status(&session)))?;
 
     let mut prepared: HashMap<u32, String> = HashMap::new();
     let mut next_statement_id: u32 = 1;
@@ -115,19 +120,20 @@ fn serve_connection(instance: &crate::instance::Instance, mut stream: TcpStream)
         };
         match command {
             COM_QUIT => break,
-            COM_PING => write_packet(&mut stream, 1, &ok_packet(STATUS_AUTOCOMMIT))?,
+            COM_PING => write_packet(&mut stream, 1, &ok_packet(session_status(&session)))?,
             COM_INIT_DB => {
                 let db = String::from_utf8_lossy(payload);
-                let _ = instance.execute_with(&mut session, &format!("use {db};"));
-                write_packet(&mut stream, 1, &ok_packet(STATUS_AUTOCOMMIT))?;
-            }
-            COM_QUERY => {
-                let sql = String::from_utf8_lossy(payload);
-                match instance.execute_with(&mut session, &sql) {
-                    Ok(results) => send_results(&mut stream, &results)?,
-                    Err(e) => write_packet(&mut stream, 1, &err_packet(1064, &e.to_string()))?,
+                // USE is a database statement: MySQL implicitly commits first.
+                if let Err(e) = commit_if_open(instance, &mut session) {
+                    write_packet(&mut stream, 1, &error_packet(&e.to_string()))?;
+                    continue;
+                }
+                match instance.execute_with(&mut session, &format!("use {db};")) {
+                    Ok(_) => write_packet(&mut stream, 1, &ok_packet(session_status(&session)))?,
+                    Err(e) => write_packet(&mut stream, 1, &error_packet(&e.to_string()))?,
                 }
             }
+            COM_QUERY => handle_query(instance, &mut stream, &mut session, payload, conn_id)?,
             COM_STMT_PREPARE => {
                 let sql = String::from_utf8_lossy(payload).into_owned();
                 let id = next_statement_id;
@@ -138,11 +144,11 @@ fn serve_connection(instance: &crate::instance::Instance, mut stream: TcpStream)
                 write_packet(&mut stream, seq, &prepare_ok_packet(id, params))?;
                 seq = seq.wrapping_add(1);
                 for _ in 0..params {
-                    write_packet(&mut stream, seq, &column_definition("?"))?;
+                    write_packet(&mut stream, seq, &column_definition("?", MYSQL_TYPE_VAR_STRING))?;
                     seq = seq.wrapping_add(1);
                 }
                 if params > 0 {
-                    write_packet(&mut stream, seq, &eof_packet(STATUS_AUTOCOMMIT))?;
+                    write_packet(&mut stream, seq, &eof_packet(session_status(&session)))?;
                 }
             }
             COM_STMT_EXECUTE => {
@@ -162,8 +168,10 @@ fn serve_connection(instance: &crate::instance::Instance, mut stream: TcpStream)
                 };
                 let bound = bind_params(&sql, &values);
                 match instance.execute_with(&mut session, &bound) {
-                    Ok(results) => send_results(&mut stream, &results)?,
-                    Err(e) => write_packet(&mut stream, 1, &err_packet(1064, &e.to_string()))?,
+                    Ok(results) => {
+                        send_results(&mut stream, &results, session_status(&session))?
+                    }
+                    Err(e) => write_packet(&mut stream, 1, &error_packet(&e.to_string()))?,
                 }
             }
             COM_STMT_CLOSE => {
@@ -172,7 +180,7 @@ fn serve_connection(instance: &crate::instance::Instance, mut stream: TcpStream)
                     prepared.remove(&id);
                 }
             }
-            COM_STMT_RESET => write_packet(&mut stream, 1, &ok_packet(STATUS_AUTOCOMMIT))?,
+            COM_STMT_RESET => write_packet(&mut stream, 1, &ok_packet(session_status(&session)))?,
             _ => write_packet(&mut stream, 1, &err_packet(1047, "unsupported command"))?,
         }
     }
@@ -211,14 +219,18 @@ fn parse_handshake_response(payload: &[u8]) -> Option<HandshakeResponse> {
     Some(HandshakeResponse { user, auth, database })
 }
 
-fn send_results(stream: &mut TcpStream, results: &[ResultSet]) -> io::Result<()> {
+fn send_results(stream: &mut TcpStream, results: &[ResultSet], base: u16) -> io::Result<()> {
     let mut seq = 1u8;
     for (i, result) in results.iter().enumerate() {
         let more = i + 1 < results.len();
-        let status = STATUS_AUTOCOMMIT | if more { STATUS_MORE_RESULTS } else { 0 };
+        let status = base | if more { STATUS_MORE_RESULTS } else { 0 };
         match result {
             ResultSet::Message(_) => {
                 write_packet(stream, seq, &ok_packet(status))?;
+                seq = seq.wrapping_add(1);
+            }
+            ResultSet::Affected(n) => {
+                write_packet(stream, seq, &ok_packet_affected(status, *n))?;
                 seq = seq.wrapping_add(1);
             }
             ResultSet::Rows { columns, rows } => {
@@ -226,8 +238,9 @@ fn send_results(stream: &mut TcpStream, results: &[ResultSet]) -> io::Result<()>
                 lenenc_int(&mut count, columns.len() as u64);
                 write_packet(stream, seq, &count)?;
                 seq = seq.wrapping_add(1);
-                for column in columns {
-                    write_packet(stream, seq, &column_definition(column))?;
+                let types = column_types(rows, columns.len());
+                for (column, &ty) in columns.iter().zip(&types) {
+                    write_packet(stream, seq, &column_definition(column, ty))?;
                     seq = seq.wrapping_add(1);
                 }
                 write_packet(stream, seq, &eof_packet(status))?;
@@ -244,7 +257,7 @@ fn send_results(stream: &mut TcpStream, results: &[ResultSet]) -> io::Result<()>
     // A statement with no result set (BEGIN/COMMIT/ROLLBACK...) still owes the
     // client one packet, or it waits forever for a reply.
     if results.is_empty() {
-        write_packet(stream, seq, &ok_packet(STATUS_AUTOCOMMIT))?;
+        write_packet(stream, seq, &ok_packet(base))?;
     }
     Ok(())
 }
@@ -432,13 +445,174 @@ fn ok_packet(status: u16) -> Vec<u8> {
     p
 }
 
+/// An OK packet reporting `affected` changed rows (last_insert_id stays 0).
+fn ok_packet_affected(status: u16, affected: u64) -> Vec<u8> {
+    let mut p = vec![0x00];
+    lenenc_int(&mut p, affected);
+    lenenc_int(&mut p, 0);
+    p.extend_from_slice(&status.to_le_bytes());
+    p.extend_from_slice(&0u16.to_le_bytes());
+    p
+}
+
 fn err_packet(code: u16, message: &str) -> Vec<u8> {
     let mut p = vec![0xff];
     p.extend_from_slice(&code.to_le_bytes());
     p.push(b'#');
-    p.extend_from_slice(b"HY000");
+    p.extend_from_slice(sqlstate(code).as_bytes());
     p.extend_from_slice(message.as_bytes());
     p
+}
+
+/// Builds an error packet, choosing the MySQL error number and SQLSTATE from
+/// the engine's message text so drivers see meaningful codes.
+fn error_packet(message: &str) -> Vec<u8> {
+    err_packet(error_code(message), message)
+}
+
+/// Maps an engine error message to the closest MySQL error number.
+fn error_code(message: &str) -> u16 {
+    let m = message.to_ascii_lowercase();
+    if m.contains("no such table") {
+        1146
+    } else if m.contains("no such column") {
+        1054
+    } else if m.contains("unknown function") {
+        1305
+    } else if m.contains("duplicate key") {
+        1062
+    } else if m.contains("database already exists") {
+        1007
+    } else if m.contains("already exists") {
+        1050
+    } else if m.contains("cannot be null") || m.contains("cannot have a null") {
+        1048
+    } else if m.contains("no such database") {
+        1049
+    } else if m.contains("permission denied") {
+        1044
+    } else if m.contains("not logged in")
+        || m.contains("access denied")
+        || m.contains("authentication failed")
+    {
+        1045
+    } else if m.contains("could not serialize") {
+        1213
+    } else if m.contains("syntax") || m.contains("unexpected") || m.contains("expected") {
+        1064
+    } else {
+        1105
+    }
+}
+
+/// The SQLSTATE that conventionally accompanies a MySQL error number.
+fn sqlstate(code: u16) -> &'static str {
+    match code {
+        1044 => "42000",
+        1045 => "28000",
+        1048 => "23000",
+        1049 => "42000",
+        1050 => "42S01",
+        1054 => "42S22",
+        1062 => "23000",
+        1064 => "42000",
+        1146 => "42S02",
+        1305 => "42000",
+        1213 => "40001",
+        _ => "HY000",
+    }
+}
+
+/// The isolation name MySQL clients expect from `@@transaction_isolation`.
+fn isolation_label(isolation: Isolation) -> &'static str {
+    match isolation {
+        Isolation::ReadCommitted => "READ-COMMITTED",
+        Isolation::RepeatableRead => "REPEATABLE-READ",
+        Isolation::Serializable => "SERIALIZABLE",
+    }
+}
+
+/// The OK/EOF status flags for the session's current autocommit mode.
+fn session_status(session: &Session) -> u16 {
+    if session.autocommit() { STATUS_AUTOCOMMIT } else { 0 }
+}
+
+/// Runs one COM_QUERY, honouring the client's `SET autocommit` and MySQL's
+/// rule that DDL and database statements implicitly commit.
+fn handle_query(
+    instance: &crate::instance::Instance,
+    stream: &mut TcpStream,
+    session: &mut Session,
+    payload: &[u8],
+    conn_id: u32,
+) -> io::Result<()> {
+    let sql = String::from_utf8_lossy(payload);
+    let isolation = isolation_label(instance.config().transaction.isolation);
+
+    if let Some(autocommit) = compat::autocommit_setting(&sql) {
+        if autocommit
+            && let Err(e) = commit_if_open(instance, session)
+        {
+            return write_packet(stream, 1, &error_packet(&e.to_string()));
+        }
+        session.set_autocommit(autocommit);
+        return write_packet(stream, 1, &ok_packet(session_status(session)));
+    }
+
+    if let Some(results) = compat::answer(&sql, session, conn_id, isolation) {
+        return send_results(stream, &results, session_status(session));
+    }
+
+    // With autocommit off, a data statement opens a transaction that stays open
+    // until COMMIT/ROLLBACK; DDL and database statements implicitly commit it.
+    if let Ok(stmts) = crate::parser::parse(&sql)
+        && !stmts.iter().any(is_transaction_control)
+    {
+        if stmts.iter().any(implicit_commit) {
+            if let Err(e) = commit_if_open(instance, session) {
+                return write_packet(stream, 1, &error_packet(&e.to_string()));
+            }
+        } else if !session.autocommit()
+            && !session.in_transaction()
+            && let Err(e) = instance.execute_with(session, "begin;")
+        {
+            return write_packet(stream, 1, &error_packet(&e.to_string()));
+        }
+    }
+
+    match instance.execute_with(session, &sql) {
+        Ok(results) => send_results(stream, &results, session_status(session)),
+        Err(e) => write_packet(stream, 1, &error_packet(&e.to_string())),
+    }
+}
+
+/// Commits the session's open transaction, if any (MySQL implicit commit).
+fn commit_if_open(instance: &crate::instance::Instance, session: &mut Session) -> crate::Result<()> {
+    if session.in_transaction() {
+        instance.execute_with(session, "commit;")?;
+    }
+    Ok(())
+}
+
+fn is_transaction_control(stmt: &crate::ast::Stmt) -> bool {
+    matches!(stmt, crate::ast::Stmt::Trx(_))
+}
+
+/// Statements that commit an open transaction before running (MySQL's implicit
+/// commit): DDL, and everything routed at the instance/database level.
+fn implicit_commit(stmt: &crate::ast::Stmt) -> bool {
+    crate::is_exclusive(stmt)
+        || matches!(
+            stmt,
+            crate::ast::Stmt::CreateDatabase(_)
+                | crate::ast::Stmt::DropDatabase(_)
+                | crate::ast::Stmt::Use(_)
+                | crate::ast::Stmt::CreateUser(_)
+                | crate::ast::Stmt::DropUser(_)
+                | crate::ast::Stmt::Grant(_)
+                | crate::ast::Stmt::Revoke(_)
+                | crate::ast::Stmt::Login(_)
+        )
 }
 
 fn eof_packet(status: u16) -> Vec<u8> {
@@ -448,7 +622,13 @@ fn eof_packet(status: u16) -> Vec<u8> {
     p
 }
 
-fn column_definition(name: &str) -> Vec<u8> {
+fn column_definition(name: &str, ty: u8) -> Vec<u8> {
+    // Numeric and date columns use the binary charset (63); text uses utf8.
+    let charset: u16 = if ty == MYSQL_TYPE_VAR_STRING || ty == MYSQL_TYPE_STRING {
+        0x21
+    } else {
+        0x3f
+    };
     let mut p = Vec::new();
     for s in ["def", "", "", ""] {
         lenenc_str(&mut p, s);
@@ -456,13 +636,38 @@ fn column_definition(name: &str) -> Vec<u8> {
     lenenc_str(&mut p, name);
     lenenc_str(&mut p, "");
     p.push(0x0c);
-    p.extend_from_slice(&0x21u16.to_le_bytes()); // charset
+    p.extend_from_slice(&charset.to_le_bytes());
     p.extend_from_slice(&255u32.to_le_bytes()); // display length
-    p.push(0xfd); // MYSQL_TYPE_VAR_STRING
+    p.push(ty);
     p.extend_from_slice(&0u16.to_le_bytes()); // flags
     p.push(0);
     p.extend_from_slice(&0u16.to_le_bytes());
     p
+}
+
+/// The MySQL type code for a value, inferred from the first non-null value of
+/// its column (the text protocol sends the value as a string either way, but
+/// clients use the type to decode it).
+fn column_type_code(value: &Value) -> u8 {
+    match value {
+        Value::Int(_) => MYSQL_TYPE_LONGLONG,
+        Value::Float(_) => MYSQL_TYPE_DOUBLE,
+        Value::Bool(_) => MYSQL_TYPE_TINY,
+        Value::Date(_) => MYSQL_TYPE_DATE,
+        Value::Null | Value::Str(_) => MYSQL_TYPE_VAR_STRING,
+    }
+}
+
+fn column_types(rows: &[Vec<Value>], count: usize) -> Vec<u8> {
+    let mut types: Vec<Option<u8>> = vec![None; count];
+    for row in rows {
+        for (i, value) in row.iter().enumerate().take(count) {
+            if types[i].is_none() && !matches!(value, Value::Null) {
+                types[i] = Some(column_type_code(value));
+            }
+        }
+    }
+    types.into_iter().map(|t| t.unwrap_or(MYSQL_TYPE_VAR_STRING)).collect()
 }
 
 fn row_packet(row: &[Value]) -> Vec<u8> {
@@ -651,6 +856,361 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     out
+}
+
+/// Connection housekeeping that MySQL clients send but the SQL dialect does
+/// not implement. Answered locally so common clients (`mysql` CLI, pymysql,
+/// ORMs) can connect without the engine growing protocol-only grammar.
+mod compat {
+    use crate::result::ResultSet;
+    use crate::trx::Session;
+    use crate::value::Value;
+
+    /// The server version string reported to clients.
+    pub(crate) const SERVER_VERSION: &str = "8.0.0-chibidb";
+
+    /// Answers a housekeeping statement locally. `Some(vec![])` means "handled,
+    /// reply with OK and no result set" (e.g. `SET ...`); `None` means the
+    /// caller should run the statement through the engine.
+    pub(crate) fn answer(
+        input: &str,
+        session: &Session,
+        conn_id: u32,
+        isolation: &str,
+    ) -> Option<Vec<ResultSet>> {
+        let sql = strip_comments(input).trim().trim_end_matches(';').trim();
+        if sql.is_empty() {
+            return Some(Vec::new());
+        }
+        let lower = sql.to_ascii_lowercase();
+        if (starts_with_word(&lower, "commit") || starts_with_word(&lower, "rollback"))
+            && !session.in_transaction()
+        {
+            // MySQL treats COMMIT/ROLLBACK with no transaction as a no-op.
+            return Some(Vec::new());
+        }
+        if starts_with_word(&lower, "set") {
+            // SET NAMES / autocommit / sql_mode / isolation are accepted and
+            // ignored: the engine has no session variables to configure.
+            return Some(Vec::new());
+        }
+        if starts_with_word(&lower, "show") {
+            let rest = lower["show".len()..].trim_start();
+            if rest.starts_with("warnings") || rest.starts_with("errors") {
+                return Some(vec![ResultSet::Rows {
+                    columns: vec!["Level".into(), "Code".into(), "Message".into()],
+                    rows: Vec::new(),
+                }]);
+            }
+            return None;
+        }
+        if !starts_with_word(&lower, "select") {
+            return None;
+        }
+        select_variables(&sql["select".len()..], session, conn_id, isolation)
+    }
+
+    /// Recognizes `SET [SESSION|GLOBAL] [@@]autocommit = 0|1|ON|OFF|TRUE|FALSE`
+    /// so the caller can track the client's autocommit mode. `None` for any
+    /// other statement.
+    pub(crate) fn autocommit_setting(input: &str) -> Option<bool> {
+        let sql = strip_comments(input).trim().trim_end_matches(';').trim();
+        let lower = sql.to_ascii_lowercase();
+        let rest = lower.strip_prefix("set")?;
+        if rest.starts_with(is_ident_char) {
+            return None;
+        }
+        let rest = rest.trim_start();
+        let rest = rest
+            .strip_prefix("session")
+            .or_else(|| rest.strip_prefix("global"))
+            .or_else(|| rest.strip_prefix("local"))
+            .unwrap_or(rest)
+            .trim_start();
+        let rest = rest.strip_prefix("@@").unwrap_or(rest);
+        let rest = rest
+            .strip_prefix("session.")
+            .or_else(|| rest.strip_prefix("global."))
+            .unwrap_or(rest);
+        let rest = rest.strip_prefix("autocommit")?;
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix('=').unwrap_or(rest).trim_start();
+        match rest {
+            "1" | "on" | "true" => Some(true),
+            "0" | "off" | "false" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Evaluates `SELECT <item>[, <item>...]`, requiring every item to be a
+    /// system variable or a supported metadata function.
+    fn select_variables(
+        body: &str,
+        session: &Session,
+        conn_id: u32,
+        isolation: &str,
+    ) -> Option<Vec<ResultSet>> {
+        let items = split_top_level(strip_limit(body), ',');
+        let mut columns = Vec::with_capacity(items.len());
+        let mut row = Vec::with_capacity(items.len());
+        for item in items {
+            let item = item.trim();
+            let value = eval_item(item, session, conn_id, isolation)?;
+            columns.push(item.to_string());
+            row.push(value);
+        }
+        Some(vec![ResultSet::Rows { columns, rows: vec![row] }])
+    }
+
+    fn eval_item(item: &str, session: &Session, conn_id: u32, isolation: &str) -> Option<Value> {
+        if let Some(value) = system_variable(item, isolation) {
+            return Some(value);
+        }
+        function(item, session, conn_id)
+    }
+
+    /// `@@name` / `@@session.name` / `@@global.name`. Names that are not a
+    /// single identifier (e.g. `@@v FROM t`) return `None` so the whole
+    /// statement falls through to the engine instead of being misread.
+    fn system_variable(item: &str, isolation: &str) -> Option<Value> {
+        let rest = item.strip_prefix("@@")?;
+        let name = parse_var_name(rest)?;
+        Some(variable_value(&name, isolation))
+    }
+
+    fn parse_var_name(text: &str) -> Option<String> {
+        let trimmed = text.trim();
+        let unquoted = trimmed
+            .strip_prefix('`')
+            .and_then(|s| s.strip_suffix('`'))
+            .unwrap_or(trimmed);
+        let lower = unquoted.to_ascii_lowercase();
+        let name = lower
+            .strip_prefix("session.")
+            .or_else(|| lower.strip_prefix("global."))
+            .or_else(|| lower.strip_prefix("local."))
+            .unwrap_or(lower.as_str());
+        let valid = !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        valid.then(|| name.to_string())
+    }
+
+    fn variable_value(name: &str, isolation: &str) -> Value {
+        match name {
+            "version_comment" => Value::Str("chibidb".into()),
+            "version" => Value::Str(SERVER_VERSION.into()),
+            "sql_mode" => Value::Str(String::new()),
+            "autocommit" => Value::Int(1),
+            "character_set_client" | "character_set_connection" | "character_set_results"
+            | "character_set_server" => Value::Str("utf8mb4".into()),
+            "collation_connection" | "collation_server" | "collation_database" => {
+                Value::Str("utf8mb4_general_ci".into())
+            }
+            "max_allowed_packet" => Value::Int(16 * 1024 * 1024),
+            "net_buffer_length" => Value::Int(16 * 1024),
+            "have_ssl" => Value::Str("DISABLED".into()),
+            "have_query_cache" => Value::Str("NO".into()),
+            "lower_case_table_names" => Value::Int(0),
+            "time_zone" => Value::Str("SYSTEM".into()),
+            "system_time_zone" => Value::Str("UTC".into()),
+            "tx_isolation" | "transaction_isolation" => Value::Str(isolation.to_string()),
+            "tx_read_only" | "transaction_read_only" => Value::Int(0),
+            "wait_timeout" | "interactive_timeout" => Value::Int(28_800),
+            "net_write_timeout" => Value::Int(60),
+            "net_read_timeout" => Value::Int(30),
+            "license" => Value::Str("GPL".into()),
+            "init_connect" => Value::Str(String::new()),
+            "foreign_key_checks" => Value::Int(1),
+            "sql_auto_is_null" => Value::Int(0),
+            "performance_schema" => Value::Int(0),
+            "max_connections" => Value::Int(151),
+            _ => Value::Str(String::new()),
+        }
+    }
+
+    fn function(item: &str, session: &Session, conn_id: u32) -> Option<Value> {
+        let normalized: String = item.to_ascii_lowercase().split_whitespace().collect();
+        match normalized.as_str() {
+            "version()" => Some(Value::Str(SERVER_VERSION.into())),
+            "database()" | "schema()" => Some(
+                session
+                    .current_db()
+                    .map(|d| Value::Str(d.to_string()))
+                    .unwrap_or(Value::Null),
+            ),
+            "user()" | "current_user()" | "session_user()" | "system_user()" => {
+                Some(Value::Str(session.user().unwrap_or("").to_string()))
+            }
+            "connection_id()" => Some(Value::Int(conn_id as i64)),
+            "last_insert_id()" => Some(Value::Int(0)),
+            _ => None,
+        }
+    }
+
+    /// Drops leading `/* ... */` comments (clients prefix statements with them).
+    fn strip_comments(mut s: &str) -> &str {
+        loop {
+            let t = s.trim_start();
+            let Some(rest) = t.strip_prefix("/*") else {
+                return t;
+            };
+            let Some(end) = rest.find("*/") else {
+                return t;
+            };
+            s = &rest[end + 2..];
+        }
+    }
+
+    fn starts_with_word(s: &str, word: &str) -> bool {
+        match s.strip_prefix(word) {
+            Some(rest) => !rest.starts_with(is_ident_char),
+            None => false,
+        }
+    }
+
+    fn is_ident_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_' || c == '$'
+    }
+
+    /// Cuts a trailing top-level `LIMIT ...` clause.
+    fn strip_limit(body: &str) -> &str {
+        let bytes = body.as_bytes();
+        let mut depth = 0i32;
+        let mut quote = 0u8;
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if quote != 0 {
+                if c == quote {
+                    quote = 0;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'\'' | b'"' | b'`' => quote = c,
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && word_at(bytes, i, b"limit") {
+                return body[..i].trim_end();
+            }
+            i += 1;
+        }
+        body
+    }
+
+    fn word_at(bytes: &[u8], i: usize, word: &[u8]) -> bool {
+        if i + word.len() > bytes.len() || !bytes[i..i + word.len()].eq_ignore_ascii_case(word) {
+            return false;
+        }
+        let before = i == 0 || !is_ident_char(bytes[i - 1] as char);
+        let after = i + word.len();
+        before && (after >= bytes.len() || !is_ident_char(bytes[after] as char))
+    }
+
+    /// Splits on top-level `sep`, ignoring quotes and parentheses.
+    fn split_top_level(s: &str, sep: char) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut depth = 0i32;
+        let mut quote = 0u8;
+        for (i, c) in s.char_indices() {
+            if quote != 0 {
+                if c as u8 == quote {
+                    quote = 0;
+                }
+                continue;
+            }
+            match c {
+                '\'' | '"' | '`' => quote = c as u8,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ if c == sep && depth == 0 => {
+                    out.push(&s[start..i]);
+                    start = i + c.len_utf8();
+                }
+                _ => {}
+            }
+        }
+        out.push(&s[start..]);
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn answered(sql: &str) -> Option<Vec<ResultSet>> {
+            answer(sql, &Session::new(), 7, "READ-COMMITTED")
+        }
+
+        fn one_value(sql: &str) -> Value {
+            match answered(sql).unwrap().into_iter().next().unwrap() {
+                ResultSet::Rows { mut rows, .. } => rows.remove(0).remove(0),
+                other => panic!("expected rows, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn set_statements_are_accepted_and_ignored() {
+            assert_eq!(answered("SET NAMES utf8mb4"), Some(Vec::new()));
+            assert_eq!(answered("/* c */ set autocommit = 1"), Some(Vec::new()));
+        }
+
+        #[test]
+        fn system_variables_are_answered() {
+            assert_eq!(one_value("select @@version_comment limit 1"), Value::Str("chibidb".into()));
+            assert_eq!(one_value("SELECT @@sql_mode"), Value::Str(String::new()));
+            assert_eq!(
+                one_value("select @@session.transaction_isolation"),
+                Value::Str("READ-COMMITTED".into())
+            );
+        }
+
+        #[test]
+        fn metadata_functions_are_answered() {
+            assert_eq!(
+                one_value("SELECT VERSION()"),
+                Value::Str(SERVER_VERSION.into())
+            );
+            assert_eq!(one_value("select connection_id()"), Value::Int(7));
+        }
+
+        #[test]
+        fn engine_statements_fall_through() {
+            assert_eq!(answered("select 1 as one"), None);
+            assert_eq!(answered("select @@v from t"), None);
+            assert_eq!(answered("insert into t values (1)"), None);
+        }
+
+        #[test]
+        fn database_and_warnings() {
+            let mut session = Session::new();
+            session.set_current_db(Some("main".into()));
+            match answer("select database()", &session, 1, "READ-COMMITTED")
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+            {
+                ResultSet::Rows { rows, .. } => {
+                    assert_eq!(rows[0][0], Value::Str("main".into()));
+                }
+                other => panic!("expected rows, got {other:?}"),
+            }
+            match answer("show warnings", &session, 1, "READ-COMMITTED")
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+            {
+                ResultSet::Rows { rows, .. } => assert!(rows.is_empty()),
+                other => panic!("expected empty rows, got {other:?}"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

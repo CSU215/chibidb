@@ -113,6 +113,12 @@ pub trait PhysicalOperator {
     fn output_kind(&self) -> OutputKind {
         OutputKind::Rows
     }
+
+    /// How many rows a command changed, once `open` has run. `None` for plans
+    /// that stream rows or do not track a count.
+    fn affected_rows(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Sequential scan of a table, filtering by MVCC visibility.

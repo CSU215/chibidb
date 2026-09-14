@@ -12,6 +12,9 @@ where
 {
     match rs {
         ResultSet::Message(m) => out.write_all(format!("{m}\n").as_bytes()).await,
+        ResultSet::Affected(n) => {
+            out.write_all(format!("{}\n", crate::wire::affected_message(*n)).as_bytes()).await
+        }
         ResultSet::Rows { columns, rows } => {
             let mut grid: Vec<Vec<String>> = vec![columns.clone()];
             for row in rows {

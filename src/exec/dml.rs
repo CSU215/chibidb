@@ -9,11 +9,12 @@ use super::operator::{ExecContext, OutputKind, PhysicalOperator};
 pub struct InsertOp {
     stmt: InsertStmt,
     schema: Schema,
+    affected: u64,
 }
 
 impl InsertOp {
     pub fn new(stmt: InsertStmt) -> Self {
-        Self { stmt, schema: Schema::default() }
+        Self { stmt, schema: Schema::default(), affected: 0 }
     }
 }
 
@@ -23,7 +24,7 @@ impl PhysicalOperator for InsertOp {
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
-        super::execute_insert(ctx.db, ctx.trx, &self.stmt)?;
+        self.affected = super::execute_insert(ctx.db, ctx.trx, &self.stmt)?;
         Ok(())
     }
 
@@ -38,17 +39,22 @@ impl PhysicalOperator for InsertOp {
     fn output_kind(&self) -> OutputKind {
         OutputKind::Command
     }
+
+    fn affected_rows(&self) -> Option<u64> {
+        Some(self.affected)
+    }
 }
 
 /// UPDATE: applies matching updates in `open` and yields no rows.
 pub struct UpdateOp {
     stmt: UpdateStmt,
     schema: Schema,
+    affected: u64,
 }
 
 impl UpdateOp {
     pub fn new(stmt: UpdateStmt) -> Self {
-        Self { stmt, schema: Schema::default() }
+        Self { stmt, schema: Schema::default(), affected: 0 }
     }
 }
 
@@ -58,7 +64,7 @@ impl PhysicalOperator for UpdateOp {
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
-        super::execute_update(ctx.db, ctx.trx, &self.stmt)?;
+        self.affected = super::execute_update(ctx.db, ctx.trx, &self.stmt)?;
         Ok(())
     }
 
@@ -73,17 +79,22 @@ impl PhysicalOperator for UpdateOp {
     fn output_kind(&self) -> OutputKind {
         OutputKind::Command
     }
+
+    fn affected_rows(&self) -> Option<u64> {
+        Some(self.affected)
+    }
 }
 
 /// DELETE: marks matching rows in `open` and yields no rows.
 pub struct DeleteOp {
     stmt: DeleteStmt,
     schema: Schema,
+    affected: u64,
 }
 
 impl DeleteOp {
     pub fn new(stmt: DeleteStmt) -> Self {
-        Self { stmt, schema: Schema::default() }
+        Self { stmt, schema: Schema::default(), affected: 0 }
     }
 }
 
@@ -93,7 +104,7 @@ impl PhysicalOperator for DeleteOp {
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
-        super::execute_delete(ctx.db, ctx.trx, &self.stmt)?;
+        self.affected = super::execute_delete(ctx.db, ctx.trx, &self.stmt)?;
         Ok(())
     }
 
@@ -107,5 +118,9 @@ impl PhysicalOperator for DeleteOp {
 
     fn output_kind(&self) -> OutputKind {
         OutputKind::Command
+    }
+
+    fn affected_rows(&self) -> Option<u64> {
+        Some(self.affected)
     }
 }

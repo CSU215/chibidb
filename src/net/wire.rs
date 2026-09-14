@@ -5,6 +5,7 @@ pub const KIND_MESSAGE: u8 = 0x00;
 pub const KIND_ROWS: u8 = 0x01;
 pub const KIND_ERROR: u8 = 0x02;
 pub const KIND_DONE: u8 = 0x03;
+pub const KIND_AFFECTED: u8 = 0x04;
 
 /// Kind-prefixed standalone encoding of one ResultSet.
 pub fn encode_result(rs: &ResultSet) -> Vec<u8> {
@@ -12,6 +13,11 @@ pub fn encode_result(rs: &ResultSet) -> Vec<u8> {
         ResultSet::Message(m) => {
             let mut buf = vec![KIND_MESSAGE];
             put_str(&mut buf, m);
+            buf
+        }
+        ResultSet::Affected(n) => {
+            let mut buf = vec![KIND_AFFECTED];
+            put_u64(&mut buf, *n);
             buf
         }
         ResultSet::Rows { columns, rows } => {
@@ -27,6 +33,7 @@ pub fn decode_result(data: &[u8]) -> Result<ResultSet> {
     let kind = take(data, &mut pos, 1)?[0];
     match kind {
         KIND_MESSAGE => Ok(ResultSet::Message(take_str(data, &mut pos)?)),
+        KIND_AFFECTED => Ok(ResultSet::Affected(take_u64(data, &mut pos)?)),
         KIND_ROWS => decode_rows_payload(data, &mut pos),
         _ => Err(Error::Runtime(format!("unknown result kind 0x{kind:02x}"))),
     }
@@ -73,6 +80,7 @@ pub fn encode_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
 
 pub enum Frame {
     Message(String),
+    Affected(u64),
     Rows(ResultSet),
     Error(String),
     Done,
@@ -84,6 +92,7 @@ pub fn decode_frame(body: &[u8]) -> Result<Frame> {
     let kind = take(body, &mut pos, 1)?[0];
     match kind {
         KIND_MESSAGE => Ok(Frame::Message(take_str(body, &mut pos)?)),
+        KIND_AFFECTED => Ok(Frame::Affected(take_u64(body, &mut pos)?)),
         KIND_ERROR => Ok(Frame::Error(take_str(body, &mut pos)?)),
         KIND_DONE => Ok(Frame::Done),
         KIND_ROWS => Ok(Frame::Rows(decode_rows_payload(body, &mut pos)?)),
@@ -99,12 +108,22 @@ pub fn encode_result_frame(rs: &ResultSet) -> Vec<u8> {
             put_str(&mut payload, m);
             encode_frame(KIND_MESSAGE, &payload)
         }
+        ResultSet::Affected(n) => {
+            let mut payload = Vec::new();
+            put_u64(&mut payload, *n);
+            encode_frame(KIND_AFFECTED, &payload)
+        }
         ResultSet::Rows { columns, rows } => {
             let mut payload = Vec::new();
             put_rows_payload(&mut payload, columns, rows);
             encode_frame(KIND_ROWS, &payload)
         }
     }
+}
+
+/// The human-readable form of a DML affected-row count for the text frontends.
+pub fn affected_message(n: u64) -> String {
+    format!("{n} rows affected")
 }
 
 /// Encodes an error string as an error-kind frame body.
@@ -125,6 +144,10 @@ fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+fn put_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
 fn put_str(buf: &mut Vec<u8>, s: &str) {
     put_u32(buf, s.len() as u32);
     buf.extend_from_slice(s.as_bytes());
@@ -142,6 +165,11 @@ fn take<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8]> {
 fn take_u32(data: &[u8], pos: &mut usize) -> Result<u32> {
     let b = take(data, pos, 4)?;
     Ok(u32::from_le_bytes(b.try_into().unwrap()))
+}
+
+fn take_u64(data: &[u8], pos: &mut usize) -> Result<u64> {
+    let b = take(data, pos, 8)?;
+    Ok(u64::from_le_bytes(b.try_into().unwrap()))
 }
 
 fn take_str(data: &[u8], pos: &mut usize) -> Result<String> {

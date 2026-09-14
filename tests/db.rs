@@ -114,7 +114,7 @@ fn inserts_rows() {
         let rs = db
             .execute_sql("insert into t values (1, 'alice', 95.5), (2, 'bob', 80);")
             .unwrap();
-        assert_eq!(rs, [ResultSet::Message("SUCCESS".into())]);
+        assert_eq!(rs, [ResultSet::Affected(2)]);
     });
 }
 

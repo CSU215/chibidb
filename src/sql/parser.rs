@@ -93,6 +93,20 @@ impl<'a> Parser<'a> {
         if self.eat_keyword("begin") {
             return Ok(Stmt::Trx(TrxCtl::Begin));
         }
+        if self.eat_keyword("start") {
+            if !self.eat_keyword("transaction") {
+                return Err(self.unexpected("transaction"));
+            }
+            // characteristics (`READ ONLY`/`READ WRITE`/`WITH CONSISTENT
+            // SNAPSHOT`) are accepted and ignored
+            if self.eat_keyword("read") {
+                let _ = self.eat_keyword("only") || self.eat_keyword("write");
+            } else if self.eat_keyword("with") {
+                let _ = self.eat_keyword("consistent");
+                let _ = self.eat_keyword("snapshot");
+            }
+            return Ok(Stmt::Trx(TrxCtl::Begin));
+        }
         if self.eat_keyword("commit") {
             return Ok(Stmt::Trx(TrxCtl::Commit));
         }

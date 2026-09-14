@@ -19,6 +19,7 @@ fn message(db: &Database, sql: &str) -> String {
     assert_eq!(rs.len(), 1, "sql: {sql}");
     match &rs[0] {
         ResultSet::Message(m) => m.clone(),
+        ResultSet::Affected(n) => format!("{n} rows affected"),
         other => panic!("expected message for `{sql}`, got {other:?}"),
     }
 }

@@ -41,6 +41,7 @@ async fn exec_remote(stream: &mut TcpStream, sql: &str) -> Result<Vec<ResultSet>
         stream.read_exact(&mut body).await.unwrap();
         match chibidb::wire::decode_frame(&body).unwrap() {
             chibidb::wire::Frame::Message(m) => out.push(ResultSet::Message(m)),
+            chibidb::wire::Frame::Affected(n) => out.push(ResultSet::Affected(n)),
             chibidb::wire::Frame::Error(e) => failure = Some(chibidb::Error::Runtime(e)),
             chibidb::wire::Frame::Rows(rs) => out.push(rs),
             chibidb::wire::Frame::Done => {
@@ -69,7 +70,7 @@ async fn sessions_share_the_database() {
     )
     .await
     .unwrap();
-    assert_eq!(rs, [ResultSet::Message("SUCCESS".into())]);
+    assert_eq!(rs, [ResultSet::Affected(2)]);
 
     // a second connection observes the same database
     let mut client2 = TcpStream::connect(addr).await.unwrap();

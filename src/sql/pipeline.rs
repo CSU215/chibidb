@@ -73,9 +73,10 @@ impl Stage for ExecuteStage {
                 plan.schema().columns.iter().map(|c| c.name.clone()).collect();
             let rows = db.collect_plan(session, plan.as_mut())?;
             match kind {
-                crate::exec::operator::OutputKind::Command => {
-                    ResultSet::Message("SUCCESS".into())
-                }
+                crate::exec::operator::OutputKind::Command => match plan.affected_rows() {
+                    Some(n) => ResultSet::Affected(n),
+                    None => ResultSet::Message("SUCCESS".into()),
+                },
                 crate::exec::operator::OutputKind::Rows => ResultSet::Rows { columns, rows },
             }
         } else {

@@ -3,6 +3,9 @@ use crate::value::Value;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResultSet {
     Message(String),
+    /// A statement that changed `n` rows (INSERT/UPDATE/DELETE), mirroring the
+    /// MySQL "affected rows" count.
+    Affected(u64),
     Rows {
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
@@ -21,6 +24,11 @@ pub fn encode_results(results: &[ResultSet]) -> String {
             ResultSet::Message(m) => {
                 out.push_str("{\"type\":\"message\",\"message\":");
                 out.push_str(&json_string(m));
+                out.push('}');
+            }
+            ResultSet::Affected(n) => {
+                out.push_str("{\"type\":\"affected\",\"affected\":");
+                out.push_str(&n.to_string());
                 out.push('}');
             }
             ResultSet::Rows { columns, rows } => {

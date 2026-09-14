@@ -83,17 +83,77 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             b'\'' => {
                 let start = i;
                 i += 1;
-                while i < bytes.len() && bytes[i] != b'\'' {
-                    i += 1;
+                let mut s = String::new();
+                loop {
+                    if i >= bytes.len() {
+                        return Err(Error::Syntax(format!(
+                            "unterminated string at byte {start}"
+                        )));
+                    }
+                    match bytes[i] {
+                        b'\'' => {
+                            // `''` is an escaped quote; a lone quote ends it.
+                            if bytes.get(i + 1) == Some(&b'\'') {
+                                s.push('\'');
+                                i += 2;
+                            } else {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        b'\\' => {
+                            // MySQL backslash escapes (the default mode).
+                            i += 1;
+                            let ch = src[i..].chars().next().ok_or_else(|| {
+                                Error::Syntax(format!("unterminated string at byte {start}"))
+                            })?;
+                            s.push(match ch {
+                                '0' => '\0',
+                                'n' => '\n',
+                                'r' => '\r',
+                                't' => '\t',
+                                'b' => '\u{8}',
+                                'Z' => '\u{1a}',
+                                other => other,
+                            });
+                            i += ch.len_utf8();
+                        }
+                        _ => {
+                            let ch = src[i..].chars().next().unwrap();
+                            s.push(ch);
+                            i += ch.len_utf8();
+                        }
+                    }
                 }
-                if i >= bytes.len() {
-                    return Err(Error::Syntax(format!(
-                        "unterminated string at byte {start}"
-                    )));
-                }
-                let s = src[start + 1..i].to_string();
-                i += 1;
                 out.push(Token { kind: TokenKind::Str(s), pos: start });
+            }
+            b'`' => {
+                // MySQL-style quoted identifier: `name`, with `` as an
+                // escaped backtick. Decoded to a plain identifier token.
+                let start = i;
+                i += 1;
+                let mut name = String::new();
+                loop {
+                    if i >= bytes.len() {
+                        return Err(Error::Syntax(format!(
+                            "unterminated identifier at byte {start}"
+                        )));
+                    }
+                    if bytes[i] == b'`' {
+                        if bytes.get(i + 1) == Some(&b'`') {
+                            name.push('`');
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        let ch = src[i..].chars().next().unwrap();
+                        name.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+                out.push(Token { kind: TokenKind::Ident(name), pos: start });
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
                 let start = i;

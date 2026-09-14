@@ -104,6 +104,25 @@ fn errors_on_unterminated_string() {
 }
 
 #[test]
+fn string_backslash_escapes() {
+    let toks = lex(r"'a\'b' 'a''b' 'a\nb' 'a\\b'").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![
+            TokenKind::Str("a'b".into()),
+            TokenKind::Str("a'b".into()),
+            TokenKind::Str("a\nb".into()),
+            TokenKind::Str("a\\b".into()),
+        ]
+    );
+}
+
+#[test]
+fn errors_on_dangling_escape() {
+    assert!(lex("'a\\").is_err());
+}
+
+#[test]
 fn tokenizes_identifiers() {
     let toks = lex("select from_1 _abc123").unwrap();
     assert_eq!(
@@ -114,6 +133,26 @@ fn tokenizes_identifiers() {
             TokenKind::Ident("_abc123".into()),
         ]
     );
+}
+
+#[test]
+fn tokenizes_backtick_identifiers() {
+    let toks = lex("`select` `a b` `we``ird`").unwrap();
+    assert_eq!(
+        toks.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+        vec![
+            TokenKind::Ident("select".into()),
+            TokenKind::Ident("a b".into()),
+            TokenKind::Ident("we`ird".into()),
+        ]
+    );
+    assert_eq!(toks[0].pos, 0);
+    assert_eq!(toks[1].pos, 9);
+}
+
+#[test]
+fn errors_on_unterminated_backtick_identifier() {
+    assert!(lex("`abc").is_err());
 }
 
 #[test]

@@ -239,12 +239,12 @@ const MAX_EPQ_RETRIES: u32 = 16;
 /// committed. The row lock is held across the restart, so the retry cannot be
 /// outraced; on repeatable read (or once retries are exhausted) the statement
 /// reports a serialization failure instead.
-fn epq_retry(
+fn epq_retry<T>(
     db: &Database,
     trx: &mut TrxState,
     table: &str,
-    mut run: impl FnMut(&Database, &mut TrxState) -> Result<()>,
-) -> Result<()> {
+    mut run: impl FnMut(&Database, &mut TrxState) -> Result<T>,
+) -> Result<T> {
     let undo_mark = trx.undo.len();
     let wal_mark = trx.wal.len();
     let mut attempts = 0u32;
@@ -263,12 +263,15 @@ fn epq_retry(
     }
 }
 
-pub(crate) fn execute_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<ResultSet> {
+pub(crate) fn execute_update(
+    db: &Database,
+    trx: &mut TrxState,
+    u: &UpdateStmt,
+) -> Result<u64> {
     epq_retry(db, trx, &u.table, |db, trx| apply_update(db, trx, u))
-        .map(|()| ResultSet::Message("SUCCESS".into()))
 }
 
-fn apply_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<()> {
+fn apply_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<u64> {
     db.note_read(trx.id, &u.table);
     let schema = db.catalog().table(&u.table)?.schema.clone();
     let mut assigns = Vec::new();
@@ -303,15 +306,19 @@ fn apply_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<()>
         db.check_unique(&u.table, &new_row, Some(rid), trx, &mut claimed)?;
         updates.push((rid, new_row));
     }
-    db.store_update_versions(&u.table, &updates, trx)
+    db.store_update_versions(&u.table, &updates, trx)?;
+    Ok(updates.len() as u64)
 }
 
-pub(crate) fn execute_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<ResultSet> {
+pub(crate) fn execute_delete(
+    db: &Database,
+    trx: &mut TrxState,
+    d: &DeleteStmt,
+) -> Result<u64> {
     epq_retry(db, trx, &d.table, |db, trx| apply_delete(db, trx, d))
-        .map(|()| ResultSet::Message("SUCCESS".into()))
 }
 
-fn apply_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<()> {
+fn apply_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<u64> {
     db.note_read(trx.id, &d.table);
     let schema = db.catalog().table(&d.table)?.schema.clone();
     let records = db.store_scan_raw(&d.table)?;
@@ -329,7 +336,8 @@ fn apply_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<()>
             victims.push(rid);
         }
     }
-    db.store_delete_mark(&d.table, &victims, trx)
+    db.store_delete_mark(&d.table, &victims, trx)?;
+    Ok(victims.len() as u64)
 }
 
 /// Resolves the schema positions targeted by an INSERT: either every column
@@ -362,7 +370,11 @@ fn check_not_null(schema: &Schema, row: &[Value]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn execute_insert(db: &Database, trx: &mut TrxState, i: &InsertStmt) -> Result<ResultSet> {
+pub(crate) fn execute_insert(
+    db: &Database,
+    trx: &mut TrxState,
+    i: &InsertStmt,
+) -> Result<u64> {
     let schema = db.catalog().table(&i.table)?.schema.clone();
     let targets = insert_targets(&schema, &i.columns)?;
     for values in &i.rows {
@@ -400,7 +412,7 @@ pub(crate) fn execute_insert(db: &Database, trx: &mut TrxState, i: &InsertStmt) 
         }
         db.store_insert(&i.table, row, trx)?;
     }
-    Ok(ResultSet::Message("SUCCESS".into()))
+    Ok(i.rows.len() as u64)
 }
 
 pub(crate) fn coerce(v: Value, dtype: DataType, col: &str) -> Result<Value> {

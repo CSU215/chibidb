@@ -131,16 +131,16 @@ fn like_matching() {
 
 #[test]
 fn like_escape() {
-    // backslash escapes the wildcard so it matches literally
-    assert_eq!(val("select 'a%b' like 'a\\%b' escape '\\';"), Value::Bool(true));
-    assert_eq!(val("select 'axb' like 'a\\%b' escape '\\';"), Value::Bool(false));
-    assert_eq!(val("select 'a_b' like 'a\\_b' escape '\\';"), Value::Bool(true));
-    assert_eq!(val("select 'axb' like 'a_b' escape '\\';"), Value::Bool(true));
+    // `!` escapes the wildcard so it matches literally
+    assert_eq!(val("select 'a%b' like 'a!%b' escape '!';"), Value::Bool(true));
+    assert_eq!(val("select 'axb' like 'a!%b' escape '!';"), Value::Bool(false));
+    assert_eq!(val("select 'a_b' like 'a!_b' escape '!';"), Value::Bool(true));
+    assert_eq!(val("select 'axb' like 'a_b' escape '!';"), Value::Bool(true));
     // the escape character itself can be escaped
-    assert_eq!(val("select 'a\\b' like 'a\\\\b' escape '\\';"), Value::Bool(true));
-    // without ESCAPE, backslash is an ordinary character
-    assert_eq!(val("select 'a%b' like 'a\\%b';"), Value::Bool(false));
-    err("select 'a' like 'a\\' escape '\\';");
+    assert_eq!(val("select 'a!b' like 'a!!b' escape '!';"), Value::Bool(true));
+    // without ESCAPE, the character is an ordinary one
+    assert_eq!(val("select 'a%b' like 'a!%b';"), Value::Bool(false));
+    err("select 'a' like 'a!' escape '!';");
 }
 
 #[test]

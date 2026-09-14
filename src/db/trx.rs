@@ -16,15 +16,33 @@ pub struct Session {
     current_db: Option<String>,
     /// Authenticated user, once the session has logged in.
     user: Option<String>,
+    /// Whether each statement commits on its own (the MySQL frontend tracks
+    /// the client's `SET autocommit`; the engine always starts sessions in
+    /// autocommit mode).
+    autocommit: bool,
 }
 
 impl Session {
     pub fn new() -> Self {
-        Self { trx: None, current_db: None, user: None }
+        Self { trx: None, current_db: None, user: None, autocommit: true }
     }
 
     pub fn current_db(&self) -> Option<&str> {
         self.current_db.as_deref()
+    }
+
+    /// Whether the session is in autocommit mode.
+    pub fn autocommit(&self) -> bool {
+        self.autocommit
+    }
+
+    pub(crate) fn set_autocommit(&mut self, autocommit: bool) {
+        self.autocommit = autocommit;
+    }
+
+    /// Whether a transaction (explicit or otherwise) is currently open.
+    pub fn in_transaction(&self) -> bool {
+        self.trx.is_some()
     }
 
     /// The authenticated user, if the session has logged in.

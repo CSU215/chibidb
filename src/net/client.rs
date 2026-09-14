@@ -43,6 +43,11 @@ pub async fn run_client(
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
             {
                 Frame::Message(m) => output.write_all(format!("{m}\n").as_bytes()).await?,
+                Frame::Affected(n) => {
+                    output
+                        .write_all(format!("{}\n", wire::affected_message(n)).as_bytes())
+                        .await?
+                }
                 Frame::Error(e) => output.write_all(format!("error: {e}\n").as_bytes()).await?,
                 Frame::Rows(rs) => write_result(output, &rs).await?,
                 Frame::Done => break,
