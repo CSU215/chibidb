@@ -139,7 +139,7 @@ fn route(
 ) -> Response {
     // The admin surface owns `/api/*` and static hosting; it declines the two
     // legacy paths so they keep their exact previous behaviour.
-    if let Some(response) = admin::handle(instance.config(), method, path, body) {
+    if let Some(response) = admin::handle(instance, session, method, path, body) {
         return response;
     }
     match (method, path) {

@@ -262,7 +262,10 @@ impl Instance {
 
     /// Returns the current database name, creating and selecting the default
     /// one when the session has not chosen one yet.
-    fn ensure_current_db(&self, session: &mut Session) -> Result<String> {
+    ///
+    /// Also used by the plan endpoint, so that planning a statement resolves
+    /// its database exactly the way running it would.
+    pub(crate) fn ensure_current_db(&self, session: &mut Session) -> Result<String> {
         if let Some(name) = session.current_db() {
             return Ok(name.to_string());
         }

@@ -7,9 +7,12 @@
 use std::path::Path;
 
 use crate::config::{Config, WebRootState};
+use crate::instance::Instance;
+use crate::introspect;
 use crate::lexer::{Punct, Token, TokenKind};
 use crate::net::json::{self, Json};
 use crate::result::{encode_error, json_string};
+use crate::trx::Session;
 use crate::{Error, lexer, parser};
 
 /// A response for `http.rs` to frame and write out.
@@ -36,26 +39,134 @@ impl Response {
 
 /// Routes the paths this module owns. `None` hands the request back to
 /// `http.rs`, which serves `/health` and `/query`.
-pub(crate) fn handle(config: &Config, method: &str, path: &str, body: &[u8]) -> Option<Response> {
+///
+/// The instance and the session are threaded through because an endpoint that
+/// inspects the engine (`/api/plan`) needs the statement's database, resolved
+/// for that session exactly as a query would resolve it.
+pub(crate) fn handle(
+    instance: &Instance,
+    session: &mut Session,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Option<Response> {
     match (method, path) {
         // The legacy frontend keeps these two.
         ("GET", "/health") | ("POST", "/query") => None,
-        (_, path) if path.starts_with("/api/") => Some(api(config, method, path, body)),
-        ("GET", path) => Some(static_file(config, path)),
+        (_, path) if path.starts_with("/api/") => {
+            Some(api(instance, session, method, path, body))
+        }
+        ("GET", path) => Some(static_file(instance.config(), path)),
         _ => None,
     }
 }
 
 /// The `/api/*` surface. Off unless `server.admin_api` says otherwise, so the
 /// whole namespace answers 404 on a default deployment.
-fn api(config: &Config, method: &str, path: &str, body: &[u8]) -> Response {
-    if !config.server.admin_api {
+fn api(
+    instance: &Instance,
+    session: &mut Session,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Response {
+    if !instance.config().server.admin_api {
         return Response::not_found();
     }
     match (method, path) {
         ("POST", "/api/parse") => parse_trace(body),
+        ("POST", "/api/plan") => plan_trace(instance, session, body),
         _ => Response::not_found(),
     }
+}
+
+/// `POST /api/plan` -- the plan the engine will run, why it chose it, and what
+/// the names resolved to.
+///
+/// **The status is 200 even when the statement does not parse or has no plan.**
+/// Like `/api/parse`, this endpoint diagnoses text as it is being written, so a
+/// statement with nothing to show is a result rather than a transport error;
+/// callers read `error` and `plans[].error`. A 400 means the *request* was
+/// malformed (not JSON, or no usable `sql` field).
+///
+/// The tree it returns is built by the executor's own `build_statement` and
+/// then dropped unopened, so it is the tree that would run -- not a rendering
+/// of `exec/plan.rs`, which is a parallel implementation of the same choice
+/// (that one is reported separately, under `explain`/`chosen`/`rejected`).
+fn plan_trace(instance: &Instance, session: &mut Session, body: &[u8]) -> Response {
+    let text = String::from_utf8_lossy(body);
+    let Ok(request) = json::parse(&text) else {
+        return Response::json("400 Bad Request", encode_error("expected a JSON object"));
+    };
+    let Some(sql) = request.get("sql").and_then(Json::as_str) else {
+        return Response::json(
+            "400 Bad Request",
+            encode_error("expected a string field \"sql\""),
+        );
+    };
+
+    let database = match instance.ensure_current_db(session) {
+        Ok(name) => name,
+        Err(e) => return plan_error(sql, "", &e.to_string()),
+    };
+    let Ok(db) = instance.database(&database) else {
+        return plan_error(sql, &database, "database is not open");
+    };
+
+    // Lex first so a failure can be placed: the lexer is all-or-nothing, so a
+    // lex error means there is no token stream, while a parse error leaves one
+    // worth showing. Same three-way outcome as `/api/parse`.
+    let (mut statements, mut error) = match lexer::lex(sql) {
+        Ok(_) => (Vec::new(), None),
+        Err(e) => (Vec::new(), Some(("lex", e))),
+    };
+    if error.is_none() {
+        match parser::parse(sql) {
+            Ok(parsed) => statements = parsed,
+            Err(e) => error = Some(("parse", e)),
+        }
+    }
+
+    let guard = db.read();
+    let plans: Vec<String> = statements
+        .iter()
+        .map(|stmt| introspect::plan::report(&database, &guard, stmt).to_json())
+        .collect();
+
+    let mut out = String::from("{\"sql\":");
+    out.push_str(&json_string(sql));
+    out.push_str(",\"database\":");
+    out.push_str(&json_string(&database));
+    out.push_str(",\"error\":");
+    match &error {
+        None => out.push_str("null"),
+        Some((stage, error)) => {
+            let (message, pos) = syntax_parts(error);
+            out.push_str(&format!(
+                "{{\"stage\":{},\"message\":{},\"pos\":{}}}",
+                json_string(stage),
+                json_string(&message),
+                pos.map_or_else(|| "null".to_string(), |at| at.to_string()),
+            ));
+        }
+    }
+    out.push_str(",\"plans\":[");
+    out.push_str(&join(plans.into_iter()));
+    out.push_str("]}");
+    Response::json("200 OK", out)
+}
+
+/// A plan response that could not even get as far as a statement.
+fn plan_error(sql: &str, database: &str, message: &str) -> Response {
+    Response::json(
+        "200 OK",
+        format!(
+            "{{\"sql\":{},\"database\":{},\"error\":{{\"stage\":\"database\",\"message\":{}}},\"plans\":[]}}",
+            json_string(sql),
+            json_string(database),
+            json_string(message),
+        ),
+    )
 }
 
 /// `POST /api/parse` -- the SQL as the compiler sees it, without running it.

@@ -4,6 +4,7 @@ pub mod db;
 mod error;
 pub mod exec;
 pub mod index;
+pub mod introspect;
 pub mod net;
 pub mod sql;
 pub mod storage;
