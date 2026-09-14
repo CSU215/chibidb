@@ -3,6 +3,10 @@ name = "chaoticdb"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["ffi"]
+default-members = [".", "ffi"]
+
 [dependencies]
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
