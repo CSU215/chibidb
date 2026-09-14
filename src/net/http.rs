@@ -7,37 +7,51 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
 use crate::instance::Instance;
-use crate::result::{encode_error, encode_results};
+use crate::result::{encode_error, encode_results, json_string};
 use crate::trx::Session;
 
 use crate::server::SharedInstance;
 
 use super::admin::{self, Response};
+use super::session::{SESSION_HEADER, SessionRegistry, spawn_sweeper};
 
 /// Largest request we will buffer (headers plus body).
 const MAX_REQUEST: usize = 8 * 1024 * 1024;
 
 /// Accepts HTTP connections until the listener closes.
 pub async fn serve(instance: SharedInstance, listener: TcpListener) -> io::Result<()> {
+    // One registry per listener. Sessions in it outlive the connections that
+    // created them, so an abandoned one is rolled back on a timer rather than
+    // when its socket closes.
+    let registry = SessionRegistry::new();
+    spawn_sweeper(Arc::clone(&registry), Arc::clone(&instance));
     loop {
         let (stream, peer) = listener.accept().await?;
         let stream = stream.into_std()?;
         stream.set_nonblocking(false)?;
         let instance = instance.clone();
+        let registry = Arc::clone(&registry);
         std::thread::spawn(move || {
-            if let Err(e) = serve_connection(&instance, stream) {
+            if let Err(e) = serve_connection(&instance, stream, &registry) {
                 eprintln!("http connection {peer} error: {e}");
             }
         });
     }
 }
 
-fn serve_connection(instance: &Instance, mut stream: TcpStream) -> io::Result<()> {
-    let mut session = Session::new();
+fn serve_connection(
+    instance: &Instance,
+    mut stream: TcpStream,
+    registry: &SessionRegistry,
+) -> io::Result<()> {
+    // The session for requests that carry no header. Rolled back when the socket
+    // goes away, exactly as it was before the registry existed.
+    let mut local = Session::new();
     let mut buf: Vec<u8> = Vec::new();
     let result = loop {
         let Some(header_end) = read_headers(&mut stream, &mut buf)? else {
@@ -64,7 +78,7 @@ fn serve_connection(instance: &Instance, mut stream: TcpStream) -> io::Result<()
         let body = &buf[header_end..body_end];
         let (method, path) = request_line(&head);
         let keep_alive = !head.to_ascii_lowercase().contains("connection: close");
-        let response = route(instance, &mut session, &method, &path, body);
+        let response = dispatch(instance, registry, &mut local, &head, &method, &path, body);
         write_response(&mut stream, &response, keep_alive)?;
 
         buf.drain(..body_end);
@@ -72,8 +86,47 @@ fn serve_connection(instance: &Instance, mut stream: TcpStream) -> io::Result<()
             break Ok(());
         }
     };
-    let _ = instance.rollback_session(&mut session);
+    // Only the connection's own session. A registry session is untouched, which
+    // is the whole point: a browser closes pooled sockets at will.
+    let _ = instance.rollback_session(&mut local);
     result
+}
+
+/// Picks the session for one request and runs it.
+///
+/// A request carrying `X-Chibi-Session` runs on that registry session; the id
+/// comes back in the response, and is a new one when the requested id was
+/// unknown. A request without the header runs on the connection's own session
+/// and gets no id, which is what keeps stateless clients identical to before.
+fn dispatch(
+    instance: &Instance,
+    registry: &SessionRegistry,
+    local: &mut Session,
+    head: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Response {
+    // `GET /session` mints an id without running a statement, so a fresh page
+    // can pick one up before its first query. It lives here rather than in the
+    // admin module because sessions are this module's business, and because it
+    // must work whether or not `admin_api` is on.
+    if method == "GET" && path == "/session" {
+        let (id, _session) = registry.mint();
+        let mut response =
+            Response::json("200 OK", format!("{{\"session\":{}}}", json_string(&id)));
+        response.extra_headers.push((SESSION_HEADER, id));
+        return response;
+    }
+
+    let Some(requested) = header(head, SESSION_HEADER) else {
+        return route(instance, local, method, path, body);
+    };
+    let (id, session) = registry.claim(requested);
+    // Locking after `claim` returned, never while holding the registry lock.
+    let mut response = route(instance, &mut session.lock(), method, path, body);
+    response.extra_headers.push((SESSION_HEADER, id));
+    response
 }
 
 fn route(
@@ -147,14 +200,17 @@ fn request_line(head: &str) -> (String, String) {
     (method, path)
 }
 
+/// The first value for a header, case-insensitively. The request line has no
+/// colon, so scanning every line including it is safe.
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
 fn content_length(head: &str) -> Option<usize> {
-    for line in head.lines() {
-        let lower = line.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("content-length:") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
+    header(head, "content-length")?.parse().ok()
 }
 
 /// Writes one response. The body is bytes, not a string: static assets include

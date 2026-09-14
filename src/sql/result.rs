@@ -70,7 +70,9 @@ fn json_value(value: &Value) -> String {
     }
 }
 
-fn json_string(s: &str) -> String {
+/// Escapes a string as a JSON literal, quotes included. Shared so the HTTP
+/// admin surface does not grow a second, subtly different escaper.
+pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

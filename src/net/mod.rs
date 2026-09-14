@@ -8,6 +8,7 @@ pub mod mysql;
 pub mod protocol;
 pub mod render;
 pub mod server;
+pub(crate) mod session;
 pub mod wire;
 
 mod repl;
