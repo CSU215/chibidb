@@ -7,20 +7,12 @@ use chaoticdb::config::{
 use chaoticdb::value::Value;
 use chaoticdb::{Database, ResultSet};
 
-/// The reference crate exposes `Config::web_console_unreachable`; the target
-/// crate does not. This shim exists only so the ported test body compiles; the
-/// test is `#[ignore]`d because it exercises no target code path.
-trait WebConsoleUnreachable {
-    fn web_console_unreachable(&self) -> bool;
+/// Renders a path so it can be embedded in a TOML basic string: on Windows a
+/// backslash is an escape, so it must be doubled.
+fn toml_path(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
 }
 
-impl WebConsoleUnreachable for Config {
-    fn web_console_unreachable(&self) -> bool {
-        self.server.http_addr.is_none() && matches!(self.web_root_state(), WebRootState::Ready(_))
-    }
-}
-
-#[ignore = "chaoticdb: default execution mode is Volcano, not Chunk"]
 #[test]
 fn defaults_are_sane() {
     let c = Config::default();
@@ -65,7 +57,6 @@ fn server_web_root_parses() {
     assert_eq!(off.server.web_root.as_deref(), Some(""));
 }
 
-#[ignore = "chaoticdb: Config::web_console_unreachable is not part of the target API"]
 #[test]
 fn a_built_console_without_an_http_listener_is_flagged() {
     // Every case sets `web_root` explicitly and none uses `Config::default()`.
@@ -74,7 +65,7 @@ fn a_built_console_without_an_http_listener_is_flagged() {
     // the console. A test that leaned on the default would pass or fail
     // depending on whether that build had happened.
     let built = tempfile::tempdir().unwrap();
-    let web_root = format!("web_root = \"{}\"", built.path().display());
+    let web_root = format!("web_root = \"{}\"", toml_path(built.path()));
 
     // The silent case this exists for: the console is built, `serve` starts, and
     // nothing says the console has nowhere to be served from. The user sees only
@@ -96,15 +87,12 @@ fn a_built_console_without_an_http_listener_is_flagged() {
     // Configured but not built yet: that case already has its own note on the
     // HTTP path, and there is no point nagging when there is nothing to serve.
     let unbuilt = built.path().join("not-built-yet");
-    let missing = Config::from_toml_str(&format!(
-        "[server]\nweb_root = \"{}\"\n",
-        unbuilt.display()
-    ))
-    .unwrap();
+    let missing =
+        Config::from_toml_str(&format!("[server]\nweb_root = \"{}\"\n", toml_path(&unbuilt)))
+            .unwrap();
     assert!(!missing.web_console_unreachable());
 }
 
-#[ignore = "chaoticdb: reference test interpolates a Windows path into TOML ('\\U' escape)"]
 #[test]
 fn web_root_state_distinguishes_off_missing_and_ready() {
     let dir = tempfile::tempdir().unwrap();
@@ -115,15 +103,17 @@ fn web_root_state_distinguishes_off_missing_and_ready() {
     // Configured but not there: the startup note and the fallback page both key
     // off this, so the absolute path must come back with it.
     let missing = dir.path().join("nope");
-    let absent = Config::from_toml_str(&format!("[server]\nweb_root = \"{}\"\n", missing.display()))
-        .unwrap();
+    let absent =
+        Config::from_toml_str(&format!("[server]\nweb_root = \"{}\"\n", toml_path(&missing)))
+            .unwrap();
     match absent.web_root_state() {
         WebRootState::Missing(path) => assert!(path.contains("nope"), "{path}"),
         other => panic!("expected Missing, got {other:?}"),
     }
 
-    let ready = Config::from_toml_str(&format!("[server]\nweb_root = \"{}\"\n", dir.path().display()))
-        .unwrap();
+    let ready =
+        Config::from_toml_str(&format!("[server]\nweb_root = \"{}\"\n", toml_path(dir.path())))
+            .unwrap();
     match ready.web_root_state() {
         WebRootState::Ready(path) => assert!(path.is_absolute(), "{}", path.display()),
         other => panic!("expected Ready, got {other:?}"),
@@ -335,7 +325,6 @@ fn database_applies_config_eviction_policy() {
     }
 }
 
-#[ignore = "chaoticdb: config.example.toml is absent from the crate root"]
 #[test]
 fn example_config_stays_valid() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");

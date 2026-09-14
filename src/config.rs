@@ -15,11 +15,13 @@ pub enum EngineKind {
 }
 
 /// Execution model: row-at-a-time (Volcano) or columnar batches (Chunk).
+/// Chunk is the default; Volcano stays selectable and is the reference the
+/// differential tests compare against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionMode {
-    #[default]
     Volcano,
+    #[default]
     Chunk,
 }
 
@@ -223,6 +225,18 @@ impl Config {
         }
     }
 
+    /// Whether a built web console exists but has nowhere to be served from,
+    /// because no HTTP listener is configured.
+    ///
+    /// This is a silent failure otherwise: `serve` starts happily, prints one
+    /// text-protocol line, and the console answers nothing -- the browser (or
+    /// the dev server's proxy) reports a 5xx that names neither the cause nor
+    /// the fix. Hence the check. Deliberately false when there is no built
+    /// console, so a backend-only setup stays quiet.
+    pub fn web_console_unreachable(&self) -> bool {
+        self.server.http_addr.is_none() && matches!(self.web_root_state(), WebRootState::Ready(_))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.storage.buffer_pool_frames == 0 {
             return Err(Error::Runtime(
@@ -246,7 +260,7 @@ mod tests {
     fn defaults_are_usable() {
         let c = Config::default();
         assert_eq!(c.storage.default_engine, EngineKind::Heap);
-        assert_eq!(c.execution.mode, ExecutionMode::Volcano);
+        assert_eq!(c.execution.mode, ExecutionMode::Chunk);
         assert_eq!(c.transaction.isolation, Isolation::ReadCommitted);
         c.validate().unwrap();
     }
