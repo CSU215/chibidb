@@ -7,6 +7,7 @@ import {
   eventDetail,
   eventLabel,
   eventTone,
+  explainInterval,
   formatBytes,
   formatRate,
   intervalCounters,
@@ -45,6 +46,10 @@ const counters = computed(() =>
   latest.value ? intervalCounters(previous.value, latest.value) : null,
 )
 const chart = computed(() => sparkline(history.value, 100, 100))
+/// Why the window looks the way it does, when a bare number would mislead.
+const hint = computed(() =>
+  explainInterval(counters.value, latest.value?.pool.capacity ?? 0),
+)
 const walPercent = computed(() => {
   const wal = latest.value?.wal
   if (!wal || wal.threshold === 0) return 0
@@ -172,6 +177,10 @@ onUnmounted(() => {
         <span class="sub">
           本次窗口 {{ counters ? `${counters.hits} 命中 / ${counters.misses} 缺页` : '等待第二次采样' }}
         </span>
+        <span class="sub">
+          累计 {{ latest ? formatRate(latest.pool.hit_rate) : '—' }}
+        </span>
+        <span v-if="hint" class="sub warn">{{ hint }}</span>
       </div>
       <div class="tile">
         <span class="label">常驻帧</span>
@@ -327,6 +336,11 @@ onUnmounted(() => {
 .tile .sub {
   font-size: 12px;
   color: var(--el-text-color-secondary);
+}
+
+.tile .warn {
+  color: var(--el-color-warning);
+  line-height: 1.5;
 }
 
 .chart {

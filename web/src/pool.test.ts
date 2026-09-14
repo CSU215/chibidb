@@ -4,6 +4,7 @@ import type { Metrics, PoolEvent } from './api/types'
 import {
   eventDetail,
   eventLabel,
+  explainInterval,
   formatBytes,
   intervalCounters,
   intervalHitRate,
@@ -125,5 +126,29 @@ describe('formatBytes', () => {
     expect(formatBytes(512)).toBe('512 B')
     expect(formatBytes(2048)).toBe('2.0 KB')
     expect(formatBytes(8 * 1024 * 1024)).toBe('8.00 MB')
+  })
+})
+
+describe('explainInterval', () => {
+  const counters = (hits: number, misses: number) => ({ hits, misses, evictions: 0 })
+
+  it('says nothing when the rate speaks for itself', () => {
+    expect(explainInterval(counters(10, 2), 64)).toBe('')
+    expect(explainInterval(null, 64)).toBe('')
+  })
+
+  it('names the working set when nothing hit', () => {
+    // A flat 0% looks like a broken meter; it is the expected reading for a
+    // scan that does not fit, and the pool size is the missing half of that.
+    const hint = explainInterval(counters(0, 115), 64)
+    expect(hint).toContain('0 次命中')
+    expect(hint).toContain('64 帧')
+    expect(hint).toContain('512.0 KB')
+    expect(hint).toContain('buffer_pool_frames')
+  })
+
+  it('distinguishes an idle window from a thrashing one', () => {
+    expect(explainInterval(counters(0, 0), 64)).toContain('没有页访问')
+    expect(explainInterval(counters(0, 0), 64)).not.toContain('工作集')
   })
 })

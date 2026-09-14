@@ -35,6 +35,31 @@ export function formatRate(rate: number | null): string {
   return rate === null ? '—' : `${(rate * 100).toFixed(1)}%`
 }
 
+/// The engine's page size (`PAGE_SIZE` in `src/storage/page.rs`). The console
+/// only needs it to turn a frame count into a readable size.
+export const FRAME_BYTES = 8192
+
+/// Why an interval came out the way it did, when that is not obvious.
+///
+/// A flat 0% is the least self-explanatory number the panel can show: it looks
+/// like a broken meter, while in fact it is the expected reading for a scan
+/// whose working set does not fit -- every page is evicted before it is needed
+/// again, so the hit count stays at zero and *will* stay there. Saying so, with
+/// the pool's size next to it, is the difference between a number and an
+/// answer. Empty when the rate speaks for itself.
+export function explainInterval(counters: Counters | null, capacityFrames: number): string {
+  if (!counters) return ''
+  const lookups = counters.hits + counters.misses
+  if (lookups === 0) return '窗口内没有页访问。'
+  if (counters.hits > 0) return ''
+  const size = formatBytes(capacityFrames * FRAME_BYTES)
+  return (
+    `窗口内 ${counters.misses} 次缺页、0 次命中：检索的工作集大于池容量` +
+    `（${capacityFrames} 帧 = ${size}），页在被再次用到之前就已经被换出。` +
+    `加大 storage.buffer_pool_frames，或改用能复用页的查询（点查/小范围）即可看到命中。`
+  )
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
