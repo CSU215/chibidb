@@ -31,7 +31,7 @@ use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
 use crate::config::{Config, EngineKind, ExecutionMode, Isolation, PageLayout};
 use crate::index::{encode_key, BTree};
 use crate::pipeline::{ExecuteStage, OptimizeStage, Pipeline, ResolveStage, SqlEvent};
-use crate::storage::codec::{decode_record, encode_record};
+use crate::storage::codec::{decode_record, encode_record, record_next_rid, unpack_rid};
 use crate::storage::engine::{HeapEngine, TableStorage};
 use crate::storage::lsm::engine::{LsmEngine, LSM_FILE_ID};
 use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, LobStore, Rid};
@@ -780,6 +780,23 @@ impl Database {
             // full rollback: release the transaction's row locks
             self.locks.unlock_all(trx.id);
         }
+        self.undo_to(trx, undo_mark, wal_mark)
+    }
+
+    /// Undoes the entries above `undo_mark` and drops the redo frames buffered
+    /// after `wal_mark` **without releasing locks**. An EPQ restart uses this so
+    /// the row lock it just won is held across the retry: releasing it would let
+    /// a competing writer steal the row and starve the retry.
+    pub(crate) fn rollback_statement(
+        &self,
+        trx: &mut TrxState,
+        undo_mark: usize,
+        wal_mark: usize,
+    ) -> Result<()> {
+        self.undo_to(trx, undo_mark, wal_mark)
+    }
+
+    fn undo_to(&self, trx: &mut TrxState, undo_mark: usize, wal_mark: usize) -> Result<()> {
         trx.wal.truncate(wal_mark);
         while trx.undo.len() > undo_mark {
             let undo = trx.undo.pop().expect("len > mark checked");
@@ -1042,12 +1059,50 @@ impl Database {
                 }
                 let rec = engine.get(&self.pool, rid)?;
                 let (creator, deleter, _) = decode_record(&rec, &self.lobs)?;
-                if self.unique_key_taken(creator, deleter, trx.id) {
-                    return Err(Error::Runtime(format!("duplicate key: {table}({column})")));
+                if !self.unique_key_taken(creator, deleter, trx.id) {
+                    continue;
                 }
+                // A version of the row being updated shares the key but is not
+                // a duplicate; the update conflict is resolved by EPQ. The
+                // chain link may have been created while we waited on the key
+                // lock, so this must be decided now, not up front.
+                if let Some(ex) = exclude
+                    && self.same_version_chain(&*engine, ex, rid)?
+                {
+                    continue;
+                }
+                return Err(Error::Runtime(format!("duplicate key: {table}({column})")));
             }
         }
         Ok(())
+    }
+
+    /// Whether two rids are versions of the same logical row, i.e. connected by
+    /// the `next_rid` update chain.
+    fn same_version_chain(&self, engine: &dyn TableStorage, a: Rid, b: Rid) -> Result<bool> {
+        Ok(a == b || self.chain_reaches(engine, a, b)? || self.chain_reaches(engine, b, a)?)
+    }
+
+    /// Whether the chain starting at `from` reaches `target`.
+    fn chain_reaches(&self, engine: &dyn TableStorage, from: Rid, target: Rid) -> Result<bool> {
+        let mut cur = from;
+        for _ in 0..4096 {
+            let rec = engine.get(&self.pool, cur)?;
+            let next = record_next_rid(&rec)?;
+            if next == 0 {
+                return Ok(false);
+            }
+            let (page, slot) = unpack_rid(next);
+            let next = Rid::new(page, slot);
+            if next == target {
+                return Ok(true);
+            }
+            if next == cur {
+                return Ok(false);
+            }
+            cur = next;
+        }
+        Ok(false)
     }
 
     /// Whether a version still occupies its unique key for the current

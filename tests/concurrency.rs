@@ -1,9 +1,10 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chibidb::config::Config;
 use chibidb::instance::Instance;
 use chibidb::value::Value;
-use chibidb::{ResultSet, Session};
+use chibidb::{Database, ResultSet, Session};
 
 fn count(inst: &Instance, db_name: &str) -> i64 {
     inst.with_database_mut(db_name, |db| {
@@ -129,6 +130,46 @@ fn concurrent_autocommit_writes_stay_correct() {
     });
 
     assert_eq!(count(&inst, "a"), 800);
+}
+
+#[test]
+fn concurrent_increments_do_not_lose_updates() {
+    // Eight writers hammer one row with an atomic increment under the default
+    // read committed. EPQ must re-read the latest version and re-apply, so the
+    // final value equals the number of successful increments and nobody aborts.
+    let db = Arc::new(Database::open_in_memory().unwrap());
+    db.execute_sql("create table t (id int primary key, n int);").unwrap();
+    db.execute_sql("insert into t values (1, 0);").unwrap();
+
+    let ok = Arc::new(AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let db = Arc::clone(&db);
+            let ok = Arc::clone(&ok);
+            scope.spawn(move || {
+                let mut session = Session::new();
+                for _ in 0..50 {
+                    if db
+                        .execute_sql_with(&mut session, "update t set n = n + 1 where id = 1;")
+                        .is_ok()
+                    {
+                        ok.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+    });
+
+    let successes = ok.load(Ordering::SeqCst) as i64;
+    let n = match db.execute_sql("select n from t where id = 1;").unwrap().remove(0) {
+        ResultSet::Rows { rows, .. } => match rows[0][0] {
+            Value::Int(v) => v,
+            ref other => panic!("expected int, got {other:?}"),
+        },
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(n, successes, "every successful increment must be reflected");
+    assert_eq!(successes, 400, "read committed must retry, not abort, under contention");
 }
 
 #[test]

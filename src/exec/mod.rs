@@ -251,7 +251,7 @@ fn epq_retry(
     loop {
         match run(db, trx) {
             Err(Error::Retry) if db.isolation() == Isolation::ReadCommitted => {
-                db.rollback_trx_to(trx, undo_mark, wal_mark)?;
+                db.rollback_statement(trx, undo_mark, wal_mark)?;
                 trx.snapshot = db.current_snapshot();
                 attempts += 1;
                 if attempts >= MAX_EPQ_RETRIES {

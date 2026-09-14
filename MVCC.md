@@ -281,8 +281,14 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
 - **唯一约束并发安全**：此前 `check_unique` 是"按快照读索引、且不加锁"，并发插入同一键会重复
   （默认 read_committed 下实测 8/8 成功）。现改为：对索引键加锁（复用行锁管理器、持至事务结束），
   再以**当前已提交状态**（而非快照）判定键是否被占用；后到者在锁上等待，前者提交后即见其已提交行并报
-  `duplicate key`。UNIQUE/PK 因此在 RC/RR/Serializable 下均成立。验收：`tests/constraints.rs`
-  三个隔离级各一个并发竞态用例 + 不同键全成功 + 并发 UPDATE 抢同一唯一值。
+  `duplicate key`。UNIQUE/PK 因此在 RC/RR/Serializable 下均成立。
+  注意 UPDATE 场景：一个**并发新建的同逻辑行版本**同键但不算重复（否则会把正常更新误判为冲突），
+  故对"已占用"的候选再沿 `next_rid` 链判断是否与 `exclude` 属同一逻辑行，是则跳过（该冲突交给 EPQ）。
+  验收：`tests/constraints.rs` 三个隔离级各一个并发竞态用例 + 不同键全成功 + 并发 UPDATE 抢同一唯一值。
+- **EPQ 重启持有行锁**：`epq_retry` 改用 `rollback_statement`（回滚语句但不解锁）——此前重启会
+  `unlock_all`，把刚拿到的行锁放掉，在单行高并发下被对手抢走导致饥饿（实测 8×50 自增只有 51/400 成功，
+  其余 40001）。持锁重试后同为 **400/400 成功且无丢失更新**。验收：`tests/concurrency.rs` 的
+  `concurrent_increments_do_not_lose_updates`。
 
 ---
 
