@@ -69,6 +69,11 @@ impl Instance {
         &self.config
     }
 
+    /// The data root: the directory holding every database and `chibi_meta`.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn bootstrap_meta(&self) -> Result<()> {
         let meta = self.meta.read();
         if !meta.table_exists("databases") {

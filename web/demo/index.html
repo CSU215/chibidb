@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>chaoticdb console</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">&#9670;</span>
+    <h1 id="app-title">chaoticdb console</h1>
+  </div>
+  <div class="topbar-right">
+    <span id="session-pill" class="pill pill-muted" title="会话 ID">no session</span>
+    <span id="health-pill" class="pill pill-muted">连接中&hellip;</span>
+  </div>
+</header>
+
+<nav class="tabs" id="tabbar" role="tablist" aria-label="功能面板">
+  <button class="tab is-active" data-tab="sql" role="tab" aria-selected="true">SQL 控制台</button>
+  <button class="tab" data-tab="pipeline" role="tab" aria-selected="false">编译流水线</button>
+  <button class="tab" data-tab="storage" role="tab" aria-selected="false">存储与页</button>
+  <button class="tab" data-tab="schema" role="tab" aria-selected="false">Schema</button>
+</nav>
+
+<main id="main">
+  <!-- ============ SQL 控制台 ============ -->
+  <section id="panel-sql" class="panel is-active" role="tabpanel">
+    <div class="sql-layout">
+      <div class="sql-main">
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">SQL</span>
+            <span class="hint">Ctrl / Cmd + Enter 执行</span>
+          </div>
+          <textarea id="sql-input" class="editor" spellcheck="false" autocomplete="off"
+            placeholder="SELECT * FROM t;&#10;-- 支持多条语句，用分号分隔"></textarea>
+          <div class="row">
+            <button id="sql-run" class="btn btn-primary" type="button">执行</button>
+            <button id="sql-clear" class="btn" type="button">清空</button>
+            <span id="sql-status" class="muted"></span>
+          </div>
+        </div>
+
+        <div id="sql-results" class="results" aria-live="polite"></div>
+
+        <div class="card">
+          <div class="card-head"><span class="card-title">历史</span><span class="hint">点击恢复</span></div>
+          <div id="sql-history" class="history"><span class="muted">暂无历史</span></div>
+        </div>
+      </div>
+
+      <aside class="sql-side">
+        <div class="card card-flush">
+          <div class="card-head"><span class="card-title">Schema</span></div>
+          <div id="sql-schema" class="schema-mini"><span class="muted">加载中&hellip;</span></div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ============ 编译流水线 ============ -->
+  <section id="panel-pipeline" class="panel" role="tabpanel" hidden>
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">SQL</span>
+        <span class="hint">POST /api/plan</span>
+      </div>
+      <textarea id="plan-input" class="editor" spellcheck="false" autocomplete="off"
+        placeholder="SELECT id FROM t WHERE id &gt; 10;">SELECT id FROM t WHERE id &gt; 10;</textarea>
+      <div class="row">
+        <button id="plan-run" class="btn btn-primary" type="button">编译</button>
+        <span id="plan-status" class="muted"></span>
+      </div>
+    </div>
+
+    <div id="plan-error"></div>
+
+    <div class="pipe-grid">
+      <div class="card pipe-card" id="pipe-card-tokens">
+        <div class="card-head collapsible" data-collapse="pipe-tokens">
+          <span class="card-title">Tokens</span>
+          <span class="chev">&#9662;</span>
+        </div>
+        <div class="pipe-body" id="pipe-tokens"><span class="muted">&mdash;</span></div>
+        <div class="pipe-detail" id="pipe-token-detail"></div>
+      </div>
+
+      <div class="card pipe-card" id="pipe-card-statement">
+        <div class="card-head collapsible" data-collapse="pipe-statement">
+          <span class="card-title">Statement</span>
+          <span class="chev">&#9662;</span>
+        </div>
+        <div class="pipe-body" id="pipe-statement"><span class="muted">&mdash;</span></div>
+      </div>
+
+      <div class="card pipe-card" id="pipe-card-plan">
+        <div class="card-head collapsible" data-collapse="pipe-plan">
+          <span class="card-title">Plan</span>
+          <span class="chev">&#9662;</span>
+        </div>
+        <div class="pipe-body" id="pipe-plan"><span class="muted">&mdash;</span></div>
+      </div>
+
+      <div class="card pipe-card" id="pipe-card-physical">
+        <div class="card-head collapsible" data-collapse="pipe-physical">
+          <span class="card-title">PhysicalOperator</span>
+          <span class="chev">&#9662;</span>
+        </div>
+        <div class="pipe-body" id="pipe-physical"><span class="muted">&mdash;</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 存储与页 ============ -->
+  <section id="panel-storage" class="panel" role="tabpanel" hidden>
+    <div class="storage-layout">
+      <aside class="storage-side">
+        <div class="card card-flush">
+          <div class="card-head"><span class="card-title">数据库</span></div>
+          <div class="pad"><select id="storage-db" class="select"></select></div>
+        </div>
+        <div class="card card-flush">
+          <div class="card-head"><span class="card-title">文件</span></div>
+          <div id="storage-files" class="file-list"><span class="muted">加载中&hellip;</span></div>
+        </div>
+      </aside>
+
+      <div class="storage-main">
+        <div id="storage-disabled" class="notice" hidden>
+          storage preview disabled (set [web] page_preview = true)
+        </div>
+
+        <div id="storage-viewer">
+          <div class="card page-nav-card">
+            <div class="page-nav">
+              <button id="page-prev" class="btn btn-small" type="button">&#9664; 上一页</button>
+              <span id="page-indicator" class="mono">0 / 0</span>
+              <button id="page-next" class="btn btn-small" type="button">下一页 &#9654;</button>
+              <form id="page-jump-form" class="jump">
+                <input id="page-jump" class="input input-small" type="number" min="0" step="1" placeholder="页码">
+                <button class="btn btn-small" type="submit">跳转</button>
+              </form>
+              <span id="page-file" class="mono muted"></span>
+            </div>
+          </div>
+
+          <div id="page-meta" class="page-meta"></div>
+          <div id="page-hex" class="hex-wrap"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ Schema ============ -->
+  <section id="panel-schema" class="panel" role="tabpanel" hidden>
+    <div class="card">
+      <div class="card-head"><span class="card-title">Schema 浏览器</span><span id="schema-summary" class="hint"></span></div>
+      <div id="schema-tree" class="schema-tree"><span class="muted">加载中&hellip;</span></div>
+    </div>
+  </section>
+</main>
+
+<script src="app.js" defer></script>
+</body>
+</html>

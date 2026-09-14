@@ -75,9 +75,10 @@ fn serve_connection(
 
         let body_end = body_end.min(buf.len());
         let body = &buf[header_end..body_end];
-        let (method, path) = request_line(&head);
+        let (method, path, query) = request_line(&head);
+        let target = Target { method: &method, path: &path, query: &query };
         let keep_alive = !head.to_ascii_lowercase().contains("connection: close");
-        let response = dispatch(instance, registry, &mut local, &head, &method, &path, body);
+        let response = dispatch(instance, registry, &mut local, &head, &target, body);
         write_response(&mut stream, &response, keep_alive)?;
 
         buf.drain(..body_end);
@@ -91,6 +92,13 @@ fn serve_connection(
     result
 }
 
+/// The parsed request line: method, path (without query) and query string.
+struct Target<'a> {
+    method: &'a str,
+    path: &'a str,
+    query: &'a str,
+}
+
 /// Picks the session for one request and runs it.
 ///
 /// A request carrying `X-Chibi-Session` runs on that registry session; the id
@@ -102,15 +110,14 @@ fn dispatch(
     registry: &SessionRegistry,
     local: &mut Session,
     head: &str,
-    method: &str,
-    path: &str,
+    target: &Target<'_>,
     body: &[u8],
 ) -> Response {
     // `GET /session` mints an id without running a statement, so a fresh page
     // can pick one up before its first query. It lives here rather than in the
     // admin module because sessions are this module's business, and because it
     // must work whether or not `admin_api` is on.
-    if method == "GET" && path == "/session" {
+    if target.method == "GET" && target.path == "/session" {
         let (id, _session) = registry.mint();
         let mut response =
             Response::json("200 OK", format!("{{\"session\":{}}}", json_string(&id)));
@@ -119,11 +126,11 @@ fn dispatch(
     }
 
     let Some(requested) = header(head, SESSION_HEADER) else {
-        return route(instance, local, method, path, body);
+        return route(instance, local, target, body);
     };
     let (id, session) = registry.claim(requested);
     // Locking after `claim` returned, never while holding the registry lock.
-    let mut response = route(instance, &mut session.lock(), method, path, body);
+    let mut response = route(instance, &mut session.lock(), target, body);
     response.extra_headers.push((SESSION_HEADER, id));
     response
 }
@@ -131,16 +138,17 @@ fn dispatch(
 fn route(
     instance: &Instance,
     session: &mut Session,
-    method: &str,
-    path: &str,
+    target: &Target<'_>,
     body: &[u8],
 ) -> Response {
     // The admin surface owns `/api/*` and static hosting; it declines the two
     // legacy paths so they keep their exact previous behaviour.
-    if let Some(response) = admin::handle(instance.config(), method, path, body) {
+    if let Some(response) =
+        admin::handle(instance, session, target.method, target.path, target.query, body)
+    {
         return response;
     }
-    match (method, path) {
+    match (target.method, target.path) {
         ("GET", "/health") => Response::json("200 OK", "{\"status\":\"ok\"}".to_string()),
         ("POST", "/query") => {
             let text = String::from_utf8_lossy(body);
@@ -189,14 +197,18 @@ fn read_body(stream: &mut TcpStream, buf: &mut Vec<u8>, want: usize) -> io::Resu
     Ok(())
 }
 
-fn request_line(head: &str) -> (String, String) {
+fn request_line(head: &str) -> (String, String, String) {
     let line = head.lines().next().unwrap_or("");
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
-    // Drop the query and fragment: `/assets/app.js?v=1` names the file `app.js`.
     let target = parts.next().unwrap_or("/");
-    let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
-    (method, path)
+    // The fragment is never sent by a browser, but drop it anyway. `/assets/app.js?v=1`
+    // names the file `app.js`, with `v=1` as the query.
+    let target = target.split('#').next().unwrap_or("/");
+    match target.split_once('?') {
+        Some((path, query)) => (method, path.to_string(), query.to_string()),
+        None => (method, target.to_string(), String::new()),
+    }
 }
 
 /// The first value for a header, case-insensitively. The request line has no

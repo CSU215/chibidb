@@ -72,6 +72,18 @@ thread_model = "per-connection"
 # thread_model = "thread-pool" 时的工作线程数（必须大于 0）。
 worker_threads = 4
 
+[web]
+# 是否启用内置的无构建演示控制台（由二进制内嵌，直接访问 / 即可）。
+# 关闭时 / 仍按 web_root 的静态托管规则处理。
+enabled = false
+
+# 控制台标题（页面头部显示）。
+title = "chaoticdb console"
+
+# 是否允许只读的磁盘预览接口（/api/files、/api/page）。默认关闭：
+# 这些接口会暴露原始数据页。
+page_preview = false
+
 [execution]
 # 执行模型：chunk（列式批处理：扫描/过滤/投影/聚合/连接，默认）或 volcano
 # （行式火山算子；其余算子自动回退行路径，两模式结果一致）。

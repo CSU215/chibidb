@@ -90,6 +90,7 @@ pub struct Config {
     pub auth: AuthConfig,
     pub transaction: TransactionConfig,
     pub observability: ObservabilityConfig,
+    pub web: WebConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -127,6 +128,29 @@ pub struct ServerConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ExecutionConfig {
     pub mode: ExecutionMode,
+}
+
+/// The built-in, no-build demo console served straight from the binary.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebConfig {
+    /// Serve the built-in, no-build demo console at `/` from the binary.
+    pub enabled: bool,
+    /// Console title shown in the header.
+    pub title: String,
+    /// Allow the read-only disk preview endpoints (`/api/files`, `/api/page`).
+    /// Off by default: they expose raw data pages.
+    pub page_preview: bool,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            title: "chaoticdb console".into(),
+            page_preview: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -279,6 +303,22 @@ mod tests {
     #[test]
     fn unknown_keys_are_rejected() {
         assert!(Config::from_toml_str("[storage]\nnope = 1\n").is_err());
+    }
+
+    #[test]
+    fn web_section_parses() {
+        let c = Config::from_toml_str(
+            "[web]\nenabled = true\ntitle = \"x\"\npage_preview = true\n",
+        )
+        .unwrap();
+        assert!(c.web.enabled);
+        assert_eq!(c.web.title, "x");
+        assert!(c.web.page_preview);
+
+        let d = Config::default().web;
+        assert!(!d.enabled);
+        assert_eq!(d.title, "chaoticdb console");
+        assert!(!d.page_preview);
     }
 
     #[test]

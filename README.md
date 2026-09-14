@@ -33,6 +33,7 @@ REPL / client 中输入 `exit` 或 `quit` 退出。启动时从**当前工作目
 - `auth.enabled`
 - `transaction.isolation`（`read_committed` 默认 / `repeatable_read` / `serializable`）、
   `transaction.lock_timeout_ms`
+- `web.enabled` / `web.title` / `web.page_preview`（内置演示前端，见下）
 
 配置为严格模式（`deny_unknown_fields`）：出现未知条目会直接报错。
 
@@ -47,6 +48,26 @@ REPL / client 中输入 `exit` 或 `quit` 退出。启动时从**当前工作目
 - **MySQL wire**：设置 `server.mysql_addr` 后，可用 `mysql` 客户端连接：握手使用
   `mysql_native_password`，`COM_QUERY` 走文本结果集，并支持
   `COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`（预处理语句）。
+
+### 内置演示前端
+
+设置 `[web] enabled = true` 后，HTTP 监听器在 `/` 直接托管一个**无需构建、零依赖**的演示控制台
+（源码在 `web/demo/`，编译期由 `include_str!` 内嵌；`web.enabled` 为真时优先于 `server.web_root`）：
+
+- **SQL 控制台**：执行 SQL 并展示结果表 / affected / 错误；会话可跨请求（事务）。
+- **编译流水线**：输入 → Token 流 → Statement(AST) → Plan(访问路径) → PhysicalOperator(缩进算子树)。
+- **存储与页**：浏览数据目录文件、页导航、文件头 / 槽目录 / B+ 节点结构 + Hex / ASCII。
+- **Schema 树**：库 / 表 / 列与约束。
+
+相关接口（均受 `server.admin_api` 门控）：`POST /api/plan`、`GET /api/config`、`GET /api/schema`、
+`GET /api/files`、`GET /api/page`；后两个另需 `[web] page_preview = true`（会读取原始数据页）。
+
+```toml
+[web]
+enabled = true          # 在 / 托管内置演示控制台
+title = "chaoticdb console"
+page_preview = false    # 允许 /api/files 与 /api/page 预览磁盘页
+```
 
 ### 冒烟演示
 
