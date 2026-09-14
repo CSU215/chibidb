@@ -233,8 +233,14 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
   （8→16 字节/槽）全部改为 `u64`；格式魔数升位（catalog `CHIDCAT9`、PAX `PAX2`、
   记录格式随 magic 升级），旧数据文件按决策 4 丢弃。验收：既有 601 项测试全绿，
   clippy 零警告，崩溃恢复/并发回归通过。
-- **Step 7b｜GC/horizon**（待做）：地平线回收 clog 前缀 + 与 vacuum/catalog 对齐。
-  验收：长跑后 xid 状态有界；崩溃恢复回归。
+- **Step 7b｜GC/horizon** ✅：`CommitStatus` 增加地平线 `base`——`xid < base` 一律视为已提交，
+  位图前缀随之丢弃。`VACUUM`（持有整库独占锁、无 open 事务）在清理后做两件事再推进地平线：
+  (1) 物理删除 creator 从未提交的版本；(2) **清除未提交 deleter 留下的删除标记**（PG 的
+  "un-delete"），使低于地平线的 xid 状态可安全冻结为"已提交"。推进后调用 `advance_horizon(next_id)`
+  并 `save_catalog()`，把 `clog_base` 持久化进 catalog（魔数 `CHIDCATA`）；重开时用
+  `base + committed_trxs(≥base)` 重建 clog。因此 clog 与 catalog 的 `committed_trxs` 都只保留
+  "上次 vacuum 之后的提交"，不再随历史提交数无界增长。验收：新增 horizon 单测、`vacuum_advances_the_clog_horizon…`
+  与 `vacuum_horizon_survives_a_reopen` 集成用例；全量 604 项测试绿。
 
 风险最高的是 Step 5（撤整库写锁），其替代（Step 3–4）必须先到位。
 

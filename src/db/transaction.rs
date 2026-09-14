@@ -34,9 +34,11 @@ pub struct TransactionManager {
 }
 
 impl TransactionManager {
-    /// Resumes from a recovered state: the next free id and the committed ids.
-    pub fn new(next_id: u64, committed: impl IntoIterator<Item = u64>) -> Self {
+    /// Resumes from a recovered state: the next free id, the committed ids at
+    /// or above the persisted horizon, and that horizon.
+    pub fn new(next_id: u64, committed: impl IntoIterator<Item = u64>, base: u64) -> Self {
         let status = CommitStatus::new();
+        status.advance_base(base);
         for id in committed {
             status.mark_committed(id);
         }
@@ -91,6 +93,18 @@ impl TransactionManager {
     /// The shared commit-status bitmap.
     pub fn commit_status(&self) -> Arc<CommitStatus> {
         Arc::clone(&self.committed)
+    }
+
+    /// The vacuum horizon below which commit status is frozen as committed.
+    pub fn clog_base(&self) -> u64 {
+        self.committed.base()
+    }
+
+    /// Advances the vacuum horizon, dropping the frozen prefix of the clog.
+    /// Callers must have run the vacuum cleanup that makes below-horizon status
+    /// equivalent to "committed".
+    pub fn advance_horizon(&self, new_base: u64) -> u64 {
+        self.committed.advance_base(new_base)
     }
 
     pub fn committed_ids(&self) -> Vec<u64> {
@@ -151,7 +165,7 @@ mod tests {
 
     #[test]
     fn commit_moves_a_transaction_into_the_snapshot() {
-        let tm = TransactionManager::new(1, []);
+        let tm = TransactionManager::new(1, [], 0);
         let a = tm.allocate();
         let b = tm.allocate();
         assert!(b > a);
@@ -173,7 +187,7 @@ mod tests {
 
     #[test]
     fn begin_open_registers_the_id_before_any_work_starts() {
-        let tm = TransactionManager::new(1, []);
+        let tm = TransactionManager::new(1, [], 0);
         let id = tm.begin_open();
         assert!(!tm.no_open_transactions(), "begin_open marks the id open");
         assert_eq!(tm.committed_count(), 0);
@@ -184,7 +198,7 @@ mod tests {
 
     #[test]
     fn with_open_set_excludes_a_concurrent_begin() {
-        let tm = TransactionManager::new(1, []);
+        let tm = TransactionManager::new(1, [], 0);
         tm.begin_open();
         let seen = tm.with_open_set(|open| open.len());
         assert_eq!(seen, 1);
@@ -193,14 +207,14 @@ mod tests {
 
     #[test]
     fn ensure_next_id_never_reuses_a_recovered_id() {
-        let tm = TransactionManager::new(1, []);
+        let tm = TransactionManager::new(1, [], 0);
         tm.ensure_next_id_at_least(10);
         assert!(tm.allocate() > 10);
     }
 
     #[test]
     fn has_open_excluding_ignores_the_caller() {
-        let tm = TransactionManager::new(1, []);
+        let tm = TransactionManager::new(1, [], 0);
         tm.insert_open(1);
         assert!(!tm.has_open_excluding(1));
         tm.insert_open(2);
@@ -209,7 +223,7 @@ mod tests {
 
     #[test]
     fn recovered_committed_ids_are_visible_to_a_new_snapshot() {
-        let tm = TransactionManager::new(7, [3, 5]);
+        let tm = TransactionManager::new(7, [3, 5], 0);
         assert!(tm.is_committed(3));
         assert!(tm.is_committed(5));
         assert!(!tm.is_committed(4));

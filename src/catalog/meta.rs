@@ -5,7 +5,7 @@ use crate::storage::header::{self, FileKind};
 use crate::value::Value;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"CHIDCAT9";
+const MAGIC: [u8; 8] = *b"CHIDCATA";
 
 const DTYPE_INT: u8 = 0x00;
 const DTYPE_FLOAT: u8 = 0x01;
@@ -52,6 +52,8 @@ pub struct CatalogSnapshot {
     pub next_table_file: u32,
     pub next_index_file: u32,
     pub next_trx_id: u64,
+    /// Vacuum horizon: xids below this are frozen as committed on reload.
+    pub clog_base: u64,
     pub committed_trxs: Vec<u64>,
     pub tables: Vec<TableMeta>,
     pub indexes: Vec<IndexMeta>,
@@ -64,6 +66,7 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
     put_u32(&mut buf, snap.next_table_file);
     put_u32(&mut buf, snap.next_index_file);
     put_u64(&mut buf, snap.next_trx_id);
+    put_u64(&mut buf, snap.clog_base);
     put_u32(&mut buf, snap.committed_trxs.len() as u32);
     for id in &snap.committed_trxs {
         put_u64(&mut buf, *id);
@@ -115,6 +118,7 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
     let next_table_file = take_u32(data, &mut pos)?;
     let next_index_file = take_u32(data, &mut pos)?;
     let next_trx_id = take_u64(data, &mut pos)?;
+    let clog_base = take_u64(data, &mut pos)?;
     let n_committed = take_u32(data, &mut pos)? as usize;
     // Do not pre-allocate from a file-supplied count: a corrupt catalog could
     // otherwise request a huge allocation before the reads fail.
@@ -182,6 +186,7 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
         next_table_file,
         next_index_file,
         next_trx_id,
+        clog_base,
         committed_trxs,
         tables,
         indexes,

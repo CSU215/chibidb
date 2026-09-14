@@ -99,7 +99,7 @@ python3 scripts/smoke.py     # Windows: python scripts\smoke.py；期望输出 S
 | `db/instance.rs` | 单实例多库：数据根 `<db>/` + 系统库 `chibi_meta/`；每个数据库一个 `Arc<RwLock<Database>>`（**跨库并行、库内读共享/写独占**），映射本身也在 `RwLock` 下，系统库同样受锁保护；`execute_with` 顶层入口（拦截库/用户/权限语句，其余路由到 current_db） | `Instance::open` / `execute_with` / `with_database_mut` |
 | `config.rs` | 全局配置中心：`Config`（storage/wal/server/execution/auth/transaction），`config.toml` 加载、默认值、校验 | `Config::load` / `from_toml_str` / `validate` |
 | `catalog/mod.rs` | `Catalog`：`Table`/`HeapStore`/`IndexEntry`、`Schema`/`ColumnDesc`（带 `owner`）、`resolve()` 歧义检测 | |
-| `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT9** + 统一文件头（事务簿记 + 视图定义 + 列约束 + 唯一索引标记）；`next_trx_id`/`committed_trxs` 为 `u64` | `CatalogSnapshot` |
+| `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCATA** + 统一文件头（事务簿记 + 视图定义 + 列约束 + 唯一索引标记）；`next_trx_id`/`clog_base`/`committed_trxs` 为 `u64` | `CatalogSnapshot` |
 | `storage/page.rs` | 页常量：`PAGE_SIZE=8192`、`FileId=u32`、`PageNo=u32`、`zeroed_page` | |
 | `storage/disk.rs` | `DiskManager`：分页文件读写、建文件、可选 Double-Write Buffer 的 stage/sync/reset；**按文件加锁**（`RwLock<BTreeMap<FileId, Arc<FileSlot>>>` 注册表 + 每文件 `Mutex<Option<File>>`，方法全 `&self`），`with_file` 提供"持单文件锁跑闭包"的原语，`alloc_page` 把"取页数 + 写零页"做成原子的；`write_page` 不再调 `File::flush`（对 `File` 是 no-op） | `with_file` / `alloc_page` |
 | `storage/header.rs` | 统一文件头 `[magic8][version u16][kind u8][page_size u32]`；`write_header`/`read_header` 校验版本/类型/页大小 | `FORMAT_VERSION` |
@@ -239,7 +239,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ```
 <data_dir>/
-  catalog.bin            # 魔数 CHIDCAT9 + 统一文件头 + next_table_file/next_index_file/next_trx_id(u64)/committed[](u64)
+  catalog.bin            # 魔数 CHIDCATA + 统一文件头 + next_table_file/next_index_file/next_trx_id(u64)/clog_base(u64)/committed[](u64)
                           # + 表元数据（列定义+file_no）+ 索引元数据（name/table/column/file_no）
   wal.bin                # 预写日志（见 §6.3）；干净关闭/flush 后为 0 字节
   tables/000000.dbf ...  # 每表一个 HeapFile；page 0 头魔数 CHIDHEAP + 统一头，数据页从 1 起，first-fit
@@ -248,6 +248,9 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 ```
 
 ### 6.2 MVCC 现状（M12.1）
+
+> 本节记录 M12.1 的初版 MVCC；当前已对齐 PostgreSQL，见 **`MVCC.md`**（PG 式 `{xmax,xip}` 快照 +
+> `src/db/clog.rs` 提交位图 + `src/db/lockmgr.rs` 行级锁 + B-link 并发索引）。
 
 - 每条堆记录物理格式：`[u64 creator_trx][u64 deleter_trx][行 codec]`（见 `codec::encode_record/decode_record`）
 - 事务状态在 `db/trx.rs`：
@@ -266,6 +269,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 - 读路径统一走 `decode_visible(records, trx)`；JOIN 流水线、索引扫描（store_get_records）都要过这层
 - 并发模型：全局单 Mutex 串行化，允许多个 BEGIN 并存但执行串行；连接断开时应 `rollback_session`（net/server.rs 当前在连接结束路径，确认已接入）
 - 索引与可见性：索引本身**不含** trx 信息，扫到 rid 后回表 + 可见性过滤；UPDATE/DELETE 会积累 stale 索引项（空间债）
+- **clog 地平线（GC）**：`CommitStatus` 有 `base`，`xid < base` 冻结为已提交。`VACUUM` 清理后（删 creator 未提交版本、清除未提交 deleter 的标记）推进地平线到 `next_id` 并 `save_catalog`，`clog_base` 落进 catalog；重开用 `base + committed[]` 重建。clog 与 catalog 的已提交集合都只保留上次 vacuum 之后的提交
 
 ### 6.3 WAL + 崩溃恢复（M12.3，已实现）
 

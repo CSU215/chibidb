@@ -168,6 +168,7 @@ impl Database {
         let mut next_table_file = 0;
         let mut next_index_file = 0;
         let mut next_trx_id = 1;
+        let mut clog_base = 0;
         let mut committed_trxs: HashSet<u64> = HashSet::new();
         // tables whose index file headers were rebuilt after a crash; their
         // contents must be re-derived from the heap
@@ -239,6 +240,7 @@ impl Database {
             next_table_file = snap.next_table_file;
             next_index_file = snap.next_index_file;
             next_trx_id = snap.next_trx_id;
+            clog_base = snap.clog_base;
             committed_trxs = snap.committed_trxs.into_iter().collect();
         }
 
@@ -266,7 +268,7 @@ impl Database {
             data_dir: path.to_path_buf(),
             next_table_file: AtomicU32::new(next_table_file),
             next_index_file: AtomicU32::new(next_index_file),
-            trx: TransactionManager::new(next_trx_id, committed_trxs),
+            trx: TransactionManager::new(next_trx_id, committed_trxs, clog_base),
             wal_checkpoint_threshold: AtomicU64::new(config.wal.checkpoint_threshold),
             conflict: config.transaction.conflict,
             writer: Arc::new(DatabaseWriteLock::new(config.transaction.lock_timeout_ms)),
@@ -360,18 +362,29 @@ impl Database {
                 let (creator, deleter, row) = crate::storage::codec::decode_record(&rec, &self.lobs)?;
                 let dead = !clog.is_committed(creator)
                     || (deleter != 0 && clog.is_committed(deleter));
-                if !dead {
+                if dead {
+                    for (ci, ix_file) in &ops {
+                        let key = encode_key(&row[*ci])?;
+                        BTree::at(*ix_file).delete(&self.pool, &key, rid)?;
+                    }
+                    self.free_lob_refs(&rec);
+                    engine.delete(&self.pool, rid)?;
+                    purged += 1;
                     continue;
                 }
-                for (ci, ix_file) in &ops {
-                    let key = encode_key(&row[*ci])?;
-                    BTree::at(*ix_file).delete(&self.pool, &key, rid)?;
+                // A live version whose delete marker was left by a transaction
+                // that never committed is un-deleted, so the horizon below can
+                // treat every old xid as committed.
+                if deleter != 0 && !clog.is_committed(deleter) {
+                    engine.delete_mark(&self.pool, rid, 0)?;
                 }
-                self.free_lob_refs(&rec);
-                engine.delete(&self.pool, rid)?;
-                purged += 1;
             }
         }
+        // Every xid below the next unallocated one has ended (no transaction is
+        // open) and no live version still references an aborted xid, so the
+        // clog prefix is frozen and can be dropped, keeping xid state bounded.
+        self.trx.advance_horizon(self.trx.next_id());
+        self.save_catalog()?;
         Ok(purged)
     }
 
@@ -926,6 +939,7 @@ impl Database {
             next_table_file: self.next_table_file.load(Ordering::SeqCst),
             next_index_file: self.next_index_file.load(Ordering::SeqCst),
             next_trx_id: self.trx.next_id(),
+            clog_base: self.trx.clog_base(),
             committed_trxs: self.trx.committed_ids(),
             tables: self.catalog().table_metas(),
             indexes: self.catalog().index_metas(),
@@ -1276,5 +1290,28 @@ mod tests {
         assert!(db.trx.next_id() > before, "write must allocate a trx id");
         assert!(db.trx.is_committed(before), "write must be committed");
         assert!(db.trx.no_open_transactions(), "write must not stay open");
+    }
+
+    #[test]
+    fn vacuum_advances_the_clog_horizon_and_bounds_xid_state() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute_sql("create table t (id int);").unwrap();
+        db.execute_sql("insert into t values (1), (2), (3);").unwrap();
+        db.execute_sql("delete from t where id = 2;").unwrap();
+        let before = db.trx.next_id();
+        assert!(!db.trx.committed_ids().is_empty(), "commits are tracked");
+
+        db.execute_sql("vacuum;").unwrap();
+
+        // every ended xid is below the horizon and its bit is dropped, so the
+        // clog no longer grows with the number of past commits
+        assert!(db.trx.clog_base() >= before, "horizon covers all ended xids");
+        assert!(db.trx.committed_ids().is_empty(), "the clog prefix is dropped");
+        // the older committed rows stay visible through the frozen horizon
+        let out = db.execute_sql("select id from t order by id;").unwrap();
+        let ResultSet::Rows { rows, .. } = out.into_iter().next().unwrap() else {
+            panic!("expected rows");
+        };
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
     }
 }

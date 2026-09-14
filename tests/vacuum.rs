@@ -118,6 +118,41 @@ fn vacuum_rejects_open_transaction() {
 }
 
 #[test]
+fn vacuum_horizon_survives_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Database::open(dir.path()).unwrap();
+        seed(&db);
+        // accumulate history, then compact it into the horizon
+        for _ in 0..20 {
+            db.execute_sql("update t set name = 'x' where id = 1;").unwrap();
+        }
+        db.execute_sql("delete from t where id = 2;").unwrap();
+        let m = message(&db, "vacuum;");
+        assert!(m.contains("1 rows purged"), "{m}");
+    }
+    // the frozen horizon is persisted, so the compacted clog reloads correctly
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(
+        rows(&db, "select * from t order by id;"),
+        vec![
+            vec![Value::Int(1), Value::Str("x".into())],
+            vec![Value::Int(3), Value::Str("c".into())],
+        ]
+    );
+    // new writes land above the horizon and stay visible
+    db.execute_sql("insert into t values (4, 'd');").unwrap();
+    assert_eq!(
+        rows(&db, "select * from t order by id;"),
+        vec![
+            vec![Value::Int(1), Value::Str("x".into())],
+            vec![Value::Int(3), Value::Str("c".into())],
+            vec![Value::Int(4), Value::Str("d".into())],
+        ]
+    );
+}
+
+#[test]
 fn vacuum_purges_rows_marked_by_other_committed_trxs() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();

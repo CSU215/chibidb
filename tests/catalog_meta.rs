@@ -21,6 +21,7 @@ fn snapshot() -> CatalogSnapshot {
         next_table_file: 7,
         next_index_file: 3,
         next_trx_id: 9,
+        clog_base: 0,
         committed_trxs: vec![1, 2, 3],
         tables: vec![
             TableMeta {
@@ -112,6 +113,7 @@ fn empty_catalog_roundtrips() {
         next_table_file: 0,
         next_index_file: 0,
         next_trx_id: 0,
+        clog_base: 0,
         committed_trxs: vec![],
         tables: vec![],
         indexes: vec![],
