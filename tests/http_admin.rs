@@ -75,6 +75,24 @@ fn body(response: &str) -> &str {
     response.split_once("\r\n\r\n").map_or("", |(_, body)| body)
 }
 
+/// Posts a raw body to a path, over its own connection.
+fn post(addr: std::net::SocketAddr, path: &str, body: &str) -> String {
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    request.push_str(body);
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+fn admin_config() -> Config {
+    Config::from_toml_str("[server]\nadmin_api = true\n").unwrap()
+}
+
 #[test]
 fn a_session_outlives_the_connection_that_started_it() {
     let (addr, _dir) = start_server(Config::default());
@@ -132,6 +150,102 @@ fn an_unknown_session_id_gets_a_fresh_session() {
     // cannot name its own session.
     let again = query(addr, Some("not-a-real-session"), "select 1 as one;");
     assert_ne!(session_id(&again).as_deref(), Some("not-a-real-session"), "{again}");
+}
+
+#[test]
+fn the_parse_endpoint_is_off_unless_switched_on() {
+    let (addr, _dir) = start_server(Config::default());
+
+    let response = post(addr, "/api/parse", r#"{"sql":"select 1;"}"#);
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+}
+
+#[test]
+fn the_parse_endpoint_returns_tokens_and_the_ast() {
+    let (addr, _dir) = start_server(admin_config());
+
+    let response = post(addr, "/api/parse", r#"{"sql":"select 1;"}"#);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let payload = body(&response);
+    assert!(payload.contains(r#""kind":"Ident","text":"select","pos":0"#), "{payload}");
+    assert!(payload.contains(r#""kind":"Punct","text":";""#), "{payload}");
+    assert!(payload.contains(r#""statements":[{"debug":"#), "{payload}");
+    assert!(payload.contains(r#""error":null"#), "{payload}");
+    // Running the statement is explicitly not part of this.
+    assert!(!payload.contains("SUCCESS"), "{payload}");
+}
+
+#[test]
+fn a_parse_error_is_a_result_not_a_transport_error() {
+    let (addr, _dir) = start_server(admin_config());
+
+    // 200, not 400: this endpoint diagnoses text the user is still typing, so
+    // failing to parse is an answer. The caller reads `error`, not the status.
+    let response = post(addr, "/api/parse", r#"{"sql":"select 1 +;"}"#);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let payload = body(&response);
+    assert!(payload.contains(r#""stage":"parse""#), "{payload}");
+    assert!(payload.contains("expected expression"), "{payload}");
+    // The token stream is still useful when parsing fails, which is the point
+    // of reporting the two stages separately.
+    assert!(payload.contains(r#""text":"select""#), "{payload}");
+    assert!(payload.contains(r#""statements":[]"#), "{payload}");
+}
+
+#[test]
+fn the_parse_endpoint_reports_syntax_only_not_semantics() {
+    let (addr, _dir) = start_server(admin_config());
+
+    // `select from;` is not a syntax error here: keywords are identifiers, so
+    // this parses as a select of a column named `from`, and only fails when it
+    // is *run* (`no such column`). Pinning that makes the division of labour
+    // explicit -- /api/parse answers "does this compile", and running the
+    // statement is still the only way to learn whether it means anything.
+    let response = post(addr, "/api/parse", r#"{"sql":"select from;"}"#);
+    let payload = body(&response);
+    assert!(payload.contains(r#""error":null"#), "{payload}");
+
+    let run = query(addr, None, "select from;");
+    assert!(run.starts_with("HTTP/1.1 400"), "{run}");
+    assert!(body(&run).contains("no such column"), "{run}");
+}
+
+#[test]
+fn a_lex_error_reports_its_own_stage() {
+    let (addr, _dir) = start_server(admin_config());
+
+    // An integer literal too large for i64 fails in the lexer, before parsing,
+    // so there is no token stream to report.
+    let response = post(addr, "/api/parse", r#"{"sql":"select 99999999999999999999;"}"#);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let payload = body(&response);
+    assert!(payload.contains(r#""stage":"lex""#), "{payload}");
+    assert!(payload.contains(r#""tokens":[]"#), "{payload}");
+}
+
+#[test]
+fn a_malformed_request_body_is_a_400() {
+    let (addr, _dir) = start_server(admin_config());
+
+    // Not JSON at all.
+    let response = post(addr, "/api/parse", "select 1;");
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(body(&response).contains("error"), "{response}");
+
+    // JSON, but without a usable `sql`.
+    let response = post(addr, "/api/parse", r#"{"query":"select 1;"}"#);
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+
+    let response = post(addr, "/api/parse", r#"{"sql":42}"#);
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+}
+
+#[test]
+fn unknown_api_paths_are_404() {
+    let (addr, _dir) = start_server(admin_config());
+
+    let response = post(addr, "/api/nope", "{}");
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
 }
 
 #[test]

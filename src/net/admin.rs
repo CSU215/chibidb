@@ -7,7 +7,10 @@
 use std::path::Path;
 
 use crate::config::{Config, WebRootState};
-use crate::result::encode_error;
+use crate::result::{encode_error, json_string};
+use crate::{lexer, parser};
+use crate::lexer::{Punct, Token, TokenKind};
+use crate::net::json::{self, Json};
 
 /// A response for `http.rs` to frame and write out.
 pub(crate) struct Response {
@@ -33,14 +36,123 @@ impl Response {
 
 /// Routes the paths this module owns. `None` hands the request back to
 /// `http.rs`, which serves `/health` and `/query`.
-pub(crate) fn handle(config: &Config, method: &str, path: &str, _body: &[u8]) -> Option<Response> {
+pub(crate) fn handle(config: &Config, method: &str, path: &str, body: &[u8]) -> Option<Response> {
     match (method, path) {
         // The legacy frontend keeps these two.
         ("GET", "/health") | ("POST", "/query") => None,
-        // Reserved namespace: 404 unless the admin API is switched on.
-        (_, path) if path.starts_with("/api/") => Some(Response::not_found()),
+        (_, path) if path.starts_with("/api/") => Some(api(config, method, path, body)),
         ("GET", path) => Some(static_file(config, path)),
         _ => None,
+    }
+}
+
+/// The `/api/*` surface. Off unless `server.admin_api` says otherwise, so the
+/// whole namespace answers 404 on a default deployment.
+fn api(config: &Config, method: &str, path: &str, body: &[u8]) -> Response {
+    if !config.server.admin_api {
+        return Response::not_found();
+    }
+    match (method, path) {
+        ("POST", "/api/parse") => parse_trace(body),
+        _ => Response::not_found(),
+    }
+}
+
+/// `POST /api/parse` -- the SQL as the compiler sees it, without running it.
+///
+/// **The status is 200 even when the SQL does not parse.** This endpoint
+/// diagnoses text the user is still typing, so a parse failure is a result
+/// rather than a transport error; callers read `error`, not the status. A 400
+/// means the *request* was malformed (not JSON, or no usable `sql` field).
+///
+/// There are three outcomes, because the lexer is all-or-nothing: `error` null,
+/// `error.stage == "lex"` (no token stream), or `error.stage == "parse"` (the
+/// token stream is still worth showing).
+fn parse_trace(body: &[u8]) -> Response {
+    let text = String::from_utf8_lossy(body);
+    let Ok(request) = json::parse(&text) else {
+        return Response::json("400 Bad Request", encode_error("expected a JSON object"));
+    };
+    let Some(sql) = request.get("sql").and_then(Json::as_str) else {
+        return Response::json(
+            "400 Bad Request",
+            encode_error("expected a string field \"sql\""),
+        );
+    };
+
+    let (tokens, mut error) = match lexer::lex(sql) {
+        Ok(tokens) => (tokens, None),
+        Err(e) => (Vec::new(), Some(("lex", e.to_string()))),
+    };
+    let mut statements = Vec::new();
+    if error.is_none() {
+        match parser::parse(sql) {
+            Ok(parsed) => statements = parsed.iter().map(|stmt| format!("{stmt:#?}")).collect(),
+            Err(e) => error = Some(("parse", e.to_string())),
+        }
+    }
+
+    let mut out = String::from("{\"sql\":");
+    out.push_str(&json_string(sql));
+    out.push_str(",\"tokens\":[");
+    out.push_str(&join(tokens.iter().map(token_json)));
+    out.push_str("],\"statements\":[");
+    out.push_str(&join(statements.iter().map(|debug| {
+        format!("{{\"debug\":{}}}", json_string(debug))
+    })));
+    out.push_str("],\"error\":");
+    match error {
+        None => out.push_str("null"),
+        Some((stage, message)) => out.push_str(&format!(
+            "{{\"stage\":{},\"message\":{}}}",
+            json_string(stage),
+            json_string(&message)
+        )),
+    }
+    out.push('}');
+    Response::json("200 OK", out)
+}
+
+fn join(items: impl Iterator<Item = String>) -> String {
+    items.collect::<Vec<_>>().join(",")
+}
+
+/// One lexer token. `text` is the lexeme as written; for a number it is the
+/// original spelling, so it stays a string and cannot be mistaken for a value.
+fn token_json(token: &Token) -> String {
+    let (kind, text) = match &token.kind {
+        TokenKind::Int(n) => ("Int", n.to_string()),
+        TokenKind::Float(x) => ("Float", x.to_string()),
+        TokenKind::Str(s) => ("Str", s.clone()),
+        TokenKind::Ident(s) => ("Ident", s.clone()),
+        TokenKind::Punct(p) => ("Punct", punct_text(*p).to_string()),
+    };
+    format!(
+        "{{\"kind\":{},\"text\":{},\"pos\":{}}}",
+        json_string(kind),
+        json_string(&text),
+        token.pos
+    )
+}
+
+fn punct_text(punct: Punct) -> &'static str {
+    match punct {
+        Punct::LParen => "(",
+        Punct::RParen => ")",
+        Punct::Comma => ",",
+        Punct::Semicolon => ";",
+        Punct::Plus => "+",
+        Punct::Minus => "-",
+        Punct::Star => "*",
+        Punct::Slash => "/",
+        Punct::Percent => "%",
+        Punct::Eq => "=",
+        Punct::NotEq => "!=",
+        Punct::Lt => "<",
+        Punct::Le => "<=",
+        Punct::Gt => ">",
+        Punct::Ge => ">=",
+        Punct::Dot => ".",
     }
 }
 

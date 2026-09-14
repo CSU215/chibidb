@@ -152,6 +152,10 @@ pub struct ServerConfig {
     /// An empty string disables static hosting (the field can no longer say
     /// "off" by being absent, since it has a default).
     pub web_root: Option<String>,
+    /// Serve the `/api/*` surface on the HTTP listener. Off by default: that
+    /// surface diagnoses and eventually pokes at storage internals, so it should
+    /// be opted into rather than reachable on every deployment.
+    pub admin_api: bool,
     pub protocols: Vec<String>,
     pub thread_model: ThreadModel,
     pub worker_threads: usize,
@@ -212,6 +216,7 @@ impl Default for ServerConfig {
             http_addr: None,
             mysql_addr: None,
             web_root: Some("web/dist".into()),
+            admin_api: false,
             protocols: vec!["text".into()],
             thread_model: ThreadModel::PerConnection,
             worker_threads: 4,
