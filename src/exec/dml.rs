@@ -19,6 +19,17 @@ impl InsertOp {
 }
 
 impl PhysicalOperator for InsertOp {
+    fn name(&self) -> &'static str {
+        "Insert"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("table", self.stmt.table.clone()),
+            ("rows", self.stmt.rows.len().to_string()),
+        ]
+    }
+
     fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -59,6 +70,25 @@ impl UpdateOp {
 }
 
 impl PhysicalOperator for UpdateOp {
+    fn name(&self) -> &'static str {
+        "Update"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        let assignments: Vec<String> = self
+            .stmt
+            .assignments
+            .iter()
+            .map(|(column, value)| format!("{column} = {value}"))
+            .collect();
+        let mut out = vec![("table", self.stmt.table.clone())];
+        out.push(("set", assignments.join(", ")));
+        if let Some(selection) = &self.stmt.selection {
+            out.push(("where", selection.to_string()));
+        }
+        out
+    }
+
     fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -99,6 +129,18 @@ impl DeleteOp {
 }
 
 impl PhysicalOperator for DeleteOp {
+    fn name(&self) -> &'static str {
+        "Delete"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        let mut out = vec![("table", self.stmt.table.clone())];
+        if let Some(selection) = &self.stmt.selection {
+            out.push(("where", selection.to_string()));
+        }
+        out
+    }
+
     fn schema(&self) -> &Schema {
         &self.schema
     }

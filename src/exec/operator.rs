@@ -119,6 +119,30 @@ pub trait PhysicalOperator {
     fn affected_rows(&self) -> Option<u64> {
         None
     }
+
+    /// This operator's name, as the plan panel shows it.
+    ///
+    /// Read-only and side-effect free: describing a tree must not open, read or
+    /// otherwise disturb anything, so that rendering a plan cannot change the
+    /// thing it describes.
+    fn name(&self) -> &'static str {
+        "Operator"
+    }
+
+    /// Description lines for the plan panel, in display order. Only what the
+    /// operator already knows -- nothing is looked up or recomputed here.
+    fn details(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+
+    /// The operators feeding this one, in execution order. Empty for scans.
+    ///
+    /// This is what makes the rendered tree the tree that runs: the plan panel
+    /// walks these, so a new operator shows up in the panel by implementing
+    /// this method rather than by editing a description elsewhere.
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        Vec::new()
+    }
 }
 
 /// Sequential scan of a table, filtering by MVCC visibility.
@@ -173,6 +197,21 @@ impl TableScan {
 }
 
 impl PhysicalOperator for TableScan {
+    fn name(&self) -> &'static str {
+        "TableScan"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        let mut out = vec![("table", self.table.clone())];
+        // Column pruning skips large objects the query never reads; saying so
+        // explains why this scan is cheaper than the row count suggests.
+        if let Some(keep) = &self.keep {
+            let read = keep.iter().filter(|k| **k).count();
+            out.push(("columns", format!("{read} of {}", keep.len())));
+        }
+        out
+    }
+
     fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -335,6 +374,23 @@ impl ViewScan {
 }
 
 impl PhysicalOperator for ViewScan {
+    fn name(&self) -> &'static str {
+        "ViewScan"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        match self.schema.columns.first().and_then(|c| c.owner.clone()) {
+            Some(view) => vec![("view", view)],
+            None => Vec::new(),
+        }
+    }
+
+    /// The view's own plan: a view is not a scan of stored rows, it is a plan
+    /// that runs in place, and the panel has to show that rather than hide it.
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
+    }
+
     fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -380,6 +436,10 @@ impl ConstantScan {
 }
 
 impl PhysicalOperator for ConstantScan {
+    fn name(&self) -> &'static str {
+        "ConstantScan"
+    }
+
     fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -494,6 +554,18 @@ impl Filter {
 }
 
 impl PhysicalOperator for Filter {
+    fn name(&self) -> &'static str {
+        "Filter"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        vec![("predicate", self.predicate.to_string())]
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
+    }
+
     fn schema(&self) -> &Schema {
         self.child.schema()
     }
@@ -584,6 +656,19 @@ impl Project {
 }
 
 impl PhysicalOperator for Project {
+    fn name(&self) -> &'static str {
+        "Project"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        let columns: Vec<String> = self.schema.columns.iter().map(|c| c.name.clone()).collect();
+        vec![("columns", columns.join(", "))]
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
+    }
+
     fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -655,6 +740,24 @@ impl Limit {
 }
 
 impl PhysicalOperator for Limit {
+    fn name(&self) -> &'static str {
+        "Limit"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("offset", self.offset.to_string()),
+            (
+                "count",
+                self.count.map_or_else(|| "all".to_string(), |n| n.to_string()),
+            ),
+        ]
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
+    }
+
     fn schema(&self) -> &Schema {
         self.child.schema()
     }
@@ -705,6 +808,14 @@ impl Distinct {
 }
 
 impl PhysicalOperator for Distinct {
+    fn name(&self) -> &'static str {
+        "Distinct"
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
+    }
+
     fn schema(&self) -> &Schema {
         self.child.schema()
     }
@@ -750,6 +861,23 @@ impl Sort {
 }
 
 impl PhysicalOperator for Sort {
+    fn name(&self) -> &'static str {
+        "Sort"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        let keys: Vec<String> = self
+            .order_by
+            .iter()
+            .map(|(e, desc)| format!("{e} {}", if *desc { "desc" } else { "asc" }))
+            .collect();
+        vec![("order by", keys.join(", "))]
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
+    }
+
     fn schema(&self) -> &Schema {
         self.child.schema()
     }
@@ -822,6 +950,19 @@ impl GroupBy {
 }
 
 impl PhysicalOperator for GroupBy {
+    fn name(&self) -> &'static str {
+        "GroupBy"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        let groups: Vec<String> = self.exprs.iter().map(|e| e.to_string()).collect();
+        vec![("groups", groups.join(", "))]
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.child.as_ref()]
+    }
+
     fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -940,6 +1081,22 @@ impl NestedLoopJoin {
 }
 
 impl PhysicalOperator for NestedLoopJoin {
+    fn name(&self) -> &'static str {
+        "NestedLoopJoin"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        let mut out = vec![("join", format!("{:?}", self.kind))];
+        if let Some(condition) = &self.condition {
+            out.push(("condition", condition.to_string()));
+        }
+        out
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.left.as_ref(), self.right.as_ref()]
+    }
+
     fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -1470,6 +1627,28 @@ fn residual_ok(
 }
 
 impl PhysicalOperator for HashJoin {
+    fn name(&self) -> &'static str {
+        "HashJoin"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        let keys: Vec<String> = self
+            .left_keys
+            .iter()
+            .zip(&self.right_keys)
+            .map(|(l, r)| format!("{l} = {r}"))
+            .collect();
+        let mut out = vec![("join", format!("{:?}", self.kind)), ("keys", keys.join(", "))];
+        if let Some(residual) = &self.residual {
+            out.push(("residual", residual.to_string()));
+        }
+        out
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![self.left.as_ref(), self.right.as_ref()]
+    }
+
     fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -1682,6 +1861,31 @@ impl Union {
 }
 
 impl PhysicalOperator for Union {
+    fn name(&self) -> &'static str {
+        "Union"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        let mut out = vec![("inputs", self.inputs.len().to_string())];
+        if !self.order_by.is_empty() {
+            let keys: Vec<String> = self
+                .order_by
+                .iter()
+                .map(|(e, desc)| format!("{e} {}", if *desc { "desc" } else { "asc" }))
+                .collect();
+            out.push(("order by", keys.join(", ")));
+        }
+        if let Some(limit) = &self.limit {
+            let offset = limit.offset.as_ref().map_or_else(|| "0".to_string(), |e| e.to_string());
+            out.push(("limit", format!("offset {} count {}", offset, limit.count)));
+        }
+        out
+    }
+
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        self.inputs.iter().map(|(_, op)| op.as_ref()).collect()
+    }
+
     fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -1831,6 +2035,27 @@ impl IndexScan {
 }
 
 impl PhysicalOperator for IndexScan {
+    fn name(&self) -> &'static str {
+        "IndexScan"
+    }
+
+    fn details(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("table", self.table.clone()),
+            ("column", self.column.clone()),
+            // The index name is not stored here (execution only needs the
+            // column); the planner's `chosen` record carries it.
+            (
+                "access",
+                match self.cursor.is_some() {
+                    true => "ordered leaf scan",
+                    false => "index lookup",
+                }
+                .to_string(),
+            ),
+        ]
+    }
+
     fn schema(&self) -> &Schema {
         &self.schema
     }
