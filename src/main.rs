@@ -74,6 +74,17 @@ async fn main() -> std::io::Result<()> {
             }
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("chibidb server listening on {addr}");
+            // The console is built but there is no HTTP listener to serve it
+            // from. Nothing else would say so: the text protocol works, and the
+            // browser only reports a 5xx from whatever is proxying to a port
+            // nobody is listening on.
+            if config.web_console_unreachable() {
+                eprintln!(
+                    "note: the web console is built but no HTTP listener is configured, so \
+                     it cannot be opened; set server.http_addr in config.toml (e.g. \
+                     \"127.0.0.1:8080\") and restart"
+                );
+            }
             server::serve(instance, listener).await
         }
         // client

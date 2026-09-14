@@ -36,6 +36,44 @@ fn server_web_root_parses() {
 }
 
 #[test]
+fn a_built_console_without_an_http_listener_is_flagged() {
+    // Every case sets `web_root` explicitly and none uses `Config::default()`.
+    // The check resolves the path against the process CWD, and `cargo test` runs
+    // from the crate root -- where `web/dist` exists as soon as anyone has built
+    // the console. A test that leaned on the default would pass or fail
+    // depending on whether that build had happened.
+    let built = tempfile::tempdir().unwrap();
+    let web_root = format!("web_root = \"{}\"", built.path().display());
+
+    // The silent case this exists for: the console is built, `serve` starts, and
+    // nothing says the console has nowhere to be served from. The user sees only
+    // a text listener and a browser-side 5xx.
+    let no_listener = Config::from_toml_str(&format!("[server]\n{web_root}\n")).unwrap();
+    assert!(no_listener.web_console_unreachable());
+
+    // A listener means the console is reachable, whatever else is wrong.
+    let with_listener =
+        Config::from_toml_str(&format!("[server]\nhttp_addr = \"127.0.0.1:8080\"\n{web_root}\n"))
+            .unwrap();
+    assert!(!with_listener.web_console_unreachable());
+
+    // Hosting switched off: nothing to warn about, so a backend-only setup stays
+    // quiet.
+    let backend_only = Config::from_toml_str("[server]\nweb_root = \"\"\n").unwrap();
+    assert!(!backend_only.web_console_unreachable());
+
+    // Configured but not built yet: that case already has its own note on the
+    // HTTP path, and there is no point nagging when there is nothing to serve.
+    let unbuilt = built.path().join("not-built-yet");
+    let missing = Config::from_toml_str(&format!(
+        "[server]\nweb_root = \"{}\"\n",
+        unbuilt.display()
+    ))
+    .unwrap();
+    assert!(!missing.web_console_unreachable());
+}
+
+#[test]
 fn web_root_state_distinguishes_off_missing_and_ready() {
     let dir = tempfile::tempdir().unwrap();
 

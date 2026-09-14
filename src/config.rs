@@ -260,6 +260,21 @@ impl Config {
         }
     }
 
+    /// Whether a built web console exists but has nowhere to be served from,
+    /// because no HTTP listener is configured.
+    ///
+    /// This is a silent failure otherwise: `cargo run -- serve` starts happily,
+    /// prints one text-protocol line, and the console answers nothing -- the
+    /// browser (or the dev server's proxy) reports a 5xx that names neither the
+    /// cause nor the fix. Hence the check.
+    ///
+    /// Deliberately false when there is no built console, so a backend-only
+    /// setup stays quiet: the default `web_root` points at `web/dist`, which
+    /// usually does not exist.
+    pub fn web_console_unreachable(&self) -> bool {
+        self.server.http_addr.is_none() && matches!(self.web_root_state(), WebRootState::Ready(_))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.storage.buffer_pool_frames == 0 {
             return Err(Error::Runtime(

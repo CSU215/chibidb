@@ -110,6 +110,20 @@ describe('ensureSession', () => {
 
     await expect(ensureSession()).rejects.toBeInstanceOf(ApiError)
   })
+
+  it('blames the connection, not the session, when a proxy answers 5xx', async () => {
+    // What a Vite proxy returns when nothing is listening upstream: a 5xx with
+    // an empty body. Reporting that as "the server did not hand out a session"
+    // points the reader at the wrong thing entirely.
+    stubFetch(new Response('', { status: 500, headers: { 'Content-Type': 'text/plain' } }))
+
+    const failure = (await ensureSession().catch((e: unknown) => e)) as ApiError
+
+    expect(failure).toBeInstanceOf(ApiError)
+    expect(failure.status).toBe(500)
+    expect(failure.message).toContain('没有到达服务端')
+    expect(failure.message).toContain('server.http_addr')
+  })
 })
 
 describe('parseSql', () => {

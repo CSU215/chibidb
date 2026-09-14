@@ -64,6 +64,25 @@ export async function query(sql: string): Promise<ResultSet[]> {
   return (body.results ?? []) as ResultSet[]
 }
 
+/// `/session` always answers 200 with the header, so any other status means the
+/// request did not get an answer from the engine.
+///
+/// This message matters more than it looks: the common cause is not a broken
+/// session but a request that never arrived -- nothing listening on the port the
+/// console is pointed at, because `server.http_addr` is unset, so the dev
+/// server's proxy answers 500 with an empty body. Saying "the server did not
+/// hand out a session" for that sends the reader looking in the wrong place.
+function sessionFailure(status: number, detail: string): string {
+  if (status >= 500) {
+    return (
+      `无法连接引擎（HTTP ${status}）：请求没有到达服务端。` +
+      `请确认后端已启动，且 config.toml 里设了 server.http_addr（当前代理目标见 vite.config.ts）。` +
+      (detail ? ` ${detail}` : '')
+    )
+  }
+  return `服务端没有下发会话（HTTP ${status}）。`
+}
+
 /// Fetches an id if this tab does not have one yet.
 export async function ensureSession(): Promise<string> {
   const existing = sessionId()
@@ -72,7 +91,9 @@ export async function ensureSession(): Promise<string> {
   const response = await fetch('/session')
   const id = response.headers.get(SESSION_HEADER)
   if (!id) {
-    throw new ApiError(`the server did not hand out a session (HTTP ${response.status})`, response.status)
+    // A proxy's error body is plain text, not JSON, so read it defensively.
+    const detail = await response.text().catch(() => '')
+    throw new ApiError(sessionFailure(response.status, detail.trim().slice(0, 200)), response.status)
   }
   remember(id)
   return id
