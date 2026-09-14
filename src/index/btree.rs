@@ -1,10 +1,10 @@
 use crate::index::node::{
     internal_bytes_used, internal_child_for, internal_entry_at, internal_entry_size,
-    internal_entries, internal_first_child, internal_init, internal_insert_entry, internal_num,
-    internal_remove_at, internal_set_first_child, leaf_bytes_used, leaf_entries, leaf_entry_size,
-    leaf_init, leaf_insert_at, leaf_lower_bound, leaf_next, leaf_num, leaf_prev, leaf_remove_at,
-    leaf_set_next, leaf_set_prev, leaf_upper_bound, node_type, leaf_entry_at, INTERNAL,
-    INTERNAL_HEADER, LEAF,
+    internal_entries, internal_first_child, internal_header_len, internal_init,
+    internal_insert_entry, internal_num, internal_remove_at, internal_set_first_child,
+    leaf_bytes_used, leaf_entries, leaf_entry_size, leaf_header_len, leaf_init, leaf_insert_at,
+    leaf_lower_bound, leaf_next, leaf_num, leaf_prev, leaf_remove_at, leaf_set_next, leaf_set_prev,
+    leaf_upper_bound, node_type, leaf_entry_at, INTERNAL, LEAF,
 };
 use crate::storage::buffer::BufferPool;
 use crate::storage::header::{self, FileKind};
@@ -12,7 +12,7 @@ use crate::storage::page::{zeroed_page, FileId, PageData, PageNo, PAGE_SIZE};
 use crate::storage::Rid;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"CHIDBITX";
+const MAGIC: [u8; 8] = *b"CHIDBITZ";
 /// Root page number in the file header.
 const ROOT_OFF: usize = header::HEADER_LEN;
 /// First leaf page number in the file header.
@@ -76,7 +76,8 @@ fn write_image(bp: &BufferPool, file: FileId, page_no: PageNo, image: &PageData)
 /// Picks a leaf split point `m` so both `[..m]` and `[m..]` fit a page,
 /// preferring the most even split. `sizes` are the encoded entry sizes.
 fn choose_leaf_split(sizes: &[usize]) -> Option<usize> {
-    choose_split(sizes, crate::index::node::LEAF_HEADER)
+    // Reserved for B-link: the high key is not written yet (length 0).
+    choose_split(sizes, leaf_header_len(0))
 }
 
 /// Picks an internal split point `m` (the promoted separator) so both halves,
@@ -90,8 +91,8 @@ fn choose_internal_split(sizes: &[usize]) -> Option<usize> {
     let total = prefix[n];
     let mut best: Option<(usize, usize)> = None;
     for (m, w) in prefix.windows(2).enumerate().skip(1) {
-        let left = INTERNAL_HEADER + w[0];
-        let right = INTERNAL_HEADER + (total - w[1]);
+        let left = internal_header_len(0) + w[0];
+        let right = internal_header_len(0) + (total - w[1]);
         if left <= PAGE_SIZE && right <= PAGE_SIZE {
             let diff = left.abs_diff(right);
             if best.is_none_or(|(bd, _)| diff < bd) {
@@ -984,7 +985,7 @@ impl BTree {
         let ua = bp.read_page(self.file, a, |p| Ok(internal_bytes_used(p)))?;
         let ub = bp.read_page(self.file, b, |p| Ok(internal_bytes_used(p)))?;
         // merging b into a appends `sep` and b's entries (minus b's header)
-        let merged = ua + internal_entry_size(sep.len()) + ub.saturating_sub(INTERNAL_HEADER);
+        let merged = ua + internal_entry_size(sep.len()) + ub.saturating_sub(internal_header_len(0));
         Ok(merged < PAGE_SIZE - 32)
     }
 

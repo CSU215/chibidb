@@ -1,3 +1,14 @@
+//! B-link index node layout.
+//!
+//! Every node carries a `next` page (its right sibling, the B-link) and a
+//! `high_key`: a bound such that any key `>= high_key` belongs to a node to the
+//! right. A zero-length high key means "unbounded" (the rightmost node / root).
+//! The high key lets a descent move right without re-reading the parent, which
+//! is what makes concurrent splits safe.
+//!
+//! leaf header:     type@0 num@1..3 prev@3..7 next@7..11 hk_len@11..13 hk@13.. entries@(13+hk_len)
+//! internal header: type@0 num@1..3 first_child@3..7 next@7..11 hk_len@11..13 hk@13.. entries@(13+hk_len)
+
 use crate::storage::{PageNo, Rid, PAGE_SIZE};
 use crate::{Error, Result};
 
@@ -6,14 +17,18 @@ pub const INTERNAL: u8 = 1;
 
 const MAX_KEY_LEN: usize = u16::MAX as usize;
 
-// leaf header: type@0, num@1..3, prev@3..7, next@7..11, entries@11
-const LEAF_ENTRIES: usize = 11;
+const LEAF_BASE: usize = 13;
+const INTERNAL_BASE: usize = 13;
 const ENTRY_OVERHEAD: usize = 2; // key_len u16
-/// Bytes occupied by a leaf page header (before the first entry).
-pub const LEAF_HEADER: usize = LEAF_ENTRIES;
+
 /// Encoded size of one leaf entry with a `key_len`-byte key.
 pub const fn leaf_entry_size(key_len: usize) -> usize {
     ENTRY_OVERHEAD + key_len + 6
+}
+
+/// Encoded size of one internal entry with a `key_len`-byte key.
+pub const fn internal_entry_size(key_len: usize) -> usize {
+    ENTRY_OVERHEAD + key_len + 4
 }
 
 fn u16_at(page: &[u8], off: usize) -> usize {
@@ -36,11 +51,32 @@ pub fn node_type(page: &[u8]) -> u8 {
     page[0]
 }
 
+fn hk_len(page: &[u8]) -> usize {
+    u16_at(page, 11)
+}
+
+fn high_key(page: &[u8]) -> Vec<u8> {
+    let l = hk_len(page);
+    page[LEAF_BASE..LEAF_BASE + l].to_vec()
+}
+
+fn set_high_key(page: &mut [u8; PAGE_SIZE], key: &[u8]) -> Result<()> {
+    if key.len() > MAX_KEY_LEN || LEAF_BASE + key.len() > PAGE_SIZE {
+        return Err(Error::Runtime("index high key too large".into()));
+    }
+    u16_set(page, 11, key.len());
+    page[LEAF_BASE..LEAF_BASE + key.len()].copy_from_slice(key);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- leaf
+
 pub fn leaf_init(page: &mut [u8; PAGE_SIZE], prev: PageNo, next: PageNo) {
     page[0] = LEAF;
     u16_set(page, 1, 0);
     u32_set(page, 3, prev);
     u32_set(page, 7, next);
+    u16_set(page, 11, 0);
 }
 
 pub fn leaf_prev(page: &[u8]) -> PageNo {
@@ -59,12 +95,32 @@ pub fn leaf_set_prev(page: &mut [u8], prev: PageNo) {
     u32_set(page, 3, prev);
 }
 
+pub fn leaf_high_key(page: &[u8]) -> Vec<u8> {
+    high_key(page)
+}
+
+/// Sets the leaf's high key. Only valid on an empty leaf (it shifts the entry
+/// area); builders set it before inserting entries.
+pub fn leaf_set_high_key(page: &mut [u8; PAGE_SIZE], key: &[u8]) -> Result<()> {
+    set_high_key(page, key)
+}
+
 pub fn leaf_num(page: &[u8]) -> usize {
     u16_at(page, 1)
 }
 
+fn leaf_entries_start(page: &[u8]) -> usize {
+    LEAF_BASE + hk_len(page)
+}
+
+/// Bytes occupied by a leaf page header (before the first entry), for a given
+/// encoded high-key length.
+pub const fn leaf_header_len(high_key_len: usize) -> usize {
+    LEAF_BASE + high_key_len
+}
+
 fn leaf_entry_offset(page: &[u8], i: usize) -> usize {
-    let mut off = LEAF_ENTRIES;
+    let mut off = leaf_entries_start(page);
     for _ in 0..i {
         let key_len = u16_at(page, off);
         off += ENTRY_OVERHEAD + key_len + 6; // + page_no u32 + slot u16
@@ -92,12 +148,9 @@ pub fn leaf_upper_bound(page: &[u8], key: &[u8]) -> usize {
     leaf_bound(page, key, true)
 }
 
-/// Walks the variable-length entries once, comparing raw key bytes. Entries are
-/// not fixed-width, so a seek still costs one pass, but it avoids rescanning
-/// every earlier entry (and building a `Vec` key) at each step.
 fn leaf_bound(page: &[u8], key: &[u8], strict: bool) -> usize {
     let n = leaf_num(page);
-    let mut off = LEAF_ENTRIES;
+    let mut off = leaf_entries_start(page);
     for i in 0..n {
         let key_len = u16_at(page, off);
         let k = &page[off + 2..off + 2 + key_len];
@@ -126,7 +179,6 @@ pub fn leaf_insert_at(page: &mut [u8; PAGE_SIZE], idx: usize, key: &[u8], rid: R
         return Err(Error::PageFull);
     }
     let at = leaf_entry_offset(page, idx);
-    // shift entries [idx..n] right by `need`
     page.copy_within(at..end, at + need);
     u16_set(page, at, key.len());
     page[at + 2..at + 2 + key.len()].copy_from_slice(key);
@@ -155,19 +207,14 @@ pub fn leaf_bytes_used(page: &[u8]) -> usize {
     leaf_entry_offset(page, leaf_num(page))
 }
 
-// internal header: type@0, num@1..3, first_child@3..7, entries@7
-const INTERNAL_ENTRIES: usize = 7;
-/// Bytes occupied by an internal page header (before the first entry).
-pub const INTERNAL_HEADER: usize = INTERNAL_ENTRIES;
-/// Encoded size of one internal entry with a `key_len`-byte key.
-pub const fn internal_entry_size(key_len: usize) -> usize {
-    ENTRY_OVERHEAD + key_len + 4
-}
+// ------------------------------------------------------------ internal
 
 pub fn internal_init(page: &mut [u8; PAGE_SIZE], first_child: PageNo) {
     page[0] = INTERNAL;
     u16_set(page, 1, 0);
     u32_set(page, 3, first_child);
+    u32_set(page, 7, 0);
+    u16_set(page, 11, 0);
 }
 
 pub fn internal_first_child(page: &[u8]) -> PageNo {
@@ -178,12 +225,38 @@ pub fn internal_set_first_child(page: &mut [u8], child: PageNo) {
     u32_set(page, 3, child);
 }
 
+/// The internal node's right sibling (B-link).
+pub fn internal_next(page: &[u8]) -> PageNo {
+    u32_at(page, 7)
+}
+
+pub fn internal_set_next(page: &mut [u8], next: PageNo) {
+    u32_set(page, 7, next);
+}
+
+pub fn internal_high_key(page: &[u8]) -> Vec<u8> {
+    high_key(page)
+}
+
+pub fn internal_set_high_key(page: &mut [u8; PAGE_SIZE], key: &[u8]) -> Result<()> {
+    set_high_key(page, key)
+}
+
 pub fn internal_num(page: &[u8]) -> usize {
     u16_at(page, 1)
 }
 
+fn internal_entries_start(page: &[u8]) -> usize {
+    INTERNAL_BASE + hk_len(page)
+}
+
+/// Bytes occupied by an internal page header, for a given high-key length.
+pub const fn internal_header_len(high_key_len: usize) -> usize {
+    INTERNAL_BASE + high_key_len
+}
+
 fn internal_entry_offset(page: &[u8], i: usize) -> usize {
-    let mut off = INTERNAL_ENTRIES;
+    let mut off = internal_entries_start(page);
     for _ in 0..i {
         let key_len = u16_at(page, off);
         off += ENTRY_OVERHEAD + key_len + 4;
@@ -208,7 +281,7 @@ pub fn internal_entries<'a>(page: &'a [u8]) -> impl Iterator<Item = (Vec<u8>, Pa
 pub fn internal_child_for(page: &[u8], key: &[u8]) -> PageNo {
     let n = internal_num(page);
     let mut child = internal_first_child(page);
-    let mut off = INTERNAL_ENTRIES;
+    let mut off = internal_entries_start(page);
     for _ in 0..n {
         let key_len = u16_at(page, off);
         let sep = &page[off + 2..off + 2 + key_len];
@@ -302,5 +375,21 @@ mod tests {
         assert_eq!(internal_child_for(&page, b"\x04"), 11);
         assert_eq!(internal_child_for(&page, b"\x05"), 12);
         assert_eq!(internal_child_for(&page, b"\xff"), 12);
+    }
+
+    #[test]
+    fn a_high_key_shifts_the_entry_area_without_corrupting_entries() {
+        let mut page: [u8; PAGE_SIZE] = *zeroed_page();
+        leaf_init(&mut page, 0, 9);
+        leaf_set_high_key(&mut page, b"m").unwrap();
+        leaf_insert_at(&mut page, 0, b"a", Rid::new(1, 1)).unwrap();
+        leaf_insert_at(&mut page, 1, b"z", Rid::new(2, 2)).unwrap();
+        assert_eq!(leaf_high_key(&page), b"m");
+        assert_eq!(leaf_chain(&page), vec![b"a".to_vec(), b"z".to_vec()]);
+        assert_eq!(leaf_next(&page), 9);
+    }
+
+    fn leaf_chain(page: &[u8]) -> Vec<Vec<u8>> {
+        leaf_entries(page).map(|(k, _)| k).collect()
     }
 }
