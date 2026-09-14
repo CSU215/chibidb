@@ -83,20 +83,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             b'\'' => {
                 let start = i;
                 i += 1;
-                while i < bytes.len() && bytes[i] != b'\'' {
-                    i += 1;
-                }
-                if i >= bytes.len() {
-                    return Err(Error::syntax("unterminated string", start));
-                }
-                let s = src[start + 1..i].to_string();
-                i += 1;
                 let mut s = String::new();
                 loop {
                     if i >= bytes.len() {
-                        return Err(Error::Syntax(format!(
-                            "unterminated string at byte {start}"
-                        )));
+                        return Err(Error::syntax("unterminated string", start));
                     }
                     match bytes[i] {
                         b'\'' => {
@@ -113,7 +103,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                             // MySQL backslash escapes (the default mode).
                             i += 1;
                             let ch = src[i..].chars().next().ok_or_else(|| {
-                                Error::Syntax(format!("unterminated string at byte {start}"))
+                                Error::syntax("unterminated string", start)
                             })?;
                             s.push(match ch {
                                 '0' => '\0',
@@ -143,9 +133,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 let mut name = String::new();
                 loop {
                     if i >= bytes.len() {
-                        return Err(Error::Syntax(format!(
-                            "unterminated identifier at byte {start}"
-                        )));
+                        return Err(Error::syntax("unterminated identifier", start));
                     }
                     if bytes[i] == b'`' {
                         if bytes.get(i + 1) == Some(&b'`') {
