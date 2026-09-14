@@ -18,6 +18,7 @@ use crate::trx::Session;
 use crate::server::SharedInstance;
 
 use super::admin::{self, Response};
+use super::json::json_string_field;
 use super::session::{SESSION_HEADER, SessionRegistry, spawn_sweeper};
 
 /// Largest request we will buffer (headers plus body).
@@ -233,42 +234,6 @@ fn write_response(stream: &mut TcpStream, response: &Response, keep_alive: bool)
     stream.write_all(header.as_bytes())?;
     stream.write_all(&response.body)?;
     stream.flush()
-}
-
-/// Extracts a top-level string field from a tiny JSON object.
-fn json_string_field(text: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let start = text.find(&needle)? + needle.len();
-    let rest = text[start..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let mut out = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => return Some(out),
-            '\\' => match chars.next()? {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                '/' => out.push('/'),
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                'b' => out.push('\u{8}'),
-                'f' => out.push('\u{c}'),
-                'u' => {
-                    let mut hex = String::new();
-                    for _ in 0..4 {
-                        hex.push(chars.next()?);
-                    }
-                    out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
-                }
-                _ => return None,
-            },
-            c => out.push(c),
-        }
-    }
-    None
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
