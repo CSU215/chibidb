@@ -1,4 +1,4 @@
-import type { ParseTrace, ResultSet } from './types'
+import type { ParseTrace, PlanTrace, ResultSet } from './types'
 
 const SESSION_KEY = 'chibidb.session'
 
@@ -97,6 +97,36 @@ export async function ensureSession(): Promise<string> {
   }
   remember(id)
   return id
+}
+
+/// Asks for the plan without running the statement.
+///
+/// Building a plan is not free for the engine -- an index scan resolves its row
+/// ids up front -- so this is called when a statement is run or when the plan
+/// panel is opened, not on every keystroke.
+///
+/// Like `/api/parse`, a SQL problem is not thrown: it arrives as `trace.error`
+/// (or per statement, as `plans[].error`) on a 200.
+export async function planSql(sql: string): Promise<PlanTrace> {
+  const response = await send('/api/plan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sql }),
+  })
+  if (response.status === 404) {
+    throw new ApiError(
+      '计划接口未开启。在服务端 config.toml 里设 server.admin_api = true 后重启。',
+      404,
+    )
+  }
+  const body = await payload(response)
+  if (!response.ok) {
+    throw new ApiError(
+      typeof body.error === 'string' ? body.error : `request failed (HTTP ${response.status})`,
+      response.status,
+    )
+  }
+  return body as unknown as PlanTrace
 }
 
 /// Compiles the SQL without running it.

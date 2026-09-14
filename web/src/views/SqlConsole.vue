@@ -2,9 +2,10 @@
 import type { Diagnostic } from '@codemirror/lint'
 import { onMounted, ref, watch } from 'vue'
 
-import { ApiError, parseSql, query } from '../api/client'
-import type { ParseTrace, ResultSet } from '../api/types'
+import { ApiError, parseSql, planSql, query } from '../api/client'
+import type { ParseTrace, PlanReport, ResultSet } from '../api/types'
 import AstDump from '../components/AstDump.vue'
+import PlanPanel from '../components/PlanPanel.vue'
 import ResultGrid from '../components/ResultGrid.vue'
 import SchemaTree from '../components/SchemaTree.vue'
 import SqlEditor from '../components/SqlEditor.vue'
@@ -33,6 +34,12 @@ const showDetail = ref(false)
 /// or a transport failure. Without this the reader is left wondering why
 /// nothing ever turns red.
 const parseNotice = ref('')
+/// The last plan report, kept for the detail panel.
+const planReport = ref<PlanReport | null>(null)
+const planLoading = ref(false)
+/// Why the plan panel is empty -- the endpoint being switched off, or a
+/// statement with nothing to plan. Blank when there is a plan.
+const planNotice = ref('')
 
 watch(sql, (text) => saveDraft(DRAFT_KEY, text))
 
@@ -72,6 +79,41 @@ async function diagnose(text: string): Promise<Diagnostic[]> {
   }
 }
 
+/// Fetches the plan for what is on screen.
+///
+/// Deliberately not part of `diagnose`: that runs on every keystroke, and
+/// building a plan is not free -- an index scan resolves its row ids up front,
+/// so asking while someone types would do real work per character. Called when
+/// a statement runs, and when the panel is opened.
+async function loadPlan(): Promise<void> {
+  const text = sql.value.trim()
+  if (!text) {
+    planReport.value = null
+    planNotice.value = ''
+    return
+  }
+  planLoading.value = true
+  try {
+    const trace = await planSql(text)
+    // A slower earlier request must not overwrite a newer statement's plan.
+    if (text !== sql.value) return
+    planReport.value = trace.plans[0] ?? null
+    planNotice.value = trace.plans.length
+      ? ''
+      : (trace.error?.message ?? '这条 SQL 没有可展示的语句。')
+  } catch (e) {
+    planReport.value = null
+    planNotice.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    planLoading.value = false
+  }
+}
+
+function toggleDetail(): void {
+  showDetail.value = !showDetail.value
+  if (showDetail.value) void loadPlan()
+}
+
 async function run(): Promise<void> {
   const text = sql.value.trim()
   if (!text || running.value) return
@@ -92,6 +134,9 @@ async function run(): Promise<void> {
     }
     // DDL changes what the tree should show.
     if (/\b(create|drop|alter)\b/i.test(text)) void tree.value?.loadDatabases()
+    // The plan is for the statement that just ran, so refresh it here rather
+    // than leaving a stale tree next to fresh results.
+    void loadPlan()
   } catch (e) {
     results.value = []
     error.value = e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e)
@@ -120,8 +165,8 @@ onMounted(session.bootstrap)
         <span class="hint">Ctrl / ⌘ + Enter</span>
         <span v-if="elapsedMs !== null" class="hint">{{ elapsedMs.toFixed(1) }} ms</span>
         <span class="spacer" />
-        <el-button link size="small" @click="showDetail = !showDetail">
-          {{ showDetail ? '▾' : '▸' }} 解析详情
+        <el-button link size="small" @click="toggleDetail">
+          {{ showDetail ? '▾' : '▸' }} 编译详情 / 执行计划
         </el-button>
       </div>
 
@@ -146,13 +191,19 @@ onMounted(session.bootstrap)
 
       <el-collapse-transition>
         <div v-show="showDetail" class="detail">
+          <div class="compile">
+            <section>
+              <h3>Token 流</h3>
+              <TokenStream :tokens="trace?.tokens ?? []" />
+            </section>
+            <section>
+              <h3>AST</h3>
+              <AstDump :statements="trace?.statements ?? []" :error="trace?.error ?? null" />
+            </section>
+          </div>
           <section>
-            <h3>Token 流</h3>
-            <TokenStream :tokens="trace?.tokens ?? []" />
-          </section>
-          <section>
-            <h3>AST</h3>
-            <AstDump :statements="trace?.statements ?? []" :error="trace?.error ?? null" />
+            <h3>执行计划</h3>
+            <PlanPanel :plans="planReport ? [planReport] : []" :notice="planNotice" :loading="planLoading" />
           </section>
         </div>
       </el-collapse-transition>
@@ -203,6 +254,13 @@ onMounted(session.bootstrap)
 }
 
 .detail {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  align-items: stretch;
+}
+
+.compile {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 20px;
@@ -216,7 +274,7 @@ onMounted(session.bootstrap)
 }
 
 @media (max-width: 1100px) {
-  .detail {
+  .compile {
     grid-template-columns: minmax(0, 1fr);
   }
 }
