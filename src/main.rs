@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 
-use chibidb::config::Config;
+use chibidb::config::{Config, WebRootState};
 use chibidb::instance::Instance;
 use chibidb::{client, run_repl, server};
 
@@ -46,6 +46,15 @@ async fn main() -> std::io::Result<()> {
             if let Some(http_addr) = config.server.http_addr.clone() {
                 let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
                 eprintln!("chibidb http listening on {http_addr}");
+                // A fresh clone has no built SPA, so this is the common case.
+                // Say it once at startup, with the path actually looked at,
+                // rather than leaving the browser to show a bare 404.
+                if let WebRootState::Missing(path) = config.web_root_state() {
+                    eprintln!(
+                        "note: web root {path} not found; the built frontend will not be \
+                         served (run scripts/build_web.sh, or cd web && npm run dev)"
+                    );
+                }
                 let http_instance = instance.clone();
                 tokio::spawn(async move {
                     if let Err(e) = chibidb::http::serve(http_instance, http_listener).await {
@@ -65,6 +74,17 @@ async fn main() -> std::io::Result<()> {
             }
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("chibidb server listening on {addr}");
+            // The console is built but there is no HTTP listener to serve it
+            // from. Nothing else would say so: the text protocol works, and the
+            // browser only reports a 5xx from whatever is proxying to a port
+            // nobody is listening on.
+            if config.web_console_unreachable() {
+                eprintln!(
+                    "note: the web console is built but no HTTP listener is configured, so \
+                     it cannot be opened; set server.http_addr in config.toml (e.g. \
+                     \"127.0.0.1:8080\") and restart"
+                );
+            }
             server::serve(instance, listener).await
         }
         // client

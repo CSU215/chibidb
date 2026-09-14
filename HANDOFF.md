@@ -1,7 +1,15 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：src 按层重组为 `sql/`/`db/`/`net/`（`lib.rs` 用 `pub use` 保留旧扁平路径）+ catalog 原子写（temp+rename）+ 新增 `config.example.toml`；P10/P7/P8/P2+/P3 + P9（HTTP+MySQL 含预处理）+ LSM 分级压实/流式 + 堆/LSM 差分等价与性能探针；477 tests 全绿、clippy 零警告。
+> 最后更新：**Web 前端 F0–F2 前半完成**——HTTP 前端同源托管 `web/dist`
+> （`src/net/admin.rs` + `server.web_root`），`X-Chibi-Session` 会话注册表让事务跨请求
+> （`src/net/session.rs`），`POST /api/parse` 返回 Token 流与 AST（受 `server.admin_api` 门控），
+> 手写 JSON 值解析器替换 `json_string_field`（新增 `src/net/json.rs`），
+> 以及 Vue 3 控制台（`web/`，SQL 控制台 + 解析实验台）。详见 §10 的 F 系列。
+> 此前：src 按层重组为 `sql/`/`db/`/`net/`（`lib.rs` 用 `pub use` 保留旧扁平路径）、
+> catalog 原子写（temp+rename）、P10/P7/P8/P3 + P9（HTTP+MySQL 含预处理）、LSM 分级压实/流式、
+> 堆/LSM 差分等价与性能探针。**658 Rust tests + 17 前端测试全绿、clippy 零警告**
+> （测试数会被后续提交改变，以 `cargo test` 输出为准；本文档其余数字同理）。
 
 ---
 
@@ -57,7 +65,9 @@ python3 scripts/smoke.py     # Windows: python scripts\smoke.py；期望输出 S
 `storage.buffer_pool_frames`、`storage.eviction`、`storage.double_write`、`storage.default_engine`、
 `storage.inline_lob_limit`、
 `storage.lsm_compaction_trigger`、`wal.checkpoint_threshold`、`server.addr`/`http_addr`/`mysql_addr`、
-`server.thread_model`/`worker_threads`、`execution.mode`、`auth.enabled`、`transaction.isolation`/`conflict`/`lock_timeout_ms`。
+`server.web_root`（默认 `"web/dist"`，托管在 `http_addr` 上的前端产物目录；`""` 关闭）、
+`server.admin_api`（默认 `false`，开启后 `/api/*` 才可用）、
+`server.thread_model`/`worker_threads`、`execution.mode`、`auth.enabled`、`transaction.isolation`/`lock_timeout_ms`。
 页大小（`PAGE_SIZE=8192`）是编译期常量，**不是**配置项（动态页大小属 P6 存储抽象）。
 
 ---
@@ -426,6 +436,34 @@ P10 收尾（P10.4/P10.5）：补齐课程验收点名的两块缓存机制—�
 | P8 | LOB（外存 + `LobReader` 流式） | ✅ P8.1：`src/storage/lob.rs`——`LobStore`（每对象一个 `<id>.lob` 文件，id 打开时按现存最大文件续号、删除不复用；`write/read/len/is_empty/reader/delete`）与 `LobReader`（`read` 小缓冲 / `next_chunk` 64KB 流式）；`tests/storage_lob.rs` 覆盖空/小/1MB 往返、小缓冲流式、跨 chunk、删除、重开续号（`0d48d50`）。P8.2 完成：行编解码接入 LOB——`Database` 增 `lobs: LobStore`（`<db>/lobs`）；`codec` 增 `LobResolver` trait、`TAG_LOB` 与 `encode_record/decode_record`（带 resolver）及 `encoded_row_size`；超过 `storage.inline_lob_limit` 的字符串编码为 LOB 引用、解码时解析回 `Value::Str`（`Value` 模型不变）；插入大小检查改用外存后尺寸，故超页文本也可存；WAL 记录存的是含引用的记录字节，恢复无需解析；`tests/lob_db.rs` 覆盖外存/读回、超页文本、checkpoint 重开、崩溃 WAL 恢复（`caef3e6`）。P8.3 完成：`codec::collect_lob_ids`（不解析、尽力扫描 `TAG_LOB` id）；`Database::free_lob_refs` 在物理删除记录时删除其 LOB——`rollback_trx`（Insert/Update 的新版本）与 `vacuum` 均调用；`tests/lob_db.rs` 增 vacuum 回收、回滚回收、更新后 vacuum 回收三例（`16ea4b8`）。DROP TABLE 亦在删表前扫描记录回收其 LOB（`27a2e85`）。P8.3b 完成：LOB 列剪裁——`codec::decode_record_pruned` + `TableScan` 的 `keep` 掩码，`build_select` 对单表无子查询查询做保守列引用分析，未被引用的 LOB 列跳过读取（`SELECT count(*)`/未投影列不读大对象；遇到 `*`/子查询/外部限定名则回退全量解码），`tests/lob_db.rs` 用「删掉 LOB 文件后查 count/id 仍成功、查 body 报错」证明（`d11e46c`）。**已知限制**：`LobReader` 单值仍整体物化为字符串（剪裁避免了不必要的读，但不做真正的流式消费） |
 | P9 | 多前端（MySQL/HTTP/Text TCP） | 🟡 HTTP/JSON 前端落地（`c17c8cf`）：`src/net/http.rs` 手写 HTTP/1.1（无新依赖），`POST /query`（JSON `{"sql":...}` → `{"results":[...]}`）、`GET /health`；每连接一个 `Session`（`LOGIN`/事务跨请求），keep-alive；由 `server.http_addr` 决定是否同时开第二个监听；`tests/http_frontend.rs` 覆盖查询/消息+错误/health。Text TCP 已有；MySQL wire 完成（`b09fd78`）：`src/net/mysql.rs` 手写 protocol 4.1（含内置 SHA-1），Handshake V10 + `mysql_native_password`（用户表增 `native` 列存 `SHA1(SHA1(pw))`，`auth.enabled` 时校验，否则放行）、`COM_QUERY` 文本结果集（列数/列定义/EOF/行/EOF，多结果集用 `SERVER_MORE_RESULTS_EXISTS`）、`COM_PING`/`COM_INIT_DB`/`COM_QUIT`；由 `server.mysql_addr` 选择监听；`tests/mysql_frontend.rs` 用最小客户端跑通握手+查询/错误+ping。预处理语句（`5e43f87`）：`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`，`?` 占位符按参数类型（int/float/string/null）绑定为字面量后执行。**限制**：仅文本结果集、列类型统一 `VAR_STRING`、无 SSL/二进制结果集 |
 | P10 | 并发：`ThreadHandler`（per-connection/thread-pool）+ 去全局锁 + 可配置冲突策略（FCW/2PL） | 🟡 P10.1：分库锁 + 去全局锁（`4984822`）+ `ThreadHandler` 双后端（`a1acc25`）。P10.2a：只读 autocommit 走本地快照事务，不写 `next_trx_id`/`open_trxs`/`committed_trxs`（`879c39e`）。P10.2b：`BufferPool` 元数据锁 + 每帧 `Mutex<PageData>`/`AtomicBool` 脏位，方法 `&self`（`f56694b`）。P10.2c：WAL 内部 `Mutex`（`f56c78d`）、Catalog `RwLock`（`9f8e801`）、事务簿记 `Atomic*`/`RwLock`（`64b52c1`）。P10.2d：`Database` 方法全 `&self`、读路径 `&Database`、`Instance` 每库 `RwLock<Database>`（读并发、写独占）（`2c70856`）。P10.3：`transaction.conflict = "fcw" | "2pl"`（`e068598`）。FCW：提交时按 `prev_deleter`/当前标记检测写写冲突并回滚失败方。2PL：每库悲观写锁（`Arc<DatabaseWriteLock>`，`Condvar` 等待 + `lock_timeout_ms`），显式事务在 `BEGIN`（取快照前）持锁至 `COMMIT/ROLLBACK`，自动提交写在语句内持锁；`Instance` 在取库锁前先取写锁，避免与 COMMIT 形成锁序死锁（`80596c1`）；`rollback_session` 释放。**P10 阶段完成**。P10.4（pin 引用计数，`5300b48`）：`Frame::pins: AtomicU32` + RAII `PinnedFrame`，`frame_for` **在 `state` 锁内**加一，淘汰器只挑 `pins == 0` 的帧、被 pin 的键留在登记里；`dirty_frames` 快照也 pin。关闭了 `os_storage.md` §6.7 记录的丢失更新窗口（容量 1 的探针实测丢 428/2000），代价是新增可达错误 `buffer pool exhausted: every frame is pinned`。P10.5（可配置置换策略，`051d72a`）：新增 `storage/replacer.rs`（`Replacer`/`FrameVitals` + `lru`/`clock`/`fifo` 纯逻辑实现）+ `storage.eviction` 配置，`BufferPool::new_with_eviction` 成为唯一生产构造路径；`Frame::accessed` 承载 CLOCK 的引用位。P10.6（`DiskManager` 去全局锁，`76afe19`）：`files` 改 `RwLock<BTreeMap<FileId, Arc<FileSlot>>>` + 每文件 `Mutex<Option<File>>`、`next_file_id` 改 `AtomicU32`，全部方法 `&self`；`Arc` 让注册表锁与文件锁**不再嵌套**（不再需要论证全局锁序）；新增 `with_file` 与 `DiskManager::alloc_page`（"取页数 + 写零页"同锁，修掉并发追加拿到重复页号的隐患）；`write_page` 删掉照抄来的 `File::flush`（no-op） |
+
+### F 系列：Web 前端（对应 `docs/web_frontend.md`）
+
+> 该文档按**交付物**拆成 F0–F9；本轮实施按**层次**重排为三步
+> （静态托管 → 会话 → 解析接口 + 前端），映射关系见下表。
+
+| 文档阶段 | 本轮步骤 | 内容 | 状态 |
+|---|---|---|---|
+| F0 | ① 静态托管 | `server.web_root`（默认 `"web/dist"`，`""` 关闭）+ 新增 `src/net/admin.rs` + `write_response` 改按字节写并支持额外响应头 + 缺失时的启动 note 与可读兜底页 | ✅ `78bd185`、`2f7a221` |
+| F0 | ② 会话令牌 | `X-Chibi-Session` 注册表：跨请求保持事务/`USE`，含空闲过期回滚、数量上限、后台清理线程 | ✅ `1f8b115` |
+| F1 + F2 前半 | ③ 解析接口 + 前端 | `POST /api/parse`（Token 流 + AST，受 `server.admin_api` 门控）+ Vue 控制台（同源托管，含库表树与结果表）；JSON 值解析器替换 `json_string_field` | ✅ `fb61689`、`c089516`、`f977bdb` |
+| F2 后半 | ④ 编辑器内标错 | `Error::Syntax { message, pos }` 带字节偏移（11 处构造点）+ `/api/parse` 透出 `error.pos`；前端换 CodeMirror 6，实时红色波浪线 + 悬停气泡；解析页并入控制台成为可折叠面板 | ✅ `2185f45`、`063eb46` |
+| F3 | — | 计划可视化（从**真实算子树**渲染 + 漂移检测测试，见 `docs/web_frontend.md` §4.3d） | ⬜ |
+| F4 | — | 缓冲池面板（置换日志由队友实现，等拉取后接） | ⬜ |
+| F5–F9 | — | 空间图/页检视、索引、LSM、运行时旋钮、管理台 | ⬜ |
+
+本轮前端已落地的两处**设计取舍**（细节见 `docs/web_frontend.md` §3 与各提交说明）：
+**不做 CORS**（同源托管 + dev 代理已足够，且浏览器可向回环地址发简单跨源 POST，
+不需要就不加）；**会话为混合制**——不带 `X-Chibi-Session` 的请求保持每连接会话与
+关闭即回滚，带头的才走注册表，因此既有客户端行为逐位不变。
+
+前端 `web/` 有独立的测试：`cd web && npm test`（vitest，17 个用例，
+覆盖请求构造、错误映射与会话 id 的接管）。`web/dist` 不入库，
+新 clone 需先跑 `scripts/build_web.sh`。
+
+本轮已定的边界：**不做 CORS**（同源托管 + 开发期 Vite 代理已足够；更重要的是
+浏览器可向回环地址发**简单**跨源 POST，不需要就不加）；**不做库级权限分级**
+（门禁只留 `admin_api` 总开关 + 已登录，残留风险已记档于 `docs/web_frontend.md` §3.4）。
 
 工作纪律：每步先写失败测试（红）再最小实现（绿），提交粒度对齐 chibicc（一次一件事），
 提交前全量 `cargo test` + clippy 零警告，并同步本文档与 README。

@@ -68,12 +68,29 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The byte offset to point at for the token under the cursor.
+    ///
+    /// Past the end of the input that is the end of the text, which is where
+    /// the cursor actually is -- the place that is missing something.
+    fn here(&self) -> usize {
+        self.peek().map_or(self.src.len(), |t| t.pos)
+    }
+
+    /// A syntax error at the token under the cursor.
+    ///
+    /// Every parser complaint is "the token you have reached is wrong", except
+    /// for the few that outlive the token they are about, and those capture
+    /// their position with [`Parser::here`] before consuming it.
+    fn syntax(&self, message: impl Into<String>) -> Error {
+        Error::syntax(message, self.here())
+    }
+
     fn unexpected(&self, want: &str) -> Error {
         let got = match self.peek() {
             None => "end of input".to_string(),
             Some(t) => format!("{:?}", t.kind),
         };
-        Error::Syntax(format!("expected {want}, got {got}"))
+        self.syntax(format!("expected {want}, got {got}"))
     }
 
     fn parse_statements(&mut self) -> Result<Vec<Stmt>> {
@@ -417,15 +434,20 @@ impl<'a> Parser<'a> {
             }
         }
         if self.eat_keyword("limit") {
+            // Captured before the expression is consumed: the complaint is about
+            // what was written here, not about whatever follows it.
+            let count_at = self.here();
             let count = self.parse_expr()?;
             if !matches!(count, Expr::Int(_)) {
-                return Err(Error::Syntax("limit count must be a non-negative integer".into()));
+                return Err(Error::syntax("limit count must be a non-negative integer", count_at));
             }
             let offset = if self.eat_keyword("offset") {
+                let offset_at = self.here();
                 let off = self.parse_expr()?;
                 if !matches!(off, Expr::Int(_)) {
-                    return Err(Error::Syntax(
-                        "limit offset must be a non-negative integer".into(),
+                    return Err(Error::syntax(
+                        "limit offset must be a non-negative integer",
+                        offset_at,
                     ));
                 }
                 Some(off)
@@ -700,12 +722,13 @@ impl<'a> Parser<'a> {
         }
         if self.eat_keyword("char") {
             self.expect_punct(Punct::LParen)?;
+            let length_at = self.here();
             let n = match self.bump() {
                 Some(Token { kind: TokenKind::Int(n), .. }) => *n,
                 _ => return Err(self.unexpected("char length")),
             };
             if n <= 0 {
-                return Err(Error::Syntax("char length must be positive".into()));
+                return Err(Error::syntax("char length must be positive", length_at));
             }
             self.expect_punct(Punct::RParen)?;
             return Ok(DataType::Char(n as u32));
@@ -778,13 +801,15 @@ impl<'a> Parser<'a> {
             }
             let pattern = self.parse_additive()?;
             let escape = if self.eat_keyword("escape") {
+                let escape_at = self.here();
                 match self.bump() {
                     Some(Token { kind: TokenKind::Str(s), .. }) if s.chars().count() == 1 => {
                         s.chars().next()
                     }
                     _ => {
-                        return Err(Error::Syntax(
-                            "ESCAPE requires a single-character string".into(),
+                        return Err(Error::syntax(
+                            "ESCAPE requires a single-character string",
+                            escape_at,
                         ))
                     }
                 }
@@ -931,12 +956,13 @@ impl<'a> Parser<'a> {
             {
                 self.pos += 2; // consume name and '('
                 let distinct = self.eat_keyword("distinct");
+                let star_at = self.here();
                 let arg = if self.eat_punct(Punct::Star) {
                     if func != AggFunc::Count {
-                        return Err(Error::Syntax("* is only valid in count(*)".into()));
+                        return Err(Error::syntax("* is only valid in count(*)", star_at));
                     }
                     if distinct {
-                        return Err(Error::Syntax("count(distinct *) is not valid".into()));
+                        return Err(Error::syntax("count(distinct *) is not valid", star_at));
                     }
                     None
                 } else {

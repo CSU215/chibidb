@@ -1,8 +1,34 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::{Error, Result};
+
+/// What `server.web_root` resolves to. Both the startup note and the fallback
+/// page key off this, so the two never disagree about why nothing is served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebRootState {
+    /// Hosting is off: `web_root` is unset or empty.
+    Off,
+    /// Configured, but not a usable directory. Carries the absolute path so the
+    /// message can say where it looked.
+    Missing(String),
+    /// A canonicalised directory, ready to serve from.
+    Ready(PathBuf),
+}
+
+/// An absolute form of a configured path, for messages. `canonicalize` cannot
+/// be used here: the whole point is that the path does not exist.
+fn absolute_display(configured: &str) -> String {
+    let path = Path::new(configured);
+    if path.is_absolute() {
+        return path.display().to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path).display().to_string(),
+        Err(_) => configured.to_string(),
+    }
+}
 
 /// Which storage engine new tables use. Existing files record their own
 /// engine in the file header, so this only affects creation.
@@ -122,6 +148,15 @@ pub struct ServerConfig {
     pub http_addr: Option<String>,
     /// Optional third listener speaking the MySQL wire protocol.
     pub mysql_addr: Option<String>,
+    /// Directory holding the built Vue SPA, served from the HTTP listener.
+    /// Relative paths resolve against the process CWD, like `config.toml`.
+    /// An empty string disables static hosting (the field can no longer say
+    /// "off" by being absent, since it has a default).
+    pub web_root: Option<String>,
+    /// Serve the `/api/*` surface on the HTTP listener. Off by default: that
+    /// surface diagnoses and eventually pokes at storage internals, so it should
+    /// be opted into rather than reachable on every deployment.
+    pub admin_api: bool,
     pub protocols: Vec<String>,
     pub thread_model: ThreadModel,
     pub worker_threads: usize,
@@ -193,6 +228,8 @@ impl Default for ServerConfig {
             addr: "127.0.0.1:5678".into(),
             http_addr: None,
             mysql_addr: None,
+            web_root: Some("web/dist".into()),
+            admin_api: false,
             protocols: vec!["text".into()],
             thread_model: ThreadModel::PerConnection,
             worker_threads: 4,
@@ -221,6 +258,34 @@ impl Config {
     /// Callers must call [`Config::validate`] to reject impossible values.
     pub fn from_toml_str(text: &str) -> Result<Self> {
         toml::from_str(text).map_err(|e| Error::Runtime(format!("invalid config: {e}")))
+    }
+
+    /// Resolves `server.web_root` against the process CWD, the same way
+    /// `config.toml` itself is resolved.
+    pub fn web_root_state(&self) -> WebRootState {
+        let Some(configured) = self.server.web_root.as_deref().filter(|root| !root.is_empty())
+        else {
+            return WebRootState::Off;
+        };
+        match Path::new(configured).canonicalize() {
+            Ok(path) if path.is_dir() => WebRootState::Ready(path),
+            _ => WebRootState::Missing(absolute_display(configured)),
+        }
+    }
+
+    /// Whether a built web console exists but has nowhere to be served from,
+    /// because no HTTP listener is configured.
+    ///
+    /// This is a silent failure otherwise: `cargo run -- serve` starts happily,
+    /// prints one text-protocol line, and the console answers nothing -- the
+    /// browser (or the dev server's proxy) reports a 5xx that names neither the
+    /// cause nor the fix. Hence the check.
+    ///
+    /// Deliberately false when there is no built console, so a backend-only
+    /// setup stays quiet: the default `web_root` points at `web/dist`, which
+    /// usually does not exist.
+    pub fn web_console_unreachable(&self) -> bool {
+        self.server.http_addr.is_none() && matches!(self.web_root_state(), WebRootState::Ready(_))
     }
 
     pub fn validate(&self) -> Result<()> {

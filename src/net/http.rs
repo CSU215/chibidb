@@ -7,35 +7,52 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
 use crate::instance::Instance;
-use crate::result::{encode_error, encode_results};
+use crate::result::{encode_error, encode_results, json_string};
 use crate::trx::Session;
 
 use crate::server::SharedInstance;
+
+use super::admin::{self, Response};
+use super::json::json_string_field;
+use super::session::{SESSION_HEADER, SessionRegistry, spawn_sweeper};
 
 /// Largest request we will buffer (headers plus body).
 const MAX_REQUEST: usize = 8 * 1024 * 1024;
 
 /// Accepts HTTP connections until the listener closes.
 pub async fn serve(instance: SharedInstance, listener: TcpListener) -> io::Result<()> {
+    // One registry per listener. Sessions in it outlive the connections that
+    // created them, so an abandoned one is rolled back on a timer rather than
+    // when its socket closes.
+    let registry = SessionRegistry::new();
+    spawn_sweeper(Arc::clone(&registry), Arc::clone(&instance));
     loop {
         let (stream, peer) = listener.accept().await?;
         let stream = stream.into_std()?;
         stream.set_nonblocking(false)?;
         let instance = instance.clone();
+        let registry = Arc::clone(&registry);
         std::thread::spawn(move || {
-            if let Err(e) = serve_connection(&instance, stream) {
+            if let Err(e) = serve_connection(&instance, stream, &registry) {
                 eprintln!("http connection {peer} error: {e}");
             }
         });
     }
 }
 
-fn serve_connection(instance: &Instance, mut stream: TcpStream) -> io::Result<()> {
-    let mut session = Session::new();
+fn serve_connection(
+    instance: &Instance,
+    mut stream: TcpStream,
+    registry: &SessionRegistry,
+) -> io::Result<()> {
+    // The session for requests that carry no header. Rolled back when the socket
+    // goes away, exactly as it was before the registry existed.
+    let mut local = Session::new();
     let mut buf: Vec<u8> = Vec::new();
     let result = loop {
         let Some(header_end) = read_headers(&mut stream, &mut buf)? else {
@@ -50,8 +67,7 @@ fn serve_connection(instance: &Instance, mut stream: TcpStream) -> io::Result<()
             _ => {
                 write_response(
                     &mut stream,
-                    "413 Payload Too Large",
-                    &encode_error("request too large"),
+                    &Response::json("413 Payload Too Large", encode_error("request too large")),
                     false,
                 )?;
                 break Ok(());
@@ -63,16 +79,55 @@ fn serve_connection(instance: &Instance, mut stream: TcpStream) -> io::Result<()
         let body = &buf[header_end..body_end];
         let (method, path) = request_line(&head);
         let keep_alive = !head.to_ascii_lowercase().contains("connection: close");
-        let (status, payload) = route(instance, &mut session, &method, &path, body);
-        write_response(&mut stream, status, &payload, keep_alive)?;
+        let response = dispatch(instance, registry, &mut local, &head, &method, &path, body);
+        write_response(&mut stream, &response, keep_alive)?;
 
         buf.drain(..body_end);
         if !keep_alive {
             break Ok(());
         }
     };
-    let _ = instance.rollback_session(&mut session);
+    // Only the connection's own session. A registry session is untouched, which
+    // is the whole point: a browser closes pooled sockets at will.
+    let _ = instance.rollback_session(&mut local);
     result
+}
+
+/// Picks the session for one request and runs it.
+///
+/// A request carrying `X-Chibi-Session` runs on that registry session; the id
+/// comes back in the response, and is a new one when the requested id was
+/// unknown. A request without the header runs on the connection's own session
+/// and gets no id, which is what keeps stateless clients identical to before.
+fn dispatch(
+    instance: &Instance,
+    registry: &SessionRegistry,
+    local: &mut Session,
+    head: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Response {
+    // `GET /session` mints an id without running a statement, so a fresh page
+    // can pick one up before its first query. It lives here rather than in the
+    // admin module because sessions are this module's business, and because it
+    // must work whether or not `admin_api` is on.
+    if method == "GET" && path == "/session" {
+        let (id, _session) = registry.mint();
+        let mut response =
+            Response::json("200 OK", format!("{{\"session\":{}}}", json_string(&id)));
+        response.extra_headers.push((SESSION_HEADER, id));
+        return response;
+    }
+
+    let Some(requested) = header(head, SESSION_HEADER) else {
+        return route(instance, local, method, path, body);
+    };
+    let (id, session) = registry.claim(requested);
+    // Locking after `claim` returned, never while holding the registry lock.
+    let mut response = route(instance, &mut session.lock(), method, path, body);
+    response.extra_headers.push((SESSION_HEADER, id));
+    response
 }
 
 fn route(
@@ -81,20 +136,28 @@ fn route(
     method: &str,
     path: &str,
     body: &[u8],
-) -> (&'static str, String) {
+) -> Response {
+    // The admin surface owns `/api/*` and static hosting; it declines the two
+    // legacy paths so they keep their exact previous behaviour.
+    if let Some(response) = admin::handle(instance.config(), method, path, body) {
+        return response;
+    }
     match (method, path) {
-        ("GET", "/health") => ("200 OK", "{\"status\":\"ok\"}".to_string()),
+        ("GET", "/health") => Response::json("200 OK", "{\"status\":\"ok\"}".to_string()),
         ("POST", "/query") => {
             let text = String::from_utf8_lossy(body);
             let Some(sql) = json_string_field(&text, "sql") else {
-                return ("400 Bad Request", encode_error("expected a JSON body {\"sql\": ...}"));
+                return Response::json(
+                    "400 Bad Request",
+                    encode_error("expected a JSON body {\"sql\": ...}"),
+                );
             };
             match instance.execute_with(session, &sql) {
-                Ok(results) => ("200 OK", encode_results(&results)),
-                Err(e) => ("400 Bad Request", encode_error(&e.to_string())),
+                Ok(results) => Response::json("200 OK", encode_results(&results)),
+                Err(e) => Response::json("400 Bad Request", encode_error(&e.to_string())),
             }
         }
-        _ => ("404 Not Found", encode_error("not found")),
+        _ => Response::not_found(),
     }
 }
 
@@ -132,70 +195,45 @@ fn request_line(head: &str) -> (String, String) {
     let line = head.lines().next().unwrap_or("");
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("/").to_string();
+    // Drop the query and fragment: `/assets/app.js?v=1` names the file `app.js`.
+    let target = parts.next().unwrap_or("/");
+    let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
     (method, path)
 }
 
+/// The first value for a header, case-insensitively. The request line has no
+/// colon, so scanning every line including it is safe.
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
 fn content_length(head: &str) -> Option<usize> {
-    for line in head.lines() {
-        let lower = line.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("content-length:") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
+    header(head, "content-length")?.parse().ok()
 }
 
-fn write_response(
-    stream: &mut TcpStream,
-    status: &str,
-    body: &str,
-    keep_alive: bool,
-) -> io::Result<()> {
+/// Writes one response. The body is bytes, not a string: static assets include
+/// binaries (`woff2`, `png`) that a lossy UTF-8 round trip would corrupt.
+fn write_response(stream: &mut TcpStream, response: &Response, keep_alive: bool) -> io::Result<()> {
     let connection = if keep_alive { "keep-alive" } else { "close" };
-    let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
-        body.len()
+    let mut header = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {connection}\r\n",
+        response.status,
+        response.content_type,
+        response.body.len(),
     );
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(body.as_bytes())?;
-    stream.flush()
-}
-
-/// Extracts a top-level string field from a tiny JSON object.
-fn json_string_field(text: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let start = text.find(&needle)? + needle.len();
-    let rest = text[start..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let mut out = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => return Some(out),
-            '\\' => match chars.next()? {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                '/' => out.push('/'),
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                'b' => out.push('\u{8}'),
-                'f' => out.push('\u{c}'),
-                'u' => {
-                    let mut hex = String::new();
-                    for _ in 0..4 {
-                        hex.push(chars.next()?);
-                    }
-                    out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
-                }
-                _ => return None,
-            },
-            c => out.push(c),
-        }
+    for (name, value) in &response.extra_headers {
+        header.push_str(name);
+        header.push_str(": ");
+        header.push_str(value);
+        header.push_str("\r\n");
     }
-    None
+    header.push_str("\r\n");
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(&response.body)?;
+    stream.flush()
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
