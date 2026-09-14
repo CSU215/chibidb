@@ -230,7 +230,7 @@ pub fn internal_next(page: &[u8]) -> PageNo {
     u32_at(page, 7)
 }
 
-pub fn internal_set_next(page: &mut [u8], next: PageNo) {
+pub fn internal_set_next(page: &mut [u8; PAGE_SIZE], next: PageNo) {
     u32_set(page, 7, next);
 }
 
