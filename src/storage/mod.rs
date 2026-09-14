@@ -6,7 +6,7 @@ pub mod engine;
 pub mod header;
 pub mod heap;
 pub mod lob;
-// lsm added later
+pub mod lsm;
 pub mod page;
 pub(crate) mod pax;
 pub mod replacer;

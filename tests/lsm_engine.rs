@@ -1,0 +1,144 @@
+use chaoticdb::storage::codec::encode_record_inline;
+use chaoticdb::storage::engine::{TableEngine, TableStorage};
+use chaoticdb::storage::lsm::engine::LSM_FILE_ID;
+use chaoticdb::storage::lsm::LsmEngine;
+use chaoticdb::storage::heap::Rid;
+use chaoticdb::storage::{BufferPool, DiskManager};
+use chaoticdb::value::Value;
+
+fn pool() -> BufferPool {
+    BufferPool::new(DiskManager::new(), 8)
+}
+
+#[test]
+fn lsm_engine_supports_the_mvcc_record_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let bp = pool();
+    let engine = LsmEngine::open(dir.path(), 256).unwrap();
+    assert_eq!(engine.file_id(), LSM_FILE_ID);
+
+    let data = encode_record_inline(1, 0, 0, &[Value::Int(42)]);
+    let rid = engine.insert(&bp, &data).unwrap();
+    assert_eq!(engine.get(&bp, rid).unwrap(), data);
+
+    // the scan yields the raw versioned record
+    let mut scanner = engine.scan(&bp).unwrap();
+    assert_eq!(scanner.next(&bp).unwrap(), Some((rid, data.clone())));
+    assert!(scanner.next(&bp).unwrap().is_none());
+
+    // delete-mark reports the previous marker
+    assert_eq!(engine.delete_mark(&bp, rid, 7, 0).unwrap(), (0, 0));
+    assert_eq!(engine.delete_mark(&bp, rid, 8, 0).unwrap(), (7, 0));
+
+    // physical delete removes it
+    engine.delete(&bp, rid).unwrap();
+    assert!(engine.get(&bp, rid).is_err());
+    let mut scanner = engine.scan(&bp).unwrap();
+    assert!(scanner.next(&bp).unwrap().is_none());
+}
+
+#[test]
+fn lsm_engine_flushed_data_survives_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let bp = pool();
+
+    let mut first: Option<Rid> = None;
+    {
+        let engine = LsmEngine::open(dir.path(), 256).unwrap();
+        for i in 0..100 {
+            let data = encode_record_inline(1, 0, 0, &[Value::Int(i)]);
+            let rid = engine.insert(&bp, &data).unwrap();
+            first.get_or_insert(rid);
+        }
+        engine.flush().unwrap();
+    }
+    let first = first.unwrap();
+
+    let engine = LsmEngine::open(dir.path(), 256).unwrap();
+    // the old rows are readable and a new row gets a fresh id
+    let data = encode_record_inline(2, 0, 0, &[Value::Int(999)]);
+    let new_rid = engine.insert(&bp, &data).unwrap();
+    assert_ne!(new_rid, first);
+    assert_eq!(engine.get(&bp, first).unwrap(), encode_record_inline(1, 0, 0, &[Value::Int(0)]));
+
+    let mut scanner = engine.scan(&bp).unwrap();
+    let mut count = 0;
+    while scanner.next(&bp).unwrap().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 101);
+}
+
+#[test]
+fn scan_prefers_the_newest_version_across_a_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let bp = pool();
+    // a high trigger keeps the two versions in separate level-0 tables
+    let engine = LsmEngine::open_with_trigger(dir.path(), 256, 100).unwrap();
+
+    let rid = engine.insert(&bp, &encode_record_inline(1, 0, 0, &[Value::Int(10)])).unwrap();
+    engine.flush().unwrap(); // the original version now lives in a table
+
+    // a newer version of the same row lands in the memtable
+    engine.delete_mark(&bp, rid, 9, 0).unwrap();
+
+    let mut scanner = engine.scan(&bp).unwrap();
+    let (seen, rec) = scanner.next(&bp).unwrap().unwrap();
+    assert_eq!(seen, rid, "the same row id must appear only once");
+    assert_eq!(rec, encode_record_inline(1, 9, 0, &[Value::Int(10)]));
+    assert!(scanner.next(&bp).unwrap().is_none());
+}
+
+#[test]
+fn lsm_auto_compaction_bounds_the_table_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let bp = pool();
+    let engine = LsmEngine::open_with_trigger(dir.path(), 128, 3).unwrap();
+
+    for round in 0..6u64 {
+        for i in 0..10 {
+            let data = encode_record_inline(round, 0, 0, &[Value::Int(i)]);
+            engine.insert(&bp, &data).unwrap();
+        }
+        engine.flush().unwrap();
+        // with levels, the live count is bounded by about (trigger-1)*log(N),
+        // well below the number of flushes
+        assert!(
+            engine.num_sstables() <= 4,
+            "live tables {} exceeded the leveled bound",
+            engine.num_sstables()
+        );
+    }
+
+    let mut scanner = engine.scan(&bp).unwrap();
+    let mut count = 0;
+    while scanner.next(&bp).unwrap().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 60);
+}
+
+#[test]
+fn lsm_engine_compaction_preserves_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let bp = pool();
+    // a high trigger keeps auto-compaction out of the way of this test
+    let engine = LsmEngine::open_with_trigger(dir.path(), 128, 100).unwrap();
+
+    let mut rows = Vec::new();
+    for round in 0..4u64 {
+        for i in 0..20 {
+            let data = encode_record_inline(round, 0, 0, &[Value::Int(i)]);
+            let rid = engine.insert(&bp, &data).unwrap();
+            rows.push((rid, round, i));
+        }
+        engine.flush().unwrap();
+    }
+    assert_eq!(engine.num_sstables(), 4);
+    engine.compact().unwrap();
+    assert_eq!(engine.num_sstables(), 1);
+
+    for (rid, round, i) in rows {
+        assert_eq!(engine.get(&bp, rid).unwrap(), encode_record_inline(round, 0, 0, &[Value::Int(i)]));
+    }
+}
