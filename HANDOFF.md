@@ -453,7 +453,7 @@ P10 收尾（P10.4/P10.5）：补齐课程验收点名的两块缓存机制—�
 | F1 + F2 前半 | ③ 解析接口 + 前端 | `POST /api/parse`（Token 流 + AST，受 `server.admin_api` 门控）+ Vue 控制台（同源托管，含库表树与结果表）；JSON 值解析器替换 `json_string_field` | ✅ `fb61689`、`c089516`、`f977bdb` |
 | F2 后半 | ④ 编辑器内标错 | `Error::Syntax { message, pos }` 带字节偏移（11 处构造点）+ `/api/parse` 透出 `error.pos`；前端换 CodeMirror 6，实时红色波浪线 + 悬停气泡；解析页并入控制台成为可折叠面板 | ✅ `2185f45`、`063eb46` |
 | F3 | — | 计划可视化（从**真实算子树**渲染 + 漂移检测测试，见 `docs/web_frontend.md` §4.3d） | ✅ 本轮：`plan.rs` 访问路径结构化（`90e62c7`）+ 算子自描述 `name()`/`details()`/`children()`（`69411e0`）+ `src/introspect/{mod,plan}.rs`（`PlanNode` 树、`bind` 绑定信息、选定/否决记录）与 `POST /api/plan`（`bc49a77`，与 `/api/parse` 同为 200 语义）+ `tests/plan_api.rs`（访问路径各形态、被否决理由、**漂移检测**、绑定解析）+ 控制台计划面板（`7c0940d`，`PlanTree.vue`/`PlanPanel.vue`） |
-| F4 | — | 缓冲池面板（**课程第一优先项**，见 `docs/os_storage.md` §6.10/§6.11） | ✅ 本轮：`PoolEvent` 事件环 + `PoolEventKind`（Load/Evict/**EvictSkipped**/Flush/Discard）+ `events(since)` 游标 + `frames()` 快照 + `TableStorage::lsm_stats` + `GET /api/metrics`、`/api/bufferpool/{frames,events}` + 控制台「缓冲池」页（命中率走势/常驻帧表/替换日志，可见时轮询） |
+| F4 | — | 缓冲池面板（**课程第一优先项**，见 `docs/os_storage.md` §6.10/§6.11） | ✅ 本轮：`PoolEvent` 事件环 + `PoolEventKind`（Load/Evict/**EvictSkipped**/Flush/Discard）+ `events(since)` 游标 + `frames()` 快照 + `TableStorage::lsm_stats` + `GET /api/metrics`、`/api/bufferpool/{frames,events}` + 控制台「缓冲池」页（命中率走势/常驻帧表/替换日志，可见时轮询）。面板同时给**区间命中率与累计命中率**，并在区间 0 命中时说明原因（工作集大于池容量：默认 64 帧 = 512 KB，实测 116 页全表扫描在 64 帧下恒为 0%、1024 帧下 100%） |
 | F5–F9 | — | 空间图/页检视、索引、LSM、运行时旋钮、管理台 | ⬜ |
 
 **缓冲池面板的数据源（F4）**：池里新增一份**永远在记**的事件环（`PoolEvent` +
