@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -59,6 +60,11 @@ impl PinnedFrame {
         self.frame.dirty.load(Ordering::Acquire)
     }
 
+    /// How many holders the frame has right now (this one included).
+    fn pins(&self) -> u32 {
+        self.frame.pins.load(Ordering::Acquire)
+    }
+
     fn mark_dirty(&self) {
         self.frame.dirty.store(true, Ordering::Release);
     }
@@ -89,11 +95,20 @@ struct PoolState {
 /// 把池的页表暴露给淘汰器。pin 数与引用位**只**存在帧上，策略不保存副本。
 struct PoolVitals<'a> {
     frames: &'a HashMap<Key, Arc<Frame>>,
+    /// 本次选择里策略**看过**哪些键、当时 pin 数是多少。
+    ///
+    /// 这不是缓存的状态，只是"策略扫过哪里"的痕迹：策略不选一个帧的原因
+    /// （被 pin 住，或拿到第二次机会）只存在于这次扫描里，不记下来就永远
+    /// 说不清"为什么淘汰的是它而不是别人"。这里不额外加锁 —— `choose_victim`
+    /// 在 `state` 锁内单线程调用，`RefCell` 足够。
+    examined: RefCell<Vec<(Key, u32)>>,
 }
 
 impl FrameVitals for PoolVitals<'_> {
     fn pins(&self, key: Key) -> u32 {
-        self.frames.get(&key).map_or(u32::MAX, |f| f.pins.load(Ordering::Acquire))
+        let pins = self.frames.get(&key).map_or(u32::MAX, |f| f.pins.load(Ordering::Acquire));
+        self.examined.borrow_mut().push((key, pins));
+        pins
     }
 
     fn referenced(&self, key: Key) -> bool {
@@ -106,6 +121,81 @@ impl FrameVitals for PoolVitals<'_> {
         }
     }
 }
+
+/// What happened to one frame, for the pool panel's event log.
+///
+/// **Not every lookup is an event**, or the log would be nothing but hits.
+/// Hits are counted by [`PoolStats`]; this ring is for the decisions the
+/// counters cannot express: which page was loaded, which was evicted, which
+/// was looked at and left alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolEvent {
+    /// Monotonic, starting at 1 -- the cursor a reader resumes from.
+    pub seq: u64,
+    pub kind: PoolEventKind,
+    pub file: FileId,
+    pub page: PageNo,
+    /// The frame's pin count when the event was recorded.
+    pub pins: u32,
+    /// Whether the frame was dirty at that moment. A `Load` is never dirty;
+    /// a `Flush` always is (that is what a flush is for).
+    pub dirty: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolEventKind {
+    /// A miss: the page was read from disk into a new frame.
+    Load,
+    /// A frame was taken to make room. `file`/`page` name the victim.
+    Evict,
+    /// The replacer examined a frame and did not take it. `pins > 0` means it
+    /// was pinned; `pins == 0` means it got a second chance (CLOCK).
+    EvictSkipped,
+    /// A dirty frame was written back.
+    Flush,
+    /// A frame was dropped without being written back (`discard_file`).
+    Discard,
+}
+
+impl PoolEventKind {
+    /// The name the wire and the console use. Short, lowercase, stable.
+    pub fn name(self) -> &'static str {
+        match self {
+            PoolEventKind::Load => "load",
+            PoolEventKind::Evict => "evict",
+            PoolEventKind::EvictSkipped => "evict_skipped",
+            PoolEventKind::Flush => "flush",
+            PoolEventKind::Discard => "discard",
+        }
+    }
+}
+
+/// A cursor over the event ring: what happened after `since`, and where to
+/// resume. `truncated` means the reader was away longer than the ring is
+/// deep, so some events are gone and it has to start over rather than
+/// silently skip a gap.
+#[derive(Debug, Clone)]
+pub struct PoolEvents {
+    pub events: Vec<PoolEvent>,
+    pub truncated: bool,
+    pub next: u64,
+}
+
+/// One resident frame, as the pool panel's table shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameView {
+    pub file: FileId,
+    pub page: PageNo,
+    pub pins: u32,
+    pub dirty: bool,
+    /// The CLOCK reference bit. Only clock reads it, but it is the one piece
+    /// of state that explains why a clock-evicted frame was chosen.
+    pub accessed: bool,
+}
+
+/// How many events the ring keeps. Deep enough for a panel polling twice a
+/// second to fall a couple of minutes behind and still resume from its cursor.
+pub const EVENT_CAPACITY: usize = 4096;
 
 /// A snapshot of the buffer pool's lookup counters, for observability and
 /// cache-behavior tests.
@@ -219,6 +309,11 @@ pub struct BufferPool {
     observability: ObservabilityConfig,
     /// Event sink, called only when the matching switch above is on.
     reporter: Arc<dyn CacheReporter>,
+    /// The event ring the pool panel polls. Always on, and **its own lock**:
+    /// it is written after the `state` lock is released, never inside it.
+    events: Mutex<VecDeque<PoolEvent>>,
+    event_capacity: usize,
+    next_event_seq: AtomicU64,
 }
 
 impl BufferPool {
@@ -272,7 +367,73 @@ impl BufferPool {
             dirty_evictions: AtomicU64::new(0),
             observability,
             reporter,
+            events: Mutex::new(VecDeque::new()),
+            event_capacity: EVENT_CAPACITY,
+            next_event_seq: AtomicU64::new(0),
         }
+    }
+
+    /// Sets how many events the ring keeps (default [`EVENT_CAPACITY`]; `0`
+    /// disables the log).
+    ///
+    /// A knob rather than a constant because the interesting behaviour -- a
+    /// reader falling behind and having to start over -- is only observable
+    /// with a ring small enough to overflow.
+    pub fn with_event_capacity(mut self, events: usize) -> Self {
+        self.event_capacity = events;
+        self
+    }
+
+    /// Appends one event, dropping the oldest when the ring is full.
+    ///
+    /// Callers must **not** hold the `state` lock: this takes the event lock,
+    /// and the whole point of keeping the ring separate is that the metadata
+    /// critical section stays as short as it is today.
+    fn record_event(&self, kind: PoolEventKind, file: FileId, page: PageNo, pins: u32, dirty: bool) {
+        if self.event_capacity == 0 {
+            return;
+        }
+        let seq = self.next_event_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut ring = self.events.lock();
+        while ring.len() >= self.event_capacity {
+            ring.pop_front();
+        }
+        ring.push_back(PoolEvent { seq, kind, file, page, pins, dirty });
+    }
+
+    /// The events after `since` (`0` for everything still buffered), plus the
+    /// cursor to ask from next time.
+    pub fn events(&self, since: u64) -> PoolEvents {
+        let ring = self.events.lock();
+        // A reader is behind when the oldest event left is newer than the one
+        // right after its cursor: the ones in between were dropped.
+        let truncated = ring.front().is_some_and(|oldest| since + 1 < oldest.seq);
+        let events: Vec<PoolEvent> = ring.iter().filter(|e| e.seq > since).cloned().collect();
+        let next = events.last().map_or(since, |e| e.seq);
+        PoolEvents { events, truncated, next }
+    }
+
+    /// The frames resident right now, sorted by `(file, page)` so a table of
+    /// them does not reshuffle between polls.
+    ///
+    /// Read-only in the strongest sense: it takes no pin, marks nothing dirty
+    /// and leaves the eviction order alone, so watching the pool cannot change
+    /// what is watched.
+    pub fn frames(&self) -> Vec<FrameView> {
+        let state = self.state.lock();
+        let mut out: Vec<FrameView> = state
+            .frames
+            .iter()
+            .map(|((file, page), frame)| FrameView {
+                file: *file,
+                page: *page,
+                pins: frame.pins.load(Ordering::Acquire),
+                dirty: frame.dirty.load(Ordering::Acquire),
+                accessed: frame.accessed.load(Ordering::Relaxed),
+            })
+            .collect();
+        out.sort_unstable_by_key(|frame| (frame.file, frame.page));
+        out
     }
 
     /// A consistent-enough snapshot of the lookup counters and residency.
@@ -326,8 +487,9 @@ impl BufferPool {
     /// pin, so the frame cannot be evicted while the caller still uses it.
     fn frame_for(&self, file: FileId, no: PageNo) -> Result<PinnedFrame> {
         let key = (file, no);
-        // 本轮淘汰的帧，锁外再上报（替换日志不能在持 `state` 锁时做 I/O）。
-        let mut evicted: Vec<(Key, bool)> = Vec::new();
+        // 本轮淘汰/跳过的帧，锁外再上报（替换日志不能在持 `state` 锁时做 I/O）。
+        let mut evicted: Vec<(Key, bool, u32)> = Vec::new();
+        let mut skipped: Vec<(Key, u32, bool)> = Vec::new();
         let pinned = {
             let mut state = self.state.lock();
             // `frames` 可变借用于淘汰，`replacer` 可变借用于重排；拆开字段让两者并存。
@@ -341,11 +503,13 @@ impl BufferPool {
             while frames.len() >= self.capacity {
                 // 被 pin 的帧留在队列/环里，只是不参与淘汰 —— 否则它们会丢掉
                 // 淘汰顺序（不变式 Ⅳ：登记数恒等于页表长度）。
-                let victim_key = {
-                    let vitals = PoolVitals { frames };
-                    replacer.choose_victim(&vitals)
-                }
-                .ok_or_else(|| {
+                let (victim_key, examined) = {
+                    let vitals =
+                        PoolVitals { frames, examined: RefCell::new(Vec::new()) };
+                    let victim = replacer.choose_victim(&vitals);
+                    (victim, vitals.examined.into_inner())
+                };
+                let victim_key = victim_key.ok_or_else(|| {
                     Error::Runtime("buffer pool exhausted: every frame is pinned".into())
                 })?;
                 self.evictions.fetch_add(1, Ordering::Relaxed);
@@ -361,7 +525,18 @@ impl BufferPool {
                     self.disk.write_page(victim.file, victim.no, &data)?;
                     victim.dirty.store(false, Ordering::Release);
                 }
-                evicted.push((victim_key, dirty));
+                // 策略看过、却没被选中的帧：那是"为什么淘汰的是它"的另一半答案。
+                // 脏位在这里顺手取 —— 出锁以后就没有 `frames` 可查了。
+                for (examined_key, pins) in examined {
+                    if examined_key == victim_key {
+                        continue;
+                    }
+                    let was_dirty = frames
+                        .get(&examined_key)
+                        .is_some_and(|f| f.dirty.load(Ordering::Acquire));
+                    skipped.push((examined_key, pins, was_dirty));
+                }
+                evicted.push((victim_key, dirty, victim.pins.load(Ordering::Acquire)));
             }
             let mut data = zeroed_page();
             self.disk.read_page(file, no, &mut data)?;
@@ -384,10 +559,25 @@ impl BufferPool {
             // `tests/storage_buffer.rs` 的并发 hammer 用例抓的正是这条。
             PinnedFrame::new(frame)
         };
+        // 事件与替换日志都在**锁外**记：事件缓冲有自己的锁，扩大 `state` 的
+        // 临界区等于给每次缺页再加一次串行化（§4.4 的锁序要求）。
+        for (key, dirty, pins) in &evicted {
+            self.record_event(PoolEventKind::Evict, key.0, key.1, *pins, *dirty);
+        }
+        for (key, pins, dirty) in &skipped {
+            self.record_event(PoolEventKind::EvictSkipped, key.0, key.1, *pins, *dirty);
+        }
+        self.record_event(
+            PoolEventKind::Load,
+            file,
+            no,
+            pinned.frame.pins.load(Ordering::Acquire),
+            false,
+        );
         if self.observability.eviction_log && !evicted.is_empty() {
             let stats = self.stats();
-            for (victim_key, dirty) in evicted {
-                self.reporter.evict(victim_key, dirty, &stats);
+            for (victim_key, dirty, _) in &evicted {
+                self.reporter.evict(*victim_key, *dirty, &stats);
             }
         }
         Ok(pinned)
@@ -431,14 +621,29 @@ impl BufferPool {
     /// （`rebuild_indexes` / `drop_table`）持库级写锁，因此正常情况下没有在飞的
     /// 闭包。真有的话，它的修改随最后一个 `Arc` 一起消失，这正是本方法要的语义。
     pub fn discard_file(&self, file: FileId) {
+        let mut dropped_events: Vec<(PageNo, u32, bool)> = Vec::new();
         let mut state = self.state.lock();
         let PoolState { frames, replacer } = &mut *state;
         let dropped: Vec<Key> = frames.keys().filter(|k| k.0 == file).copied().collect();
+        for key in &dropped {
+            if let Some(frame) = frames.get(key) {
+                dropped_events.push((
+                    key.1,
+                    frame.pins.load(Ordering::Acquire),
+                    frame.dirty.load(Ordering::Acquire),
+                ));
+            }
+        }
         frames.retain(|k, _| k.0 != file);
         // 逐键注销：策略只提供 `forget(&mut self, key)`，没有"按文件清空"，
         // 这样三种策略共用一条路径，也顺手维持了 `len()` 与页表同步。
         for key in dropped {
             replacer.forget(key);
+        }
+        drop(state);
+        // 摘帧也留痕：面板上"这些帧为什么消失了"必须有答案。
+        for (page, pins, dirty) in dropped_events {
+            self.record_event(PoolEventKind::Discard, file, page, pins, dirty);
         }
     }
 
@@ -458,6 +663,13 @@ impl BufferPool {
                 let data = frame.data();
                 self.disk.write_page(frame.file(), frame.no(), &data)?;
                 frame.clear_dirty();
+                self.record_event(
+                    PoolEventKind::Flush,
+                    frame.file(),
+                    frame.no(),
+                    frame.pins(),
+                    true,
+                );
             }
         }
         self.disk.sync_file(file)?;
@@ -482,6 +694,7 @@ impl BufferPool {
             let data = frame.data();
             self.disk.write_page(frame.file(), frame.no(), &data)?;
             frame.clear_dirty();
+            self.record_event(PoolEventKind::Flush, frame.file(), frame.no(), frame.pins(), true);
         }
         // The final pages must be durable before the DWB can be discarded;
         // otherwise a crash after reset would lose them with no repair copy.

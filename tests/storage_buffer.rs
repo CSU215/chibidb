@@ -488,3 +488,173 @@ fn pool_stats_derives_hit_rate_and_clean_evictions() {
     assert_eq!(s.clean_evictions(), 3);
     assert_eq!(PoolStats::default().hit_rate(), 0.0);
 }
+
+// ── 事件日志与帧快照（F4：缓冲池面板的数据源） ─────────────────────────────
+//
+// 面板要说两件事：池子里现在有什么（`frames`），以及刚刚发生了什么（`events`）。
+// 前者是快照，后者是**从某个序号往后取**的游标 —— 前端记住上次读到的序号，
+// 轮询时不必重传全部历史。
+
+/// 2 帧池访问 3 页：被淘汰的必须是 LRU 那一页，事件要带上它当时的脏位与 pin 数。
+/// 单线程、不依赖任何交错。
+#[test]
+fn eviction_events_name_the_frame_that_was_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = pool(&dir, "events.dbf", 2);
+
+    // 页 0 脏（`with_page` 访问即脏），页 1 干净。
+    bp.with_page(f, 0, |p| {
+        p[0] = 7;
+        Ok(())
+    })
+    .unwrap();
+    bp.read_page(f, 1, |_| Ok(())).unwrap();
+    // 池满，这次缺页只能淘汰 LRU：页 0。
+    bp.read_page(f, 2, |_| Ok(())).unwrap();
+
+    let log = bp.events(0);
+    assert!(!log.truncated, "环没有溢出，不该报截断");
+    let kinds: Vec<&str> = log.events.iter().map(|e| e.kind.name()).collect();
+    assert_eq!(kinds, vec!["load", "load", "evict", "load"], "{log:?}");
+
+    let evicted = &log.events[2];
+    assert_eq!((evicted.file, evicted.page), (f, 0), "淘汰的不是 LRU 那页：{log:?}");
+    assert_eq!(evicted.pins, 0, "能被淘汰的帧 pin 必然是 0");
+    assert!(evicted.dirty, "页 0 是脏帧，事件必须标明（它触发了回写）");
+
+    // 干净帧出局时同样的字段要标成不脏。
+    let (bp2, f2) = pool(&dir, "events-clean.dbf", 2);
+    bp2.read_page(f2, 0, |_| Ok(())).unwrap();
+    bp2.read_page(f2, 1, |_| Ok(())).unwrap();
+    bp2.read_page(f2, 2, |_| Ok(())).unwrap();
+    let log2 = bp2.events(0);
+    let evicted2 = log2.events.iter().find(|e| e.kind.name() == "evict").expect("一次淘汰");
+    assert_eq!((evicted2.file, evicted2.page, evicted2.dirty), (f2, 0, false), "{log2:?}");
+}
+
+/// 游标语义：`since` 之后的事件、环溢出时的 `truncated`、以及下次该传的 `next`。
+#[test]
+fn the_event_log_is_a_cursor_over_a_ring() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = pool(&dir, "ring.dbf", 1);
+    // 小环才好观察溢出：容量 1 的池每访问一页就淘汰上一页。
+    let bp = bp.with_event_capacity(2);
+
+    for page in 0..4 {
+        bp.read_page(f, page, |_| Ok(())).unwrap();
+    }
+
+    let all = bp.events(0);
+    assert!(all.truncated, "环只有 2 个位置，最早的序号已经被丢掉");
+    assert_eq!(all.events.len(), 2, "只留得住最后两条：{all:?}");
+    let last = all.events.last().unwrap().seq;
+    assert_eq!(all.next, last, "next 是最后一条的序号，不是条数");
+
+    // 从倒数第二条之后取：只剩一条，且已经不再落后于环。
+    let from_middle = bp.events(all.events[0].seq);
+    assert!(!from_middle.truncated, "游标已经落在环内");
+    assert_eq!(from_middle.events.len(), 1);
+    assert_eq!(from_middle.next, last);
+
+    // 没有新事件：空结果，游标不动。
+    let idle = bp.events(last);
+    assert!(idle.events.is_empty());
+    assert!(!idle.truncated);
+    assert_eq!(idle.next, last);
+}
+
+/// 「没有被选中的帧」也要记下来 —— 那正是「为什么没淘汰它」的答案。
+/// 被 pin 的帧（事件里 `pins > 0`）与拿到第二次机会的帧（`pins == 0`）
+/// 都会出现在 `EvictSkipped` 里。
+#[test]
+fn a_skipped_candidate_says_why_it_was_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = pool(&dir, "skip.dbf", 2);
+    let bp = Arc::new(bp);
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let writer = {
+        let bp = Arc::clone(&bp);
+        std::thread::spawn(move || {
+            bp.with_page(f, 0, |p| {
+                p[0] = 1;
+                ready_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        })
+    };
+
+    ready_rx.recv().unwrap(); // 页 0 已被 pin，且在 LRU 的队首
+    bp.read_page(f, 1, |_| Ok(())).unwrap(); // 队列变成 [0(pinned), 1]
+    bp.read_page(f, 2, |_| Ok(())).unwrap(); // 缺页：先跳过 0，再淘汰 1
+    go_tx.send(()).unwrap();
+    writer.join().unwrap();
+
+    let log = bp.events(0);
+    let skipped: Vec<_> =
+        log.events.iter().filter(|e| e.kind.name() == "evict_skipped").collect();
+    assert_eq!(skipped.len(), 1, "应当恰好跳过一帧：{log:?}");
+    assert_eq!((skipped[0].file, skipped[0].page), (f, 0));
+    assert_eq!(skipped[0].pins, 1, "跳过的原因写在 pins 上：它当时被 pin 着");
+
+    let evicted: Vec<_> = log.events.iter().filter(|e| e.kind.name() == "evict").collect();
+    assert_eq!((evicted[0].file, evicted[0].page), (f, 1), "被淘汰的是没被 pin 的那帧");
+}
+
+/// 帧快照：现在池子里有什么、各自什么状态。顺序必须稳定（前端要拿它当表格用），
+/// 所以按 `(file, page)` 排序，而不是跟随 HashMap 的遍历顺序。
+#[test]
+fn the_frame_snapshot_reports_what_is_resident() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = pool(&dir, "frames.dbf", 4);
+
+    bp.read_page(f, 1, |_| Ok(())).unwrap();
+    bp.with_page(f, 0, |p| {
+        p[0] = 1;
+        Ok(())
+    })
+    .unwrap();
+
+    let frames = bp.frames();
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    assert_eq!(frames[0].page, 0, "按页号排序，不随 HashMap 顺序变");
+    assert!(frames[0].dirty, "`with_page` 访问即脏");
+    assert_eq!(frames[0].pins, 0, "闭包结束后 pin 已经归还");
+    assert_eq!(frames[1].page, 1);
+    assert!(!frames[1].dirty, "`read_page` 不置脏");
+
+    // 快照不是免费的观测动作：它不该改变命中/缺页计数，也不该动淘汰顺序。
+    let before = bp.stats();
+    let _ = bp.frames();
+    let after = bp.stats();
+    assert_eq!((before.hits, before.misses, before.evictions), (after.hits, after.misses, after.evictions));
+}
+
+/// 回写与摘帧也要留痕：flush 是「脏页落盘」，discard 是「这份数据不要了」。
+#[test]
+fn flush_and_discard_leave_traces() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = pool(&dir, "flush.dbf", 4);
+
+    bp.with_page(f, 0, |p| {
+        p[0] = 1;
+        Ok(())
+    })
+    .unwrap();
+    bp.flush_file(f).unwrap();
+    let flushed = bp.events(0);
+    assert!(
+        flushed.events.iter().any(|e| e.kind.name() == "flush" && e.page == 0),
+        "回写必须留痕：{flushed:?}"
+    );
+
+    bp.close_file(f).unwrap();
+    let discarded = bp.events(0);
+    assert!(
+        discarded.events.iter().any(|e| e.kind.name() == "discard" && e.page == 0),
+        "摘帧必须留痕：{discarded:?}"
+    );
+}

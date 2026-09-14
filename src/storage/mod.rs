@@ -12,7 +12,10 @@ pub(crate) mod pax;
 pub mod replacer;
 pub mod slotted;
 
-pub use buffer::{BufferPool, CacheReporter, PoolStats, StderrReporter};
+pub use buffer::{
+    BufferPool, CacheReporter, FrameView, PoolEvent, PoolEventKind, PoolEvents, PoolStats,
+    StderrReporter,
+};
 pub use disk::DiskManager;
 pub use heap::{HeapFile, Rid};
 pub use lob::{LobId, LobReader, LobStore};
