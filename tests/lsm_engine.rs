@@ -17,7 +17,7 @@ fn lsm_engine_supports_the_mvcc_record_lifecycle() {
     let engine = LsmEngine::open(dir.path(), 256).unwrap();
     assert_eq!(engine.file_id(), LSM_FILE_ID);
 
-    let data = encode_record_inline(1, 0, &[Value::Int(42)]);
+    let data = encode_record_inline(1, 0, 0, &[Value::Int(42)]);
     let rid = engine.insert(&bp, &data).unwrap();
     assert_eq!(engine.get(&bp, rid).unwrap(), data);
 
@@ -27,8 +27,8 @@ fn lsm_engine_supports_the_mvcc_record_lifecycle() {
     assert!(scanner.next(&bp).unwrap().is_none());
 
     // delete-mark reports the previous marker
-    assert_eq!(engine.delete_mark(&bp, rid, 7).unwrap(), 0);
-    assert_eq!(engine.delete_mark(&bp, rid, 8).unwrap(), 7);
+    assert_eq!(engine.delete_mark(&bp, rid, 7, 0).unwrap(), (0, 0));
+    assert_eq!(engine.delete_mark(&bp, rid, 8, 0).unwrap(), (7, 0));
 
     // physical delete removes it
     engine.delete(&bp, rid).unwrap();
@@ -46,7 +46,7 @@ fn lsm_engine_flushed_data_survives_a_reopen() {
     {
         let engine = LsmEngine::open(dir.path(), 256).unwrap();
         for i in 0..100 {
-            let data = encode_record_inline(1, 0, &[Value::Int(i)]);
+            let data = encode_record_inline(1, 0, 0, &[Value::Int(i)]);
             let rid = engine.insert(&bp, &data).unwrap();
             first.get_or_insert(rid);
         }
@@ -56,10 +56,10 @@ fn lsm_engine_flushed_data_survives_a_reopen() {
 
     let engine = LsmEngine::open(dir.path(), 256).unwrap();
     // the old rows are readable and a new row gets a fresh id
-    let data = encode_record_inline(2, 0, &[Value::Int(999)]);
+    let data = encode_record_inline(2, 0, 0, &[Value::Int(999)]);
     let new_rid = engine.insert(&bp, &data).unwrap();
     assert_ne!(new_rid, first);
-    assert_eq!(engine.get(&bp, first).unwrap(), encode_record_inline(1, 0, &[Value::Int(0)]));
+    assert_eq!(engine.get(&bp, first).unwrap(), encode_record_inline(1, 0, 0, &[Value::Int(0)]));
 
     let mut scanner = engine.scan(&bp).unwrap();
     let mut count = 0;
@@ -76,16 +76,16 @@ fn scan_prefers_the_newest_version_across_a_flush() {
     // a high trigger keeps the two versions in separate level-0 tables
     let engine = LsmEngine::open_with_trigger(dir.path(), 256, 100).unwrap();
 
-    let rid = engine.insert(&bp, &encode_record_inline(1, 0, &[Value::Int(10)])).unwrap();
+    let rid = engine.insert(&bp, &encode_record_inline(1, 0, 0, &[Value::Int(10)])).unwrap();
     engine.flush().unwrap(); // the original version now lives in a table
 
     // a newer version of the same row lands in the memtable
-    engine.delete_mark(&bp, rid, 9).unwrap();
+    engine.delete_mark(&bp, rid, 9, 0).unwrap();
 
     let mut scanner = engine.scan(&bp).unwrap();
     let (seen, rec) = scanner.next(&bp).unwrap().unwrap();
     assert_eq!(seen, rid, "the same row id must appear only once");
-    assert_eq!(rec, encode_record_inline(1, 9, &[Value::Int(10)]));
+    assert_eq!(rec, encode_record_inline(1, 9, 0, &[Value::Int(10)]));
     assert!(scanner.next(&bp).unwrap().is_none());
 }
 
@@ -97,7 +97,7 @@ fn lsm_auto_compaction_bounds_the_table_count() {
 
     for round in 0..6u64 {
         for i in 0..10 {
-            let data = encode_record_inline(round, 0, &[Value::Int(i)]);
+            let data = encode_record_inline(round, 0, 0, &[Value::Int(i)]);
             engine.insert(&bp, &data).unwrap();
         }
         engine.flush().unwrap();
@@ -128,7 +128,7 @@ fn lsm_engine_compaction_preserves_values() {
     let mut rows = Vec::new();
     for round in 0..4u64 {
         for i in 0..20 {
-            let data = encode_record_inline(round, 0, &[Value::Int(i)]);
+            let data = encode_record_inline(round, 0, 0, &[Value::Int(i)]);
             let rid = engine.insert(&bp, &data).unwrap();
             rows.push((rid, round, i));
         }
@@ -139,6 +139,6 @@ fn lsm_engine_compaction_preserves_values() {
     assert_eq!(engine.num_sstables(), 1);
 
     for (rid, round, i) in rows {
-        assert_eq!(engine.get(&bp, rid).unwrap(), encode_record_inline(round, 0, &[Value::Int(i)]));
+        assert_eq!(engine.get(&bp, rid).unwrap(), encode_record_inline(round, 0, 0, &[Value::Int(i)]));
     }
 }

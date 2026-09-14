@@ -172,14 +172,14 @@ fn table_storage_supports_the_mvcc_version_lifecycle() {
     assert_eq!(engine.file_id(), f);
 
     // insert a version (creator, deleter, row) and read it back
-    let data = encode_record_inline(1, 0, &[Value::Int(42)]);
+    let data = encode_record_inline(1, 0, 0, &[Value::Int(42)]);
     let rid = engine.insert(&bp, &data).unwrap();
     assert_eq!(engine.get(&bp, rid).unwrap(), data);
 
-    // a delete-mark reports the previous (zero) marker
-    assert_eq!(engine.delete_mark(&bp, rid, 7).unwrap(), 0);
+    // a delete-mark reports the previous (zero) marker and pointer
+    assert_eq!(engine.delete_mark(&bp, rid, 7, 0).unwrap(), (0, 0));
     // and a second marker reports the first
-    assert_eq!(engine.delete_mark(&bp, rid, 8).unwrap(), 7);
+    assert_eq!(engine.delete_mark(&bp, rid, 8, 0).unwrap(), (7, 0));
 
     // physical delete removes it from the scan
     engine.delete(&bp, rid).unwrap();

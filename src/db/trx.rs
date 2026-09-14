@@ -154,7 +154,7 @@ pub(crate) enum Undo {
     Insert { table: String, rid: Rid, row: Vec<crate::value::Value> },
     /// Own delete-mark: clear the marker on rollback. `prev_deleter` is the
     /// marker before our write, used by first-committer-wins conflict checks.
-    DeleteMark { table: String, rid: Rid, prev_deleter: u64 },
+    DeleteMark { table: String, rid: Rid, prev_deleter: u64, prev_next_rid: u64 },
     /// MVCC update: remove the new version, unmark the old one.
     Update {
         table: String,
@@ -162,5 +162,6 @@ pub(crate) enum Undo {
         new_rid: Rid,
         new_row: Vec<crate::value::Value>,
         prev_deleter: u64,
+        prev_next_rid: u64,
     },
 }

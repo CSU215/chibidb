@@ -7,7 +7,7 @@
 //!
 //! Page header (all little-endian):
 //! ```text
-//! [0..4)   magic "PAX2"
+//! [0..4)   magic "PAX3"
 //! [4..6)   nrows   slot high-water mark (slots are never renumbered)
 //! [6..8)   ncols
 //! [8..10)  nseg    ncols + 1 (segment 0 is the version segment)
@@ -15,7 +15,8 @@
 //! [12..16) reserved
 //! [16..16+nseg*4) segment directory of (offset u16, length u16)
 //! ```
-//! Segment 0 is `nrows * 16` version bytes (`creator`, `deleter` as `u64`). Segment
+//! Segment 0 is `nrows * 24` version bytes (`creator`, `deleter`, `next_rid` as
+//! `u64`). Segment
 //! `1+c` holds column `c`: `(nrows+1)` `u16` offsets relative to the value
 //! data, then the tagged values. A slot is empty when its column-0 value has
 //! zero length, which also keeps empty slots' space reclaimable.
@@ -24,10 +25,10 @@ use crate::storage::codec::row_column_ranges;
 use crate::storage::page::PAGE_SIZE;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 4] = *b"PAX2";
+const MAGIC: [u8; 4] = *b"PAX3";
 
-/// Size in bytes of the `(creator, deleter)` version pair stored per slot.
-const VERSION_LEN: usize = 16;
+/// Size in bytes of the `(creator, deleter, next_rid)` version triple per slot.
+const VERSION_LEN: usize = 24;
 const HEADER: usize = 16;
 const DIR_ENTRY: usize = 4;
 
@@ -119,7 +120,7 @@ fn pack<'a, FV, FC>(
     val: FC,
 ) -> Result<()>
 where
-    FV: Fn(usize) -> [u8; 16],
+    FV: Fn(usize) -> [u8; VERSION_LEN],
     FC: Fn(usize, usize) -> &'a [u8],
 {
     let nseg = ncols + 1;
@@ -173,7 +174,7 @@ where
 type ColumnRanges = Vec<(usize, usize)>;
 
 /// Splits a versioned record into `(version bytes, value ranges)`.
-fn split(record: &[u8]) -> Result<([u8; 16], ColumnRanges)> {
+fn split(record: &[u8]) -> Result<([u8; VERSION_LEN], ColumnRanges)> {
     if record.len() < VERSION_LEN {
         return Err(Error::Runtime("truncated versioned record".into()));
     }
@@ -200,7 +201,7 @@ pub(crate) fn insert(page: &mut [u8; PAGE_SIZE], record: &[u8]) -> Result<u16> {
     let row = &record[VERSION_LEN..];
     let voff = if had { dir(&src, 0).0 } else { 0 };
 
-    let ver = |s: usize| -> [u8; 16] {
+    let ver = |s: usize| -> [u8; VERSION_LEN] {
         if s == slot {
             record[0..VERSION_LEN].try_into().unwrap()
         } else if s < old_n {
@@ -244,7 +245,7 @@ pub(crate) fn put_at(page: &mut [u8; PAGE_SIZE], slot: u16, record: &[u8]) -> Re
     let row = &record[VERSION_LEN..];
     let voff = if had { dir(&src, 0).0 } else { 0 };
 
-    let ver = |s: usize| -> [u8; 16] {
+    let ver = |s: usize| -> [u8; VERSION_LEN] {
         if s == target {
             record[0..VERSION_LEN].try_into().unwrap()
         } else if s < old_n {
@@ -277,7 +278,7 @@ pub(crate) fn delete(page: &mut [u8; PAGE_SIZE], slot: u16) -> Result<()> {
     let ncols = ncols(&src);
     let target = slot as usize;
     let voff = dir(&src, 0).0;
-    let ver = |s: usize| -> [u8; 16] {
+    let ver = |s: usize| -> [u8; VERSION_LEN] {
         if s == target {
             [0u8; VERSION_LEN]
         } else {
@@ -293,15 +294,22 @@ pub(crate) fn delete(page: &mut [u8; PAGE_SIZE], slot: u16) -> Result<()> {
 }
 
 /// Rewrites the deleter field in place, returning the previous value.
-pub(crate) fn delete_mark(page: &mut [u8; PAGE_SIZE], slot: u16, deleter: u64) -> Result<u64> {
+pub(crate) fn delete_mark(
+    page: &mut [u8; PAGE_SIZE],
+    slot: u16,
+    deleter: u64,
+    next_rid: u64,
+) -> Result<(u64, u64)> {
     if is_empty(page, slot) {
         return Err(Error::Runtime(format!("no record at slot {slot}")));
     }
     let (voff, _) = dir(page, 0);
     let at = voff + slot as usize * VERSION_LEN;
     let prev = u64::from_le_bytes(page[at + 8..at + 16].try_into().unwrap());
+    let prev_next = u64::from_le_bytes(page[at + 16..at + 24].try_into().unwrap());
     page[at + 8..at + 16].copy_from_slice(&deleter.to_le_bytes());
-    Ok(prev)
+    page[at + 16..at + 24].copy_from_slice(&next_rid.to_le_bytes());
+    Ok((prev, prev_next))
 }
 
 /// Reconstructs a record's versioned bytes. With `keep`, unread columns are
@@ -334,7 +342,7 @@ mod tests {
     use crate::value::Value;
 
     fn rec(creator: u64, deleter: u64, vals: &[Value]) -> Vec<u8> {
-        encode_record_inline(creator, deleter, vals)
+        encode_record_inline(creator, deleter, 0, vals)
     }
 
     #[test]
@@ -372,15 +380,17 @@ mod tests {
     }
 
     #[test]
-    fn delete_mark_updates_deleter_in_place() {
+    fn delete_mark_updates_deleter_and_next_rid_in_place() {
         let mut page = [0u8; PAGE_SIZE];
         let r = rec(5, 0, &[Value::Int(1), Value::Str("x".into())]);
         let s = insert(&mut page, &r).unwrap();
-        assert_eq!(delete_mark(&mut page, s, 9).unwrap(), 0);
-        assert_eq!(delete_mark(&mut page, s, 11).unwrap(), 9);
+        assert_eq!(delete_mark(&mut page, s, 9, 0).unwrap(), (0, 0));
+        assert_eq!(delete_mark(&mut page, s, 11, 0x0007_0002).unwrap(), (9, 0));
         let mut out = Vec::new();
         assert!(read_record(&page, s, None, &mut out));
-        assert_eq!(out, rec(5, 11, &[Value::Int(1), Value::Str("x".into())]));
+        let mut expect = rec(5, 11, &[Value::Int(1), Value::Str("x".into())]);
+        expect[16..24].copy_from_slice(&0x0007_0002u64.to_le_bytes());
+        assert_eq!(out, expect);
     }
 
     #[test]

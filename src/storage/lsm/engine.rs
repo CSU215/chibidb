@@ -127,7 +127,8 @@ impl TableStorage for LsmEngine {
         Ok(())
     }
 
-    fn delete_mark(&self, _bp: &BufferPool, rid: Rid, deleter: u64) -> Result<u64> {
+    fn delete_mark(&self, _bp: &BufferPool, rid: Rid, deleter: u64, next_rid: u64)
+    -> Result<(u64, u64)> {
         let mut lsm = self.inner.lock();
         let key = rid_key(rid);
         let mut record = lsm
@@ -137,9 +138,11 @@ impl TableStorage for LsmEngine {
             return Err(Error::Runtime("record lacks mvcc fields".into()));
         }
         let previous = u64::from_le_bytes(record[8..16].try_into().unwrap());
+        let prev_next = u64::from_le_bytes(record[16..24].try_into().unwrap());
         record[8..16].copy_from_slice(&deleter.to_le_bytes());
+        record[16..24].copy_from_slice(&next_rid.to_le_bytes());
         lsm.put(key, record);
-        Ok(previous)
+        Ok((previous, prev_next))
     }
 
     fn file_id(&self) -> FileId {

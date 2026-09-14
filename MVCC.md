@@ -220,7 +220,15 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
   以及原来的 FCW 测试改为多线程（第二个写者阻塞→提交冲突）。
 - **Step 3.5｜索引并发（B-link tree）**（见 §12）：让 `BTree` 支持并发读写。
   验收：`tests/index_model.rs` 随机模型在并发下通过；`index_btree` 全绿。
-- **Step 4｜RC + EPQ**（默认档先做对）：记录头加 `next_rid`；等锁后 EPQ 重读最新版本。
+- **Step 4a｜版本链前向指针 `next_rid`** ✅：记录版本头由 16 字节扩到 24
+  （`[creator u64][deleter u64][next_rid u64]`，`codec::RECORD_HEADER`，`pack_rid/unpack_rid`）。
+  UPDATE 先插新版本，再把旧版本标记为 `deleter=trx, next_rid=pack(new_rid)`；回滚用 undo 里的
+  `(prev_deleter, prev_next_rid)` 还原。WAL `DeleteMark` 帧增加 `next_rid`（payload 18→26 字节）；
+  PAX 版本段 16→24 字节/槽（魔数 `PAX2→PAX3`）；`TableStorage::delete_mark` 返回
+  `(prev_deleter, prev_next_rid)`。验收：`update_links_the_old_version_to_the_new_one` +
+  codec/pax/engine 链相关单测；全量 607 项测试绿。
+- **Step 4b｜RC + EPQ**（待做，依赖 4a）：加隔离级别配置（`read_committed` 默认，按语句取快照）；
+  等锁后沿 `next_rid` 重读最新已提交版本并重跑 WHERE/SET（EPQ），命中则改最新版本，否则跳过。
   验收：RC 下「后写者看到前者结果而非 abort」用例。
 - **Step 5｜RR / SI**：事务级快照固定；冲突报 40001（不再 FCW）。撤掉 Instance 的整库写独占。
   验收：丢更新回滚、可重复读、并发吞吐随线程上升。

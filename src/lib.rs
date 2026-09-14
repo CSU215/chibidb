@@ -376,7 +376,7 @@ impl Database {
                 // that never committed is un-deleted, so the horizon below can
                 // treat every old xid as committed.
                 if deleter != 0 && !clog.is_committed(deleter) {
-                    engine.delete_mark(&self.pool, rid, 0)?;
+                    engine.delete_mark(&self.pool, rid, 0, 0)?;
                 }
             }
         }
@@ -418,7 +418,7 @@ impl Database {
                         touched.insert(*file_no);
                         engine.insert_at(&self.pool, *rid, record)?;
                     }
-                    Record::DeleteMark { file_no, rid, deleter } => {
+                    Record::DeleteMark { file_no, rid, deleter, next_rid } => {
                         let Some((kind, engine)) = storage.get(file_no) else { continue };
                         touched.insert(*file_no);
                         // a heap record past the last allocated page was never
@@ -432,7 +432,7 @@ impl Database {
                             && bytes.len() >= crate::storage::codec::RECORD_HEADER
                             && u64::from_le_bytes(bytes[8..16].try_into().unwrap()) == 0
                         {
-                            engine.delete_mark(&self.pool, *rid, *deleter)?;
+                            engine.delete_mark(&self.pool, *rid, *deleter, *next_rid)?;
                         }
                     }
                     Record::Commit => {}
@@ -520,7 +520,7 @@ impl Database {
     fn check_conflicts(&self, trx: &TrxState) -> Result<()> {
         for undo in &trx.undo {
             let (table, rid, prev) = match undo {
-                Undo::DeleteMark { table, rid, prev_deleter } => {
+                Undo::DeleteMark { table, rid, prev_deleter, .. } => {
                     (table, *rid, *prev_deleter)
                 }
                 Undo::Update { table, old_rid, prev_deleter, .. } => {
@@ -833,11 +833,11 @@ impl Database {
                         BTree::at(ix_file).delete(&self.pool, &key, rid)?;
                     }
                 }
-                Undo::DeleteMark { table, rid, prev_deleter } => {
+                Undo::DeleteMark { table, rid, prev_deleter, prev_next_rid } => {
                     let engine = self.catalog().table(&table)?.engine();
-                    engine.delete_mark(&self.pool, rid, prev_deleter)?;
+                    engine.delete_mark(&self.pool, rid, prev_deleter, prev_next_rid)?;
                 }
-                Undo::Update { table, old_rid, new_rid, new_row, prev_deleter } => {
+                Undo::Update { table, old_rid, new_rid, new_row, prev_deleter, prev_next_rid } => {
                     let engine = self.catalog().table(&table)?.engine();
                     if let Ok(record) = engine.get(&self.pool, new_rid) {
                         self.free_lob_refs(&record);
@@ -847,7 +847,7 @@ impl Database {
                         let key = encode_key(&new_row[ci])?;
                         BTree::at(ix_file).delete(&self.pool, &key, new_rid)?;
                     }
-                    engine.delete_mark(&self.pool, old_rid, prev_deleter)?;
+                    engine.delete_mark(&self.pool, old_rid, prev_deleter, prev_next_rid)?;
                 }
             }
         }
@@ -1089,7 +1089,7 @@ impl Database {
             (t.heap.file_no, t.engine())
         };
         let creator = trx.id;
-        let data = encode_record(creator, 0, &row, &self.lobs, self.inline_lob_limit())?;
+        let data = encode_record(creator, 0, 0, &row, &self.lobs, self.inline_lob_limit())?;
         let rid = engine.insert(&self.pool, &data)?;
         // Record the undo as soon as the row exists so that a later failure in
         // the WAL or index steps is still undone by the enclosing transaction.
@@ -1123,16 +1123,17 @@ impl Database {
         for rid in rids {
             // serialize writers of the same row; different rows proceed
             self.locks.lock(deleter, name, *rid)?;
-            let prev_deleter = engine.delete_mark(&self.pool, *rid, deleter)?;
+            let (prev_deleter, prev_next_rid) = engine.delete_mark(&self.pool, *rid, deleter, 0)?;
             trx.undo.push(Undo::DeleteMark {
                 table: name.to_string(),
                 rid: *rid,
                 prev_deleter,
+                prev_next_rid,
             });
             crate::wal::encode_frame_into(
                 &mut trx.wal,
                 deleter,
-                &Record::DeleteMark { file_no, rid: *rid, deleter },
+                &Record::DeleteMark { file_no, rid: *rid, deleter, next_rid: 0 },
             );
         }
         Ok(())
@@ -1157,18 +1158,21 @@ impl Database {
         for (rid, new_row) in updates {
             // serialize writers of the same row; different rows proceed
             self.locks.lock(trx_id, name, *rid)?;
-            let prev_deleter = engine.delete_mark(&self.pool, *rid, trx_id)?;
-            crate::wal::encode_frame_into(
-                &mut trx.wal,
-                trx_id,
-                &Record::DeleteMark { file_no, rid: *rid, deleter: trx_id },
-            );
-            let data = encode_record(trx_id, 0, new_row, &self.lobs, self.inline_lob_limit())?;
+            let data = encode_record(trx_id, 0, 0, new_row, &self.lobs, self.inline_lob_limit())?;
             let new_rid = engine.insert(&self.pool, &data)?;
             crate::wal::encode_frame_into(
                 &mut trx.wal,
                 trx_id,
                 &Record::Insert { file_no, rid: new_rid, record: data },
+            );
+            // link the old version forward to the new one (PG's t_ctid)
+            let next_rid = crate::storage::codec::pack_rid(new_rid.page_no, new_rid.slot);
+            let (prev_deleter, prev_next_rid) =
+                engine.delete_mark(&self.pool, *rid, trx_id, next_rid)?;
+            crate::wal::encode_frame_into(
+                &mut trx.wal,
+                trx_id,
+                &Record::DeleteMark { file_no, rid: *rid, deleter: trx_id, next_rid },
             );
             for (ci, ix_file) in &ops {
                 let key = encode_key(&new_row[*ci])?;
@@ -1180,6 +1184,7 @@ impl Database {
                 new_rid,
                 new_row: new_row.clone(),
                 prev_deleter,
+                prev_next_rid,
             });
         }
         Ok(())
@@ -1313,5 +1318,39 @@ mod tests {
             panic!("expected rows");
         };
         assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+    }
+
+    #[test]
+    fn update_links_the_old_version_to_the_new_one() {
+        use crate::storage::codec::{decode_record, record_next_rid, unpack_rid};
+        let db = Database::open_in_memory().unwrap();
+        db.execute_sql("create table t (id int, v int);").unwrap();
+        db.execute_sql("insert into t values (1, 10);").unwrap();
+        db.execute_sql("update t set v = 20 where id = 1;").unwrap();
+
+        let recs = db.store_scan_raw("t").unwrap();
+        assert_eq!(recs.len(), 2, "both versions remain");
+        let (old_rid, old_rec, next) = recs
+            .iter()
+            .find_map(|(rid, rec)| {
+                let next = record_next_rid(rec).unwrap();
+                (next != 0).then(|| (*rid, rec.clone(), next))
+            })
+            .expect("exactly one version links forward");
+        let (_, _, old_row) = decode_record(&old_rec, db.lobs()).unwrap();
+        assert_eq!(old_row, vec![Value::Int(1), Value::Int(10)]);
+
+        let (page, slot) = unpack_rid(next);
+        assert_ne!((old_rid.page_no, old_rid.slot), (page, slot));
+        let (_, _, new_row) = decode_record(
+            &recs
+                .iter()
+                .find(|(r, _)| r.page_no == page && r.slot == slot)
+                .expect("the pointer targets the new version")
+                .1,
+            db.lobs(),
+        )
+        .unwrap();
+        assert_eq!(new_row, vec![Value::Int(1), Value::Int(20)]);
     }
 }

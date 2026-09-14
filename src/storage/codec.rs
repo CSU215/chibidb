@@ -11,8 +11,18 @@ const TAG_DATE: u8 = 0x05;
 /// A reference to an out-of-line large object (a `u64` id follows).
 const TAG_LOB: u8 = 0x06;
 
-/// Size of the `(creator, deleter)` version header that precedes every row.
-pub const RECORD_HEADER: usize = 16;
+/// Size of the `(creator, deleter, next_rid)` version header preceding a row.
+pub const RECORD_HEADER: usize = 24;
+
+/// Packs a row id into the single `u64` stored in a version's forward pointer.
+pub fn pack_rid(page_no: u32, slot: u16) -> u64 {
+    ((page_no as u64) << 16) | slot as u64
+}
+
+/// Unpacks a forward pointer written by [`pack_rid`].
+pub fn unpack_rid(v: u64) -> (u32, u16) {
+    ((v >> 16) as u32, v as u16)
+}
 
 /// Out-of-line storage used to externalize long string values.
 pub trait LobResolver {
@@ -30,11 +40,14 @@ impl LobResolver for LobStore {
     }
 }
 
-/// Versioned record: two hidden u64 transaction fields precede the row. String
-/// values longer than `inline_limit` are stored out-of-line in `lobs`.
+/// Versioned record: hidden `(creator, deleter, next_rid)` transaction fields
+/// precede the row. `next_rid` is the packed row id of the version that
+/// superseded this one (0 when there is none). String values longer than
+/// `inline_limit` are stored out-of-line in `lobs`.
 pub fn encode_record(
     creator: u64,
     deleter: u64,
+    next_rid: u64,
     row: &[Value],
     lobs: &dyn LobResolver,
     inline_limit: usize,
@@ -42,8 +55,17 @@ pub fn encode_record(
     let mut buf = Vec::new();
     buf.extend_from_slice(&creator.to_le_bytes());
     buf.extend_from_slice(&deleter.to_le_bytes());
+    buf.extend_from_slice(&next_rid.to_le_bytes());
     buf.extend(encode_row_with(row, Some(lobs), inline_limit)?);
     Ok(buf)
+}
+
+/// Reads the forward pointer of a versioned record (0 when there is none).
+pub fn record_next_rid(data: &[u8]) -> Result<u64> {
+    if data.len() < RECORD_HEADER {
+        return Err(Error::Runtime("truncated versioned record".into()));
+    }
+    Ok(u64::from_le_bytes(data[16..24].try_into().unwrap()))
 }
 
 /// Reads the `(creator, deleter)` version header of a versioned record.
@@ -184,10 +206,11 @@ pub fn encoded_row_size(row: &[Value], inline_limit: usize) -> usize {
 
 /// Encodes a versioned record with every string inline, for tests and callers
 /// that do not use large objects.
-pub fn encode_record_inline(creator: u64, deleter: u64, row: &[Value]) -> Vec<u8> {
+pub fn encode_record_inline(creator: u64, deleter: u64, next_rid: u64, row: &[Value]) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&creator.to_le_bytes());
     buf.extend_from_slice(&deleter.to_le_bytes());
+    buf.extend_from_slice(&next_rid.to_le_bytes());
     buf.extend(encode_row(row));
     buf
 }
@@ -450,4 +473,27 @@ pub(crate) fn decode_row_with_want(
 pub(crate) fn decode_tagged_value(data: &[u8], lobs: &dyn LobResolver) -> Result<Value> {
     let mut pos = 0;
     decode_value(data, &mut pos, 0, Some(lobs), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rid_packing_roundtrips() {
+        for (page, slot) in [(0u32, 0u16), (1, 0), (0, 7), (123_456, 42), (u32::MAX, u16::MAX)] {
+            assert_eq!(unpack_rid(pack_rid(page, slot)), (page, slot));
+        }
+    }
+
+    #[test]
+    fn version_header_exposes_creator_deleter_and_next_rid() {
+        let row = [Value::Int(5)];
+        let rec = encode_record_inline(3, 4, pack_rid(9, 2), &row);
+        assert_eq!(record_version(&rec).unwrap(), (3, 4));
+        assert_eq!(unpack_rid(record_next_rid(&rec).unwrap()), (9, 2));
+        // a plain version points nowhere
+        let live = encode_record_inline(3, 0, 0, &row);
+        assert_eq!(record_next_rid(&live).unwrap(), 0);
+    }
 }

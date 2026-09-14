@@ -182,10 +182,16 @@ impl HeapFile {
         })
     }
 
-    /// MVCC delete-mark: rewrites the record in place, setting its deleter id.
-    /// Returns the previous deleter (0 when the version was live), which the
-    /// first-committer-wins check needs.
-    pub fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u64) -> Result<u64> {
+    /// MVCC delete-mark: rewrites the record in place, setting its deleter id
+    /// and forward pointer. Returns `(previous deleter, previous next_rid)`,
+    /// which rollback and the conflict check need.
+    pub fn delete_mark(
+        &self,
+        bp: &BufferPool,
+        rid: Rid,
+        deleter: u64,
+        next_rid: u64,
+    ) -> Result<(u64, u64)> {
         bp.with_page(self.file, rid.page_no, |page| match self.layout {
             PageLayout::Row => {
                 let rec = page_get(page, rid.slot)?
@@ -195,11 +201,13 @@ impl HeapFile {
                     return Err(Error::Runtime("record lacks mvcc fields".into()));
                 }
                 let prev = u64::from_le_bytes(updated[8..16].try_into().unwrap());
+                let prev_next = u64::from_le_bytes(updated[16..24].try_into().unwrap());
                 updated[8..16].copy_from_slice(&deleter.to_le_bytes());
+                updated[16..24].copy_from_slice(&next_rid.to_le_bytes());
                 page_write(page, rid.slot, &updated)?;
-                Ok(prev)
+                Ok((prev, prev_next))
             }
-            PageLayout::Pax => pax::delete_mark(page, rid.slot, deleter),
+            PageLayout::Pax => pax::delete_mark(page, rid.slot, deleter, next_rid),
         })
     }
 

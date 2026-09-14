@@ -98,9 +98,10 @@ pub trait TableStorage: TableEngine + std::fmt::Debug {
     /// Physically removes a record (rollback and vacuum).
     fn delete(&self, bp: &BufferPool, rid: Rid) -> Result<()>;
 
-    /// Rewrites the record's deleter field; returns the previous deleter,
-    /// which first-committer-wins needs.
-    fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u64) -> Result<u64>;
+    /// Rewrites the record's deleter and forward pointer; returns the previous
+    /// `(deleter, next_rid)`, which rollback and the conflict check need.
+    fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u64, next_rid: u64)
+    -> Result<(u64, u64)>;
 
     /// The file backing this table, for WAL replay and index mapping.
     fn file_id(&self) -> FileId;
@@ -231,8 +232,9 @@ impl TableStorage for HeapEngine {
         HeapFile::at(self.file, self.layout).delete(bp, rid)
     }
 
-    fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u64) -> Result<u64> {
-        HeapFile::at(self.file, self.layout).delete_mark(bp, rid, deleter)
+    fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u64, next_rid: u64)
+    -> Result<(u64, u64)> {
+        HeapFile::at(self.file, self.layout).delete_mark(bp, rid, deleter, next_rid)
     }
 
     fn file_id(&self) -> FileId {

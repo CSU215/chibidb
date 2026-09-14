@@ -109,7 +109,7 @@ python3 scripts/smoke.py     # Windows: python scripts\smoke.py；期望输出 S
 | `storage/slotted.rs` | slotted 页纯函数：槽目录、变长条目、`page_insert`（空槽复用+压实）、`page_get/iter/delete/write` | |
 | `storage/engine.rs` | 存储读接缝：`TableEngine`/`RowScanner` trait + `HeapEngine`（流式逐页扫描） | `HeapEngine::scan` |
 | `storage/heap.rs` | `HeapFile`：page 0 文件头（魔数 **CHIDHEAP** + 统一头；行带 MVCC 字段）、first-fit 多页、`insert/get/delete(物理)/delete_mark(MVCC)/for_each` | `Rid{page_no,slot}` |
-| `storage/codec.rs` | 行/记录编码：自描述 tag（Null=00/Int=01/Float=02/Str=03/Bool=04/Date=05/Text）、值计数前缀；`encode_row/decode_row`；**版本化记录** `encode_record(creator,deleter,row)`（前 16 字节两个隐藏 `u64`，`RECORD_HEADER`） | |
+| `storage/codec.rs` | 行/记录编码：自描述 tag（Null=00/Int=01/Float=02/Str=03/Bool=04/Date=05/Text）、值计数前缀；`encode_row/decode_row`；**版本化记录** `encode_record(creator,deleter,next_rid,row)`（前 24 字节三个隐藏 `u64`：`creator`/`deleter`/版本链前向指针 `next_rid`，`RECORD_HEADER`） | |
 | `index/key.rs` | 索引保序键编码：int 符号翻转大端、float 保序变换、str+NUL 结尾、date 符号翻转、null=0x00 | `encode_key` |
 | `index/node.rs` | B+ 树节点页：叶/内部条目、lower/upper bound、bytes 占用阈值 25%、`page_write` 原位重写 | |
 | `index/btree.rs` | B+ 树主体：`init/open/open_or_repair/at`、递归插入双级分裂长高、search（跨叶重复键回退）、scan_range 叶链、delete 借用/合并/根收缩（~880 行） | |
@@ -252,7 +252,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 > 本节记录 M12.1 的初版 MVCC；当前已对齐 PostgreSQL，见 **`MVCC.md`**（PG 式 `{xmax,xip}` 快照 +
 > `src/db/clog.rs` 提交位图 + `src/db/lockmgr.rs` 行级锁 + B-link 并发索引）。
 
-- 每条堆记录物理格式：`[u64 creator_trx][u64 deleter_trx][行 codec]`（见 `codec::encode_record/decode_record`）
+- 每条堆记录物理格式：`[u64 creator_trx][u64 deleter_trx][u64 next_rid][行 codec]`（见 `codec::encode_record/decode_record`；`next_rid` 是 UPDATE 版本链前向指针）
 - 事务状态在 `db/trx.rs`：
   - `Session { trx: Option<TrxState> }`（server 每连接一个；REPL 一个）
   - `TrxState { id: u64, snapshot: Snapshot { xmax, xip }, clog: Arc<CommitStatus>, undo, wal, explicit }`
@@ -263,7 +263,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 - 自动提交：`execute_sql`（无 session）每条语句一个临时事务；语句失败 → 整条语句 undo
 - DML 语义：
   - INSERT → 新版本（creator=trx）；undo 物理删除该 rid 并删对应索引项
-  - DELETE → `HeapFile::delete_mark`（原位改写 16 字节版本头的 deleter，记录长度不变；**不做物理回收**）；undo 清标记
+  - DELETE → `HeapFile::delete_mark`（原位改写版本头的 deleter/next_rid，记录长度不变；**不做物理回收**）；undo 清标记
   - UPDATE → 标记旧版本 + 追加新版本（新 Rid）；索引只追加新键项，旧项靠读时可见性过滤；undo 删新版本+索引项+解除旧标记
 - 提交：**只有写事务**（undo 非空）才追加 Commit 帧 + `wal.sync()`；**每提交不再 `save_catalog`**（Step 1 去掉 O(n²) 重写，WAL 的 Commit 帧即提交事实，恢复时据此修复 catalog）。只读事务只更新内存 clog 就返回
 - 读路径统一走 `decode_visible(records, trx)`；JOIN 流水线、索引扫描（store_get_records）都要过这层
@@ -273,7 +273,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ### 6.3 WAL + 崩溃恢复（M12.3，已实现）
 
-帧格式 `[u32 len][u8 type][u64 trx_id][payload]`（len 覆盖 len 之后的所有字节；type 1=Insert、2=DeleteMark、3=Commit；解析遇截断尾帧/未知 type 即停止）。Update 记为 DeleteMark+Insert 两条。
+帧格式 `[u32 len][u8 type][u64 trx_id][payload]`（len 覆盖 len 之后的所有字节；type 1=Insert、2=DeleteMark、3=Commit；解析遇截断尾帧/未知 type 即停止）。DeleteMark 的 payload 含 `file_no/page_no/slot/deleter/next_rid`（版本链前向指针）。Update 记为 Insert（新版本）+ DeleteMark（旧版本，带 next_rid）两条。
 
 - **写时机**：`store_insert` / `store_delete_mark` / `store_update_versions`（lib.rs）在堆操作成功后追加；`commit_trx(trx_id, wrote)` 在 `committed_trxs.insert` 后追加 Commit 帧 + `sync_all()`（真正的提交点），随后 save_catalog。**只读事务（undo 空）不记 Commit、不 fsync**
 - **恢复**（`Database::open` 末尾，`recover_from_wal`）：

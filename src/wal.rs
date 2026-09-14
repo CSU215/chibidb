@@ -27,8 +27,8 @@ const HEADER_LEN: usize = 9;
 pub enum Record {
     /// A full versioned row image written at an exact rid.
     Insert { file_no: u32, rid: Rid, record: Vec<u8> },
-    /// MVCC delete mark (deleter trx id) on the record at an exact rid.
-    DeleteMark { file_no: u32, rid: Rid, deleter: u64 },
+    /// MVCC delete mark (deleter trx id + forward pointer) at an exact rid.
+    DeleteMark { file_no: u32, rid: Rid, deleter: u64, next_rid: u64 },
     /// Commit boundary; redo replays only transactions with one of these.
     Commit,
 }
@@ -121,13 +121,14 @@ pub fn encode_frame_into(out: &mut Vec<u8>, trx_id: u64, rec: &Record) {
             out.extend_from_slice(&rid.slot.to_le_bytes());
             out.extend_from_slice(record);
         }
-        Record::DeleteMark { file_no, rid, deleter } => {
+        Record::DeleteMark { file_no, rid, deleter, next_rid } => {
             out.push(REC_DELETE_MARK);
             out.extend_from_slice(&trx_id.to_le_bytes());
             out.extend_from_slice(&file_no.to_le_bytes());
             out.extend_from_slice(&rid.page_no.to_le_bytes());
             out.extend_from_slice(&rid.slot.to_le_bytes());
             out.extend_from_slice(&deleter.to_le_bytes());
+            out.extend_from_slice(&next_rid.to_le_bytes());
         }
         Record::Commit => {
             out.push(REC_COMMIT);
@@ -203,14 +204,15 @@ fn decode_frame(bytes: &[u8]) -> Option<(u64, Record, usize)> {
             Record::Insert { file_no, rid: Rid::new(page_no, slot), record: payload[10..].to_vec() }
         }
         REC_DELETE_MARK => {
-            if payload.len() < 18 {
+            if payload.len() < 26 {
                 return None;
             }
             let file_no = u32::from_le_bytes(payload[0..4].try_into().unwrap());
             let page_no = u32::from_le_bytes(payload[4..8].try_into().unwrap());
             let slot = u16::from_le_bytes(payload[8..10].try_into().unwrap());
             let deleter = u64::from_le_bytes(payload[10..18].try_into().unwrap());
-            Record::DeleteMark { file_no, rid: Rid::new(page_no, slot), deleter }
+            let next_rid = u64::from_le_bytes(payload[18..26].try_into().unwrap());
+            Record::DeleteMark { file_no, rid: Rid::new(page_no, slot), deleter, next_rid }
         }
         REC_COMMIT => Record::Commit,
         _ => return None, // unknown frame type: stop scanning
@@ -230,7 +232,7 @@ mod tests {
     fn frames_roundtrip() {
         let recs = [
             (7u64, Record::Insert { file_no: 3, rid: rid(9, 4), record: vec![1, 2, 3] }),
-            (8u64, Record::DeleteMark { file_no: 3, rid: rid(9, 4), deleter: 8 }),
+            (8u64, Record::DeleteMark { file_no: 3, rid: rid(9, 4), deleter: 8, next_rid: 0 }),
             (9u64, Record::Commit),
         ];
         let mut bytes = Vec::new();
@@ -249,7 +251,7 @@ mod tests {
     fn buffered_frames_match_individual_encodes() {
         let recs = [
             (7u64, Record::Insert { file_no: 3, rid: rid(9, 4), record: vec![1, 2, 3] }),
-            (8u64, Record::DeleteMark { file_no: 3, rid: rid(9, 4), deleter: 8 }),
+            (8u64, Record::DeleteMark { file_no: 3, rid: rid(9, 4), deleter: 8, next_rid: 0 }),
             (8u64, Record::Commit),
         ];
         let mut buffered = Vec::new();
@@ -285,7 +287,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend(encode_frame(1, &Record::Insert { file_no: 0, rid: rid(1, 0), record: b"a".to_vec() }));
         bytes.extend(encode_frame(2, &Record::Insert { file_no: 0, rid: rid(1, 1), record: b"b".to_vec() }));
-        bytes.extend(encode_frame(1, &Record::DeleteMark { file_no: 0, rid: rid(1, 1), deleter: 1 }));
+        bytes.extend(encode_frame(1, &Record::DeleteMark { file_no: 0, rid: rid(1, 1), deleter: 1, next_rid: 0 }));
         bytes.extend(encode_frame(1, &Record::Commit));
         bytes.extend(encode_frame(2, &Record::Commit));
         let plan = plan_recovery(&bytes);
