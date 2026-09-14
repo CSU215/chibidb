@@ -15,7 +15,8 @@ cargo run -q -- client [addr]   # 连接 server 的交互式客户端
 # Web 控制台：同一个 http_addr 上还托管 Web 前端，浏览器直接访问该地址即可
 #   scripts/build_web.sh                      # 构建前端产物 web/dist（需 Node 与网络）
 #   cd web && npm run dev                     # 或开发期用 Vite dev server，API 走代理
-#   设 server.admin_api = true 后，/api/parse 提供 Token 流与 AST（「解析」页要用）
+#   设 server.admin_api = true 后，编辑器里会实时标出词法/语法错误（红色波浪线 + 悬停气泡），
+#   并可展开「解析详情」查看 Token 流与 AST；关掉则退化为只有错误横幅
 # MySQL 前端：配置 server.mysql_addr 后，可用 mysql 客户端连接（mysql_native_password、文本结果集、预处理语句）
 cargo test                      # 全量回归（658 tests，另有 9 个 #[ignore] 性能探针）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准

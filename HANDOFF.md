@@ -445,6 +445,7 @@ P10 收尾（P10.4/P10.5）：补齐课程验收点名的两块缓存机制—�
 | F0 | ① 静态托管 | `server.web_root`（默认 `"web/dist"`，`""` 关闭）+ 新增 `src/net/admin.rs` + `write_response` 改按字节写并支持额外响应头 + 缺失时的启动 note 与可读兜底页 | ✅ `78bd185`、`2f7a221` |
 | F0 | ② 会话令牌 | `X-Chibi-Session` 注册表：跨请求保持事务/`USE`，含空闲过期回滚、数量上限、后台清理线程 | ✅ `1f8b115` |
 | F1 + F2 前半 | ③ 解析接口 + 前端 | `POST /api/parse`（Token 流 + AST，受 `server.admin_api` 门控）+ Vue 控制台（同源托管，含库表树与结果表）；JSON 值解析器替换 `json_string_field` | ✅ `fb61689`、`c089516`、`f977bdb` |
+| F2 后半 | ④ 编辑器内标错 | `Error::Syntax { message, pos }` 带字节偏移（11 处构造点）+ `/api/parse` 透出 `error.pos`；前端换 CodeMirror 6，实时红色波浪线 + 悬停气泡；解析页并入控制台成为可折叠面板 | ✅ `2185f45`、`063eb46` |
 | F3 | — | 计划可视化（从**真实算子树**渲染 + 漂移检测测试，见 `docs/web_frontend.md` §4.3d） | ⬜ |
 | F4 | — | 缓冲池面板（置换日志由队友实现，等拉取后接） | ⬜ |
 | F5–F9 | — | 空间图/页检视、索引、LSM、运行时旋钮、管理台 | ⬜ |
