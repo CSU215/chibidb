@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use crate::config::Config;
+use crate::config::{Config, WebRootState};
 use crate::result::encode_error;
 
 /// A response for `http.rs` to frame and write out.
@@ -46,9 +46,6 @@ pub(crate) fn handle(config: &Config, method: &str, path: &str, _body: &[u8]) ->
 
 /// Serves one file from the configured web root.
 fn static_file(config: &Config, path: &str) -> Response {
-    let Some(root) = config.server.web_root.as_deref().filter(|root| !root.is_empty()) else {
-        return Response::not_found();
-    };
     // No percent-decoding: anything that would need it is rejected instead. Vite
     // emits ASCII with hashed names, so nothing legitimate is lost, and `%2e%2e`
     // cannot be smuggled through.
@@ -56,14 +53,18 @@ fn static_file(config: &Config, path: &str) -> Response {
         return Response::not_found();
     }
     let relative = path.trim_start_matches('/');
-    let relative = if relative.is_empty() { "index.html" } else { relative };
+    let is_index = relative.is_empty();
+    let relative = if is_index { "index.html" } else { relative };
     // Reject traversal before touching the filesystem.
     if relative.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
         return Response::not_found();
     }
-    let root = Path::new(root);
-    let Ok(base) = root.canonicalize() else {
-        return Response::not_found();
+    let base = match config.web_root_state() {
+        WebRootState::Ready(base) => base,
+        // A fresh clone has no built SPA. Answering a bare 404 for `/` reads as
+        // "the server is broken"; say what to run instead.
+        WebRootState::Missing(looked_in) if is_index => return missing_web_root_page(&looked_in),
+        WebRootState::Missing(_) | WebRootState::Off => return Response::not_found(),
     };
     let Ok(resolved) = base.join(relative).canonicalize() else {
         return Response::not_found();
@@ -87,6 +88,42 @@ fn static_file(config: &Config, path: &str) -> Response {
     response.extra_headers.push(("Cache-Control", cache.to_string()));
     response.extra_headers.push(("X-Content-Type-Options", "nosniff".to_string()));
     response
+}
+
+/// The page served for `/` when the web root is configured but absent.
+fn missing_web_root_page(looked_in: &str) -> Response {
+    let origin = "POST /query {\"sql\":\"...\"}";
+    let body = format!(
+        "<!doctype html>\n<meta charset=\"utf-8\">\n<title>chibidb</title>\n\
+         <h1>chibidb</h1>\n\
+         <p>The web console is not built. Expected it at\n<code>{}</code>.</p>\n\
+         <p>Build it with <code>scripts/build_web.sh</code> (needs Node), or run the\n\
+         dev server with <code>cd web &amp;&amp; npm run dev</code>.</p>\n\
+         <p>The SQL endpoints work either way: <code>GET /health</code>,\n\
+         <code>{origin}</code>.</p>\n",
+        escape_html(looked_in)
+    );
+    let mut response = Response::new("200 OK", "text/html; charset=utf-8", body.into_bytes());
+    response.extra_headers.push(("Cache-Control", "no-cache".to_string()));
+    response
+}
+
+/// Escapes the five HTML metacharacters. The path comes from the operator's own
+/// config, not from a request, but an unescaped `&` would still produce broken
+/// markup and hide the very message that is meant to help.
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The content type for a served file, by extension.

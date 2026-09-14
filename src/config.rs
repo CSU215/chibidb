@@ -1,8 +1,34 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::{Error, Result};
+
+/// What `server.web_root` resolves to. Both the startup note and the fallback
+/// page key off this, so the two never disagree about why nothing is served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebRootState {
+    /// Hosting is off: `web_root` is unset or empty.
+    Off,
+    /// Configured, but not a usable directory. Carries the absolute path so the
+    /// message can say where it looked.
+    Missing(String),
+    /// A canonicalised directory, ready to serve from.
+    Ready(PathBuf),
+}
+
+/// An absolute form of a configured path, for messages. `canonicalize` cannot
+/// be used here: the whole point is that the path does not exist.
+fn absolute_display(configured: &str) -> String {
+    let path = Path::new(configured);
+    if path.is_absolute() {
+        return path.display().to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path).display().to_string(),
+        Err(_) => configured.to_string(),
+    }
+}
 
 /// Which storage engine new tables use. Existing files record their own
 /// engine in the file header, so this only affects creation.
@@ -214,6 +240,19 @@ impl Config {
     /// Callers must call [`Config::validate`] to reject impossible values.
     pub fn from_toml_str(text: &str) -> Result<Self> {
         toml::from_str(text).map_err(|e| Error::Runtime(format!("invalid config: {e}")))
+    }
+
+    /// Resolves `server.web_root` against the process CWD, the same way
+    /// `config.toml` itself is resolved.
+    pub fn web_root_state(&self) -> WebRootState {
+        let Some(configured) = self.server.web_root.as_deref().filter(|root| !root.is_empty())
+        else {
+            return WebRootState::Off;
+        };
+        match Path::new(configured).canonicalize() {
+            Ok(path) if path.is_dir() => WebRootState::Ready(path),
+            _ => WebRootState::Missing(absolute_display(configured)),
+        }
     }
 
     pub fn validate(&self) -> Result<()> {

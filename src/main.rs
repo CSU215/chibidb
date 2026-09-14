@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 
-use chibidb::config::Config;
+use chibidb::config::{Config, WebRootState};
 use chibidb::instance::Instance;
 use chibidb::{client, run_repl, server};
 
@@ -46,6 +46,15 @@ async fn main() -> std::io::Result<()> {
             if let Some(http_addr) = config.server.http_addr.clone() {
                 let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
                 eprintln!("chibidb http listening on {http_addr}");
+                // A fresh clone has no built SPA, so this is the common case.
+                // Say it once at startup, with the path actually looked at,
+                // rather than leaving the browser to show a bare 404.
+                if let WebRootState::Missing(path) = config.web_root_state() {
+                    eprintln!(
+                        "note: web root {path} not found; the built frontend will not be \
+                         served (run scripts/build_web.sh, or cd web && npm run dev)"
+                    );
+                }
                 let http_instance = instance.clone();
                 tokio::spawn(async move {
                     if let Err(e) = chibidb::http::serve(http_instance, http_listener).await {

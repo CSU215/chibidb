@@ -2,6 +2,7 @@ use std::io::Write;
 
 use chibidb::config::{
     Config, EngineKind, EvictionPolicy, ExecutionMode, Isolation, PageLayout, ThreadModel,
+    WebRootState,
 };
 use chibidb::value::Value;
 use chibidb::{Database, ResultSet};
@@ -32,6 +33,31 @@ fn server_web_root_parses() {
     // so it can no longer say "off" by being absent).
     let off = Config::from_toml_str("[server]\nweb_root = \"\"\n").unwrap();
     assert_eq!(off.server.web_root.as_deref(), Some(""));
+}
+
+#[test]
+fn web_root_state_distinguishes_off_missing_and_ready() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let off = Config::from_toml_str("[server]\nweb_root = \"\"\n").unwrap();
+    assert!(matches!(off.web_root_state(), WebRootState::Off));
+
+    // Configured but not there: the startup note and the fallback page both key
+    // off this, so the absolute path must come back with it.
+    let missing = dir.path().join("nope");
+    let absent = Config::from_toml_str(&format!("[server]\nweb_root = \"{}\"\n", missing.display()))
+        .unwrap();
+    match absent.web_root_state() {
+        WebRootState::Missing(path) => assert!(path.contains("nope"), "{path}"),
+        other => panic!("expected Missing, got {other:?}"),
+    }
+
+    let ready = Config::from_toml_str(&format!("[server]\nweb_root = \"{}\"\n", dir.path().display()))
+        .unwrap();
+    match ready.web_root_state() {
+        WebRootState::Ready(path) => assert!(path.is_absolute(), "{}", path.display()),
+        other => panic!("expected Ready, got {other:?}"),
+    }
 }
 
 #[test]

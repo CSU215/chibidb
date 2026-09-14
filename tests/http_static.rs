@@ -141,3 +141,23 @@ fn an_empty_web_root_serves_nothing() {
     let response = request(addr, "GET", "/");
     assert!(!response.starts_with("HTTP/1.1 200 OK"), "{response}");
 }
+
+#[test]
+fn a_missing_web_root_explains_how_to_build_the_spa() {
+    // A fresh clone has no web/dist, so this is the common case, not an edge one.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-such-web-root");
+    let (addr, _data) = start_server(config_with_web_root(&missing));
+
+    let response = request(addr, "GET", "/");
+    // 200, not 404: browsers hide the body of a 404, and this body is the point.
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("Content-Type: text/html"), "{response}");
+    // It must say what to do, and where it looked.
+    assert!(response.contains("build_web.sh"), "{response}");
+    assert!(response.contains("no-such-web-root"), "{response}");
+
+    // There is no site, so assets are still missing rather than a hint page.
+    let asset = request(addr, "GET", "/assets/app.js");
+    assert!(asset.starts_with("HTTP/1.1 404"), "{asset}");
+}
