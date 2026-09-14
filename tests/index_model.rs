@@ -237,6 +237,49 @@ fn concurrent_inserts_stay_consistent() {
 }
 
 #[test]
+fn concurrent_edits_stay_consistent() {
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = setup(&dir);
+    BTree::init(&bp, f).unwrap();
+    let bp = Arc::new(bp);
+
+    const THREADS: usize = 4;
+    const PER: usize = 1500;
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let bp = Arc::clone(&bp);
+            std::thread::spawn(move || {
+                let tree = BTree::at(f);
+                for i in 0..PER {
+                    let key = format!("k{t}_{i:06}").into_bytes();
+                    tree.insert(&bp, &key, Rid::new(t as u32, i as u16)).unwrap();
+                }
+                // delete every other key, forcing concurrent borrows/merges
+                for i in (0..PER).step_by(2) {
+                    let key = format!("k{t}_{i:06}").into_bytes();
+                    tree.delete(&bp, &key, Rid::new(t as u32, i as u16)).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let tree = BTree::at(f);
+    tree.check_invariants(&bp).unwrap();
+    for t in 0..THREADS {
+        for i in 0..PER {
+            let key = format!("k{t}_{i:06}").into_bytes();
+            let want = if i % 2 == 0 { vec![] } else { vec![Rid::new(t as u32, i as u16)] };
+            assert_eq!(tree.search(&bp, &key).unwrap(), want, "key {key:?}");
+        }
+    }
+}
+
+#[test]
 fn oversized_key_is_rejected_without_corruption() {
     let dir = tempfile::tempdir().unwrap();
     let (bp, f) = setup(&dir);

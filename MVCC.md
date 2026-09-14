@@ -315,7 +315,17 @@ Repeatable Read 行为一致。
   还有空间**，避免"闩外预检"的竞态。索引 magic 升 `CHIDBIV`。并发压力测试（4 线程 × 2000 插入）
   稳定通过，压 60 次无失败/挂起。
   *注*：`prev` 链不再维护（读端已不用它，改为 B-link `next` 链校验）。**删除仍未并发化（C4）**。
-- **C4**（下一步）：删除/合并的并发化（redistribute/merge 走 right-link 协议）。
+- **C4｜并发删除** ✅（本提交）：`delete` 改**顶向下 latch coupling**——持父闩取子闩下降，在叶子里
+  删除后，**仍持父闩**地对欠载子节点做 borrow/merge（把 `fix_child`/`fix_leaf_child`/`fix_internal_child`/
+  `refresh_separator`/`set_separator_key` 全部改成操作**已持有的父页引用**的 `_at` 变体）。欠载随递归
+  **自然向上传播**（每帧持有父闩，检查并修复其子）。并发压力测试（4 线程 × 1500 插入 + 隔一删一）
+  稳定通过（压 20 次 0 失败）。`deletes_cause_merge_and_height_shrink` 等单线程测试仍全绿（保留了
+  borrow/merge 与高度收缩）。
+
+### 索引并发现状
+C1–C4 之后，`BTree` 的**读、插入、删除都支持并发**（lock-fetch + crabbing + B-link），不变量测试与
+并发压力测试均通过。**下一步回到数据库层**：撤掉 `Instance` 每语句的整库写独占，接线行级 `LockManager`
+（Step 3 待办）与 EPQ，然后按 §5–§7 推进 RR/SI、SSI、GC。参见 §9 路线。
 - **C2**｜查找改 lock-fetch（right-link 右移）。验收：并发「读 + 插入」压力下结果与模型一致。
 - **C3**｜插入改 top-down + latch coupling + 预分裂。验收：`tests/index_model.rs` 的随机
   模型在**并发**插入/删除下与 `BTreeMap` 模型一致；无损坏。
