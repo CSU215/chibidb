@@ -27,7 +27,7 @@ pub struct ColumnMeta {
 pub struct TableMeta {
     pub name: String,
     pub columns: Vec<ColumnMeta>,
-    pub file_no: u32,
+    pub file: u32,
     pub engine: EngineKind,
     pub layout: PageLayout,
 }
@@ -38,7 +38,7 @@ pub struct IndexMeta {
     pub table: String,
     pub column: String,
     pub unique: bool,
-    pub file_no: u32,
+    pub file: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,7 +92,7 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
             buf.push(c.unique as u8);
             put_value(&mut buf, c.default.as_ref());
         }
-        put_u32(&mut buf, t.file_no);
+        put_u32(&mut buf, t.file);
         buf.push(engine_tag(t.engine));
         buf.push(layout_tag(t.layout));
     }
@@ -102,7 +102,7 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
         put_str(&mut buf, &ix.table);
         put_str(&mut buf, &ix.column);
         buf.push(ix.unique as u8);
-        put_u32(&mut buf, ix.file_no);
+        put_u32(&mut buf, ix.file);
     }
     put_u32(&mut buf, snap.views.len() as u32);
     for v in &snap.views {
@@ -149,7 +149,7 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
             let default = take_value(data, &mut pos)?;
             columns.push(ColumnMeta { name: cname, dtype, not_null, primary_key, unique, default });
         }
-        let file_no = take_u32(data, &mut pos)?;
+        let file = take_u32(data, &mut pos)?;
         let engine = match take(data, &mut pos, 1)?[0] {
             0 => EngineKind::Heap,
             1 => EngineKind::Lsm,
@@ -160,7 +160,7 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
             1 => PageLayout::Pax,
             other => return Err(Error::Runtime(format!("unknown layout tag 0x{other:02x}"))),
         };
-        tables.push(TableMeta { name, columns, file_no, engine, layout });
+        tables.push(TableMeta { name, columns, file, engine, layout });
     }
     let n_indexes = take_u32(data, &mut pos)?;
     let mut indexes = Vec::new();
@@ -169,8 +169,8 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
         let table = take_str(data, &mut pos)?;
         let column = take_str(data, &mut pos)?;
         let unique = take(data, &mut pos, 1)?[0] != 0;
-        let file_no = take_u32(data, &mut pos)?;
-        indexes.push(IndexMeta { name, table, column, unique, file_no });
+        let file = take_u32(data, &mut pos)?;
+        indexes.push(IndexMeta { name, table, column, unique, file });
     }
     let n_views = take_u32(data, &mut pos)?;
     let mut views = Vec::new();

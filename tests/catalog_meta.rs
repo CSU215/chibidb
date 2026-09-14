@@ -45,14 +45,14 @@ fn snapshot() -> CatalogSnapshot {
                         default: Some(Value::Float(60.0)),
                     },
                 ],
-                file_no: 0,
+                file: 0,
                 engine: EngineKind::Heap,
                 layout: PageLayout::Pax,
             },
             TableMeta {
                 name: "课程".into(),
                 columns: vec![col("cid", DataType::Int), col("title", DataType::Char(32))],
-                file_no: 1,
+                file: 1,
                 engine: EngineKind::Lsm,
                 layout: PageLayout::Row,
             },
@@ -62,7 +62,7 @@ fn snapshot() -> CatalogSnapshot {
             table: "student".into(),
             column: "id".into(),
             unique: true,
-            file_no: 0,
+            file: 0,
         }],
         views: vec![ViewMeta {
             name: "passed".into(),
@@ -83,7 +83,7 @@ fn roundtrips_snapshot() {
     assert_eq!(back.tables[0].columns[1].name, "name");
     assert_eq!(back.tables[0].columns[1].dtype, DataType::Char(10));
     assert_eq!(back.tables[1].name, "课程");
-    assert_eq!(back.tables[1].file_no, 1);
+    assert_eq!(back.tables[1].file, 1);
     assert_eq!(back.tables[0].engine, EngineKind::Heap);
     assert_eq!(back.tables[1].engine, EngineKind::Lsm);
     assert_eq!(back.tables[0].layout, PageLayout::Pax);

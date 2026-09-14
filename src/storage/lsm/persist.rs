@@ -29,7 +29,7 @@ const SSTABLE_SUFFIX: &str = ".sst";
 pub struct PersistentLsm {
     dir: PathBuf,
     store: LsmStore,
-    next_file_no: u32,
+    next_sst_no: u32,
 }
 
 impl PersistentLsm {
@@ -56,14 +56,14 @@ impl PersistentLsm {
             for &no in level {
                 let bytes = std::fs::read(sstable_path(dir, no))
                     .map_err(|e| Error::Runtime(format!("cannot read sstable {no}: {e}")))?;
-                tables.push(SSTable::parse(bytes)?.with_file_no(no));
+                tables.push(SSTable::parse(bytes)?.with_sst_no(no));
                 max_file = max_file.max(no);
             }
             levels.push(tables);
         }
         store.set_levels(levels);
-        let next_file_no = stored_next.max(max_file + 1).max(1);
-        Ok(Self { dir: dir.to_path_buf(), store, next_file_no })
+        let next_sst_no = stored_next.max(max_file + 1).max(1);
+        Ok(Self { dir: dir.to_path_buf(), store, next_sst_no })
     }
 
     pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
@@ -92,7 +92,7 @@ impl PersistentLsm {
             .levels()
             .iter()
             .flatten()
-            .filter_map(SSTable::file_no)
+            .filter_map(SSTable::sst_no)
             .collect()
     }
 
@@ -107,10 +107,10 @@ impl PersistentLsm {
         let Some(image) = self.store.memtable_image() else {
             return Ok(());
         };
-        let no = self.next_file_no;
+        let no = self.next_sst_no;
         write_sstable(&self.dir, no, &image)?;
-        self.next_file_no += 1;
-        self.store.insert_level0(SSTable::parse(image)?.with_file_no(no));
+        self.next_sst_no += 1;
+        self.store.insert_level0(SSTable::parse(image)?.with_sst_no(no));
         self.store.reset_memtable();
         let mut obsolete = Vec::new();
         self.cascade(&mut obsolete)?;
@@ -131,10 +131,10 @@ impl PersistentLsm {
             return Ok(());
         };
         let old = self.sstable_file_numbers();
-        let no = self.next_file_no;
+        let no = self.next_sst_no;
         write_sstable(&self.dir, no, &image)?;
-        self.next_file_no += 1;
-        self.store.set_levels(vec![vec![SSTable::parse(image)?.with_file_no(no)]]);
+        self.next_sst_no += 1;
+        self.store.set_levels(vec![vec![SSTable::parse(image)?.with_sst_no(no)]]);
         // Commit the manifest before removing the obsolete tables (see flush).
         self.write_manifest()?;
         for file in old {
@@ -150,12 +150,12 @@ impl PersistentLsm {
         while let Some(level) = self.store.level_needing_compaction() {
             let tables: Vec<SSTable> = self.store.level_tables(level).to_vec();
             let image = self.store.merge_tables(&tables)?;
-            let no = self.next_file_no;
+            let no = self.next_sst_no;
             write_sstable(&self.dir, no, &image)?;
-            self.next_file_no += 1;
-            let merged = SSTable::parse(image)?.with_file_no(no);
+            self.next_sst_no += 1;
+            let merged = SSTable::parse(image)?.with_sst_no(no);
             for table in &tables {
-                if let Some(file) = table.file_no() {
+                if let Some(file) = table.sst_no() {
                     obsolete.push(file);
                 }
             }
@@ -169,28 +169,28 @@ impl PersistentLsm {
             .store
             .levels()
             .iter()
-            .map(|level| level.iter().filter_map(SSTable::file_no).collect())
+            .map(|level| level.iter().filter_map(SSTable::sst_no).collect())
             .collect();
-        write_manifest(&self.dir, self.next_file_no, &levels)
+        write_manifest(&self.dir, self.next_sst_no, &levels)
     }
 }
 
-fn sstable_path(dir: &Path, file_no: u32) -> PathBuf {
-    dir.join(format!("sst-{file_no:06}{SSTABLE_SUFFIX}"))
+fn sstable_path(dir: &Path, sst_no: u32) -> PathBuf {
+    dir.join(format!("sst-{sst_no:06}{SSTABLE_SUFFIX}"))
 }
 
-fn write_sstable(dir: &Path, file_no: u32, image: &[u8]) -> Result<()> {
-    let path = sstable_path(dir, file_no);
+fn write_sstable(dir: &Path, sst_no: u32, image: &[u8]) -> Result<()> {
+    let path = sstable_path(dir, sst_no);
     let mut file = File::create(&path)
         .map_err(|e| Error::Runtime(format!("cannot create {}: {e}", path.display())))?;
     file.write_all(image).map_err(|e| Error::Runtime(format!("cannot write sstable: {e}")))?;
     file.sync_all().map_err(|e| Error::Runtime(format!("cannot sync sstable: {e}")))
 }
 
-fn write_manifest(dir: &Path, next_file_no: u32, levels: &[Vec<u32>]) -> Result<()> {
+fn write_manifest(dir: &Path, next_sst_no: u32, levels: &[Vec<u32>]) -> Result<()> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&MANIFEST_MAGIC);
-    buf.extend_from_slice(&next_file_no.to_le_bytes());
+    buf.extend_from_slice(&next_sst_no.to_le_bytes());
     buf.extend_from_slice(&(levels.len() as u32).to_le_bytes());
     for level in levels {
         buf.extend_from_slice(&(level.len() as u32).to_le_bytes());
@@ -219,7 +219,7 @@ fn read_manifest(dir: &Path) -> Result<(u32, Vec<Vec<u32>>)> {
     if bytes.len() < 16 || bytes[0..8] != MANIFEST_MAGIC {
         return Err(Error::Runtime("manifest is corrupt".into()));
     }
-    let next_file_no = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let next_sst_no = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let num_levels = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
     let mut pos = 16;
     let mut levels = Vec::with_capacity(num_levels);
@@ -234,7 +234,7 @@ fn read_manifest(dir: &Path) -> Result<(u32, Vec<Vec<u32>>)> {
         }
         levels.push(level);
     }
-    Ok((next_file_no, levels))
+    Ok((next_sst_no, levels))
 }
 
 fn take_u32(data: &[u8], pos: &mut usize) -> Result<u32> {

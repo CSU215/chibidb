@@ -16,7 +16,8 @@ fn writes_and_reads_pages() {
     let path = dir.path().join("data.dbf");
 
     let disk = DiskManager::new();
-    let file = disk.create_file(&path).unwrap();
+    disk.create_file(0, &path).unwrap();
+    let file = 0;
 
     let mut page = [0u8; PAGE_SIZE];
     page[0..4].copy_from_slice(&42u32.to_le_bytes());
@@ -29,7 +30,8 @@ fn writes_and_reads_pages() {
     drop(disk);
 
     let disk = DiskManager::new();
-    let file = disk.open_file(&path).unwrap();
+    disk.open_file(0, &path).unwrap();
+    let file = 0;
 
     let mut buf = [0u8; PAGE_SIZE];
     disk.read_page(file, 0, &mut buf).unwrap();
@@ -48,7 +50,8 @@ fn reads_unallocated_page_as_zeros() {
     let path = dir.path().join("data.dbf");
 
     let disk = DiskManager::new();
-    let file = disk.create_file(&path).unwrap();
+    disk.create_file(0, &path).unwrap();
+    let file = 0;
 
     let mut buf = [1u8; PAGE_SIZE];
     disk.read_page(file, 5, &mut buf).unwrap();
@@ -62,8 +65,8 @@ fn create_existing_file_errors() {
     let path = dir.path().join("data.dbf");
 
     let disk = DiskManager::new();
-    disk.create_file(&path).unwrap();
-    assert!(disk.create_file(&path).is_err());
+    disk.create_file(0, &path).unwrap();
+    assert!(disk.create_file(0, &path).is_err());
 }
 
 #[test]
@@ -83,7 +86,8 @@ fn closed_file_handle_is_released_before_the_path_is_returned() {
     let path = dir.path().join("gone.dbf");
 
     let disk = DiskManager::new();
-    let file = disk.create_file(&path).unwrap();
+    disk.create_file(0, &path).unwrap();
+    let file = 0;
     let returned = disk.close_file(file).unwrap();
     assert_eq!(returned, path);
 
@@ -96,7 +100,8 @@ fn closed_file_handle_is_released_before_the_path_is_returned() {
 fn alloc_page_appends_zeroed_pages() {
     let dir = tempfile::tempdir().unwrap();
     let disk = DiskManager::new();
-    let file = disk.create_file(&dir.path().join("alloc.dbf")).unwrap();
+    disk.create_file(0, &dir.path().join("alloc.dbf")).unwrap();
+    let file = 0;
 
     assert_eq!(disk.alloc_page(file).unwrap(), 0);
     assert_eq!(disk.alloc_page(file).unwrap(), 1);
@@ -118,7 +123,8 @@ fn with_file_makes_a_read_modify_write_atomic_on_one_file() {
 
     let dir = tempfile::tempdir().unwrap();
     let disk = Arc::new(DiskManager::new());
-    let file = disk.create_file(&dir.path().join("rmw.dbf")).unwrap();
+    disk.create_file(0, &dir.path().join("rmw.dbf")).unwrap();
+    let file = 0;
     disk.write_page(file, 0, &[0u8; PAGE_SIZE]).unwrap();
 
     let mut handles = Vec::new();
@@ -159,8 +165,10 @@ fn with_file_makes_a_read_modify_write_atomic_on_one_file() {
 fn different_files_do_not_block_each_other() {
     let dir = tempfile::tempdir().unwrap();
     let disk = Arc::new(DiskManager::new());
-    let f1 = disk.create_file(&dir.path().join("one.dbf")).unwrap();
-    let f2 = disk.create_file(&dir.path().join("two.dbf")).unwrap();
+    disk.create_file(0, &dir.path().join("one.dbf")).unwrap();
+    disk.create_file(1, &dir.path().join("two.dbf")).unwrap();
+    let f1 = 0;
+    let f2 = 1;
 
     let (inside_tx, inside_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -210,7 +218,8 @@ fn flush_all_under_concurrent_writers_terminates() {
     let path = dir.path().join("mixed.dbf");
     {
         let seed = DiskManager::new();
-        let f = seed.create_file(&path).unwrap();
+        seed.create_file(0, &path).unwrap();
+        let f = 0;
         for no in 0..PAGES {
             seed.write_page(f, no, &[0u8; PAGE_SIZE]).unwrap();
         }
@@ -218,7 +227,8 @@ fn flush_all_under_concurrent_writers_terminates() {
 
     // 容量 4 < 页数 8：写者必然触发淘汰，与 flush_all 争用同一批文件锁。
     let pool_disk = DiskManager::new();
-    let file = pool_disk.open_file(&path).unwrap();
+    pool_disk.open_file(0, &path).unwrap();
+    let file = 0;
     let pool = Arc::new(BufferPool::new(pool_disk, THREADS as usize));
 
     let (done_tx, done_rx) = mpsc::channel();
@@ -266,7 +276,8 @@ fn flush_all_under_concurrent_writers_terminates() {
     // 每一次自增都必须落到盘上：清空缓存后重开，逐页求和。
     drop(pool);
     let check = DiskManager::new();
-    let f = check.open_file(&path).unwrap();
+    check.open_file(0, &path).unwrap();
+    let f = 0;
     let mut total = 0u32;
     for no in 0..PAGES {
         let mut buf = [0u8; PAGE_SIZE];
@@ -284,9 +295,11 @@ fn per_file_page_spaces_are_independent() {
 
     let dir = tempfile::tempdir().unwrap();
     let disk = Arc::new(DiskManager::new());
-    let ids: Vec<u32> = (0..FILES)
-        .map(|i| disk.create_file(&dir.path().join(format!("t{i}.dbf"))).unwrap())
-        .collect();
+    let mut ids: Vec<u32> = Vec::new();
+    for i in 0..FILES {
+        disk.create_file(i, &dir.path().join(format!("t{i}.dbf"))).unwrap();
+        ids.push(i);
+    }
 
     let written = Arc::new(AtomicU32::new(0));
     let handles: Vec<_> = ids

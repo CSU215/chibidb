@@ -74,22 +74,21 @@ impl Schema {
     }
 }
 
+/// A table's single file identifier: the persistent catalog/WAL id and the
+/// buffer-pool handle are the same value now.
 #[derive(Debug)]
 pub(crate) struct HeapStore {
     pub file: FileId,
-    pub file_no: u32,
 }
 
 #[derive(Debug)]
 pub(crate) struct IndexStore {
     pub file: FileId,
-    pub file_no: u32,
 }
 
 /// Files to remove from disk after DROP TABLE.
 pub(crate) struct DroppedTable {
     pub heap_file: FileId,
-    pub file_no: u32,
     pub engine: EngineKind,
     pub index_files: Vec<FileId>,
 }
@@ -182,7 +181,7 @@ impl Catalog {
                 TableMeta {
                     name: name.clone(),
                     columns,
-                    file_no: t.heap.file_no,
+                    file: t.heap.file,
                     engine: t.engine_kind,
                     layout: t.layout,
                 }
@@ -234,7 +233,6 @@ impl Catalog {
         }
         Ok(DroppedTable {
             heap_file: table.heap.file,
-            file_no: table.heap.file_no,
             engine: table.engine_kind,
             index_files,
         })
@@ -248,7 +246,7 @@ impl Catalog {
                 table: ix.table.clone(),
                 column: ix.column.clone(),
                 unique: ix.unique,
-                file_no: ix.store.file_no,
+                file: ix.store.file,
             })
             .collect()
     }
@@ -269,20 +267,20 @@ impl Catalog {
         self.indexes.get(name)
     }
 
-    /// (heap file_no, FileId) for every table, for WAL replay mapping.
-    pub(crate) fn heap_files(&self) -> Vec<(u32, FileId)> {
-        self.tables.values().map(|t| (t.heap.file_no, t.heap.file)).collect()
+    /// File id of every table, for WAL replay mapping.
+    pub(crate) fn heap_files(&self) -> Vec<FileId> {
+        self.tables.values().map(|t| t.heap.file).collect()
     }
 
-    /// The engine kind and handle for the table owning `file_no`, used to
-    /// route WAL replay by storage type.
-    pub(crate) fn storage_for_file_no(
+    /// The engine kind and handle for the table owning `file`, used to route
+    /// WAL replay by storage type.
+    pub(crate) fn storage_for_file(
         &self,
-        file_no: u32,
+        file: FileId,
     ) -> Option<(EngineKind, Arc<dyn TableStorage>)> {
         self.tables
             .values()
-            .find(|t| t.heap.file_no == file_no)
+            .find(|t| t.heap.file == file)
             .map(|t| (t.engine_kind, t.engine()))
     }
 

@@ -13,13 +13,13 @@ use crate::error::{Error, Result};
 use crate::index::{encode_key, BTree};
 use crate::storage::codec::encode_record;
 use crate::storage::engine::{HeapEngine, TableStorage};
-use crate::storage::lsm::engine::{LsmEngine, LSM_FILE_ID};
+use crate::storage::lsm::engine::LsmEngine;
 use crate::storage::{FileId, HeapFile, LobStore, Rid};
 use crate::txn::trx::{TrxState, Undo};
 use crate::value::Value;
 use crate::wal::Record;
 
-use super::{Database, LSM_BLOCK_SIZE};
+use super::{index_file_id, Database, LSM_BLOCK_SIZE};
 
 impl Database {
     /// Buffer-pool lookup counters, for observability and cache-behavior tests.
@@ -75,35 +75,36 @@ impl Database {
         kind: EngineKind,
         layout: PageLayout,
     ) -> Result<(HeapStore, Arc<dyn TableStorage>)> {
-        let file_no = self.next_table_file.fetch_add(1, Ordering::SeqCst);
+        let file = self.next_table_file.fetch_add(1, Ordering::SeqCst);
         match kind {
             EngineKind::Heap => {
-                let path = self.data_dir.join("tables").join(format!("{file_no:06}.dbf"));
-                let file = self.pool.create_file(&path)?;
+                let path = self.data_dir.join("tables").join(format!("{file:06}.dbf"));
+                self.pool.create_file(file, &path)?;
                 HeapFile::init_with_layout(&self.pool, file, layout)?;
                 Ok((
-                    HeapStore { file, file_no },
+                    HeapStore { file },
                     Arc::new(HeapEngine::with_layout(file, layout)),
                 ))
             }
             EngineKind::Lsm => {
-                let dir = self.data_dir.join("tables").join(format!("{file_no:06}.lsm"));
+                let dir = self.data_dir.join("tables").join(format!("{file:06}.lsm"));
                 let engine = LsmEngine::open_with_trigger(
                     &dir,
                     LSM_BLOCK_SIZE,
                     self.config.storage.lsm_compaction_trigger,
                 )?;
-                Ok((HeapStore { file: LSM_FILE_ID, file_no }, Arc::new(engine)))
+                Ok((HeapStore { file }, Arc::new(engine)))
             }
         }
     }
 
     pub(crate) fn new_index_heap(&self, _name: &str) -> Result<IndexStore> {
-        let file_no = self.next_index_file.fetch_add(1, Ordering::SeqCst);
-        let path = self.data_dir.join("indexes").join(format!("{file_no:06}.idxf"));
-        let file = self.pool.create_file(&path)?;
+        let no = self.next_index_file.fetch_add(1, Ordering::SeqCst);
+        let file = index_file_id(no);
+        let path = self.data_dir.join("indexes").join(format!("{no:06}.idxf"));
+        self.pool.create_file(file, &path)?;
         BTree::init(&self.pool, file)?;
-        Ok(IndexStore { file, file_no })
+        Ok(IndexStore { file })
     }
 
     pub(crate) fn save_catalog(&self) -> Result<()> {
@@ -148,7 +149,7 @@ impl Database {
         let dropped = self.catalog_mut().drop_table(name)?;
         self.save_catalog()?;
         if dropped.engine == EngineKind::Lsm {
-            let dir = self.data_dir.join("tables").join(format!("{:06}.lsm", dropped.file_no));
+            let dir = self.data_dir.join("tables").join(format!("{:06}.lsm", dropped.heap_file));
             match std::fs::remove_dir_all(&dir) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -203,10 +204,10 @@ impl Database {
         row: Vec<Value>,
         trx: &mut TrxState,
     ) -> Result<Rid> {
-        let (file_no, engine) = {
+        let (file, engine) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
-            (t.heap.file_no, t.engine())
+            (t.heap.file, t.engine())
         };
         let creator = trx.id;
         self.note_write(creator, name);
@@ -218,7 +219,7 @@ impl Database {
         crate::wal::encode_frame_into(
             &mut trx.wal,
             creator,
-            &Record::Insert { file_no, rid, record: data },
+            &Record::Insert { file, rid, record: data },
         );
         for (ci, ix_file) in self.index_ops(name)? {
             let key = encode_key(&row[ci])?;
@@ -235,10 +236,10 @@ impl Database {
         rids: &[Rid],
         trx: &mut TrxState,
     ) -> Result<()> {
-        let (file_no, engine) = {
+        let (file, engine) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
-            (t.heap.file_no, t.engine())
+            (t.heap.file, t.engine())
         };
         let deleter = trx.id;
         self.note_write(deleter, name);
@@ -262,7 +263,7 @@ impl Database {
             crate::wal::encode_frame_into(
                 &mut trx.wal,
                 deleter,
-                &Record::DeleteMark { file_no, rid: *rid, deleter, next_rid: 0 },
+                &Record::DeleteMark { file, rid: *rid, deleter, next_rid: 0 },
             );
         }
         Ok(())
@@ -277,10 +278,10 @@ impl Database {
         updates: &[(Rid, Vec<Value>)],
         trx: &mut TrxState,
     ) -> Result<()> {
-        let (file_no, engine) = {
+        let (file, engine) = {
             let catalog = self.catalog();
             let t = catalog.table(name)?;
-            (t.heap.file_no, t.engine())
+            (t.heap.file, t.engine())
         };
         let trx_id = trx.id;
         self.note_write(trx_id, name);
@@ -300,7 +301,7 @@ impl Database {
             crate::wal::encode_frame_into(
                 &mut trx.wal,
                 trx_id,
-                &Record::Insert { file_no, rid: new_rid, record: data },
+                &Record::Insert { file, rid: new_rid, record: data },
             );
             // link the old version forward to the new one (PG's t_ctid)
             let next_rid = crate::storage::codec::pack_rid(new_rid.page_no, new_rid.slot);
@@ -320,7 +321,7 @@ impl Database {
             crate::wal::encode_frame_into(
                 &mut trx.wal,
                 trx_id,
-                &Record::DeleteMark { file_no, rid: *rid, deleter: trx_id, next_rid },
+                &Record::DeleteMark { file, rid: *rid, deleter: trx_id, next_rid },
             );
             for (ci, ix_file) in &ops {
                 let key = encode_key(&new_row[*ci])?;

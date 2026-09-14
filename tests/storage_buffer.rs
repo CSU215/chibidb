@@ -15,8 +15,8 @@ fn pool_with(
     policy: EvictionPolicy,
 ) -> (BufferPool, u32) {
     let disk = DiskManager::new();
-    let file = disk.create_file(&dir.path().join(name)).unwrap();
-    (BufferPool::new_with_eviction(disk, cap, policy), file)
+    disk.create_file(0, &dir.path().join(name)).unwrap();
+    (BufferPool::new_with_eviction(disk, cap, policy), 0)
 }
 
 /// 默认策略（`lru`）的池，供不关心策略的用例使用。
@@ -53,9 +53,9 @@ fn data_survives_pool_restart() {
 
     {
         let disk = DiskManager::new();
-        let f = disk.create_file(&path).unwrap();
+        disk.create_file(0, &path).unwrap();
         let bp = BufferPool::new(disk, 4);
-        bp.with_page(f, 2, |p| {
+        bp.with_page(0, 2, |p| {
             p[5] = 42;
             Ok(())
         })
@@ -63,9 +63,9 @@ fn data_survives_pool_restart() {
     }
 
     let disk = DiskManager::new();
-    let f = disk.open_file(&path).unwrap();
+    disk.open_file(0, &path).unwrap();
     let bp = BufferPool::new(disk, 4);
-    let v = bp.with_page(f, 2, |p| Ok(p[5])).unwrap();
+    let v = bp.with_page(0, 2, |p| Ok(p[5])).unwrap();
     assert_eq!(v, 42);
 }
 
@@ -152,13 +152,13 @@ fn alloc_pages_are_appended_and_persisted() {
 
     {
         let disk = DiskManager::new();
-        let f = disk.create_file(&path).unwrap();
+        disk.create_file(0, &path).unwrap();
         let bp = BufferPool::new(disk, 4);
-        assert_eq!(bp.alloc_page(f).unwrap(), 0);
-        assert_eq!(bp.alloc_page(f).unwrap(), 1);
-        let no = bp.alloc_page(f).unwrap();
+        assert_eq!(bp.alloc_page(0).unwrap(), 0);
+        assert_eq!(bp.alloc_page(0).unwrap(), 1);
+        let no = bp.alloc_page(0).unwrap();
         assert_eq!(no, 2);
-        bp.with_page(f, no, |p| {
+        bp.with_page(0, no, |p| {
             p[0] = 9;
             Ok(())
         })
@@ -166,10 +166,10 @@ fn alloc_pages_are_appended_and_persisted() {
     }
 
     let disk = DiskManager::new();
-    let f = disk.open_file(&path).unwrap();
+    disk.open_file(0, &path).unwrap();
     let bp = BufferPool::new(disk, 4);
-    assert_eq!(bp.page_count(f).unwrap(), 3);
-    let v = bp.with_page(f, 2, |p| Ok(p[0])).unwrap();
+    assert_eq!(bp.page_count(0).unwrap(), 3);
+    let v = bp.with_page(0, 2, |p| Ok(p[0])).unwrap();
     assert_eq!(v, 9);
 }
 
@@ -185,7 +185,8 @@ fn page_spans_full_page_size() {
 fn shared_pool_reads_and_writes_concurrently() {
     let dir = tempfile::tempdir().unwrap();
     let disk = DiskManager::new();
-    let f = disk.create_file(&dir.path().join("g.dbf")).unwrap();
+    disk.create_file(0, &dir.path().join("g.dbf")).unwrap();
+    let f = 0;
     let bp = Arc::new(BufferPool::new(disk, 8));
     for no in 0..4u32 {
         bp.with_page(f, no, |p| {
@@ -328,7 +329,8 @@ fn hammer(path: &std::path::Path, policy: EvictionPolicy) -> (Vec<u32>, Vec<u32>
 
     {
         let disk = DiskManager::new();
-        let f = disk.create_file(path).unwrap();
+        disk.create_file(0, path).unwrap();
+        let f = 0;
         // 容量 4、4 个线程：每个线程最多持 1 个 pin，故总有可淘汰的帧，
         // 不会真的耗尽；保留重试分支以防实现细节变化。
         let bp = Arc::new(BufferPool::new_with_eviction(disk, 4, policy));
@@ -362,7 +364,8 @@ fn hammer(path: &std::path::Path, policy: EvictionPolicy) -> (Vec<u32>, Vec<u32>
     }
 
     let disk = DiskManager::new();
-    let f = disk.open_file(path).unwrap();
+    disk.open_file(0, path).unwrap();
+    let f = 0;
     let bp = BufferPool::new(disk, PAGES as usize);
     let on_disk = (0..PAGES)
         .map(|page| {
@@ -419,7 +422,8 @@ impl CacheReporter for RecordingReporter {
 fn reporter_sees_eviction_events_with_dirtiness() {
     let dir = tempfile::tempdir().unwrap();
     let disk = DiskManager::new();
-    let f = disk.create_file(&dir.path().join("report.dbf")).unwrap();
+    disk.create_file(0, &dir.path().join("report.dbf")).unwrap();
+    let f = 0;
     let obs = ObservabilityConfig { cache_stats: true, eviction_log: true };
     let reporter = Arc::new(RecordingReporter::default());
     let bp =
@@ -456,7 +460,8 @@ fn reporter_sees_eviction_events_with_dirtiness() {
 fn reporter_is_silent_when_switches_are_off() {
     let dir = tempfile::tempdir().unwrap();
     let disk = DiskManager::new();
-    let f = disk.create_file(&dir.path().join("quiet.dbf")).unwrap();
+    disk.create_file(0, &dir.path().join("quiet.dbf")).unwrap();
+    let f = 0;
     let reporter = Arc::new(RecordingReporter::default());
     let bp = BufferPool::new_with_reporter(
         disk,

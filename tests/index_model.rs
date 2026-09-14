@@ -27,8 +27,8 @@ impl Rng {
 
 fn setup(dir: &tempfile::TempDir) -> (BufferPool, u32) {
     let disk = DiskManager::new();
-    let file = disk.create_file(&dir.path().join("model.idxf")).unwrap();
-    (BufferPool::new(disk, 64), file)
+    disk.create_file(0, &dir.path().join("model.idxf")).unwrap();
+    (BufferPool::new(disk, 64), 0)
 }
 
 /// A pool of distinct keys, mostly short with the occasional longer one.

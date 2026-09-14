@@ -396,12 +396,12 @@ impl BufferPool {
         self.disk.alloc_page(file)
     }
 
-    pub fn create_file(&self, path: &Path) -> Result<FileId> {
-        self.disk.create_file(path)
+    pub fn create_file(&self, id: FileId, path: &Path) -> Result<()> {
+        self.disk.create_file(id, path)
     }
 
-    pub fn open_file(&self, path: &Path) -> Result<FileId> {
-        self.disk.open_file(path)
+    pub fn open_file(&self, id: FileId, path: &Path) -> Result<()> {
+        self.disk.open_file(id, path)
     }
 
     pub fn page_count(&self, file: FileId) -> Result<PageNo> {

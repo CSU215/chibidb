@@ -12,7 +12,7 @@ use std::path::Path;
 
 use parking_lot::Mutex;
 
-use crate::storage::Rid;
+use crate::storage::{FileId, Rid};
 use crate::{Error, Result};
 
 const REC_INSERT: u8 = 1;
@@ -26,9 +26,9 @@ const HEADER_LEN: usize = 9;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Record {
     /// A full versioned row image written at an exact rid.
-    Insert { file_no: u32, rid: Rid, record: Vec<u8> },
+    Insert { file: FileId, rid: Rid, record: Vec<u8> },
     /// MVCC delete mark (deleter trx id + forward pointer) at an exact rid.
-    DeleteMark { file_no: u32, rid: Rid, deleter: u64, next_rid: u64 },
+    DeleteMark { file: FileId, rid: Rid, deleter: u64, next_rid: u64 },
     /// Commit boundary; redo replays only transactions with one of these.
     Commit,
 }
@@ -113,18 +113,18 @@ pub fn encode_frame_into(out: &mut Vec<u8>, trx_id: u64, rec: &Record) {
     let start = out.len();
     out.extend_from_slice(&[0u8; 4]); // length, patched once the frame is written
     match rec {
-        Record::Insert { file_no, rid, record } => {
+        Record::Insert { file, rid, record } => {
             out.push(REC_INSERT);
             out.extend_from_slice(&trx_id.to_le_bytes());
-            out.extend_from_slice(&file_no.to_le_bytes());
+            out.extend_from_slice(&file.to_le_bytes());
             out.extend_from_slice(&rid.page_no.to_le_bytes());
             out.extend_from_slice(&rid.slot.to_le_bytes());
             out.extend_from_slice(record);
         }
-        Record::DeleteMark { file_no, rid, deleter, next_rid } => {
+        Record::DeleteMark { file, rid, deleter, next_rid } => {
             out.push(REC_DELETE_MARK);
             out.extend_from_slice(&trx_id.to_le_bytes());
-            out.extend_from_slice(&file_no.to_le_bytes());
+            out.extend_from_slice(&file.to_le_bytes());
             out.extend_from_slice(&rid.page_no.to_le_bytes());
             out.extend_from_slice(&rid.slot.to_le_bytes());
             out.extend_from_slice(&deleter.to_le_bytes());
@@ -198,21 +198,21 @@ fn decode_frame(bytes: &[u8]) -> Option<(u64, Record, usize)> {
             if payload.len() < 10 {
                 return None;
             }
-            let file_no = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+            let file = u32::from_le_bytes(payload[0..4].try_into().unwrap());
             let page_no = u32::from_le_bytes(payload[4..8].try_into().unwrap());
             let slot = u16::from_le_bytes(payload[8..10].try_into().unwrap());
-            Record::Insert { file_no, rid: Rid::new(page_no, slot), record: payload[10..].to_vec() }
+            Record::Insert { file, rid: Rid::new(page_no, slot), record: payload[10..].to_vec() }
         }
         REC_DELETE_MARK => {
             if payload.len() < 26 {
                 return None;
             }
-            let file_no = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+            let file = u32::from_le_bytes(payload[0..4].try_into().unwrap());
             let page_no = u32::from_le_bytes(payload[4..8].try_into().unwrap());
             let slot = u16::from_le_bytes(payload[8..10].try_into().unwrap());
             let deleter = u64::from_le_bytes(payload[10..18].try_into().unwrap());
             let next_rid = u64::from_le_bytes(payload[18..26].try_into().unwrap());
-            Record::DeleteMark { file_no, rid: Rid::new(page_no, slot), deleter, next_rid }
+            Record::DeleteMark { file, rid: Rid::new(page_no, slot), deleter, next_rid }
         }
         REC_COMMIT => Record::Commit,
         _ => return None, // unknown frame type: stop scanning
@@ -231,8 +231,8 @@ mod tests {
     #[test]
     fn frames_roundtrip() {
         let recs = [
-            (7u64, Record::Insert { file_no: 3, rid: rid(9, 4), record: vec![1, 2, 3] }),
-            (8u64, Record::DeleteMark { file_no: 3, rid: rid(9, 4), deleter: 8, next_rid: 0 }),
+            (7u64, Record::Insert { file: 3, rid: rid(9, 4), record: vec![1, 2, 3] }),
+            (8u64, Record::DeleteMark { file: 3, rid: rid(9, 4), deleter: 8, next_rid: 0 }),
             (9u64, Record::Commit),
         ];
         let mut bytes = Vec::new();
@@ -250,8 +250,8 @@ mod tests {
     #[test]
     fn buffered_frames_match_individual_encodes() {
         let recs = [
-            (7u64, Record::Insert { file_no: 3, rid: rid(9, 4), record: vec![1, 2, 3] }),
-            (8u64, Record::DeleteMark { file_no: 3, rid: rid(9, 4), deleter: 8, next_rid: 0 }),
+            (7u64, Record::Insert { file: 3, rid: rid(9, 4), record: vec![1, 2, 3] }),
+            (8u64, Record::DeleteMark { file: 3, rid: rid(9, 4), deleter: 8, next_rid: 0 }),
             (8u64, Record::Commit),
         ];
         let mut buffered = Vec::new();
@@ -285,9 +285,9 @@ mod tests {
     #[test]
     fn plan_groups_by_trx_in_log_order() {
         let mut bytes = Vec::new();
-        bytes.extend(encode_frame(1, &Record::Insert { file_no: 0, rid: rid(1, 0), record: b"a".to_vec() }));
-        bytes.extend(encode_frame(2, &Record::Insert { file_no: 0, rid: rid(1, 1), record: b"b".to_vec() }));
-        bytes.extend(encode_frame(1, &Record::DeleteMark { file_no: 0, rid: rid(1, 1), deleter: 1, next_rid: 0 }));
+        bytes.extend(encode_frame(1, &Record::Insert { file: 0, rid: rid(1, 0), record: b"a".to_vec() }));
+        bytes.extend(encode_frame(2, &Record::Insert { file: 0, rid: rid(1, 1), record: b"b".to_vec() }));
+        bytes.extend(encode_frame(1, &Record::DeleteMark { file: 0, rid: rid(1, 1), deleter: 1, next_rid: 0 }));
         bytes.extend(encode_frame(1, &Record::Commit));
         bytes.extend(encode_frame(2, &Record::Commit));
         let plan = plan_recovery(&bytes);
@@ -316,7 +316,7 @@ mod tests {
                     wal.append(
                         trx,
                         &Record::Insert {
-                            file_no: 0,
+                            file: 0,
                             rid: Rid::new(1, slot),
                             record: vec![trx as u8],
                         },
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn uncommitted_records_are_not_replayed() {
         let mut bytes = Vec::new();
-        bytes.extend(encode_frame(5, &Record::Insert { file_no: 0, rid: rid(1, 0), record: b"x".to_vec() }));
+        bytes.extend(encode_frame(5, &Record::Insert { file: 0, rid: rid(1, 0), record: b"x".to_vec() }));
         let plan = plan_recovery(&bytes);
         assert!(plan.committed.is_empty());
         assert!(plan.committed_ids.is_empty());

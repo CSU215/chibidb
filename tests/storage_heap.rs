@@ -2,8 +2,8 @@ use chaoticdb::storage::{BufferPool, DiskManager, HeapFile, PAGE_SIZE};
 
 fn setup(dir: &tempfile::TempDir, name: &str) -> (BufferPool, u32) {
     let disk = DiskManager::new();
-    let file = disk.create_file(&dir.path().join(name)).unwrap();
-    (BufferPool::new(disk, 8), file)
+    disk.create_file(0, &dir.path().join(name)).unwrap();
+    (BufferPool::new(disk, 8), 0)
 }
 
 #[test]
@@ -75,16 +75,16 @@ fn data_survives_pool_restart() {
 
     {
         let disk = DiskManager::new();
-        let f = disk.create_file(&path).unwrap();
+        disk.create_file(0, &path).unwrap();
         let bp = BufferPool::new(disk, 4);
-        let heap = HeapFile::init(&bp, f).unwrap();
+        let heap = HeapFile::init(&bp, 0).unwrap();
         heap.insert(&bp, b"persist me").unwrap();
     }
 
     let disk = DiskManager::new();
-    let f = disk.open_file(&path).unwrap();
+    disk.open_file(0, &path).unwrap();
     let bp = BufferPool::new(disk, 4);
-    let heap = HeapFile::open(&bp, f).unwrap();
+    let heap = HeapFile::open(&bp, 0).unwrap();
     let mut seen = Vec::new();
     heap.for_each(&bp, |_, rec| {
         seen.push(rec.to_vec());
@@ -99,13 +99,13 @@ fn open_rejects_foreign_files() {
     let dir = tempfile::tempdir().unwrap();
 
     let disk = DiskManager::new();
-    let f1 = disk.create_file(&dir.path().join("empty.dbf")).unwrap();
-    let (bp, f) = (BufferPool::new(disk, 4), f1);
+    disk.create_file(0, &dir.path().join("empty.dbf")).unwrap();
+    let (bp, f) = (BufferPool::new(disk, 4), 0);
     assert!(HeapFile::open(&bp, f).is_err(), "empty file has no header");
 
     let disk2 = DiskManager::new();
-    let f2 = disk2.create_file(&dir.path().join("garbage.dbf")).unwrap();
-    let (bp2, f) = (BufferPool::new(disk2, 4), f2);
+    disk2.create_file(0, &dir.path().join("garbage.dbf")).unwrap();
+    let (bp2, f) = (BufferPool::new(disk2, 4), 0);
     bp2.alloc_page(f).unwrap();
     bp2.with_page(f, 0, |p| {
         p[0..4].copy_from_slice(b"NOPE");

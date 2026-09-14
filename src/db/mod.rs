@@ -22,8 +22,8 @@ use crate::sql::parser;
 use crate::sql::result::ResultSet;
 use crate::storage::codec::decode_record;
 use crate::storage::engine::{HeapEngine, TableStorage};
-use crate::storage::lsm::engine::{LsmEngine, LSM_FILE_ID};
-use crate::storage::{BufferPool, DiskManager, HeapFile, LobStore, Rid};
+use crate::storage::lsm::engine::LsmEngine;
+use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, LobStore, Rid};
 use crate::txn::lock::LockManager;
 use crate::txn::transaction::TransactionManager;
 use crate::txn::trx::{Session, TrxState, Undo};
@@ -32,6 +32,19 @@ use crate::wal::{self, Record, Wal};
 
 /// SSTable block size for LSM-backed tables.
 const LSM_BLOCK_SIZE: usize = 4096;
+
+/// Table and index files share one buffer pool, so index ids carry a high tag
+/// bit that keeps them disjoint from every table file number. The low bits are
+/// the persisted index number used to name the file on disk.
+const INDEX_FILE_TAG: FileId = 1 << 31;
+
+fn index_file_id(no: FileId) -> FileId {
+    INDEX_FILE_TAG | no
+}
+
+fn index_number(id: FileId) -> FileId {
+    id & !INDEX_FILE_TAG
+}
 
 pub struct Database {
     config: Config,
@@ -133,25 +146,28 @@ impl Database {
                 };
                 let (heap, engine): (HeapStore, Arc<dyn TableStorage>) = match meta.engine {
                     EngineKind::Heap => {
-                        let fpath = tables_dir.join(format!("{:06}.dbf", meta.file_no));
-                        let file = pool.open_file(&fpath)?;
+                        let file = meta.file;
+                        let fpath = tables_dir.join(format!("{file:06}.dbf"));
+                        pool.open_file(file, &fpath)?;
                         HeapFile::open_or_repair(&pool, file, meta.layout)?;
                         (
-                            HeapStore { file, file_no: meta.file_no },
+                            HeapStore { file },
                             Arc::new(HeapEngine::with_layout(file, meta.layout)),
                         )
                     }
                     EngineKind::Lsm => {
-                        let dir = tables_dir.join(format!("{:06}.lsm", meta.file_no));
+                        let file = meta.file;
+                        let dir = tables_dir.join(format!("{file:06}.lsm"));
                         let engine = LsmEngine::open_with_trigger(&dir, LSM_BLOCK_SIZE, config.storage.lsm_compaction_trigger)?;
-                        (HeapStore { file: LSM_FILE_ID, file_no: meta.file_no }, Arc::new(engine))
+                        (HeapStore { file }, Arc::new(engine))
                     }
                 };
                 catalog.create_table(&meta.name, schema, heap, meta.engine, meta.layout, engine)?;
             }
             for ix in &snap.indexes {
-                let fpath = indexes_dir.join(format!("{:06}.idxf", ix.file_no));
-                let file = pool.open_file(&fpath)?;
+                let file = index_file_id(ix.file);
+                let fpath = indexes_dir.join(format!("{:06}.idxf", index_number(ix.file)));
+                pool.open_file(file, &fpath)?;
                 if BTree::open_or_repair(&pool, file)? {
                     repaired_index_tables.push(ix.table.clone());
                 }
@@ -167,7 +183,7 @@ impl Database {
                     ix.table.clone(),
                     ix.column.clone(),
                     ix.unique,
-                    IndexStore { file, file_no: ix.file_no },
+                    IndexStore { file },
                 )?;
             }
             for v in &snap.views {
@@ -192,7 +208,7 @@ impl Database {
 
         let mut touched: HashSet<u32> = HashSet::new();
         for table in &repaired_index_tables {
-            touched.insert(catalog.table(table)?.heap.file_no);
+            touched.insert(catalog.table(table)?.heap.file);
         }
 
         let db = Self {

@@ -3,8 +3,8 @@ use chaoticdb::storage::{BufferPool, DiskManager, Rid};
 
 fn setup(dir: &tempfile::TempDir, name: &str) -> (BufferPool, u32) {
     let disk = DiskManager::new();
-    let file = disk.create_file(&dir.path().join(name)).unwrap();
-    (BufferPool::new(disk, 32), file)
+    disk.create_file(0, &dir.path().join(name)).unwrap();
+    (BufferPool::new(disk, 32), 0)
 }
 
 #[test]
@@ -46,16 +46,16 @@ fn survives_reopen() {
     let path = dir.path().join("c.idxf");
     {
         let disk = DiskManager::new();
-        let f = disk.create_file(&path).unwrap();
+        disk.create_file(0, &path).unwrap();
         let bp = BufferPool::new(disk, 8);
-        let tree = BTree::init(&bp, f).unwrap();
+        let tree = BTree::init(&bp, 0).unwrap();
         tree.insert(&bp, b"k1", Rid::new(7, 3)).unwrap();
         tree.insert(&bp, b"k2", Rid::new(7, 4)).unwrap();
     }
     let disk = DiskManager::new();
-    let f = disk.open_file(&path).unwrap();
+    disk.open_file(0, &path).unwrap();
     let bp = BufferPool::new(disk, 8);
-    let tree = BTree::open(&bp, f).unwrap();
+    let tree = BTree::open(&bp, 0).unwrap();
     assert_eq!(tree.search(&bp, b"k1").unwrap(), [Rid::new(7, 3)]);
     assert_eq!(tree.search(&bp, b"k2").unwrap(), [Rid::new(7, 4)]);
 }

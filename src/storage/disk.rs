@@ -3,7 +3,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use parking_lot::{Mutex, RwLock};
 
@@ -34,7 +33,6 @@ struct FileSlot {
 /// 两条路径在"页闩 → 文件锁"这一段同向，因此不会成环。
 pub struct DiskManager {
     files: RwLock<BTreeMap<FileId, Arc<FileSlot>>>,
-    next_file_id: AtomicU32,
     /// Double-Write Buffer 是一个 db 目录一个的全局单例，单独一把锁，
     /// 与 `files` 不嵌套（`stage_page` 先取出 `Arc<FileSlot>` 再锁 dwb）。
     dwb: Mutex<Option<DoubleWrite>>,
@@ -48,11 +46,7 @@ impl Default for DiskManager {
 
 impl DiskManager {
     pub fn new() -> Self {
-        Self {
-            files: RwLock::new(BTreeMap::new()),
-            next_file_id: AtomicU32::new(0),
-            dwb: Mutex::new(None),
-        }
+        Self { files: RwLock::new(BTreeMap::new()), dwb: Mutex::new(None) }
     }
 
     /// Enables a double-write buffer: dirty pages are staged there and synced
@@ -87,30 +81,36 @@ impl DiskManager {
         Ok(())
     }
 
-    pub fn create_file(&self, path: &Path) -> Result<FileId> {
+    /// Opens a new file under the caller-chosen `id`. The id is the persistent
+    /// catalog/WAL file identifier and the buffer-pool handle at once, so a
+    /// second file cannot take the same id: that is a clear error.
+    pub fn create_file(&self, id: FileId, path: &Path) -> Result<()> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(path)
             .map_err(|e| Error::Runtime(format!("cannot create file {}: {e}", path.display())))?;
-        Ok(self.register(path, file))
+        self.register(id, path, file)
     }
 
-    pub fn open_file(&self, path: &Path) -> Result<FileId> {
+    pub fn open_file(&self, id: FileId, path: &Path) -> Result<()> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(|e| Error::Runtime(format!("cannot open file {}: {e}", path.display())))?;
-        Ok(self.register(path, file))
+        self.register(id, path, file)
     }
 
-    fn register(&self, path: &Path, file: File) -> FileId {
-        let id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
+    fn register(&self, id: FileId, path: &Path, file: File) -> Result<()> {
+        let mut files = self.files.write();
+        if files.contains_key(&id) {
+            return Err(Error::Runtime(format!("file id {id} is already registered")));
+        }
         let slot = Arc::new(FileSlot { path: path.to_path_buf(), file: Mutex::new(Some(file)) });
-        self.files.write().insert(id, slot);
-        id
+        files.insert(id, slot);
+        Ok(())
     }
 
     /// Closes the handle of a file that is about to be deleted and returns

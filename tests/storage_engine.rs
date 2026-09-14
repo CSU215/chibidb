@@ -5,8 +5,8 @@ use chaoticdb::value::Value;
 
 fn setup(dir: &tempfile::TempDir, name: &str) -> (BufferPool, u32) {
     let disk = DiskManager::new();
-    let file = disk.create_file(&dir.path().join(name)).unwrap();
-    (BufferPool::new(disk, 8), file)
+    disk.create_file(0, &dir.path().join(name)).unwrap();
+    (BufferPool::new(disk, 8), 0)
 }
 
 fn drain(bp: &BufferPool, file: u32) -> Vec<String> {
