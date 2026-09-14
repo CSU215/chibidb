@@ -213,27 +213,44 @@ fn transaction_control_errors() {
 
 #[test]
 fn first_committer_wins_aborts_the_lost_update() {
-    let db = Database::open_in_memory().unwrap();
+    use std::sync::Arc;
+    use std::sync::mpsc;
+
+    let db = Arc::new(Database::open_in_memory().unwrap());
     let mut a = Session::new();
-    let mut b = Session::new();
     setup(&db, &mut a);
     db.execute_sql_with(&mut a, "insert into t values (1, 'base');").unwrap();
 
-    // both transactions update the same row from the same snapshot
+    // A updates the row and holds its row lock until COMMIT.
     db.execute_sql_with(&mut a, "begin;").unwrap();
     db.execute_sql_with(&mut a, "update t set name = 'a' where id = 1;").unwrap();
-    db.execute_sql_with(&mut b, "begin;").unwrap();
-    db.execute_sql_with(&mut b, "update t set name = 'b' where id = 1;").unwrap();
 
-    // the first committer wins
+    // B begins (snapshot before A commits) and blocks updating the same row.
+    let (begun_tx, begun_rx) = mpsc::channel();
+    let b = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let mut b = Session::new();
+            db.execute_sql_with(&mut b, "begin;").unwrap();
+            begun_tx.send(()).unwrap();
+            let update = db.execute_sql_with(&mut b, "update t set name = 'b' where id = 1;");
+            let commit = db.execute_sql_with(&mut b, "commit;");
+            (update.err().map(|e| e.to_string()), commit.err().map(|e| e.to_string()))
+        })
+    };
+    begun_rx.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    // A commits, releasing the row lock; B's update then runs on its stale
+    // snapshot and its commit is rejected.
     db.execute_sql_with(&mut a, "commit;").unwrap();
-    let err = db.execute_sql_with(&mut b, "commit;").unwrap_err();
-    assert!(err.to_string().contains("conflict"), "{err}");
+    let (update_err, commit_err) = b.join().unwrap();
+    assert!(update_err.is_none(), "update should not fail: {update_err:?}");
+    let commit_err = commit_err.expect("B's commit must fail");
+    assert!(commit_err.contains("conflict"), "{commit_err}");
 
     // the loser's value never lands
-    assert_eq!(rows(&db, &mut b, "select name from t;"), [[Value::Str("a".into())]]);
-    // and its write is not left open
-    assert_eq!(rows(&db, &mut b, "select count(*) from t;"), [[Value::Int(1)]]);
+    assert_eq!(rows(&db, &mut a, "select name from t;"), [[Value::Str("a".into())]]);
+    assert_eq!(rows(&db, &mut a, "select count(*) from t;"), [[Value::Int(1)]]);
 }
 
 #[test]

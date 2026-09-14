@@ -260,12 +260,12 @@ impl Instance {
                     if let Some(lock) = &write_lock {
                         lock.acquire(session.id())?;
                     }
-                    // read-only statements share the database; anything that
-                    // may write takes it exclusively for the statement
-                    let result = if read_only {
-                        db.read().execute_stmt_with(session, other)?
-                    } else {
+                    // Only schema/physical changes need the database exclusively;
+                    // DML shares it and serializes per row via the lock manager.
+                    let result = if crate::is_exclusive(other) {
                         db.write().execute_stmt_with(session, other)?
+                    } else {
+                        db.read().execute_stmt_with(session, other)?
                     };
                     // release only if this statement took it and no explicit
                     // transaction (BEGIN) adopted it

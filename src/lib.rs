@@ -80,6 +80,7 @@ use crate::storage::codec::{decode_record, encode_record};
 use crate::storage::engine::{HeapEngine, TableStorage};
 use crate::storage::lsm::engine::{LsmEngine, LSM_FILE_ID};
 use crate::storage::{BufferPool, DiskManager, FileId, HeapFile, LobStore, Rid};
+use crate::db::lockmgr::LockManager;
 use crate::transaction::TransactionManager;
 use crate::trx::{TrxState, Undo};
 use crate::value::Value;
@@ -110,6 +111,9 @@ pub struct Database {
     /// The per-database 2PL write lock, shared with the instance layer so it
     /// can be acquired before the database lock.
     writer: Arc<DatabaseWriteLock>,
+    /// Row-level tuple locks, held by a transaction until it ends. Writers of
+    /// different rows proceed concurrently; same-row writers queue.
+    locks: LockManager,
     /// Serializes a whole checkpoint (`flush_inner`): the buffer-pool flush,
     /// each engine's flush, the catalog save and the WAL truncation. Per-
     /// statement checkpoints already hold the database write lock, so this is
@@ -266,6 +270,7 @@ impl Database {
             wal_checkpoint_threshold: AtomicU64::new(config.wal.checkpoint_threshold),
             conflict: config.transaction.conflict,
             writer: Arc::new(DatabaseWriteLock::new(config.transaction.lock_timeout_ms)),
+            locks: LockManager::new(config.transaction.lock_timeout_ms, 100),
             checkpoint_lock: Mutex::new(()),
             catalog_lock: Mutex::new(()),
             _temp: None,
@@ -468,6 +473,7 @@ impl Database {
             // snapshot needs its id and its bookkeeping need not hit disk.
             // Skipping the catalog rewrite keeps SELECT cheap.
             self.trx.commit(trx_id);
+            self.locks.unlock_all(trx_id as u64);
             return Ok(());
         }
         // The synced commit record is the durability point. Flush the
@@ -489,6 +495,7 @@ impl Database {
         {
             eprintln!("commit: opportunistic checkpoint failed: {e}");
         }
+        self.locks.unlock_all(trx_id as u64);
         Ok(())
     }
 
@@ -794,6 +801,10 @@ impl Database {
     /// explicit transaction, so earlier statements survive and their buffered
     /// frames stay.
     fn rollback_trx_to(&self, trx: &mut TrxState, undo_mark: usize, wal_mark: usize) -> Result<()> {
+        if undo_mark == 0 {
+            // full rollback: release the transaction's row locks
+            self.locks.unlock_all(trx.id as u64);
+        }
         trx.wal.truncate(wal_mark);
         while trx.undo.len() > undo_mark {
             let undo = trx.undo.pop().expect("len > mark checked");
@@ -1096,6 +1107,8 @@ impl Database {
         };
         let deleter = trx.id;
         for rid in rids {
+            // serialize writers of the same row; different rows proceed
+            self.locks.lock(deleter as u64, name, *rid)?;
             let prev_deleter = engine.delete_mark(&self.pool, *rid, deleter)?;
             trx.undo.push(Undo::DeleteMark {
                 table: name.to_string(),
@@ -1128,6 +1141,8 @@ impl Database {
         let trx_id = trx.id;
         let ops = self.index_ops(name)?;
         for (rid, new_row) in updates {
+            // serialize writers of the same row; different rows proceed
+            self.locks.lock(trx_id as u64, name, *rid)?;
             let prev_deleter = engine.delete_mark(&self.pool, *rid, trx_id)?;
             crate::wal::encode_frame_into(
                 &mut trx.wal,
@@ -1155,6 +1170,23 @@ impl Database {
         }
         Ok(())
     }
+}
+
+/// Whether a statement mutates schema or physical state and therefore needs the
+/// database in exclusive mode. DML and transaction control take the database
+/// shared: concurrent writers are serialized per row by the lock manager.
+pub(crate) fn is_exclusive(stmt: &crate::ast::Stmt) -> bool {
+    matches!(
+        stmt,
+        crate::ast::Stmt::CreateIndex(_)
+            | crate::ast::Stmt::CreateTable(_)
+            | crate::ast::Stmt::CreateView(_)
+            | crate::ast::Stmt::DropIndex(_)
+            | crate::ast::Stmt::DropTable(_)
+            | crate::ast::Stmt::DropView(_)
+            | crate::ast::Stmt::Checkpoint
+            | crate::ast::Stmt::Vacuum
+    )
 }
 
 /// Whether a statement only reads, so its autocommit needs no transaction

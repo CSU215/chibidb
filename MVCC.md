@@ -211,12 +211,12 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
   `snapshot()` 从 O(committed) 降到 O(in-progress)。
   *注*：实际 Snapshot 未保留单独的 `xmin` —— 有精确 clog 时 `x < xmin` 与 `[xmin,xmax)`
   的判定合流，`xmin` 只在"用区间近似 clog"（Step 7 的 horizon）时才需要。
-- **Step 3｜行级锁管理器**（进行中）：原语 `LockManager` ✅（`14ee18a`，`src/db/lockmgr.rs`）
-  —— `(table, rid)` 元组锁 + FIFO 交接 + `lock_timeout` + 等待图死锁自检，含单测
-  （重入 / 超时 / 交接 / 双持有者死锁）。
-  **阻塞项**：接线 + 撤整库写锁需要**索引支持并发写**（见 §12）——`BTree::insert/delete`
-  是"下降 + 底向上分裂/合并"、逐页加锁、无 latch coupling，`db.write()` 目前是索引正确性的
-  实际保护。**必须在行锁接线之前先做索引并发。**
+- **Step 3｜行级锁管理器** ✅：原语 `LockManager`（`14ee18a`）；**接线完成**——`Database` 持
+  `locks: LockManager`，写路径（`store_delete_mark`/`store_update_versions`）在改行前取
+  `(table, rid)` 元组锁（owner = trx id），事务结束（commit/全量 rollback）释放全部。
+  **`Instance` 不再对 DML 独占整库**：只有 DDL/CHECKPOINT/VACUUM 走 `db.write()`，
+  DML 与事务控制走 `db.read()`，同库并发写按行串行。验收：并发自动提交写（4×200），
+  以及原来的 FCW 测试改为多线程（第二个写者阻塞→提交冲突）。
 - **Step 3.5｜索引并发（B-link tree）**（见 §12）：让 `BTree` 支持并发读写。
   验收：`tests/index_model.rs` 随机模型在并发下通过；`index_btree` 全绿。
 - **Step 4｜RC + EPQ**（默认档先做对）：记录头加 `next_rid`；等锁后 EPQ 重读最新版本。
@@ -324,8 +324,10 @@ Repeatable Read 行为一致。
 
 ### 索引并发现状
 C1–C4 之后，`BTree` 的**读、插入、删除都支持并发**（lock-fetch + crabbing + B-link），不变量测试与
-并发压力测试均通过。**下一步回到数据库层**：撤掉 `Instance` 每语句的整库写独占，接线行级 `LockManager`
-（Step 3 待办）与 EPQ，然后按 §5–§7 推进 RR/SI、SSI、GC。参见 §9 路线。
+并发压力测试均通过。数据库层也已**撤掉 DML 的整库写独占**并接线行级锁（Step 3 ✅）。
+
+**剩余**：EPQ（`next_rid` 前向指针）以实现 RC 的"等锁后重读最新版本"；RR/SI 的 40001 语义
+（当前 FCW 已近似 SI）；SSI；GC/horizon + xid64。参见 §5–§7 与 §9 路线。
 - **C2**｜查找改 lock-fetch（right-link 右移）。验收：并发「读 + 插入」压力下结果与模型一致。
 - **C3**｜插入改 top-down + latch coupling + 预分裂。验收：`tests/index_model.rs` 的随机
   模型在**并发**插入/删除下与 `BTreeMap` 模型一致；无损坏。

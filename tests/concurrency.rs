@@ -100,6 +100,36 @@ fn instance_two_pl_blocks_the_second_writer() {
 }
 
 #[test]
+fn concurrent_autocommit_writes_stay_correct() {
+    // DML now shares the database lock; distinct rows are serialized per row
+    // by the lock manager, so concurrent writers must not lose or corrupt data.
+    let dir = tempfile::tempdir().unwrap();
+    let inst = Arc::new(Instance::open(dir.path(), &Config::default()).unwrap());
+    inst.create_database("a").unwrap();
+    inst.with_database_mut("a", |db| db.execute_sql("create table t (id int);").unwrap())
+        .unwrap();
+
+    std::thread::scope(|scope| {
+        for worker in 0..4u32 {
+            let inst = Arc::clone(&inst);
+            scope.spawn(move || {
+                let mut session = Session::new();
+                inst.execute_with(&mut session, "use a;").unwrap();
+                for i in 0..200u32 {
+                    inst.execute_with(
+                        &mut session,
+                        &format!("insert into t values ({});", worker * 1000 + i),
+                    )
+                    .unwrap();
+                }
+            });
+        }
+    });
+
+    assert_eq!(count(&inst, "a"), 800);
+}
+
+#[test]
 fn same_database_reads_run_concurrently() {
     let dir = tempfile::tempdir().unwrap();
     let inst = Arc::new(Instance::open(dir.path(), &Config::default()).unwrap());
