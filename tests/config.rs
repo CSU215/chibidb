@@ -17,10 +17,21 @@ fn defaults_are_sane() {
     assert_eq!(c.storage.eviction, EvictionPolicy::Lru);
     assert_eq!(c.wal.checkpoint_threshold, 8 * 1024 * 1024);
     assert_eq!(c.server.addr, "127.0.0.1:5678");
+    assert_eq!(c.server.web_root.as_deref(), Some("web/dist"));
     assert_eq!(c.server.protocols, ["text"]);
     assert_eq!(c.execution.mode, ExecutionMode::Chunk);
     assert!(!c.auth.enabled);
     assert_eq!(c.transaction.isolation, Isolation::ReadCommitted);
+}
+
+#[test]
+fn server_web_root_parses() {
+    let c = Config::from_toml_str("[server]\nweb_root = \"web/dist\"\n").unwrap();
+    assert_eq!(c.server.web_root.as_deref(), Some("web/dist"));
+    // An empty string is how hosting is switched off (the field has a default,
+    // so it can no longer say "off" by being absent).
+    let off = Config::from_toml_str("[server]\nweb_root = \"\"\n").unwrap();
+    assert_eq!(off.server.web_root.as_deref(), Some(""));
 }
 
 #[test]

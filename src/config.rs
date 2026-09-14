@@ -121,6 +121,11 @@ pub struct ServerConfig {
     pub http_addr: Option<String>,
     /// Optional third listener speaking the MySQL wire protocol.
     pub mysql_addr: Option<String>,
+    /// Directory holding the built Vue SPA, served from the HTTP listener.
+    /// Relative paths resolve against the process CWD, like `config.toml`.
+    /// An empty string disables static hosting (the field can no longer say
+    /// "off" by being absent, since it has a default).
+    pub web_root: Option<String>,
     pub protocols: Vec<String>,
     pub thread_model: ThreadModel,
     pub worker_threads: usize,
@@ -180,6 +185,7 @@ impl Default for ServerConfig {
             addr: "127.0.0.1:5678".into(),
             http_addr: None,
             mysql_addr: None,
+            web_root: Some("web/dist".into()),
             protocols: vec!["text".into()],
             thread_model: ThreadModel::PerConnection,
             worker_threads: 4,

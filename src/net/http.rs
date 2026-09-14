@@ -16,6 +16,8 @@ use crate::trx::Session;
 
 use crate::server::SharedInstance;
 
+use super::admin::{self, Response};
+
 /// Largest request we will buffer (headers plus body).
 const MAX_REQUEST: usize = 8 * 1024 * 1024;
 
@@ -50,8 +52,7 @@ fn serve_connection(instance: &Instance, mut stream: TcpStream) -> io::Result<()
             _ => {
                 write_response(
                     &mut stream,
-                    "413 Payload Too Large",
-                    &encode_error("request too large"),
+                    &Response::json("413 Payload Too Large", encode_error("request too large")),
                     false,
                 )?;
                 break Ok(());
@@ -63,8 +64,8 @@ fn serve_connection(instance: &Instance, mut stream: TcpStream) -> io::Result<()
         let body = &buf[header_end..body_end];
         let (method, path) = request_line(&head);
         let keep_alive = !head.to_ascii_lowercase().contains("connection: close");
-        let (status, payload) = route(instance, &mut session, &method, &path, body);
-        write_response(&mut stream, status, &payload, keep_alive)?;
+        let response = route(instance, &mut session, &method, &path, body);
+        write_response(&mut stream, &response, keep_alive)?;
 
         buf.drain(..body_end);
         if !keep_alive {
@@ -81,20 +82,28 @@ fn route(
     method: &str,
     path: &str,
     body: &[u8],
-) -> (&'static str, String) {
+) -> Response {
+    // The admin surface owns `/api/*` and static hosting; it declines the two
+    // legacy paths so they keep their exact previous behaviour.
+    if let Some(response) = admin::handle(instance.config(), method, path, body) {
+        return response;
+    }
     match (method, path) {
-        ("GET", "/health") => ("200 OK", "{\"status\":\"ok\"}".to_string()),
+        ("GET", "/health") => Response::json("200 OK", "{\"status\":\"ok\"}".to_string()),
         ("POST", "/query") => {
             let text = String::from_utf8_lossy(body);
             let Some(sql) = json_string_field(&text, "sql") else {
-                return ("400 Bad Request", encode_error("expected a JSON body {\"sql\": ...}"));
+                return Response::json(
+                    "400 Bad Request",
+                    encode_error("expected a JSON body {\"sql\": ...}"),
+                );
             };
             match instance.execute_with(session, &sql) {
-                Ok(results) => ("200 OK", encode_results(&results)),
-                Err(e) => ("400 Bad Request", encode_error(&e.to_string())),
+                Ok(results) => Response::json("200 OK", encode_results(&results)),
+                Err(e) => Response::json("400 Bad Request", encode_error(&e.to_string())),
             }
         }
-        _ => ("404 Not Found", encode_error("not found")),
+        _ => Response::not_found(),
     }
 }
 
@@ -132,7 +141,9 @@ fn request_line(head: &str) -> (String, String) {
     let line = head.lines().next().unwrap_or("");
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("/").to_string();
+    // Drop the query and fragment: `/assets/app.js?v=1` names the file `app.js`.
+    let target = parts.next().unwrap_or("/");
+    let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
     (method, path)
 }
 
@@ -146,19 +157,25 @@ fn content_length(head: &str) -> Option<usize> {
     None
 }
 
-fn write_response(
-    stream: &mut TcpStream,
-    status: &str,
-    body: &str,
-    keep_alive: bool,
-) -> io::Result<()> {
+/// Writes one response. The body is bytes, not a string: static assets include
+/// binaries (`woff2`, `png`) that a lossy UTF-8 round trip would corrupt.
+fn write_response(stream: &mut TcpStream, response: &Response, keep_alive: bool) -> io::Result<()> {
     let connection = if keep_alive { "keep-alive" } else { "close" };
-    let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
-        body.len()
+    let mut header = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {connection}\r\n",
+        response.status,
+        response.content_type,
+        response.body.len(),
     );
+    for (name, value) in &response.extra_headers {
+        header.push_str(name);
+        header.push_str(": ");
+        header.push_str(value);
+        header.push_str("\r\n");
+    }
+    header.push_str("\r\n");
     stream.write_all(header.as_bytes())?;
-    stream.write_all(body.as_bytes())?;
+    stream.write_all(&response.body)?;
     stream.flush()
 }
 

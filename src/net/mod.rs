@@ -1,5 +1,7 @@
 //! Frontends: the local REPL and the text / HTTP / MySQL wire servers.
 
+// The admin surface has no public API; it is reached only through `http.rs`.
+pub(crate) mod admin;
 pub mod client;
 pub mod http;
 pub mod mysql;
