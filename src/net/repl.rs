@@ -1,0 +1,52 @@
+use std::io;
+
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::instance::Instance;
+use crate::net::render::write_result;
+use crate::txn::trx::Session;
+
+/// Runs the REPL. `interactive` controls whether the `db> ` prompt is written:
+/// a terminal echoes the input's newline, but piped input does not, so emitting
+/// the prompt there would glue it to the first result line and break table
+/// alignment.
+pub async fn run_repl(
+    instance: &Instance,
+    mut input: impl AsyncBufRead + Unpin,
+    output: &mut (impl AsyncWrite + Unpin),
+    interactive: bool,
+) -> io::Result<()> {
+    // one session for the whole REPL so transactions span lines
+    let mut session = Session::new();
+    let mut line = String::new();
+    let result = loop {
+        if interactive {
+            output.write_all(b"db> ").await?;
+            output.flush().await?;
+        }
+        line.clear();
+        if input.read_line(&mut line).await? == 0 {
+            break Ok(());
+        }
+        let sql = line.trim();
+        if sql.is_empty() {
+            continue;
+        }
+        if sql == "exit" || sql == "quit" {
+            break Ok(());
+        }
+        match instance.execute_with(&mut session, sql) {
+            Ok(results) => {
+                for rs in &results {
+                    write_result(output, rs).await?;
+                }
+            }
+            Err(e) => output.write_all(format!("error: {e}\n").as_bytes()).await?,
+        }
+    };
+    // roll back any open transaction when the REPL goes away
+    if let Err(e) = instance.rollback_session(&mut session) {
+        eprintln!("error: rollback failed: {e}");
+    }
+    result
+}

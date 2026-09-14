@@ -320,7 +320,6 @@ fn decode_row_with(
 /// Decodes an encoded row, handing each value to `sink` as it is read instead
 /// of collecting a `Vec<Value>`. Returns the column count. Lets a scan fill
 /// chunk columns directly.
-#[allow(dead_code)] // used by the chunk executor once it is ported
 pub(crate) fn decode_row_each(    data: &[u8],
     lobs: Option<&dyn LobResolver>,
     keep: Option<&[bool]>,
@@ -337,7 +336,6 @@ pub(crate) fn decode_row_each(    data: &[u8],
 
 /// Like [`decode_row_each`], but collects the values into `out` (cleared
 /// first), reusing its allocation. Returns the column count.
-#[allow(dead_code)] // used by the volcano executor once it is ported
 pub(crate) fn decode_row_into(
     data: &[u8],
     lobs: Option<&dyn LobResolver>,
