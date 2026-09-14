@@ -3,3 +3,8 @@
 
 __pycache__
 /.venv
+
+# Web console: build artefacts, not sources. `web/dist` is what the HTTP
+# frontend serves, and it is rebuilt by `scripts/build_web.sh`.
+/web/node_modules
+/web/dist
