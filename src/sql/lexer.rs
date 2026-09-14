@@ -74,7 +74,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                     TokenKind::Float(src[start..i].parse().unwrap())
                 } else {
                     let n: i64 = src[start..i].parse().map_err(|_| {
-                        Error::Syntax(format!("integer overflow at byte {start}"))
+                        Error::syntax("integer overflow", start)
                     })?;
                     TokenKind::Int(n)
                 };
@@ -87,9 +87,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                     i += 1;
                 }
                 if i >= bytes.len() {
-                    return Err(Error::Syntax(format!(
-                        "unterminated string at byte {start}"
-                    )));
+                    return Err(Error::syntax("unterminated string", start));
                 }
                 let s = src[start + 1..i].to_string();
                 i += 1;
@@ -138,16 +136,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 if bytes.get(i + 1) == Some(&b'=') {
                     push_punct(&mut out, &mut i, Punct::NotEq, 2);
                 } else {
-                    return Err(Error::Syntax(format!(
-                        "unexpected character '!' at byte {i}"
-                    )));
+                    return Err(Error::syntax("unexpected character '!'", i));
                 }
             }
             _ => {
                 let ch = src.get(i..).and_then(|s| s.chars().next());
-                return Err(Error::Syntax(format!(
-                    "unexpected character {ch:?} at byte {i}"
-                )));
+                return Err(Error::syntax(format!("unexpected character {ch:?}"), i));
             }
         }
     }

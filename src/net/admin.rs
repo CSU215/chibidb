@@ -7,10 +7,10 @@
 use std::path::Path;
 
 use crate::config::{Config, WebRootState};
-use crate::result::{encode_error, json_string};
-use crate::{lexer, parser};
 use crate::lexer::{Punct, Token, TokenKind};
 use crate::net::json::{self, Json};
+use crate::result::{encode_error, json_string};
+use crate::{Error, lexer, parser};
 
 /// A response for `http.rs` to frame and write out.
 pub(crate) struct Response {
@@ -82,13 +82,13 @@ fn parse_trace(body: &[u8]) -> Response {
 
     let (tokens, mut error) = match lexer::lex(sql) {
         Ok(tokens) => (tokens, None),
-        Err(e) => (Vec::new(), Some(("lex", e.to_string()))),
+        Err(e) => (Vec::new(), Some(("lex", e))),
     };
     let mut statements = Vec::new();
     if error.is_none() {
         match parser::parse(sql) {
             Ok(parsed) => statements = parsed.iter().map(|stmt| format!("{stmt:#?}")).collect(),
-            Err(e) => error = Some(("parse", e.to_string())),
+            Err(e) => error = Some(("parse", e)),
         }
     }
 
@@ -103,14 +103,32 @@ fn parse_trace(body: &[u8]) -> Response {
     out.push_str("],\"error\":");
     match error {
         None => out.push_str("null"),
-        Some((stage, message)) => out.push_str(&format!(
-            "{{\"stage\":{},\"message\":{}}}",
-            json_string(stage),
-            json_string(&message)
-        )),
+        Some((stage, error)) => {
+            let (message, pos) = syntax_parts(&error);
+            out.push_str(&format!(
+                "{{\"stage\":{},\"message\":{},\"pos\":{}}}",
+                json_string(stage),
+                json_string(&message),
+                // Null rather than 0: byte 0 is a real position, and a client
+                // must be able to tell "no position" from "the very first byte".
+                pos.map_or_else(|| "null".to_string(), |at| at.to_string()),
+            ));
+        }
     }
     out.push('}');
     Response::json("200 OK", out)
+}
+
+/// The message and byte offset of a compiler complaint.
+///
+/// The offset is only available for syntax errors: once execution starts there
+/// is no token to point at, so a runtime complaint (`no such column`) carries
+/// no position and the client falls back to showing it in the banner.
+fn syntax_parts(error: &Error) -> (String, Option<usize>) {
+    match error {
+        Error::Syntax { message, pos } => (format!("syntax error: {message}"), *pos),
+        other => (other.to_string(), None),
+    }
 }
 
 fn join(items: impl Iterator<Item = String>) -> String {

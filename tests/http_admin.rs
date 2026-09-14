@@ -93,6 +93,84 @@ fn admin_config() -> Config {
     Config::from_toml_str("[server]\nadmin_api = true\n").unwrap()
 }
 
+/// The byte offset the trace pointed at, or `None` if it said `null`.
+///
+/// Starts from the `error` object on purpose: every token also carries a `pos`,
+/// so searching the whole payload finds a token's offset and quietly reports it
+/// as the error's.
+fn reported_pos(payload: &str) -> Option<usize> {
+    let rest = &payload[payload.find(r#""error":"#)?..];
+    let needle = r#""pos":"#;
+    let rest = &rest[rest.find(needle)? + needle.len()..];
+    if rest.starts_with("null") {
+        return None;
+    }
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// Parses `sql` and returns where the trace pointed.
+fn parse_pos(addr: std::net::SocketAddr, sql: &str) -> Option<usize> {
+    let response = post(addr, "/api/parse", &format!("{{\"sql\":\"{sql}\"}}"));
+    reported_pos(body(&response))
+}
+
+#[test]
+fn a_syntax_error_points_at_the_offending_token() {
+    let (addr, _dir) = start_server(admin_config());
+
+    // Each case is asserted by the character found at the reported offset, so
+    // the expectation states what the position *means* rather than restating an
+    // index that was read off the implementation.
+    for (sql, expected) in [
+        ("select 99999999999999999999;", '9'),
+        ("create table t (c char(0));", '0'),
+        ("select 1 limit -1;", '-'),
+        ("select 1 like 2 escape 3;", '3'),
+        ("select 1 +;", ' '),
+    ] {
+        let pos = parse_pos(addr, sql).unwrap_or_else(|| panic!("no position for {sql:?}"));
+        let at = sql[pos..].chars().next();
+        if expected == ' ' {
+            // Nothing to point at: the terminator was consumed, so the cursor is
+            // the honest answer, and that is the end of the statement.
+            assert_eq!(pos, sql.len(), "{sql:?} -> {pos}");
+        } else {
+            assert_eq!(at, Some(expected), "{sql:?} -> pos {pos}, char {at:?}");
+        }
+    }
+}
+
+#[test]
+fn an_unfinished_statement_points_at_its_end() {
+    let (addr, _dir) = start_server(admin_config());
+
+    // The complaint ("expected punctuation") is about a `)` that was never
+    // written, so there is no token to blame; the end of the input is where the
+    // user's cursor is.
+    let sql = "create table t (id int";
+    assert_eq!(parse_pos(addr, sql), Some(sql.len()));
+}
+
+#[test]
+fn a_runtime_only_problem_reports_no_position() {
+    let (addr, _dir) = start_server(admin_config());
+
+    // `select from;` compiles, so /api/parse has nothing to point at. The
+    // distinction matters: the console falls back to a banner for these, and a
+    // position here would make it draw a marker somewhere arbitrary.
+    assert_eq!(parse_pos(addr, "select from;"), None);
+}
+
+#[test]
+fn a_clean_statement_reports_no_error() {
+    let (addr, _dir) = start_server(admin_config());
+
+    let response = post(addr, "/api/parse", r#"{"sql":"select 1 as one;"}"#);
+    assert!(body(&response).contains(r#""error":null"#), "{response}");
+    assert_eq!(reported_pos(body(&response)), None);
+}
+
 #[test]
 fn a_session_outlives_the_connection_that_started_it() {
     let (addr, _dir) = start_server(Config::default());
