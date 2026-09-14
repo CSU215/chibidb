@@ -43,7 +43,14 @@ addr = "127.0.0.1:5678"
 
 # 可选的 HTTP/JSON 前端监听地址；取消注释即可同时开启。
 # POST /query {"sql":"..."} -> {"results":[...]}，GET /health。
+# 该监听器同时托管 Web 控制台（见下面的 web_root），浏览器直接访问即可。
 # http_addr = "127.0.0.1:8080"
+
+# Web 控制台的构建产物目录，托管在 http_addr 的同源路径上。
+# 相对路径按程序启动时的当前工作目录解析（与 config.toml 一致）。
+# 默认值就是 "web/dist"；目录不存在时启动会打印一条 note，访问 / 会给出构建提示。
+# 置为空串表示关闭静态托管。
+# web_root = "web/dist"
 
 # 可选的 MySQL wire 协议监听地址；取消注释即可用 mysql 客户端连接。
 # mysql_addr = "127.0.0.1:3306"

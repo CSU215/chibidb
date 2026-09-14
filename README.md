@@ -12,8 +12,11 @@ cargo run -q -- <dir>           # 文件实例 REPL（数据根目录，多库�
 cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
 # HTTP/JSON 前端：配置 server.http_addr 后，POST /query {"sql":"..."} → {"results":[...]}
+# Web 控制台：同一个 http_addr 上还托管 Web 前端，浏览器直接访问该地址即可
+#   cd web && npm install && npm run build   # 构建产物（需 Node），由 Rust 同源托管
+#   cd web && npm run dev                     # 开发期用 Vite dev server，API 走代理
 # MySQL 前端：配置 server.mysql_addr 后，可用 mysql 客户端连接（mysql_native_password、文本结果集、预处理语句）
-cargo test                      # 全量回归（626 tests，另有 9 个 #[ignore] 性能探针）
+cargo test                      # 全量回归（635 tests，另有 9 个 #[ignore] 性能探针）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -24,6 +27,8 @@ REPL / client 中输入 `exit` 或 `quit` 退出。
 `storage.double_write`、`storage.default_engine`（`"heap"` / `"lsm"`）、
 `storage.inline_lob_limit`、`storage.lsm_compaction_trigger`、`wal.checkpoint_threshold`、`server.addr`、
 `server.http_addr`（可选，HTTP/JSON 监听）、`server.mysql_addr`（可选，MySQL wire 监听）、
+`server.web_root`（默认 `"web/dist"`；托管在 `http_addr` 上的前端产物目录，
+相对路径按当前工作目录解析，`""` 表示关闭托管）、
 `server.thread_model`/`worker_threads`、
 `execution.mode`（`"volcano"` 默认 / `"chunk"` 列式批处理，见下）、
 `transaction.isolation`（`"read_committed"` 默认 / `"repeatable_read"` / `"serializable"`）、
@@ -148,7 +153,7 @@ src/
   index/     key node btree
   catalog/   mod meta
   db/        instance transaction trx
-  net/       server client protocol wire http mysql repl render
+  net/       server client protocol wire http admin mysql repl render
 ```
 
 表存储通过 `TableStorage` 抽象（`Arc<dyn TableStorage>` 存于 catalog），执行层与
