@@ -246,7 +246,7 @@ impl Instance {
                     // Only schema/physical changes need the database
                     // exclusively; DML shares it and serializes per row via the
                     // lock manager.
-                    let result = if crate::is_exclusive(other) {
+                    let result = if other.needs_exclusive() {
                         db.write().execute_stmt_with(session, other)?
                     } else {
                         db.read().execute_stmt_with(session, other)?

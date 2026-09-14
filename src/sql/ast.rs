@@ -369,3 +369,33 @@ pub enum Stmt {
     Checkpoint,
     Vacuum,
 }
+
+impl Stmt {
+    /// Whether a statement mutates schema or physical state and therefore needs
+    /// the database in exclusive mode. DML and transaction control take the
+    /// database shared: concurrent writers are serialized per row by the lock
+    /// manager.
+    pub fn needs_exclusive(&self) -> bool {
+        matches!(
+            self,
+            Stmt::CreateIndex(_)
+                | Stmt::CreateTable(_)
+                | Stmt::CreateView(_)
+                | Stmt::DropIndex(_)
+                | Stmt::DropTable(_)
+                | Stmt::DropView(_)
+                | Stmt::Checkpoint
+                | Stmt::Vacuum
+        )
+    }
+
+    /// Whether a statement only reads, so its autocommit needs no transaction
+    /// bookkeeping. Everything else (DML, DDL, CHECKPOINT, VACUUM) may mutate
+    /// state and takes the normal round trip.
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Stmt::Select(_) | Stmt::Explain(_) | Stmt::ShowTables | Stmt::ShowColumns(_)
+        )
+    }
+}

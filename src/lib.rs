@@ -25,4 +25,4 @@ pub use net::{client, http, mysql, protocol, render, server, wire};
 pub use net::run_repl;
 
 #[allow(unused_imports)]
-pub(crate) use db::{conflict_error, is_exclusive, is_read_only, serialization_error};
+pub(crate) use db::{conflict_error, serialization_error};

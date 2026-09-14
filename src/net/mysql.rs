@@ -601,7 +601,7 @@ fn is_transaction_control(stmt: &crate::sql::ast::Stmt) -> bool {
 /// Statements that commit an open transaction before running (MySQL's implicit
 /// commit): DDL, and everything routed at the instance/database level.
 fn implicit_commit(stmt: &crate::sql::ast::Stmt) -> bool {
-    crate::is_exclusive(stmt)
+    stmt.needs_exclusive()
         || matches!(
             stmt,
             crate::sql::ast::Stmt::CreateDatabase(_)
