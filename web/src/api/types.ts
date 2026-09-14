@@ -100,3 +100,56 @@ export type PlanTrace = {
   error: ParseError | null
   plans: PlanReport[]
 }
+
+/// Cumulative pool counters. A rate is the reader's subtraction: the engine
+/// keeps no window, so changing the polling interval changes nothing here.
+export type PoolCounters = {
+  capacity: number
+  resident: number
+  hits: number
+  misses: number
+  evictions: number
+  dirty_evictions: number
+  hit_rate: number
+}
+
+export type LsmTable = { table: string; levels: number[]; memtable_bytes: number }
+
+/// `GET /api/metrics`.
+export type Metrics = {
+  database: string
+  pool: PoolCounters
+  wal: { bytes: number; threshold: number }
+  lsm: LsmTable[]
+}
+
+/// One resident frame. `accessed` is the CLOCK reference bit.
+export type FrameView = {
+  file: number
+  page: number
+  pins: number
+  dirty: boolean
+  accessed: boolean
+}
+
+/// What happened to one frame. `file`/`page` name the frame the event is
+/// about: for `evict` that is the victim, for `evict_skipped` a frame the
+/// replacer examined and left alone.
+export type PoolEventKind = 'load' | 'evict' | 'evict_skipped' | 'flush' | 'discard'
+
+export type PoolEvent = {
+  seq: number
+  kind: PoolEventKind
+  file: number
+  page: number
+  pins: number
+  dirty: boolean
+}
+
+/// `GET /api/bufferpool/events?since=N`. `next` is the cursor to send back;
+/// `truncated` means the reader fell behind the ring and missed events.
+export type PoolEventLog = {
+  events: PoolEvent[]
+  next: number
+  truncated: boolean
+}

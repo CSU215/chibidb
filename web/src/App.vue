@@ -16,6 +16,10 @@ onMounted(session.bootstrap)
         <strong>chibidb</strong>
         <span class="subtitle">控制台</span>
       </div>
+      <nav class="nav">
+        <router-link to="/">SQL 控制台</router-link>
+        <router-link to="/bufferpool">缓冲池</router-link>
+      </nav>
       <div class="spacer" />
       <div class="session">
         <el-tag size="small" type="info">会话 {{ shortId(session.id) }}</el-tag>
@@ -60,6 +64,24 @@ onMounted(session.bootstrap)
 .subtitle {
   color: var(--el-text-color-secondary);
   font-size: 12px;
+}
+
+.nav {
+  display: flex;
+  gap: 16px;
+  font-size: 13px;
+}
+
+.nav a {
+  color: var(--el-text-color-regular);
+  text-decoration: none;
+  padding: 2px 0;
+  border-bottom: 2px solid transparent;
+}
+
+.nav a.router-link-active {
+  color: var(--el-color-primary);
+  border-bottom-color: var(--el-color-primary);
 }
 
 .spacer {

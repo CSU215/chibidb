@@ -1,4 +1,11 @@
-import type { ParseTrace, PlanTrace, ResultSet } from './types'
+import type {
+  FrameView,
+  Metrics,
+  ParseTrace,
+  PlanTrace,
+  PoolEventLog,
+  ResultSet,
+} from './types'
 
 const SESSION_KEY = 'chibidb.session'
 
@@ -97,6 +104,39 @@ export async function ensureSession(): Promise<string> {
   }
   remember(id)
   return id
+}
+
+/// The admin endpoints answer 404 when `server.admin_api` is off, and that is
+/// the one failure worth naming: everything else is a transport problem.
+function adminFailure(path: string, status: number): ApiError {
+  if (status === 404) {
+    return new ApiError(
+      '内省接口未开启。在服务端 config.toml 里设 server.admin_api = true 后重启。',
+      404,
+    )
+  }
+  return new ApiError(`${path} 请求失败（HTTP ${status}）`, status)
+}
+
+async function adminGet<T>(path: string): Promise<T> {
+  const response = await send(path)
+  if (!response.ok) throw adminFailure(path, response.status)
+  return (await payload(response)) as unknown as T
+}
+
+/// Pool counters, the WAL's position and the LSM tables. Polled on a timer.
+export async function metrics(): Promise<Metrics> {
+  return adminGet<Metrics>('/api/metrics')
+}
+
+/// The frames resident right now.
+export async function poolFrames(): Promise<{ frames: FrameView[] }> {
+  return adminGet<{ frames: FrameView[] }>('/api/bufferpool/frames')
+}
+
+/// The event log after `since` (the `seq` of the last event already seen).
+export async function poolEvents(since: number): Promise<PoolEventLog> {
+  return adminGet<PoolEventLog>(`/api/bufferpool/events?since=${since}`)
 }
 
 /// Asks for the plan without running the statement.
