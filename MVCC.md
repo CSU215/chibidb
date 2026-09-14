@@ -305,6 +305,10 @@ Repeatable Read 行为一致。
   叶链与树一致），随机模型测试每个操作后校验。验收：全绿。
 - **C2**｜lock-fetch 下降 ✅（本提交）：`descend` 在 `key >= high_key` 时沿 `next` 右移重试，
   超过 high key 的键归属右兄弟。单线程下行为不变（模型测试全绿），是并发分裂下的安全网。
+- **C2.5｜复合键 `(key, rid)`** ✅（本提交）：索引排序/路由键改为 `(key, rid)`，rid 打破平局使
+  每条唯一，从而消除非唯一索引的重复串歧义——B-link 无需 `prev` 回溯。分隔键与 high-key 都携带
+  rid；`search`/范围扫描用 sentinel rid（`(k,0)` / `(k,MAX)`）映射区间；删除不再需要多候选子节点。
+  分裂点选择把 high-key 的 rid 字节计入容量；索引 magic 升到 `CHIDBITY`。不变量测试全绿。
 - **C3**（下一步）：插入改 top-down + latch coupling + 预分裂（这才是真正让并发写安全的机制）。
 - **C2**｜查找改 lock-fetch（right-link 右移）。验收：并发「读 + 插入」压力下结果与模型一致。
 - **C3**｜插入改 top-down + latch coupling + 预分裂。验收：`tests/index_model.rs` 的随机

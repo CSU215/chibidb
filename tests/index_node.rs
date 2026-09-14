@@ -10,6 +10,10 @@ fn leaf_page() -> Box<[u8; PAGE_SIZE]> {
     page
 }
 
+fn no_rid() -> Rid {
+    Rid::new(0, 0)
+}
+
 #[test]
 fn leaf_roundtrip_entries() {
     let mut page = leaf_page();
@@ -32,12 +36,12 @@ fn leaf_lower_bound_finds_first_ge() {
     leaf_insert_at(&mut page, 1, b"3", Rid::new(1, 1)).unwrap();
     leaf_insert_at(&mut page, 2, b"5", Rid::new(1, 2)).unwrap();
 
-    assert_eq!(leaf_lower_bound(&page[..], b"0"), 0);
-    assert_eq!(leaf_lower_bound(&page[..], b"1"), 0);
-    assert_eq!(leaf_lower_bound(&page[..], b"2"), 1);
-    assert_eq!(leaf_lower_bound(&page[..], b"3"), 1);
-    assert_eq!(leaf_lower_bound(&page[..], b"5"), 2);
-    assert_eq!(leaf_lower_bound(&page[..], b"6"), 3);
+    assert_eq!(leaf_lower_bound(&page[..], b"0", no_rid()), 0);
+    assert_eq!(leaf_lower_bound(&page[..], b"1", no_rid()), 0);
+    assert_eq!(leaf_lower_bound(&page[..], b"2", no_rid()), 1);
+    assert_eq!(leaf_lower_bound(&page[..], b"3", no_rid()), 1);
+    assert_eq!(leaf_lower_bound(&page[..], b"5", no_rid()), 2);
+    assert_eq!(leaf_lower_bound(&page[..], b"6", no_rid()), 3);
 }
 
 #[test]
@@ -72,27 +76,26 @@ fn internal_routes_to_children() {
     let mut page = Box::new([0u8; PAGE_SIZE]);
     internal_init(&mut page, 100);
     // separators: child 100 covers k < 10; child 101 covers 10 <= k < 20; child 102 covers k >= 20
-    internal_insert_entry(&mut page, 0, b"10", 101).unwrap();
-    internal_insert_entry(&mut page, 1, b"20", 102).unwrap();
+    internal_insert_entry(&mut page, 0, b"10", no_rid(), 101).unwrap();
+    internal_insert_entry(&mut page, 1, b"20", no_rid(), 102).unwrap();
 
     assert_eq!(internal_num(&page[..]), 2);
-    assert_eq!(internal_child_for(&page[..], b"05"), 100);
-    assert_eq!(internal_child_for(&page[..], b"10"), 101);
-    assert_eq!(internal_child_for(&page[..], b"15"), 101);
-    assert_eq!(internal_child_for(&page[..], b"20"), 102);
-    assert_eq!(internal_child_for(&page[..], b"99"), 102);
-    assert_eq!(internal_child_for(&page[..], b""), 100, "empty key goes leftmost");
+    assert_eq!(internal_child_for(&page[..], b"05", no_rid()), 100);
+    assert_eq!(internal_child_for(&page[..], b"10", no_rid()), 101);
+    assert_eq!(internal_child_for(&page[..], b"15", no_rid()), 101);
+    assert_eq!(internal_child_for(&page[..], b"20", no_rid()), 102);
+    assert_eq!(internal_child_for(&page[..], b"99", no_rid()), 102);
+    assert_eq!(internal_child_for(&page[..], b"", no_rid()), 100, "empty key goes leftmost");
 }
 
 #[test]
 fn internal_insert_shifts_children() {
     let mut page = Box::new([0u8; PAGE_SIZE]);
     internal_init(&mut page, 1);
-    internal_insert_entry(&mut page, 0, b"30", 2).unwrap();
+    internal_insert_entry(&mut page, 0, b"30", no_rid(), 2).unwrap();
     // insert a separator between first_child(1) and child 2
-    internal_insert_entry(&mut page, 0, b"10", 3).unwrap();
-    assert_eq!(internal_child_for(&page[..], b"05"), 1);
-    assert_eq!(internal_child_for(&page[..], b"10"), 3);
-    assert_eq!(internal_child_for(&page[..], b"30"), 2);
+    internal_insert_entry(&mut page, 0, b"10", no_rid(), 3).unwrap();
+    assert_eq!(internal_child_for(&page[..], b"05", no_rid()), 1);
+    assert_eq!(internal_child_for(&page[..], b"10", no_rid()), 3);
+    assert_eq!(internal_child_for(&page[..], b"30", no_rid()), 2);
 }
-
