@@ -116,6 +116,20 @@ fn plan_reports_an_index_scan_for_an_indexed_predicate() {
 }
 
 #[test]
+fn plan_on_a_fresh_instance_shows_tokens_without_an_error() {
+    let (addr, _dir) = start_server(demo_config(true));
+
+    // No table, and no database has been created yet. The token stream and AST
+    // are still worth showing; the missing database is not an error.
+    let response = post(addr, "/api/plan", r#"{"sql":"select 1;"}"#);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let payload = body(&response);
+    assert!(payload.contains(r#""error":null"#), "{payload}");
+    assert!(payload.contains(r#""physical":null"#), "{payload}");
+    assert!(payload.contains(r#""tokens":[{"kind":"#), "{payload}");
+}
+
+#[test]
 fn plan_reports_a_plan_stage_error_for_a_missing_table() {
     let (addr, _dir) = start_server(demo_config(true));
     setup(addr);
@@ -215,5 +229,43 @@ fn page_is_404_when_page_preview_is_off() {
     setup(addr);
 
     let response = get(addr, "/api/page?db=main&file=tables%2F000000.dbf&no=0");
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+}
+
+/// Enabling the built-in console is enough; `server.admin_api` is not required
+/// for the plan/schema/config endpoints. Raw page previews still need
+/// `web.page_preview`.
+#[test]
+fn the_demo_console_enables_its_own_api() {
+    let config = Config::from_toml_str(
+        "[server]\nadmin_api = false\n[web]\nenabled = true\npage_preview = false\n",
+    )
+    .unwrap();
+    let (addr, _dir) = start_server(config);
+    setup(addr);
+
+    for path in ["/api/config", "/api/schema"] {
+        let response = get(addr, path);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{path}: {response}");
+    }
+    let response = post(addr, "/api/plan", r#"{"sql":"select 1;"}"#);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+    // The raw disk preview is a separate switch and stays off.
+    let files = get(addr, "/api/files?db=main");
+    assert!(files.starts_with("HTTP/1.1 404"), "{files}");
+}
+
+/// With neither switch on, the whole namespace is closed.
+#[test]
+fn the_api_is_404_without_admin_api_or_the_console() {
+    let config = Config::from_toml_str("[server]\nadmin_api = false\n[web]\nenabled = false\n").unwrap();
+    let (addr, _dir) = start_server(config);
+
+    for path in ["/api/config", "/api/schema"] {
+        let response = get(addr, path);
+        assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
+    }
+    let response = post(addr, "/api/plan", r#"{"sql":"select 1;"}"#);
     assert!(response.starts_with("HTTP/1.1 404"), "{response}");
 }

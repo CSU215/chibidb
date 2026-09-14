@@ -70,8 +70,10 @@ pub(crate) fn handle(
     }
 }
 
-/// The `/api/*` surface. Off unless `server.admin_api` says otherwise, so the
-/// whole namespace answers 404 on a default deployment.
+/// The `/api/*` surface. Off unless `server.admin_api` (for an external SPA) or
+/// `web.enabled` (the built-in console needs it) is set, so the whole namespace
+/// answers 404 on a default deployment. Raw page previews are still gated
+/// separately by `web.page_preview`.
 fn api(
     instance: &Instance,
     session: &Session,
@@ -81,7 +83,7 @@ fn api(
     body: &[u8],
 ) -> Response {
     let config = instance.config();
-    if !config.server.admin_api {
+    if !(config.server.admin_api || config.web.enabled) {
         return Response::not_found();
     }
     match (method, path) {
@@ -174,7 +176,12 @@ fn resolve_statement(
     stmt: &Stmt,
 ) -> std::result::Result<(Option<String>, Option<String>), Error> {
     let db_name = session.current_db().unwrap_or(crate::instance::DEFAULT_DB);
-    let db = instance.database(db_name)?;
+    // A fresh instance has no default database until the first statement
+    // creates it, so there is nothing to plan against yet: report the token
+    // stream and AST only rather than a "no such database" error.
+    let Ok(db) = instance.database(db_name) else {
+        return Ok((None, None));
+    };
     let guard = db.read();
     let Stmt::Select(select) = stmt else {
         return Ok((None, None));

@@ -166,4 +166,6 @@ information_schema/constraints/correlated/miniob_compat/engine_equivalence/concu
 - 内置演示前端在 `web/demo/`（纯 HTML/CSS/JS，`include_str!` 内嵌，无构建），
   `[web] enabled = true` 时在 `/` 托管并优先于 `server.web_root`（默认 `web/dist`）；
   没有 Vue/`scripts/build_web.sh`，`web_root` 仅用于外置构建产物。
+  `/api/*` 在 `[web] enabled` **或** `server.admin_api` 开启后可用；`/api/files`、`/api/page`
+  另需 `[web] page_preview = true`（读原始磁盘页）。内嵌控制台源码改动需重新编译（`include_str!`）。
 - `config.example.toml` 未列出 `server.admin_api`（代码已支持）。

@@ -42,9 +42,10 @@ REPL / client 中输入 `exit` 或 `quit` 退出。启动时从**当前工作目
 - **Text TCP**：`server.addr`；`[u32 len][sql]` 请求 / 帧响应，`client` 子命令即用它。
 - **HTTP/JSON**：设置 `server.http_addr` 后，`GET /health` 返回 `{"status":"ok"}`，
   `POST /query` 以 `{"sql":"..."}` 请求、返回 `{"results":[...]}`；`GET /session` 领取会话，
-  之后携带 `X-Chibi-Session` 头即可让事务跨请求。同一监听器还托管 `server.web_root`
-  指定的静态站点（默认 `web/dist`，不存在时给出构建提示），`/api/*` 由
-  `server.admin_api` 门控（目前提供 `POST /api/parse`，返回 Token 流与 AST）。
+  之后携带 `X-Chibi-Session` 头即可让事务跨请求。同一监听器在 `[web] enabled = true` 时托管
+  内置演示控制台，否则托管 `server.web_root` 指定的静态站点（默认 `web/dist`）。`/api/*`
+  在 `[web] enabled` 或 `server.admin_api` 开启后可用（提供 `/api/parse`、`/api/plan`、
+  `/api/config`、`/api/schema`，以及 `web.page_preview` 门控的 `/api/files`、`/api/page`）。
 - **MySQL wire**：设置 `server.mysql_addr` 后，可用 `mysql` 客户端连接：握手使用
   `mysql_native_password`，`COM_QUERY` 走文本结果集，并支持
   `COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`（预处理语句）。
@@ -59,8 +60,9 @@ REPL / client 中输入 `exit` 或 `quit` 退出。启动时从**当前工作目
 - **存储与页**：浏览数据目录文件、页导航、文件头 / 槽目录 / B+ 节点结构 + Hex / ASCII。
 - **Schema 树**：库 / 表 / 列与约束。
 
-相关接口（均受 `server.admin_api` 门控）：`POST /api/plan`、`GET /api/config`、`GET /api/schema`、
-`GET /api/files`、`GET /api/page`；后两个另需 `[web] page_preview = true`（会读取原始数据页）。
+相关接口（开启 `[web] enabled` **或** `server.admin_api` 后可用）：`POST /api/plan`、`GET /api/config`、
+`GET /api/schema`、`GET /api/files`、`GET /api/page`；后两个另需 `[web] page_preview = true`
+（会读取原始数据页）。
 
 ```toml
 [web]
