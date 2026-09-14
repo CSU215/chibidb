@@ -303,7 +303,9 @@ Repeatable Read 行为一致。
   **借用/合并**与**根坍缩**同步更新 hk/next（`set_leaf_high_key`/`set_internal_high_key` 重建页）。
   新增公开的 `BTree::check_invariants`（节点内 key < hk、hk = 右兄弟最小 key、最右节点 hk 为空、
   叶链与树一致），随机模型测试每个操作后校验。验收：全绿。
-- **C2**（下一步）：查找/下降改 lock-fetch（`key >= high_key` 沿 `next` 右移）。
+- **C2**｜lock-fetch 下降 ✅（本提交）：`descend` 在 `key >= high_key` 时沿 `next` 右移重试，
+  超过 high key 的键归属右兄弟。单线程下行为不变（模型测试全绿），是并发分裂下的安全网。
+- **C3**（下一步）：插入改 top-down + latch coupling + 预分裂（这才是真正让并发写安全的机制）。
 - **C2**｜查找改 lock-fetch（right-link 右移）。验收：并发「读 + 插入」压力下结果与模型一致。
 - **C3**｜插入改 top-down + latch coupling + 预分裂。验收：`tests/index_model.rs` 的随机
   模型在**并发**插入/删除下与 `BTreeMap` 模型一致；无损坏。

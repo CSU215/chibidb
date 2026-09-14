@@ -1128,16 +1128,39 @@ impl BTree {
         }
     }
 
+    /// Descends to the leaf that should hold `key`. B-link "lock-fetch": if
+    /// `key` is at or past a node's high key the key belongs to that node's
+    /// right sibling, so follow `next` and retry. This keeps a descent correct
+    /// even if a split moved the key right after we read its parent.
     fn descend(&self, bp: &BufferPool, mut page_no: PageNo, key: &[u8]) -> Result<PageNo> {
         loop {
-            let ty = bp.read_page(self.file, page_no, |page| Ok(node_type(page)))?;
-            if ty == LEAF {
-                return Ok(page_no);
+            let (ty, hk, next) = bp.read_page(self.file, page_no, |page| {
+                let ty = node_type(page);
+                let hk = if ty == LEAF {
+                    leaf_high_key(page)
+                } else {
+                    internal_high_key(page)
+                };
+                let next = if ty == LEAF { leaf_next(page) } else { internal_next(page) };
+                Ok((ty, hk, next))
+            })?;
+            if !hk.is_empty() && key >= hk.as_slice() {
+                if next == 0 {
+                    return Err(Error::Runtime(format!(
+                        "corrupt index: page {page_no} bounded without a right link"
+                    )));
+                }
+                page_no = next;
+                continue;
             }
-            if ty != INTERNAL {
-                return Err(Error::Runtime(format!("corrupt index page {page_no}")));
+            match ty {
+                LEAF => return Ok(page_no),
+                INTERNAL => {
+                    page_no =
+                        bp.read_page(self.file, page_no, |page| Ok(internal_child_for(page, key)))?;
+                }
+                _ => return Err(Error::Runtime(format!("corrupt index page {page_no}"))),
             }
-            page_no = bp.read_page(self.file, page_no, |page| Ok(internal_child_for(page, key)))?;
         }
     }
 
