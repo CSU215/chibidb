@@ -117,18 +117,18 @@
 ### 4.1 关键接口（示意）
 
 ```rust
-/// PG 式快照：区间 + 例外列表，而不是完整 committed 集合。
+/// PG 式快照：上界 + in-progress 列表，而不是完整 committed 集合。
 pub struct Snapshot {
-    pub xmin: u32,               // < xmin 都已结束
-    pub xmax: u32,               // >= xmax 必不可见
-    pub xip: Box<[u32]>,         // in-progress xid 列表
-    pub self_xid: u32,
+    pub xmax: u32,        // >= xmax 必不可见；< xmax 且不在 xip 的都已在快照前结束
+    pub xip: Vec<u32>,    // in-progress xid 列表（升序）
 }
 
-/// clog 替身：任意 xid 的最终状态。
-pub trait XidStatus {
-    fn is_committed(&self, xid: u32) -> bool;
-    fn is_aborted(&self, xid: u32) -> bool; // 两者皆假 = in progress
+/// clog 替身：按 xid 稠密索引的提交位图（`src/db/clog.rs`）。
+pub struct CommitStatus { /* 分段 AtomicU64 位图 */ }
+impl CommitStatus {
+    pub fn mark_committed(&self, xid: u32);
+    pub fn is_committed(&self, xid: u32) -> bool;
+    pub fn ids(&self) -> Vec<u32>;
 }
 
 /// 行级锁管理器。
@@ -202,13 +202,16 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
 
 > 原则：**先建后拆**。每步保留现有测试通过，并新增锁定新语义的用例。
 
-- **Step 0｜设计定稿**：本文评审通过。验收：文档合入。
-- **Step 1｜快照与 O(n) 开销**：`Snapshot {xmin,xmax,xip}`；`snapshot()` O(in-progress)；
-  去掉每提交 `save_catalog`（改 checkpoint/DDL 保存）。
-  验收：新增「连续 N 次提交后 catalog 大小/提交延迟不随 N 增长」测试；回归全绿。
-- **Step 2｜可见性抽象**：`TrxState.snapshot: HashSet` → `Snapshot` + `XidStatus`；
-  `visible()` 改 PG 区间判定。验收：现有一致性/隔离测试全绿 + 可见性边界单测。
-- **Step 3｜行级锁管理器**：原语化 `LockManager`（tuple 锁 + 等待队列 + 超时 + 死锁检测），
+- **Step 0｜设计定稿** ✅：本文评审通过（`3c7ff1e`）。
+- **Step 1｜去 O(n) 开销** ✅：去掉每提交 `save_catalog`（`4e66b6b`）；
+  DML 不再重写 catalog，`catalog.bin` 随历史提交数不再增长。
+- **Step 2｜快照与可见性抽象** ✅（`2bdd52e`）：`Snapshot {xmax, xip}` + 稠密提交位图
+  `CommitStatus`（clog）；`TrxState` 持 `{ snapshot, clog: Arc<CommitStatus> }`，`visible()`
+  改为"`xid < xmax`、不在 `xip`、clog 已提交"；`conflicting_committer`/`vacuum` 走 clog。
+  `snapshot()` 从 O(committed) 降到 O(in-progress)。
+  *注*：实际 Snapshot 未保留单独的 `xmin` —— 有精确 clog 时 `x < xmin` 与 `[xmin,xmax)`
+  的判定合流，`xmin` 只在"用区间近似 clog"（Step 7 的 horizon）时才需要。
+- **Step 3｜行级锁管理器**（下一步）：原语化 `LockManager`（tuple 锁 + 等待队列 + 超时 + 死锁检测），
   替换整库 `DatabaseWriteLock`。验收：不同行不阻塞 / 同行按序等待 / 超时 / 死锁回退用例。
 - **Step 4｜RC + EPQ**（默认档先做对）：记录头加 `next_rid`；等锁后 EPQ 重读最新版本。
   验收：RC 下「后写者看到前者结果而非 abort」用例。
