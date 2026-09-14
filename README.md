@@ -16,9 +16,9 @@ cargo run -q -- client [addr]   # 连接 server 的交互式客户端
 #   scripts/build_web.sh                      # 构建前端产物 web/dist（需 Node 与网络）
 #   cd web && npm run dev                     # 或开发期用 Vite dev server，API 走代理
 #   设 server.admin_api = true 后，编辑器里会实时标出词法/语法错误（红色波浪线 + 悬停气泡），
-#   并可展开「解析详情」查看 Token 流与 AST；关掉则退化为只有错误横幅
+#   并可展开「编译详情 / 执行计划」查看 Token 流、AST 与执行计划；关掉则退化为只有错误横幅
 # MySQL 前端：配置 server.mysql_addr 后，可用 mysql 客户端连接（mysql_native_password、文本结果集、预处理语句）
-cargo test                      # 全量回归（658 tests，另有 9 个 #[ignore] 性能探针）
+cargo test                      # 全量回归（682 tests，另有 9 个 #[ignore] 性能探针）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -31,7 +31,8 @@ REPL / client 中输入 `exit` 或 `quit` 退出。
 `server.http_addr`（可选，HTTP/JSON 监听）、`server.mysql_addr`（可选，MySQL wire 监听）、
 `server.web_root`（默认 `"web/dist"`；托管在 `http_addr` 上的前端产物目录，
 相对路径按当前工作目录解析，`""` 表示关闭托管）、
-`server.admin_api`（默认 `false`；开启后 `/api/*` 才可用，目前提供 `POST /api/parse`）、
+`server.admin_api`（默认 `false`；开启后 `/api/*` 才可用，目前提供 `POST /api/parse`（Token 流 + AST）
+与 `POST /api/plan`（执行计划：**真实算子树** + 选定/被否决的访问路径与理由 + 表/列绑定信息））、
 `server.thread_model`/`worker_threads`、
 `execution.mode`（`"volcano"` 默认 / `"chunk"` 列式批处理，见下）、
 `transaction.isolation`（`"read_committed"` 默认 / `"repeatable_read"` / `"serializable"`）、
@@ -164,6 +165,12 @@ src/
 `web/dist/` 是 `scripts/build_web.sh` 的构建产物（**不入库**），由 `server.web_root` 指定。
 控制台通过 `X-Chibi-Session` 让事务跨越多次 HTTP 请求——浏览器会自由复用连接，
 没有这个头的话 `BEGIN` 之后的 `INSERT` 可能落到另一条连接上。
+
+控制台的「执行计划」面板走 `POST /api/plan`，它渲染的是**执行器刚构建的那棵算子树**
+（`build_statement` 建好后不执行、直接丢弃），而不是 `exec/plan.rs` 的 EXPLAIN 文本——
+后者是同一判定的**平行实现**（设计书 §11.1 自述「每处改动需要两边同步」）。
+两者都给，并且 `tests/plan_api.rs` 的漂移检测断言它们对同一语句的访问路径一致，
+把「靠纪律同步」变成「靠断言同步」。面板同时给出被否决的候选路径与理由、表/列绑定信息。
 
 表存储通过 `TableStorage` 抽象（`Arc<dyn TableStorage>` 存于 catalog），执行层与
 `Database` 的 `store_*`/回滚/vacuum/唯一性检查都走该接缝。两种引擎：
