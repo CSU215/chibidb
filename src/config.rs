@@ -48,6 +48,23 @@ pub enum ConflictStrategy {
     TwoPl,
 }
 
+/// Transaction isolation level, following PostgreSQL's model. The difference
+/// is only *when* a snapshot is taken and how a write-write conflict is
+/// resolved: read committed refreshes the snapshot per statement and re-reads
+/// the conflicting row (EPQ); repeatable read keeps one snapshot for the whole
+/// transaction and aborts on a conflicting write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Isolation {
+    /// Each statement sees the latest committed data; writers whose row was
+    /// concurrently updated restart the statement and apply to the new version.
+    #[default]
+    ReadCommitted,
+    /// The transaction sees one stable snapshot; a conflicting writer gets a
+    /// serialization failure (SQLSTATE 40001).
+    RepeatableRead,
+}
+
 /// How accepted connections are mapped to execution threads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -134,13 +151,19 @@ pub struct AuthConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct TransactionConfig {
     pub conflict: ConflictStrategy,
+    /// Isolation level for explicit transactions and autocommit statements.
+    pub isolation: Isolation,
     /// How long a writer waits for the 2PL database lock before giving up.
     pub lock_timeout_ms: u64,
 }
 
 impl Default for TransactionConfig {
     fn default() -> Self {
-        Self { conflict: ConflictStrategy::Fcw, lock_timeout_ms: 5000 }
+        Self {
+            conflict: ConflictStrategy::Fcw,
+            isolation: Isolation::ReadCommitted,
+            lock_timeout_ms: 5000,
+        }
     }
 }
 

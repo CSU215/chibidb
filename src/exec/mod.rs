@@ -3,7 +3,7 @@ use crate::ast::{
     DropTableStmt, DropViewStmt, Expr, InsertStmt, ShowColumnsStmt, Stmt, UpdateStmt,
 };
 use crate::catalog::Schema;
-use crate::config::{EngineKind, PageLayout};
+use crate::config::{EngineKind, Isolation, PageLayout};
 use crate::result::ResultSet;
 use crate::storage::codec::decode_record;
 use crate::trx::TrxState;
@@ -231,7 +231,44 @@ fn execute_vacuum(db: &Database, trx: &TrxState) -> Result<ResultSet> {
     Ok(ResultSet::Message(format!("VACUUM COMPLETE: {purged} rows purged")))
 }
 
+/// How many times a read-committed statement is restarted after a concurrent
+/// row update before it gives up with a serialization failure.
+const MAX_EPQ_RETRIES: u32 = 16;
+
+/// Runs a write statement, restarting it on an EPQ conflict under read
+/// committed. The row lock is held across the restart, so the retry cannot be
+/// outraced; on repeatable read (or once retries are exhausted) the statement
+/// reports a serialization failure instead.
+fn epq_retry(
+    db: &Database,
+    trx: &mut TrxState,
+    table: &str,
+    mut run: impl FnMut(&Database, &mut TrxState) -> Result<()>,
+) -> Result<()> {
+    let undo_mark = trx.undo.len();
+    let wal_mark = trx.wal.len();
+    let mut attempts = 0u32;
+    loop {
+        match run(db, trx) {
+            Err(Error::Retry) if db.isolation() == Isolation::ReadCommitted => {
+                db.rollback_trx_to(trx, undo_mark, wal_mark)?;
+                trx.snapshot = db.current_snapshot();
+                attempts += 1;
+                if attempts >= MAX_EPQ_RETRIES {
+                    return Err(crate::conflict_error(table));
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
 pub(crate) fn execute_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<ResultSet> {
+    epq_retry(db, trx, &u.table, |db, trx| apply_update(db, trx, u))
+        .map(|()| ResultSet::Message("SUCCESS".into()))
+}
+
+fn apply_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<()> {
     let schema = db.catalog().table(&u.table)?.schema.clone();
     let mut assigns = Vec::new();
     for (col, expr) in &u.assignments {
@@ -265,11 +302,15 @@ pub(crate) fn execute_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) 
         db.check_unique(&u.table, &new_row, Some(rid), trx, &mut claimed)?;
         updates.push((rid, new_row));
     }
-    db.store_update_versions(&u.table, &updates, trx)?;
-    Ok(ResultSet::Message("SUCCESS".into()))
+    db.store_update_versions(&u.table, &updates, trx)
 }
 
 pub(crate) fn execute_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<ResultSet> {
+    epq_retry(db, trx, &d.table, |db, trx| apply_delete(db, trx, d))
+        .map(|()| ResultSet::Message("SUCCESS".into()))
+}
+
+fn apply_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<()> {
     let schema = db.catalog().table(&d.table)?.schema.clone();
     let records = db.store_scan_raw(&d.table)?;
     let mut victims = Vec::new();
@@ -286,8 +327,7 @@ pub(crate) fn execute_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) 
             victims.push(rid);
         }
     }
-    db.store_delete_mark(&d.table, &victims, trx)?;
-    Ok(ResultSet::Message("SUCCESS".into()))
+    db.store_delete_mark(&d.table, &victims, trx)
 }
 
 /// Resolves the schema positions targeted by an INSERT: either every column

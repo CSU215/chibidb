@@ -73,7 +73,7 @@ impl DatabaseWriteLock {
 
 use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
-use crate::config::{Config, ConflictStrategy, EngineKind, ExecutionMode, PageLayout};
+use crate::config::{Config, ConflictStrategy, EngineKind, ExecutionMode, Isolation, PageLayout};
 use crate::index::{encode_key, BTree};
 use crate::pipeline::{ExecuteStage, OptimizeStage, Pipeline, ResolveStage, SqlEvent};
 use crate::storage::codec::{decode_record, encode_record};
@@ -298,6 +298,17 @@ impl Database {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The configured transaction isolation level.
+    pub(crate) fn isolation(&self) -> Isolation {
+        self.config.transaction.isolation
+    }
+
+    /// A fresh snapshot of the currently committed state, used by read
+    /// committed to give each statement its own view (and by EPQ restarts).
+    pub(crate) fn current_snapshot(&self) -> crate::db::transaction::Snapshot {
+        self.trx.snapshot()
     }
 
     /// Buffer-pool lookup counters, for observability and cache-behavior tests.
@@ -549,6 +560,21 @@ impl Database {
             && self.trx.is_committed(id)
     }
 
+    /// Whether the version at `rid` was deleted or superseded by a transaction
+    /// that committed after `trx`'s snapshot. Callers hold the row lock, so the
+    /// answer is stable. Read committed restarts the statement on `true` (EPQ);
+    /// repeatable read lets the commit-time check abort instead.
+    fn row_was_concurrently_modified(
+        &self,
+        rid: Rid,
+        engine: &dyn TableStorage,
+        trx: &TrxState,
+    ) -> Result<bool> {
+        let rec = engine.get(&self.pool, rid)?;
+        let (_, deleter, _) = decode_record(&rec, &self.lobs)?;
+        Ok(self.conflicting_committer(trx, deleter))
+    }
+
     /// Emulates a process crash: dirty buffer-pool pages are lost while
     /// already-appended WAL bytes (OS page cache) survive, like SIGKILL.
     /// Leaks the temp dir of in-memory databases; use file-backed ones.
@@ -696,6 +722,11 @@ impl Database {
                         let (snapshot, clog) = self.trx.begin_snapshot();
                         session.begin(id, snapshot, clog, false);
                     }
+                } else if self.isolation() == Isolation::ReadCommitted {
+                    // read committed: every statement sees the latest committed
+                    // data, so refresh the transaction's snapshot per statement.
+                    session.trx.as_mut().expect("explicit trx is open").snapshot =
+                        self.current_snapshot();
                 }
                 let (undo_mark, wal_mark) = session
                     .trx
@@ -813,7 +844,12 @@ impl Database {
     /// buffered after `wal_mark`. Used for a statement-level rollback inside an
     /// explicit transaction, so earlier statements survive and their buffered
     /// frames stay.
-    fn rollback_trx_to(&self, trx: &mut TrxState, undo_mark: usize, wal_mark: usize) -> Result<()> {
+    pub(crate) fn rollback_trx_to(
+        &self,
+        trx: &mut TrxState,
+        undo_mark: usize,
+        wal_mark: usize,
+    ) -> Result<()> {
         if undo_mark == 0 {
             // full rollback: release the transaction's row locks
             self.locks.unlock_all(trx.id);
@@ -1123,6 +1159,13 @@ impl Database {
         for rid in rids {
             // serialize writers of the same row; different rows proceed
             self.locks.lock(deleter, name, *rid)?;
+            // read committed: the row changed under us, so restart the statement
+            // (EPQ) with a fresh snapshot rather than abort.
+            if self.isolation() == Isolation::ReadCommitted
+                && self.row_was_concurrently_modified(*rid, &*engine, trx)?
+            {
+                return Err(Error::Retry);
+            }
             let (prev_deleter, prev_next_rid) = engine.delete_mark(&self.pool, *rid, deleter, 0)?;
             trx.undo.push(Undo::DeleteMark {
                 table: name.to_string(),
@@ -1158,6 +1201,13 @@ impl Database {
         for (rid, new_row) in updates {
             // serialize writers of the same row; different rows proceed
             self.locks.lock(trx_id, name, *rid)?;
+            // read committed: the row changed under us, so restart the statement
+            // (EPQ) with a fresh snapshot rather than abort.
+            if self.isolation() == Isolation::ReadCommitted
+                && self.row_was_concurrently_modified(*rid, &*engine, trx)?
+            {
+                return Err(Error::Retry);
+            }
             let data = encode_record(trx_id, 0, 0, new_row, &self.lobs, self.inline_lob_limit())?;
             let new_rid = engine.insert(&self.pool, &data)?;
             crate::wal::encode_frame_into(
@@ -1225,7 +1275,7 @@ pub(crate) fn is_read_only(stmt: &crate::ast::Stmt) -> bool {
 /// serialization-failure wording (`SQLSTATE 40001`): the version this
 /// transaction read was updated by another transaction that committed after
 /// its snapshot.
-fn conflict_error(table: &str) -> Error {
+pub(crate) fn conflict_error(table: &str) -> Error {
     Error::Runtime(format!(
         "could not serialize access due to concurrent update on {table}"
     ))

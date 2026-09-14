@@ -227,9 +227,20 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
   PAX 版本段 16→24 字节/槽（魔数 `PAX2→PAX3`）；`TableStorage::delete_mark` 返回
   `(prev_deleter, prev_next_rid)`。验收：`update_links_the_old_version_to_the_new_one` +
   codec/pax/engine 链相关单测；全量 607 项测试绿。
-- **Step 4b｜RC + EPQ**（待做，依赖 4a）：加隔离级别配置（`read_committed` 默认，按语句取快照）；
-  等锁后沿 `next_rid` 重读最新已提交版本并重跑 WHERE/SET（EPQ），命中则改最新版本，否则跳过。
-  验收：RC 下「后写者看到前者结果而非 abort」用例。
+- **Step 4b｜RC + EPQ** ✅：新增 `transaction.isolation`（`read_committed` **默认** / `repeatable_read`）。
+  - **RC 快照时机**：`execute_stmt_with` 在显式事务内每条语句前刷新 `trx.snapshot`（`current_snapshot()`）；
+    自动提交本就在语句开始时取新快照。
+  - **EPQ 以"语句级重启"实现**：`store_update_versions`/`store_delete_mark` 在拿到行锁后检查该版本是否被
+    "本快照之后提交"的事务改过（`row_was_concurrently_modified`）。若是，RC 下返回内部信号
+    `Error::Retry`；`execute_update`/`execute_delete` 的 `epq_retry` 回滚本语句（`rollback_trx_to` 到语句
+    起点，行锁全程持有）→ 用新快照重跑整条语句。重启时重新扫描即看到最新已提交版本并重跑 WHERE/SET，
+    谓词不再命中则自然跳过；超过 `MAX_EPQ_RETRIES`(16) 次报 40001。
+  - **RR**：不重启，冲突由提交期 FCW 检查报 40001（原语义保留）。
+  - 说明：本实现是 RC 下 EPQ 的等价形式（整条语句重启而非仅重读冲突行）；`next_rid`（Step 4a）已记录，
+    供后续逐行 EPQ/SSI 使用。验收：`read_committed_reapplies_after_a_concurrent_update`（不丢更新）、
+    `read_committed_skips_a_row_the_concurrent_commit_moved_out_of_the_predicate`、
+    `read_committed_sees_a_concurrent_commit_per_statement`、`repeatable_read_aborts_the_lost_update`；
+    全量 611 项测试绿。
 - **Step 5｜RR / SI**：事务级快照固定；冲突报 40001（不再 FCW）。撤掉 Instance 的整库写独占。
   验收：丢更新回滚、可重复读、并发吞吐随线程上升。
 - **Step 6｜Serializable（SSI）**：跟踪 rw-依赖并检测危险结构，命中报 40001。

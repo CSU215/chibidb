@@ -57,7 +57,7 @@ python3 scripts/smoke.py     # Windows: python scripts\smoke.py；期望输出 S
 `storage.buffer_pool_frames`、`storage.eviction`、`storage.double_write`、`storage.default_engine`、
 `storage.inline_lob_limit`、
 `storage.lsm_compaction_trigger`、`wal.checkpoint_threshold`、`server.addr`/`http_addr`/`mysql_addr`、
-`server.thread_model`/`worker_threads`、`execution.mode`、`auth.enabled`、`transaction.conflict`/`lock_timeout_ms`。
+`server.thread_model`/`worker_threads`、`execution.mode`、`auth.enabled`、`transaction.isolation`/`conflict`/`lock_timeout_ms`。
 页大小（`PAGE_SIZE=8192`）是编译期常量，**不是**配置项（动态页大小属 P6 存储抽象）。
 
 ---
