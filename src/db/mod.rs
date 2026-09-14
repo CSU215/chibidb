@@ -2,5 +2,6 @@
 
 pub mod clog;
 pub mod instance;
+pub mod lockmgr;
 pub mod transaction;
 pub mod trx;
