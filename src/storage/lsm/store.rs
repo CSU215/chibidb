@@ -99,6 +99,17 @@ impl LsmStore {
             .collect())
     }
 
+    /// Bytes buffered in the memtable, i.e. how much is waiting to become an
+    /// SSTable. Approximate: it counts the encoded entries, not capacity.
+    pub fn memtable_bytes(&self) -> usize {
+        self.memtable.approx_bytes()
+    }
+
+    /// How many live tables each level holds, level 0 first.
+    pub fn level_counts(&self) -> Vec<usize> {
+        self.levels.iter().map(Vec::len).collect()
+    }
+
     pub fn num_sstables(&self) -> usize {
         self.levels.iter().map(Vec::len).sum()
     }

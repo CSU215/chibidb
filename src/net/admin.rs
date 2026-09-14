@@ -48,13 +48,14 @@ pub(crate) fn handle(
     session: &mut Session,
     method: &str,
     path: &str,
+    query: &str,
     body: &[u8],
 ) -> Option<Response> {
     match (method, path) {
         // The legacy frontend keeps these two.
         ("GET", "/health") | ("POST", "/query") => None,
         (_, path) if path.starts_with("/api/") => {
-            Some(api(instance, session, method, path, body))
+            Some(api(instance, session, method, path, query, body))
         }
         ("GET", path) => Some(static_file(instance.config(), path)),
         _ => None,
@@ -68,6 +69,7 @@ fn api(
     session: &mut Session,
     method: &str,
     path: &str,
+    query: &str,
     body: &[u8],
 ) -> Response {
     if !instance.config().server.admin_api {
@@ -76,8 +78,88 @@ fn api(
     match (method, path) {
         ("POST", "/api/parse") => parse_trace(body),
         ("POST", "/api/plan") => plan_trace(instance, session, body),
+        ("GET", "/api/metrics") => metrics_trace(instance, session),
+        ("GET", "/api/bufferpool/frames") => frames_trace(instance, session),
+        ("GET", "/api/bufferpool/events") => events_trace(instance, session, query),
         _ => Response::not_found(),
     }
+}
+
+/// `GET /api/metrics` -- cumulative pool counters, the WAL's position, and one
+/// line per LSM table.
+///
+/// **Cumulative, not a rate.** The console samples this on a timer and
+/// subtracts; the engine keeps no window, so changing the polling interval
+/// changes nothing on this side. Same rule as `tests/perf_stats.rs`.
+fn metrics_trace(instance: &Instance, session: &mut Session) -> Response {
+    with_current_db(instance, session, |database, db| {
+        Response::json("200 OK", introspect::pool::metrics(database, db).to_json())
+    })
+}
+
+/// `GET /api/bufferpool/frames` -- what is resident right now, with the pin
+/// count and dirty bit each frame is in.
+fn frames_trace(instance: &Instance, session: &mut Session) -> Response {
+    with_current_db(instance, session, |_, db| {
+        Response::json("200 OK", introspect::pool::frames_json(&introspect::pool::frames(db)))
+    })
+}
+
+/// `GET /api/bufferpool/events?since=N` -- the event log from a cursor.
+///
+/// The cursor is the `seq` of the last event the caller saw; the response's
+/// `next` is what to send back. `truncated` means the caller was away longer
+/// than the ring is deep, so it must start over rather than believe it saw
+/// everything.
+fn events_trace(instance: &Instance, session: &mut Session, query: &str) -> Response {
+    let since = match query_param(query, "since") {
+        None => 0,
+        Some(text) => match text.parse::<u64>() {
+            Ok(seq) => seq,
+            Err(_) => {
+                return Response::json(
+                    "400 Bad Request",
+                    encode_error("since must be a non-negative integer"),
+                );
+            }
+        },
+    };
+    with_current_db(instance, session, |_, db| {
+        Response::json(
+            "200 OK",
+            introspect::pool::events_json(&introspect::pool::events(db, since)),
+        )
+    })
+}
+
+/// Runs `f` against the session's database, resolved exactly the way a query
+/// would resolve it (including creating and selecting the default one), and
+/// held under the shared lock: these endpoints only read.
+fn with_current_db<F>(instance: &Instance, session: &mut Session, f: F) -> Response
+where
+    F: FnOnce(&str, &crate::Database) -> Response,
+{
+    let database = match instance.ensure_current_db(session) {
+        Ok(name) => name,
+        Err(e) => return Response::json("500 Internal Server Error", encode_error(&e.to_string())),
+    };
+    let Ok(db) = instance.database(&database) else {
+        return Response::json(
+            "500 Internal Server Error",
+            encode_error("database is not open"),
+        );
+    };
+    f(&database, &db.read())
+}
+
+/// One parameter out of a query string, percent-decoding left out on purpose:
+/// the only parameter in use is a decimal cursor, and anything that would need
+/// decoding is rejected rather than guessed at.
+fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then_some(value)
+    })
 }
 
 /// `POST /api/plan` -- the plan the engine will run, why it chose it, and what

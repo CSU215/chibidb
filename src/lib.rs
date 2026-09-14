@@ -283,6 +283,16 @@ impl Database {
         self.pool.stats()
     }
 
+    /// Bytes appended to the WAL since the last checkpoint, and the threshold
+    /// that triggers one. The console plots how close the two are.
+    pub fn wal_bytes(&self) -> u64 {
+        self.wal.len().unwrap_or(0)
+    }
+
+    pub fn wal_checkpoint_threshold(&self) -> u64 {
+        self.wal_checkpoint_threshold.load(Ordering::Relaxed)
+    }
+
     pub fn flush(&self) -> Result<()> {
         if !self.trx.no_open_transactions() {
             // truncating the log now would drop the open transaction's redo

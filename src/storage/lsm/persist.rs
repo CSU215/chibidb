@@ -86,6 +86,14 @@ impl PersistentLsm {
         self.store.num_sstables()
     }
 
+    pub fn memtable_bytes(&self) -> usize {
+        self.store.memtable_bytes()
+    }
+
+    pub fn level_counts(&self) -> Vec<usize> {
+        self.store.level_counts()
+    }
+
     /// File numbers of every live table, newest first.
     pub fn sstable_file_numbers(&self) -> Vec<u32> {
         self.store

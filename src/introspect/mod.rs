@@ -11,3 +11,4 @@
 //! the catalog and the plan, and hands back something a JSON writer can spell.
 
 pub mod plan;
+pub mod pool;

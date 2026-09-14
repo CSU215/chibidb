@@ -126,6 +126,24 @@ pub trait TableStorage: TableEngine + std::fmt::Debug {
     fn flush(&self) -> Result<()> {
         Ok(())
     }
+
+    /// A summary of an LSM table's shape, for the console's LSM view.
+    ///
+    /// `None` for engines without levels to report -- the heap's pages are
+    /// described by the buffer pool and the space map instead, and inventing
+    /// a "level 0" for it would mean nothing.
+    fn lsm_stats(&self) -> Option<LsmStats> {
+        None
+    }
+}
+
+/// How an LSM table is laid out right now: live tables per level, and how much
+/// is still in the memtable waiting to become one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsmStats {
+    /// Live SSTable count per level, level 0 first.
+    pub levels: Vec<usize>,
+    pub memtable_bytes: u64,
 }
 
 /// Engine backed by the current on-disk heap layout. `new` is an unvalidated

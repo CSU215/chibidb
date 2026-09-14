@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 
 use crate::storage::buffer::BufferPool;
-use crate::storage::engine::{RowScanner, TableEngine, TableStorage};
+use crate::storage::engine::{LsmStats, RowScanner, TableEngine, TableStorage};
 use crate::storage::heap::Rid;
 use crate::storage::lsm::persist::PersistentLsm;
 use crate::storage::lsm::store::MergeScanner;
@@ -149,6 +149,14 @@ impl TableStorage for LsmEngine {
 
     fn file_id(&self) -> FileId {
         LSM_FILE_ID
+    }
+
+    fn lsm_stats(&self) -> Option<LsmStats> {
+        let inner = self.inner.lock();
+        Some(LsmStats {
+            levels: inner.level_counts(),
+            memtable_bytes: inner.memtable_bytes() as u64,
+        })
     }
 
     fn insert_at(&self, _bp: &BufferPool, rid: Rid, record: &[u8]) -> Result<()> {

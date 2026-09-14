@@ -77,9 +77,10 @@ fn serve_connection(
 
         let body_end = body_end.min(buf.len());
         let body = &buf[header_end..body_end];
-        let (method, path) = request_line(&head);
+        let (method, path, query) = request_line(&head);
         let keep_alive = !head.to_ascii_lowercase().contains("connection: close");
-        let response = dispatch(instance, registry, &mut local, &head, &method, &path, body);
+        let response =
+            dispatch(instance, registry, &mut local, &head, &method, &path, &query, body);
         write_response(&mut stream, &response, keep_alive)?;
 
         buf.drain(..body_end);
@@ -99,6 +100,7 @@ fn serve_connection(
 /// comes back in the response, and is a new one when the requested id was
 /// unknown. A request without the header runs on the connection's own session
 /// and gets no id, which is what keeps stateless clients identical to before.
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     instance: &Instance,
     registry: &SessionRegistry,
@@ -106,6 +108,7 @@ fn dispatch(
     head: &str,
     method: &str,
     path: &str,
+    query: &str,
     body: &[u8],
 ) -> Response {
     // `GET /session` mints an id without running a statement, so a fresh page
@@ -121,11 +124,11 @@ fn dispatch(
     }
 
     let Some(requested) = header(head, SESSION_HEADER) else {
-        return route(instance, local, method, path, body);
+        return route(instance, local, method, path, query, body);
     };
     let (id, session) = registry.claim(requested);
     // Locking after `claim` returned, never while holding the registry lock.
-    let mut response = route(instance, &mut session.lock(), method, path, body);
+    let mut response = route(instance, &mut session.lock(), method, path, query, body);
     response.extra_headers.push((SESSION_HEADER, id));
     response
 }
@@ -135,11 +138,12 @@ fn route(
     session: &mut Session,
     method: &str,
     path: &str,
+    query: &str,
     body: &[u8],
 ) -> Response {
     // The admin surface owns `/api/*` and static hosting; it declines the two
     // legacy paths so they keep their exact previous behaviour.
-    if let Some(response) = admin::handle(instance, session, method, path, body) {
+    if let Some(response) = admin::handle(instance, session, method, path, query, body) {
         return response;
     }
     match (method, path) {
@@ -191,14 +195,20 @@ fn read_body(stream: &mut TcpStream, buf: &mut Vec<u8>, want: usize) -> io::Resu
     Ok(())
 }
 
-fn request_line(head: &str) -> (String, String) {
+/// Splits the request line into method, path and query.
+///
+/// The path keeps dropping the query and fragment -- `/assets/app.js?v=1` names
+/// the file `app.js`, and a route never matches on a query. The query is passed
+/// on separately because `/api/bufferpool/events?since=N` reads a cursor out of
+/// it.
+fn request_line(head: &str) -> (String, String, String) {
     let line = head.lines().next().unwrap_or("");
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
-    // Drop the query and fragment: `/assets/app.js?v=1` names the file `app.js`.
     let target = parts.next().unwrap_or("/");
-    let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
-    (method, path)
+    let target = target.split('#').next().unwrap_or("/");
+    let (path, query) = target.split_once('?').map_or((target, ""), |(path, query)| (path, query));
+    (method, path.to_string(), query.to_string())
 }
 
 /// The first value for a header, case-insensitively. The request line has no
