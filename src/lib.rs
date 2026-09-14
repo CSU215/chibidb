@@ -1438,4 +1438,31 @@ mod tests {
         .unwrap();
         assert_eq!(new_row, vec![Value::Int(1), Value::Int(20)]);
     }
+
+    #[test]
+    fn update_version_link_is_rebuilt_from_the_wal() {
+        use crate::storage::codec::{record_next_rid, unpack_rid};
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Database::open(dir.path()).unwrap();
+            db.execute_sql("create table t (id int, v int);").unwrap();
+            db.execute_sql("insert into t values (1, 10);").unwrap();
+            // make the base version durable so recovery only has the update to redo
+            db.flush().unwrap();
+            db.execute_sql("update t set v = 20 where id = 1;").unwrap();
+            db.simulate_crash();
+        }
+        let db = Database::open(dir.path()).unwrap();
+        let recs = db.store_scan_raw("t").unwrap();
+        let next = recs
+            .iter()
+            .map(|(_, r)| record_next_rid(r).unwrap())
+            .find(|n| *n != 0)
+            .expect("the forwarded link is rebuilt from the WAL DeleteMark frame");
+        let (page, slot) = unpack_rid(next);
+        assert!(
+            recs.iter().any(|(rid, _)| rid.page_no == page && rid.slot == slot),
+            "the link must target a version present after recovery"
+        );
+    }
 }
