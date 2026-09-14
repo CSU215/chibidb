@@ -243,37 +243,14 @@ impl Instance {
                     }
                     let db_name = self.ensure_current_db(session)?;
                     let db = self.database(&db_name)?;
-                    let read_only = crate::is_read_only(other);
-                    // Take the 2PL write lock before the database lock. The
-                    // clone is taken under a short read, then the wait happens
-                    // with no database lock held, so it cannot deadlock against
-                    // another session's COMMIT.
-                    let pre_acquired = self.config.transaction.conflict
-                        == crate::config::ConflictStrategy::TwoPl
-                        && !read_only
-                        && !session.holds_writer();
-                    let write_lock = if pre_acquired {
-                        Some(db.read().write_lock())
-                    } else {
-                        None
-                    };
-                    if let Some(lock) = &write_lock {
-                        lock.acquire(session.id())?;
-                    }
-                    // Only schema/physical changes need the database exclusively;
-                    // DML shares it and serializes per row via the lock manager.
+                    // Only schema/physical changes need the database
+                    // exclusively; DML shares it and serializes per row via the
+                    // lock manager.
                     let result = if crate::is_exclusive(other) {
                         db.write().execute_stmt_with(session, other)?
                     } else {
                         db.read().execute_stmt_with(session, other)?
                     };
-                    // release only if this statement took it and no explicit
-                    // transaction (BEGIN) adopted it
-                    if let Some(lock) = &write_lock
-                        && !session.holds_writer()
-                    {
-                        lock.release(session.id());
-                    }
                     if let Some(rs) = result {
                         out.push(rs);
                     }

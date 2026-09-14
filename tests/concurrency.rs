@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chibidb::config::{Config, ConflictStrategy};
+use chibidb::config::Config;
 use chibidb::instance::Instance;
 use chibidb::value::Value;
 use chibidb::{ResultSet, Session};
@@ -72,10 +72,9 @@ fn same_database_writes_serialize_safely() {
 }
 
 #[test]
-fn instance_two_pl_blocks_the_second_writer() {
+fn instance_row_locks_block_the_second_writer() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
-    cfg.transaction.conflict = ConflictStrategy::TwoPl;
     cfg.transaction.lock_timeout_ms = 100;
     let inst = Instance::open(dir.path(), &cfg).unwrap();
     inst.create_database("a").unwrap();
@@ -89,13 +88,16 @@ fn instance_two_pl_blocks_the_second_writer() {
     inst.execute_with(&mut a, "begin;").unwrap();
     inst.execute_with(&mut a, "update t set id = 2 where id = 1;").unwrap();
 
+    // BEGIN is not blocked (there is no whole-database lock); the write to the
+    // same row waits on a's row lock and times out.
     inst.execute_with(&mut b, "use a;").unwrap();
-    let err = inst.execute_with(&mut b, "begin;").unwrap_err();
+    inst.execute_with(&mut b, "begin;").unwrap();
+    let err = inst.execute_with(&mut b, "update t set id = 3 where id = 1;").unwrap_err();
     assert!(err.to_string().contains("lock wait timeout"), "{err}");
 
-    // a can still commit while b waits (no lock-order deadlock)
+    // a can still commit while b waits (no lock-order deadlock), then b retries
     inst.execute_with(&mut a, "commit;").unwrap();
-    inst.execute_with(&mut b, "begin;").unwrap();
+    inst.execute_with(&mut b, "update t set id = 3 where id = 1;").unwrap();
     inst.execute_with(&mut b, "commit;").unwrap();
 }
 

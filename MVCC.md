@@ -235,13 +235,15 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
     `Error::Retry`；`execute_update`/`execute_delete` 的 `epq_retry` 回滚本语句（`rollback_trx_to` 到语句
     起点，行锁全程持有）→ 用新快照重跑整条语句。重启时重新扫描即看到最新已提交版本并重跑 WHERE/SET，
     谓词不再命中则自然跳过；超过 `MAX_EPQ_RETRIES`(16) 次报 40001。
-  - **RR**：不重启，冲突由提交期 FCW 检查报 40001（原语义保留）。
+  - **RR**：不重启，冲突由提交期写写冲突检查（`check_conflicts`）报 40001。
   - 说明：本实现是 RC 下 EPQ 的等价形式（整条语句重启而非仅重读冲突行）；`next_rid`（Step 4a）已记录，
     供后续逐行 EPQ/SSI 使用。验收：`read_committed_reapplies_after_a_concurrent_update`（不丢更新）、
     `read_committed_skips_a_row_the_concurrent_commit_moved_out_of_the_predicate`、
     `read_committed_sees_a_concurrent_commit_per_statement`、`repeatable_read_aborts_the_lost_update`；
     全量 611 项测试绿。
-- **Step 5｜RR / SI**：事务级快照固定；冲突报 40001（不再 FCW）。撤掉 Instance 的整库写独占。
+- **Step 5｜RR / SI** ✅：`repeatable_read` = 事务级固定快照，冲突报 40001；Instance 已无整库写独占
+  （DML 走 `db.read()` + 行锁）。**收尾**：删除遗留的 `transaction.conflict = fcw | 2pl` 轴与
+  整库 `DatabaseWriteLock`——冲突行为统一由 `isolation` 决定，写并发统一走行级锁。
   验收：丢更新回滚、可重复读、并发吞吐随线程上升。
 - **Step 6｜Serializable（SSI）** ✅：新增 `isolation = "serializable"`（= 固定快照 + SSI 冲突跟踪）。
   - 新增 `src/db/ssi.rs`：维护 rw-反依赖 `R→W`（R 读了 W 写的表）。快照隔离下的异常必然对应一条

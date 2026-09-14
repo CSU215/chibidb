@@ -23,57 +23,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
-
-/// A per-database 2PL write lock. It is reference-counted so callers can hold
-/// it (and wait on it) without holding the database lock itself, which keeps
-/// lock acquisition from deadlocking against statement execution.
-pub(crate) struct DatabaseWriteLock {
-    owner: Mutex<Option<u64>>,
-    cv: Condvar,
-    timeout: Duration,
-}
-
-impl DatabaseWriteLock {
-    fn new(timeout_ms: u64) -> Self {
-        Self {
-            owner: Mutex::new(None),
-            cv: Condvar::new(),
-            timeout: Duration::from_millis(timeout_ms),
-        }
-    }
-
-    /// Takes the lock for `session_id`, blocking until it is free or the
-    /// configured timeout elapses. Re-entrant by owner id.
-    pub(crate) fn acquire(&self, session_id: u64) -> Result<()> {
-        let mut owner = self.owner.lock();
-        if *owner == Some(session_id) {
-            return Ok(());
-        }
-        while owner.is_some() {
-            let timed_out = self.cv.wait_for(&mut owner, self.timeout).timed_out();
-            if timed_out && owner.is_some() {
-                return Err(Error::Runtime("lock wait timeout".into()));
-            }
-        }
-        *owner = Some(session_id);
-        Ok(())
-    }
-
-    pub(crate) fn release(&self, session_id: u64) {
-        let mut owner = self.owner.lock();
-        if *owner == Some(session_id) {
-            *owner = None;
-            self.cv.notify_one();
-        }
-    }
-}
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::catalog::meta::{decode_catalog, encode_catalog, CatalogSnapshot};
 use crate::catalog::{Catalog, ColumnDesc, HeapStore, IndexStore, Schema};
-use crate::config::{Config, ConflictStrategy, EngineKind, ExecutionMode, Isolation, PageLayout};
+use crate::config::{Config, EngineKind, ExecutionMode, Isolation, PageLayout};
 use crate::index::{encode_key, BTree};
 use crate::pipeline::{ExecuteStage, OptimizeStage, Pipeline, ResolveStage, SqlEvent};
 use crate::storage::codec::{decode_record, encode_record};
@@ -107,10 +62,6 @@ pub struct Database {
     /// Transaction id source, committed set and open set.
     trx: TransactionManager,
     wal_checkpoint_threshold: AtomicU64,
-    conflict: ConflictStrategy,
-    /// The per-database 2PL write lock, shared with the instance layer so it
-    /// can be acquired before the database lock.
-    writer: Arc<DatabaseWriteLock>,
     /// Row-level tuple locks, held by a transaction until it ends. Writers of
     /// different rows proceed concurrently; same-row writers queue.
     locks: LockManager,
@@ -275,8 +226,6 @@ impl Database {
                 config.transaction.isolation == Isolation::Serializable,
             ),
             wal_checkpoint_threshold: AtomicU64::new(config.wal.checkpoint_threshold),
-            conflict: config.transaction.conflict,
-            writer: Arc::new(DatabaseWriteLock::new(config.transaction.lock_timeout_ms)),
             locks: LockManager::new(config.transaction.lock_timeout_ms, 100),
             checkpoint_lock: Mutex::new(()),
             catalog_lock: Mutex::new(()),
@@ -499,10 +448,13 @@ impl Database {
         Ok(())
     }
 
-    /// Commit bookkeeping shared by explicit COMMIT and autocommit. Under
-    /// first-committer-wins a write transaction whose target rows were changed
-    /// by a transaction that committed after its snapshot is rejected before
-    /// any commit record is written.
+    /// Commit bookkeeping shared by explicit COMMIT and autocommit.
+    ///
+    /// Under snapshot isolation (repeatable read / serializable) a write
+    /// transaction whose target rows were changed by a transaction that
+    /// committed after its snapshot is rejected before any commit record is
+    /// written; read committed resolves that with EPQ instead, so it is not
+    /// checked here.
     fn commit_trx(&self, trx: &TrxState, wrote: bool) -> Result<()> {
         let trx_id = trx.id;
         // Serializable: abort a transaction that would close a cycle of
@@ -510,7 +462,7 @@ impl Database {
         if self.trx.ssi_conflict(trx_id) {
             return Err(serialization_error());
         }
-        if wrote && self.conflict == ConflictStrategy::Fcw {
+        if wrote && self.isolation() != Isolation::ReadCommitted {
             self.check_conflicts(trx)?;
         }
         if !wrote {
@@ -681,13 +633,6 @@ impl Database {
                 if session.trx.is_some() {
                     return Err(Error::Runtime("transaction already begun".into()));
                 }
-                // 2PL: a transaction holds the database write lock from BEGIN
-                // (before its snapshot) until COMMIT/ROLLBACK, so writers
-                // serialize and later writers build on the latest commit.
-                if self.conflict == ConflictStrategy::TwoPl {
-                    self.acquire_writer(session.id())?;
-                    session.set_holds_writer(true);
-                }
                 let id = self.trx.begin_open();
                 let (snapshot, clog) = self.trx.begin_snapshot();
                 session.begin(id, snapshot, clog, true);
@@ -712,7 +657,6 @@ impl Database {
                         }
                     }
                 }
-                self.end_writer(session);
                 result
             }
             crate::ast::Stmt::Trx(crate::ast::TrxCtl::Rollback) => {
@@ -724,16 +668,11 @@ impl Database {
                     self.trx.remove_open(trx.id);
                     result = self.rollback_trx(&mut trx).map(|()| None);
                 }
-                self.end_writer(session);
                 result
             }
             other => {
                 let read_only = is_read_only(other);
                 let autocommit = session.trx.is_none();
-                let took_writer = self.needs_writer(session, read_only);
-                if took_writer {
-                    self.acquire_writer(session.id())?;
-                }
                 if autocommit {
                     if read_only {
                         let (snapshot, clog) = self.trx.begin_snapshot();
@@ -755,7 +694,7 @@ impl Database {
                     .map(|t| (t.undo.len(), t.wal.len()))
                     .unwrap_or((0, 0));
                 let mut event = SqlEvent::new(other);
-                let outcome = match pipeline.run(self, session, &mut event) {
+                match pipeline.run(self, session, &mut event) {
                     Ok(()) => {
                         let rs = event.result.take().expect("execute stage produced no result");
                         if autocommit
@@ -798,20 +737,8 @@ impl Database {
                         }
                         Err(e)
                     }
-                };
-                if took_writer {
-                    self.release_writer(session.id());
                 }
-                outcome
             }
-        }
-    }
-
-    /// Releases the 2PL write lock at the end of an explicit transaction.
-    fn end_writer(&self, session: &mut Session) {
-        if session.holds_writer() {
-            self.release_writer(session.id());
-            session.set_holds_writer(false);
         }
     }
 
@@ -822,7 +749,6 @@ impl Database {
             self.trx.remove_open(trx.id);
             result = self.rollback_trx(&mut trx);
         }
-        self.end_writer(session);
         result
     }
 
@@ -834,27 +760,6 @@ impl Database {
     /// Overrides the auto-checkpoint log budget in bytes; mainly for tests.
     pub fn set_wal_checkpoint_threshold(&self, bytes: u64) {
         self.wal_checkpoint_threshold.store(bytes, Ordering::Relaxed);
-    }
-
-    /// The database's 2PL write lock, so the instance layer can take it before
-    /// acquiring the database lock.
-    pub(crate) fn write_lock(&self) -> Arc<DatabaseWriteLock> {
-        Arc::clone(&self.writer)
-    }
-
-    /// 2PL: takes the database write lock for `session_id`.
-    fn acquire_writer(&self, session_id: u64) -> Result<()> {
-        self.writer.acquire(session_id)
-    }
-
-    /// 2PL: releases the database write lock held by `session_id`.
-    fn release_writer(&self, session_id: u64) {
-        self.writer.release(session_id);
-    }
-
-    /// Whether the session needs to take the 2PL write lock for a statement.
-    fn needs_writer(&self, session: &Session, read_only: bool) -> bool {
-        self.conflict == ConflictStrategy::TwoPl && !read_only && !session.holds_writer()
     }
 
     fn rollback_trx(&self, trx: &mut TrxState) -> Result<()> {

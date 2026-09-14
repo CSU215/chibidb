@@ -36,18 +36,6 @@ pub enum PageLayout {
     Pax,
 }
 
-/// How write-write conflicts between concurrent transactions are resolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-pub enum ConflictStrategy {
-    /// First-committer-wins: the second committer is aborted. Optimistic.
-    #[default]
-    #[serde(rename = "fcw")]
-    Fcw,
-    /// Two-phase locking: writers block each other. Pessimistic.
-    #[serde(rename = "2pl")]
-    TwoPl,
-}
-
 /// Transaction isolation level, following PostgreSQL's model. The difference
 /// is only *when* a snapshot is taken and how a write-write conflict is
 /// resolved: read committed refreshes the snapshot per statement and re-reads
@@ -153,20 +141,16 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TransactionConfig {
-    pub conflict: ConflictStrategy,
-    /// Isolation level for explicit transactions and autocommit statements.
+    /// Isolation level for explicit transactions and autocommit statements; it
+    /// determines how concurrent writes conflict (EPQ vs abort).
     pub isolation: Isolation,
-    /// How long a writer waits for the 2PL database lock before giving up.
+    /// How long a writer waits for a row lock before giving up.
     pub lock_timeout_ms: u64,
 }
 
 impl Default for TransactionConfig {
     fn default() -> Self {
-        Self {
-            conflict: ConflictStrategy::Fcw,
-            isolation: Isolation::ReadCommitted,
-            lock_timeout_ms: 5000,
-        }
+        Self { isolation: Isolation::ReadCommitted, lock_timeout_ms: 5000 }
     }
 }
 

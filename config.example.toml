@@ -70,10 +70,8 @@ enabled = false
 # 隔离级别：read_committed（默认，每条语句取新快照，冲突后 EPQ 重读最新版本）、
 # repeatable_read（事务内固定快照，写写冲突报 40001）或
 # serializable（固定快照 + SSI 读写依赖跟踪，检测到环则报 40001）。
+# 写并发统一走行级锁；冲突处理由隔离级别决定，不再有单独的 fcw/2pl 开关。
 isolation = "read_committed"
 
-# 写写冲突策略：fcw（先提交者胜，乐观，默认）或 2pl（悲观两阶段锁）。
-conflict = "fcw"
-
-# 2PL 模式下写者等待数据库锁的超时时间（毫秒）。
+# 写者等待行锁的超时时间（毫秒）。
 lock_timeout_ms = 5000

@@ -1,12 +1,8 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::db::clog::CommitStatus;
 use crate::db::transaction::Snapshot;
 use crate::storage::Rid;
-
-/// Source of process-unique session ids, used to attribute the 2PL write lock.
-static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Sentinel transaction id for an autocommitted read-only snapshot. Real
 /// transactions are numbered from 1, so this can never collide with a creator
@@ -18,23 +14,13 @@ pub(crate) const READ_ONLY_TRX_ID: u64 = 0;
 pub struct Session {
     pub(crate) trx: Option<TrxState>,
     current_db: Option<String>,
-    /// Process-unique id, used to attribute the 2PL database write lock.
-    id: u64,
-    /// Whether this session currently holds the database's 2PL write lock.
-    holds_writer: bool,
     /// Authenticated user, once the session has logged in.
     user: Option<String>,
 }
 
 impl Session {
     pub fn new() -> Self {
-        Self {
-            trx: None,
-            current_db: None,
-            id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
-            holds_writer: false,
-            user: None,
-        }
+        Self { trx: None, current_db: None, user: None }
     }
 
     pub fn current_db(&self) -> Option<&str> {
@@ -52,18 +38,6 @@ impl Session {
 
     pub(crate) fn set_current_db(&mut self, name: Option<String>) {
         self.current_db = name;
-    }
-
-    pub(crate) fn id(&self) -> u64 {
-        self.id
-    }
-
-    pub(crate) fn holds_writer(&self) -> bool {
-        self.holds_writer
-    }
-
-    pub(crate) fn set_holds_writer(&mut self, held: bool) {
-        self.holds_writer = held;
     }
 
     pub(crate) fn begin(

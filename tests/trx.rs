@@ -1,10 +1,9 @@
-use chibidb::config::{Config, ConflictStrategy, Isolation};
+use chibidb::config::{Config, Isolation};
 use chibidb::value::Value;
 use chibidb::{Database, ResultSet, Session};
 
-fn two_pl_config() -> Config {
+fn short_lock_config() -> Config {
     let mut cfg = Config::default();
-    cfg.transaction.conflict = ConflictStrategy::TwoPl;
     cfg.transaction.lock_timeout_ms = 100;
     cfg
 }
@@ -383,9 +382,8 @@ fn read_committed_keeps_independent_updates() {
 }
 
 #[test]
-fn two_pl_serializes_writers_and_times_out() {
-    let cfg = two_pl_config();
-    let db = Database::open_in_memory_with_config(&cfg).unwrap();
+fn row_locks_serialize_writers_and_time_out() {
+    let db = Database::open_in_memory_with_config(&short_lock_config()).unwrap();
     let mut a = Session::new();
     let mut b = Session::new();
     setup(&db, &mut a);
@@ -394,13 +392,14 @@ fn two_pl_serializes_writers_and_times_out() {
     db.execute_sql_with(&mut a, "begin;").unwrap();
     db.execute_sql_with(&mut a, "update t set name = 'a' where id = 1;").unwrap();
 
-    // b cannot BEGIN while a holds the database write lock
-    let err = db.execute_sql_with(&mut b, "begin;").unwrap_err();
+    // BEGIN is not blocked (there is no whole-database lock), but b's write to
+    // the same row waits on a's row lock and times out.
+    db.execute_sql_with(&mut b, "begin;").unwrap();
+    let err = db.execute_sql_with(&mut b, "update t set name = 'b' where id = 1;").unwrap_err();
     assert!(err.to_string().contains("lock wait timeout"), "{err}");
 
-    // once a releases it, b proceeds against a fresh snapshot and sees a
+    // once a commits, b's retry runs against the latest row and succeeds
     db.execute_sql_with(&mut a, "commit;").unwrap();
-    db.execute_sql_with(&mut b, "begin;").unwrap();
     db.execute_sql_with(&mut b, "update t set name = 'b' where id = 1;").unwrap();
     db.execute_sql_with(&mut b, "commit;").unwrap();
     assert_eq!(rows(&db, &mut b, "select name from t;"), [[Value::Str("b".into())]]);
@@ -408,9 +407,8 @@ fn two_pl_serializes_writers_and_times_out() {
 }
 
 #[test]
-fn two_pl_lock_also_covers_autocommit_writers() {
-    let cfg = two_pl_config();
-    let db = Database::open_in_memory_with_config(&cfg).unwrap();
+fn row_locks_cover_autocommit_writers() {
+    let db = Database::open_in_memory_with_config(&short_lock_config()).unwrap();
     let mut a = Session::new();
     let mut b = Session::new();
     setup(&db, &mut a);
@@ -419,12 +417,13 @@ fn two_pl_lock_also_covers_autocommit_writers() {
     db.execute_sql_with(&mut a, "begin;").unwrap();
     db.execute_sql_with(&mut a, "update t set name = 'a' where id = 1;").unwrap();
 
-    // an autocommitted write from another session waits for the lock too
-    let err = db.execute_sql_with(&mut b, "insert into t values (2, 'x');").unwrap_err();
+    // an autocommit write to the *same* row waits on the row lock and times out
+    let err = db.execute_sql_with(&mut b, "update t set name = 'x' where id = 1;").unwrap_err();
     assert!(err.to_string().contains("lock wait timeout"), "{err}");
+    // a different row is unaffected: locks are per row, not per database
+    db.execute_sql_with(&mut b, "insert into t values (2, 'x');").unwrap();
 
     db.execute_sql_with(&mut a, "commit;").unwrap();
-    db.execute_sql_with(&mut b, "insert into t values (2, 'x');").unwrap();
     assert_eq!(rows(&db, &mut b, "select count(*) from t;"), [[Value::Int(2)]]);
 }
 

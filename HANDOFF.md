@@ -87,7 +87,7 @@ python3 scripts/smoke.py     # Windows: python scripts\smoke.py；期望输出 S
 | `sql/value.rs` | `Value`：Null/Bool/Int(i64)/Float(f64)/Str/Date(i32 纪元天数)/Text | Display 决定 REPL 输出 |
 | `sql/datetime.rs` | 日期校验：civil-date 算法（Hinnant），`'YYYY-MM-DD'` 比较时隐式转日期 | `parse_date` |
 | `db/trx.rs` | 事务：`Session`（trx + `current_db`）/ `TrxState`（id+快照+undo）/ 可见性判定 / `Undo` | `TrxState::visible` |
-| `db/transaction.rs` | 事务簿记：id 分配、`committed`/`open` 集合、快照、FCW/2PL 校验辅助、SSI 生命周期 | `TransactionManager` |
+| `db/transaction.rs` | 事务簿记：id 分配、`committed`/`open` 集合、快照、SSI 生命周期 | `TransactionManager` |
 | `db/ssi.rs` | 串行化冲突跟踪（简化 SSI）：表粒度读写集 + rw-反依赖边 + 提交期环检测 | `Ssi` |
 | `sql/result.rs` | `ResultSet::Message / Rows` | |
 | `net/render.rs` | 对齐表格渲染（REPL 与 client 共用） | `write_result` |

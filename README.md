@@ -13,7 +13,7 @@ cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
 # HTTP/JSON 前端：配置 server.http_addr 后，POST /query {"sql":"..."} → {"results":[...]}
 # MySQL 前端：配置 server.mysql_addr 后，可用 mysql 客户端连接（mysql_native_password、文本结果集、预处理语句）
-cargo test                      # 全量回归（620 tests，另有 9 个 #[ignore] 性能探针）
+cargo test                      # 全量回归（619 tests，另有 9 个 #[ignore] 性能探针）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -26,7 +26,8 @@ REPL / client 中输入 `exit` 或 `quit` 退出。
 `server.http_addr`（可选，HTTP/JSON 监听）、`server.mysql_addr`（可选，MySQL wire 监听）、
 `server.thread_model`/`worker_threads`、
 `execution.mode`（`"volcano"` 默认 / `"chunk"` 列式批处理，见下）、
-`transaction.conflict`（`"fcw"` / `"2pl"`）、`transaction.lock_timeout_ms`；
+`transaction.isolation`（`"read_committed"` 默认 / `"repeatable_read"` / `"serializable"`）、
+`transaction.lock_timeout_ms`；
 其余为后续阶段预留（详见 `HANDOFF.md` §10 重构路线图）。
 
 ### 冒烟演示
@@ -182,13 +183,13 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
 - 磁盘 I/O 按文件并行：`DiskManager` 用注册表 `RwLock` + **每文件** `Mutex`，
   不同文件的读写互不阻塞（`with_file` 提供"持单文件锁跑闭包"的原语，
   `alloc_page` 的"取页数 + 写零页"因此在同一把锁内完成）
-- 冲突策略可配置：`transaction.conflict = "fcw" | "2pl"`。默认 **FCW**
-  （first-committer-wins）：提交时比对被改写基版本的 `prev_deleter` 与当前标记，
-  若其间有后提交的事务改过同一行则回滚失败方
-- **2PL**（pessimistic）：每库一把悲观写锁，显式事务在 `BEGIN`（取快照前）持锁至
-  `COMMIT/ROLLBACK`，自动提交写语句在语句内持锁；等待超过
-  `transaction.lock_timeout_ms` 报 `lock wait timeout`。写者串行、后写者基于最新提交，
-  避免丢失更新；`Instance` 先取写锁再取库锁，规避锁序死锁
+- 写并发统一走**行级锁**：写前对元组 `(table, rid)` 加锁，事务结束释放；不同行并发、
+  同行排队，等待超过 `transaction.lock_timeout_ms` 报 `lock wait timeout`
+- 冲突处理由**隔离级别**决定（`transaction.isolation`）：
+  - `read_committed`（默认）：每条语句取新快照；等锁后发现目标行已被并发提交改动，则以
+    新快照重启该语句（EPQ），重跑 WHERE/SET，不 abort
+  - `repeatable_read`：事务内固定快照；写写冲突在提交时检测并报 40001
+  - `serializable`：固定快照 + SSI；跟踪读写依赖，提交时检测到环则报 40001
 - 连接断开自动回滚其未提交事务
 - 崩溃恢复：WAL 只重放有 COMMIT 记录的事务，重放幂等（精确 Rid 回写 +
   删除标记条件重放）；索引页属派生数据，恢复时对被触及的表重建
@@ -197,7 +198,7 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
 
 ## 测试
 
-`cargo test` 跑 620 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
+`cargo test` 跑 619 个测试，覆盖词法/语法/求值/LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/
 表约束（PK/UNIQUE/NOT NULL/DEFAULT）/索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等，
 另有 `tests/miniob_compat.rs` 用经典 student/course/sc 场景做端到端回归，`tests/engine_equivalence.rs`
 用确定性随机脚本对 heap/LSM 两引擎做差分等价（含中途重开）。`tests/perf_stats.rs` 为 `#[ignore]` 性能探针
