@@ -1,7 +1,7 @@
 //! Write-ahead log: append-only redo records that make committed
 //! transactions durable even when dirty buffer-pool pages are lost.
 //!
-//! Frame layout: `[u32 len][u8 type][u32 trx_id][payload]` where `len`
+//! Frame layout: `[u32 len][u8 type][u64 trx_id][payload]` where `len`
 //! counts everything after the length field itself. Recovery replays only
 //! transactions that have a commit record; truncated tails and unknown
 //! frame types end the scan.
@@ -20,7 +20,7 @@ const REC_DELETE_MARK: u8 = 2;
 const REC_COMMIT: u8 = 3;
 
 /// Header overhead: type byte + trx id.
-const HEADER_LEN: usize = 5;
+const HEADER_LEN: usize = 9;
 
 /// One redo record.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,7 +28,7 @@ pub enum Record {
     /// A full versioned row image written at an exact rid.
     Insert { file_no: u32, rid: Rid, record: Vec<u8> },
     /// MVCC delete mark (deleter trx id) on the record at an exact rid.
-    DeleteMark { file_no: u32, rid: Rid, deleter: u32 },
+    DeleteMark { file_no: u32, rid: Rid, deleter: u64 },
     /// Commit boundary; redo replays only transactions with one of these.
     Commit,
 }
@@ -53,7 +53,7 @@ impl Wal {
 
     /// Appends a frame at the end of the log. The file lock makes the
     /// seek+write atomic, so concurrent committers never interleave bytes.
-    pub fn append(&self, trx_id: u32, rec: &Record) -> Result<()> {
+    pub fn append(&self, trx_id: u64, rec: &Record) -> Result<()> {
         let mut file = self.file.lock();
         file.seek(SeekFrom::End(0)).map_err(wal_io)?;
         file.write_all(&encode_frame(trx_id, rec)).map_err(wal_io)
@@ -101,7 +101,7 @@ fn wal_io(e: std::io::Error) -> Error {
     Error::Runtime(format!("wal io error: {e}"))
 }
 
-pub fn encode_frame(trx_id: u32, rec: &Record) -> Vec<u8> {
+pub fn encode_frame(trx_id: u64, rec: &Record) -> Vec<u8> {
     let mut frame = Vec::new();
     encode_frame_into(&mut frame, trx_id, rec);
     frame
@@ -109,7 +109,7 @@ pub fn encode_frame(trx_id: u32, rec: &Record) -> Vec<u8> {
 
 /// Appends one encoded frame to `out`, so a transaction can buffer its rows
 /// and flush them in a single write at commit.
-pub fn encode_frame_into(out: &mut Vec<u8>, trx_id: u32, rec: &Record) {
+pub fn encode_frame_into(out: &mut Vec<u8>, trx_id: u64, rec: &Record) {
     let start = out.len();
     out.extend_from_slice(&[0u8; 4]); // length, patched once the frame is written
     match rec {
@@ -144,18 +144,18 @@ pub fn encode_frame_into(out: &mut Vec<u8>, trx_id: u32, rec: &Record) {
 pub struct RecoveryPlan {
     /// (commit position, trx id, redo records in log order), sorted by the
     /// commit position so replay follows the original commit order.
-    pub committed: Vec<(u64, u32, Vec<Record>)>,
+    pub committed: Vec<(u64, u64, Vec<Record>)>,
     /// Every trx id with a commit record, used to repair the catalog's
     /// committed set.
-    pub committed_ids: Vec<u32>,
+    pub committed_ids: Vec<u64>,
     /// Highest trx id seen anywhere; uncommitted ids must never be reused.
-    pub max_trx_id: u32,
+    pub max_trx_id: u64,
 }
 
 /// Parses a raw log image. Stops at the first truncated or unknown frame.
 pub fn plan_recovery(bytes: &[u8]) -> RecoveryPlan {
-    let mut records: BTreeMap<u32, Vec<Record>> = BTreeMap::new();
-    let mut commit_pos: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut records: BTreeMap<u64, Vec<Record>> = BTreeMap::new();
+    let mut commit_pos: BTreeMap<u64, u64> = BTreeMap::new();
     let mut max_trx_id = 0;
     let mut pos = 0usize;
     while let Some((trx_id, rec, frame_len)) = decode_frame(&bytes[pos..]) {
@@ -170,7 +170,7 @@ pub fn plan_recovery(bytes: &[u8]) -> RecoveryPlan {
             }
         }
     }
-    let mut committed: Vec<(u64, u32, Vec<Record>)> = commit_pos
+    let mut committed: Vec<(u64, u64, Vec<Record>)> = commit_pos
         .iter()
         .filter_map(|(trx, pos)| {
             records.remove(trx).map(|recs| (*pos, *trx, recs))
@@ -181,7 +181,7 @@ pub fn plan_recovery(bytes: &[u8]) -> RecoveryPlan {
 }
 
 /// Returns (trx id, record, frame length) or None at end-of-log / corruption.
-fn decode_frame(bytes: &[u8]) -> Option<(u32, Record, usize)> {
+fn decode_frame(bytes: &[u8]) -> Option<(u64, Record, usize)> {
     if bytes.len() < 4 {
         return None;
     }
@@ -190,8 +190,8 @@ fn decode_frame(bytes: &[u8]) -> Option<(u32, Record, usize)> {
         return None; // truncated tail frame
     }
     let ty = bytes[4];
-    let trx_id = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
-    let payload = &bytes[9..4 + len];
+    let trx_id = u64::from_le_bytes(bytes[5..13].try_into().unwrap());
+    let payload = &bytes[13..4 + len];
     let rec = match ty {
         REC_INSERT => {
             if payload.len() < 10 {
@@ -203,13 +203,13 @@ fn decode_frame(bytes: &[u8]) -> Option<(u32, Record, usize)> {
             Record::Insert { file_no, rid: Rid::new(page_no, slot), record: payload[10..].to_vec() }
         }
         REC_DELETE_MARK => {
-            if payload.len() < 14 {
+            if payload.len() < 18 {
                 return None;
             }
             let file_no = u32::from_le_bytes(payload[0..4].try_into().unwrap());
             let page_no = u32::from_le_bytes(payload[4..8].try_into().unwrap());
             let slot = u16::from_le_bytes(payload[8..10].try_into().unwrap());
-            let deleter = u32::from_le_bytes(payload[10..14].try_into().unwrap());
+            let deleter = u64::from_le_bytes(payload[10..18].try_into().unwrap());
             Record::DeleteMark { file_no, rid: Rid::new(page_no, slot), deleter }
         }
         REC_COMMIT => Record::Commit,
@@ -229,9 +229,9 @@ mod tests {
     #[test]
     fn frames_roundtrip() {
         let recs = [
-            (7u32, Record::Insert { file_no: 3, rid: rid(9, 4), record: vec![1, 2, 3] }),
-            (8u32, Record::DeleteMark { file_no: 3, rid: rid(9, 4), deleter: 8 }),
-            (9u32, Record::Commit),
+            (7u64, Record::Insert { file_no: 3, rid: rid(9, 4), record: vec![1, 2, 3] }),
+            (8u64, Record::DeleteMark { file_no: 3, rid: rid(9, 4), deleter: 8 }),
+            (9u64, Record::Commit),
         ];
         let mut bytes = Vec::new();
         for (trx, rec) in &recs {
@@ -248,9 +248,9 @@ mod tests {
     #[test]
     fn buffered_frames_match_individual_encodes() {
         let recs = [
-            (7u32, Record::Insert { file_no: 3, rid: rid(9, 4), record: vec![1, 2, 3] }),
-            (8u32, Record::DeleteMark { file_no: 3, rid: rid(9, 4), deleter: 8 }),
-            (8u32, Record::Commit),
+            (7u64, Record::Insert { file_no: 3, rid: rid(9, 4), record: vec![1, 2, 3] }),
+            (8u64, Record::DeleteMark { file_no: 3, rid: rid(9, 4), deleter: 8 }),
+            (8u64, Record::Commit),
         ];
         let mut buffered = Vec::new();
         for (trx, rec) in &recs {
@@ -277,7 +277,7 @@ mod tests {
         let mut bytes = encode_frame(1, &Record::Commit);
         bytes[4] = 0xFF;
         let plan = plan_recovery(&bytes);
-        assert_eq!(plan.committed_ids, Vec::<u32>::new());
+        assert_eq!(plan.committed_ids, Vec::<u64>::new());
     }
 
     #[test]
@@ -307,7 +307,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wal = Arc::new(Wal::open(&dir.path().join("wal.bin")).unwrap());
         let mut handles = Vec::new();
-        for trx in 1..=8u32 {
+        for trx in 1..=8u64 {
             let wal = Arc::clone(&wal);
             handles.push(std::thread::spawn(move || {
                 for slot in 0..50u16 {

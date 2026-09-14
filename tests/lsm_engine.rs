@@ -95,7 +95,7 @@ fn lsm_auto_compaction_bounds_the_table_count() {
     let bp = pool();
     let engine = LsmEngine::open_with_trigger(dir.path(), 128, 3).unwrap();
 
-    for round in 0..6u32 {
+    for round in 0..6u64 {
         for i in 0..10 {
             let data = encode_record_inline(round, 0, &[Value::Int(i)]);
             engine.insert(&bp, &data).unwrap();
@@ -126,7 +126,7 @@ fn lsm_engine_compaction_preserves_values() {
     let engine = LsmEngine::open_with_trigger(dir.path(), 128, 100).unwrap();
 
     let mut rows = Vec::new();
-    for round in 0..4u32 {
+    for round in 0..4u64 {
         for i in 0..20 {
             let data = encode_record_inline(round, 0, &[Value::Int(i)]);
             let rid = engine.insert(&bp, &data).unwrap();

@@ -11,7 +11,7 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 /// Sentinel transaction id for an autocommitted read-only snapshot. Real
 /// transactions are numbered from 1, so this can never collide with a creator
 /// or deleter id.
-pub(crate) const READ_ONLY_TRX_ID: u32 = 0;
+pub(crate) const READ_ONLY_TRX_ID: u64 = 0;
 
 /// Per-connection state: at most one active transaction at a time, plus the
 /// database the statements route to (selected with `USE`).
@@ -68,7 +68,7 @@ impl Session {
 
     pub(crate) fn begin(
         &mut self,
-        id: u32,
+        id: u64,
         snapshot: Snapshot,
         clog: Arc<CommitStatus>,
         explicit: bool,
@@ -111,7 +111,7 @@ impl Default for Session {
 }
 
 pub(crate) struct TrxState {
-    pub id: u32,
+    pub id: u64,
     /// PostgreSQL-style snapshot: an xid is visible if the clog says it
     /// committed and it was neither in flight nor allocated after this
     /// snapshot.
@@ -128,7 +128,7 @@ pub(crate) struct TrxState {
 
 impl TrxState {
     /// Snapshot-isolation visibility of a row version.
-    pub fn visible(&self, creator: u32, deleter: u32) -> bool {
+    pub fn visible(&self, creator: u64, deleter: u64) -> bool {
         let creator_visible =
             creator == 0 || creator == self.id || self.committed_before(creator);
         // a row is gone for me if I deleted it myself, or the deleter
@@ -141,7 +141,7 @@ impl TrxState {
     /// Whether `xid` had already committed when this transaction's snapshot was
     /// taken. An xid that was in flight then, or was allocated after, does not
     /// count even if it has since committed.
-    pub(crate) fn committed_before(&self, xid: u32) -> bool {
+    pub(crate) fn committed_before(&self, xid: u64) -> bool {
         xid < self.snapshot.xmax
             && self.snapshot.xip.binary_search(&xid).is_err()
             && self.clog.is_committed(xid)
@@ -154,13 +154,13 @@ pub(crate) enum Undo {
     Insert { table: String, rid: Rid, row: Vec<crate::value::Value> },
     /// Own delete-mark: clear the marker on rollback. `prev_deleter` is the
     /// marker before our write, used by first-committer-wins conflict checks.
-    DeleteMark { table: String, rid: Rid, prev_deleter: u32 },
+    DeleteMark { table: String, rid: Rid, prev_deleter: u64 },
     /// MVCC update: remove the new version, unmark the old one.
     Update {
         table: String,
         old_rid: Rid,
         new_rid: Rid,
         new_row: Vec<crate::value::Value>,
-        prev_deleter: u32,
+        prev_deleter: u64,
     },
 }

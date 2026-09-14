@@ -23,7 +23,8 @@
   每个事务 begin、**每个只读语句**都 clone 一份 → O(n) 时间/内存。
 - `committed` 集合只增不减，且**每次写提交都把全量 id 写进 catalog**（`src/lib.rs:481`、
   `src/catalog/meta.rs:61-70`）并 fsync → 每提交 O(n) 磁盘，累计 O(n²)。
-- xid 是 `AtomicU32`（`src/db/transaction.rs`），写事务到 2³² 后回卷即破坏正确性。
+- ~~xid 是 `AtomicU32`（`src/db/transaction.rs`），写事务到 2³² 后回卷即破坏正确性。~~
+  （**已修**：Step 7a 全面升到 `u64`。）
 - 没有：行级锁、等待队列、死锁检测、EPQ、SSI、快照地平线/GC。
 
 结论：可见性层与锁层都没做到位且互相重叠。**目标 = 全面对齐 PostgreSQL 模型。**
@@ -119,16 +120,16 @@
 ```rust
 /// PG 式快照：上界 + in-progress 列表，而不是完整 committed 集合。
 pub struct Snapshot {
-    pub xmax: u32,        // >= xmax 必不可见；< xmax 且不在 xip 的都已在快照前结束
-    pub xip: Vec<u32>,    // in-progress xid 列表（升序）
+    pub xmax: u64,        // >= xmax 必不可见；< xmax 且不在 xip 的都已在快照前结束
+    pub xip: Vec<u64>,    // in-progress xid 列表（升序）
 }
 
 /// clog 替身：按 xid 稠密索引的提交位图（`src/db/clog.rs`）。
 pub struct CommitStatus { /* 分段 AtomicU64 位图 */ }
 impl CommitStatus {
-    pub fn mark_committed(&self, xid: u32);
-    pub fn is_committed(&self, xid: u32) -> bool;
-    pub fn ids(&self) -> Vec<u32>;
+    pub fn mark_committed(&self, xid: u64);
+    pub fn is_committed(&self, xid: u64) -> bool;
+    pub fn ids(&self) -> Vec<u64>;
 }
 
 /// 行级锁管理器。
@@ -225,8 +226,15 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
   验收：丢更新回滚、可重复读、并发吞吐随线程上升。
 - **Step 6｜Serializable（SSI）**：跟踪 rw-依赖并检测危险结构，命中报 40001。
   验收：写偏斜用例按 Serializable 被拒、按 RR 通过。
-- **Step 7｜GC/horizon + xid64**：地平线回收 + 格式升级到 xid64。
-  验收：长跑后 xid 状态有界；xid64 单测；崩溃恢复回归。
+- **Step 7a｜xid64** ✅：事务 id 全面由 `u32` 升到 `u64`，消除 2³² 悬崖。记录版本头
+  `(creator, deleter)` 由 8 字节升到 16 字节（`codec::RECORD_HEADER`）；WAL 帧头
+  `[len u32][type u8][trx_id u64]`；catalog `next_trx_id`/`committed_trxs`、clog 位图、
+  `Snapshot{xmax, xip}`、`TransactionManager`、`TrxState`、行锁 owner、PAX 版本段
+  （8→16 字节/槽）全部改为 `u64`；格式魔数升位（catalog `CHIDCAT9`、PAX `PAX2`、
+  记录格式随 magic 升级），旧数据文件按决策 4 丢弃。验收：既有 601 项测试全绿，
+  clippy 零警告，崩溃恢复/并发回归通过。
+- **Step 7b｜GC/horizon**（待做）：地平线回收 clog 前缀 + 与 vacuum/catalog 对齐。
+  验收：长跑后 xid 状态有界；崩溃恢复回归。
 
 风险最高的是 Step 5（撤整库写锁），其替代（Step 3–4）必须先到位。
 

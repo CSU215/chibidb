@@ -127,17 +127,17 @@ impl TableStorage for LsmEngine {
         Ok(())
     }
 
-    fn delete_mark(&self, _bp: &BufferPool, rid: Rid, deleter: u32) -> Result<u32> {
+    fn delete_mark(&self, _bp: &BufferPool, rid: Rid, deleter: u64) -> Result<u64> {
         let mut lsm = self.inner.lock();
         let key = rid_key(rid);
         let mut record = lsm
             .get(&key)?
             .ok_or_else(|| Error::Runtime(format!("no record at {rid:?}")))?;
-        if record.len() < 8 {
+        if record.len() < crate::storage::codec::RECORD_HEADER {
             return Err(Error::Runtime("record lacks mvcc fields".into()));
         }
-        let previous = u32::from_le_bytes(record[4..8].try_into().unwrap());
-        record[4..8].copy_from_slice(&deleter.to_le_bytes());
+        let previous = u64::from_le_bytes(record[8..16].try_into().unwrap());
+        record[8..16].copy_from_slice(&deleter.to_le_bytes());
         lsm.put(key, record);
         Ok(previous)
     }

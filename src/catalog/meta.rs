@@ -5,7 +5,7 @@ use crate::storage::header::{self, FileKind};
 use crate::value::Value;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 8] = *b"CHIDCAT8";
+const MAGIC: [u8; 8] = *b"CHIDCAT9";
 
 const DTYPE_INT: u8 = 0x00;
 const DTYPE_FLOAT: u8 = 0x01;
@@ -51,8 +51,8 @@ pub struct ViewMeta {
 pub struct CatalogSnapshot {
     pub next_table_file: u32,
     pub next_index_file: u32,
-    pub next_trx_id: u32,
-    pub committed_trxs: Vec<u32>,
+    pub next_trx_id: u64,
+    pub committed_trxs: Vec<u64>,
     pub tables: Vec<TableMeta>,
     pub indexes: Vec<IndexMeta>,
     pub views: Vec<ViewMeta>,
@@ -63,10 +63,10 @@ pub fn encode_catalog(snap: &CatalogSnapshot) -> Vec<u8> {
     header::write_header(&mut buf, &MAGIC, FileKind::Catalog);
     put_u32(&mut buf, snap.next_table_file);
     put_u32(&mut buf, snap.next_index_file);
-    put_u32(&mut buf, snap.next_trx_id);
+    put_u64(&mut buf, snap.next_trx_id);
     put_u32(&mut buf, snap.committed_trxs.len() as u32);
     for id in &snap.committed_trxs {
-        put_u32(&mut buf, *id);
+        put_u64(&mut buf, *id);
     }
     put_u32(&mut buf, snap.tables.len() as u32);
     for t in &snap.tables {
@@ -114,13 +114,13 @@ pub fn decode_catalog(data: &[u8]) -> Result<CatalogSnapshot> {
     let mut pos = header::HEADER_LEN;
     let next_table_file = take_u32(data, &mut pos)?;
     let next_index_file = take_u32(data, &mut pos)?;
-    let next_trx_id = take_u32(data, &mut pos)?;
+    let next_trx_id = take_u64(data, &mut pos)?;
     let n_committed = take_u32(data, &mut pos)? as usize;
     // Do not pre-allocate from a file-supplied count: a corrupt catalog could
     // otherwise request a huge allocation before the reads fail.
     let mut committed_trxs = Vec::new();
     for _ in 0..n_committed {
-        committed_trxs.push(take_u32(data, &mut pos)?);
+        committed_trxs.push(take_u64(data, &mut pos)?);
     }
     let n_tables = take_u32(data, &mut pos)?;
     let mut tables = Vec::new();
@@ -229,6 +229,10 @@ fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+fn put_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
 fn put_str(buf: &mut Vec<u8>, s: &str) {
     put_u32(buf, s.len() as u32);
     buf.extend_from_slice(s.as_bytes());
@@ -246,6 +250,11 @@ fn take<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8]> {
 fn take_u32(data: &[u8], pos: &mut usize) -> Result<u32> {
     let b = take(data, pos, 4)?;
     Ok(u32::from_le_bytes(b.try_into().unwrap()))
+}
+
+fn take_u64(data: &[u8], pos: &mut usize) -> Result<u64> {
+    let b = take(data, pos, 8)?;
+    Ok(u64::from_le_bytes(b.try_into().unwrap()))
 }
 
 fn take_str(data: &[u8], pos: &mut usize) -> Result<String> {

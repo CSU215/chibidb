@@ -349,7 +349,8 @@ pub(crate) fn execute_insert(db: &Database, trx: &mut TrxState, i: &InsertStmt) 
         db.check_unique(&i.table, &row, None, trx, &mut claimed)?;
         // the check is on the externalized size: long strings live in the lob
         // store, so only the fixed-size reference stays in the row
-        let size = crate::storage::codec::encoded_row_size(&row, db.inline_lob_limit()) + 8;
+        let size = crate::storage::codec::encoded_row_size(&row, db.inline_lob_limit())
+            + crate::storage::codec::RECORD_HEADER;
         if size + 16 > crate::storage::PAGE_SIZE {
             return Err(Error::Runtime(format!(
                 "record too large ({size} bytes does not fit in a page)"

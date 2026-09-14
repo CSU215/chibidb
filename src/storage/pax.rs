@@ -7,7 +7,7 @@
 //!
 //! Page header (all little-endian):
 //! ```text
-//! [0..4)   magic "PAX1"
+//! [0..4)   magic "PAX2"
 //! [4..6)   nrows   slot high-water mark (slots are never renumbered)
 //! [6..8)   ncols
 //! [8..10)  nseg    ncols + 1 (segment 0 is the version segment)
@@ -15,7 +15,7 @@
 //! [12..16) reserved
 //! [16..16+nseg*4) segment directory of (offset u16, length u16)
 //! ```
-//! Segment 0 is `nrows * 8` version bytes (`creator`, `deleter`). Segment
+//! Segment 0 is `nrows * 16` version bytes (`creator`, `deleter` as `u64`). Segment
 //! `1+c` holds column `c`: `(nrows+1)` `u16` offsets relative to the value
 //! data, then the tagged values. A slot is empty when its column-0 value has
 //! zero length, which also keeps empty slots' space reclaimable.
@@ -24,7 +24,10 @@ use crate::storage::codec::row_column_ranges;
 use crate::storage::page::PAGE_SIZE;
 use crate::{Error, Result};
 
-const MAGIC: [u8; 4] = *b"PAX1";
+const MAGIC: [u8; 4] = *b"PAX2";
+
+/// Size in bytes of the `(creator, deleter)` version pair stored per slot.
+const VERSION_LEN: usize = 16;
 const HEADER: usize = 16;
 const DIR_ENTRY: usize = 4;
 
@@ -87,12 +90,12 @@ pub(crate) fn alive_slots(page: &[u8]) -> impl Iterator<Item = u16> + '_ {
 }
 
 /// `(creator, deleter)` of a live slot's version.
-pub(crate) fn version_at(page: &[u8], slot: u16) -> (u32, u32) {
+pub(crate) fn version_at(page: &[u8], slot: u16) -> (u64, u64) {
     let (voff, _) = dir(page, 0);
-    let at = voff + slot as usize * 8;
+    let at = voff + slot as usize * VERSION_LEN;
     (
-        u32::from_le_bytes(page[at..at + 4].try_into().unwrap()),
-        u32::from_le_bytes(page[at + 4..at + 8].try_into().unwrap()),
+        u64::from_le_bytes(page[at..at + 8].try_into().unwrap()),
+        u64::from_le_bytes(page[at + 8..at + 16].try_into().unwrap()),
     )
 }
 
@@ -106,7 +109,7 @@ pub(crate) fn column_bytes(page: &[u8], col: usize, slot: u16) -> &[u8] {
 }
 
 /// Writes a fresh page from `nrows` slots and `ncols` columns. `ver(slot)`
-/// yields the 8 version bytes; `val(slot, col)` yields a column's tagged value
+/// yields the 16 version bytes; `val(slot, col)` yields a column's tagged value
 /// bytes (`&[]` for an empty slot).
 fn pack<'a, FV, FC>(
     dst: &mut [u8; PAGE_SIZE],
@@ -116,12 +119,12 @@ fn pack<'a, FV, FC>(
     val: FC,
 ) -> Result<()>
 where
-    FV: Fn(usize) -> [u8; 8],
+    FV: Fn(usize) -> [u8; 16],
     FC: Fn(usize, usize) -> &'a [u8],
 {
     let nseg = ncols + 1;
     let dir_end = HEADER + nseg * DIR_ENTRY;
-    let mut total = dir_end + nrows * 8;
+    let mut total = dir_end + nrows * VERSION_LEN;
     for c in 0..ncols {
         total += 2 * (nrows + 1);
         for s in 0..nrows {
@@ -139,11 +142,12 @@ where
     dst[10..12].copy_from_slice(&(total as u16).to_le_bytes());
 
     let mut cur = dir_end;
-    set_dir(dst, 0, cur, nrows * 8);
+    set_dir(dst, 0, cur, nrows * VERSION_LEN);
     for s in 0..nrows {
-        dst[cur + s * 8..cur + s * 8 + 8].copy_from_slice(&ver(s));
+        let at = cur + s * VERSION_LEN;
+        dst[at..at + VERSION_LEN].copy_from_slice(&ver(s));
     }
-    cur += nrows * 8;
+    cur += nrows * VERSION_LEN;
 
     for c in 0..ncols {
         let seg_off = cur;
@@ -169,12 +173,12 @@ where
 type ColumnRanges = Vec<(usize, usize)>;
 
 /// Splits a versioned record into `(version bytes, value ranges)`.
-fn split(record: &[u8]) -> Result<([u8; 8], ColumnRanges)> {
-    if record.len() < 8 {
+fn split(record: &[u8]) -> Result<([u8; 16], ColumnRanges)> {
+    if record.len() < VERSION_LEN {
         return Err(Error::Runtime("truncated versioned record".into()));
     }
-    let version = record[0..8].try_into().unwrap();
-    let ranges = row_column_ranges(&record[8..])?;
+    let version = record[0..VERSION_LEN].try_into().unwrap();
+    let ranges = row_column_ranges(&record[VERSION_LEN..])?;
     Ok((version, ranges))
 }
 
@@ -193,16 +197,18 @@ pub(crate) fn insert(page: &mut [u8; PAGE_SIZE], record: &[u8]) -> Result<u16> {
         .find(|&s| is_empty(&src, s as u16))
         .unwrap_or(old_n);
     let n = old_n.max(slot + 1);
-    let row = &record[8..];
+    let row = &record[VERSION_LEN..];
     let voff = if had { dir(&src, 0).0 } else { 0 };
 
-    let ver = |s: usize| -> [u8; 8] {
+    let ver = |s: usize| -> [u8; 16] {
         if s == slot {
-            record[0..8].try_into().unwrap()
+            record[0..VERSION_LEN].try_into().unwrap()
         } else if s < old_n {
-            src[voff + s * 8..voff + s * 8 + 8].try_into().unwrap()
+            src[voff + s * VERSION_LEN..voff + (s + 1) * VERSION_LEN]
+                .try_into()
+                .unwrap()
         } else {
-            [0u8; 8]
+            [0u8; VERSION_LEN]
         }
     };
     let val = |s: usize, c: usize| -> &[u8] {
@@ -235,16 +241,18 @@ pub(crate) fn put_at(page: &mut [u8; PAGE_SIZE], slot: u16, record: &[u8]) -> Re
     let old_n = if had { nrows(&src) } else { 0 };
     let target = slot as usize;
     let n = old_n.max(target + 1);
-    let row = &record[8..];
+    let row = &record[VERSION_LEN..];
     let voff = if had { dir(&src, 0).0 } else { 0 };
 
-    let ver = |s: usize| -> [u8; 8] {
+    let ver = |s: usize| -> [u8; 16] {
         if s == target {
-            record[0..8].try_into().unwrap()
+            record[0..VERSION_LEN].try_into().unwrap()
         } else if s < old_n {
-            src[voff + s * 8..voff + s * 8 + 8].try_into().unwrap()
+            src[voff + s * VERSION_LEN..voff + (s + 1) * VERSION_LEN]
+                .try_into()
+                .unwrap()
         } else {
-            [0u8; 8]
+            [0u8; VERSION_LEN]
         }
     };
     let val = |s: usize, c: usize| -> &[u8] {
@@ -269,11 +277,13 @@ pub(crate) fn delete(page: &mut [u8; PAGE_SIZE], slot: u16) -> Result<()> {
     let ncols = ncols(&src);
     let target = slot as usize;
     let voff = dir(&src, 0).0;
-    let ver = |s: usize| -> [u8; 8] {
+    let ver = |s: usize| -> [u8; 16] {
         if s == target {
-            [0u8; 8]
+            [0u8; VERSION_LEN]
         } else {
-            src[voff + s * 8..voff + s * 8 + 8].try_into().unwrap()
+            src[voff + s * VERSION_LEN..voff + (s + 1) * VERSION_LEN]
+                .try_into()
+                .unwrap()
         }
     };
     let val = |s: usize, c: usize| -> &[u8] {
@@ -283,14 +293,14 @@ pub(crate) fn delete(page: &mut [u8; PAGE_SIZE], slot: u16) -> Result<()> {
 }
 
 /// Rewrites the deleter field in place, returning the previous value.
-pub(crate) fn delete_mark(page: &mut [u8; PAGE_SIZE], slot: u16, deleter: u32) -> Result<u32> {
+pub(crate) fn delete_mark(page: &mut [u8; PAGE_SIZE], slot: u16, deleter: u64) -> Result<u64> {
     if is_empty(page, slot) {
         return Err(Error::Runtime(format!("no record at slot {slot}")));
     }
     let (voff, _) = dir(page, 0);
-    let at = voff + slot as usize * 8;
-    let prev = u32::from_le_bytes(page[at + 4..at + 8].try_into().unwrap());
-    page[at + 4..at + 8].copy_from_slice(&deleter.to_le_bytes());
+    let at = voff + slot as usize * VERSION_LEN;
+    let prev = u64::from_le_bytes(page[at + 8..at + 16].try_into().unwrap());
+    page[at + 8..at + 16].copy_from_slice(&deleter.to_le_bytes());
     Ok(prev)
 }
 
@@ -304,7 +314,7 @@ pub(crate) fn read_record(page: &[u8], slot: u16, keep: Option<&[bool]>, out: &m
     let ncols = ncols(page);
     let (voff, _) = dir(page, 0);
     out.clear();
-    out.extend_from_slice(&page[voff + s * 8..voff + s * 8 + 8]);
+    out.extend_from_slice(&page[voff + s * VERSION_LEN..voff + (s + 1) * VERSION_LEN]);
     out.extend_from_slice(&(ncols as u16).to_le_bytes());
     for c in 0..ncols {
         let needed = keep.is_none_or(|k| k.get(c).copied().unwrap_or(true));
@@ -323,7 +333,7 @@ mod tests {
     use crate::storage::codec::{decode_row, encode_record_inline, record_version};
     use crate::value::Value;
 
-    fn rec(creator: u32, deleter: u32, vals: &[Value]) -> Vec<u8> {
+    fn rec(creator: u64, deleter: u64, vals: &[Value]) -> Vec<u8> {
         encode_record_inline(creator, deleter, vals)
     }
 
@@ -381,7 +391,7 @@ mod tests {
         let keep = [false, false, true];
         let mut out = Vec::new();
         assert!(read_record(&page, s, Some(&keep), &mut out));
-        let (row, _) = decode_row(&out[8..]).unwrap();
+        let (row, _) = decode_row(&out[VERSION_LEN..]).unwrap();
         assert_eq!(row, vec![Value::Null, Value::Null, Value::Int(9)]);
         // reading all columns is unaffected
         assert!(read_record(&page, s, None, &mut out));

@@ -99,7 +99,7 @@ python3 scripts/smoke.py     # Windows: python scripts\smoke.py；期望输出 S
 | `db/instance.rs` | 单实例多库：数据根 `<db>/` + 系统库 `chibi_meta/`；每个数据库一个 `Arc<RwLock<Database>>`（**跨库并行、库内读共享/写独占**），映射本身也在 `RwLock` 下，系统库同样受锁保护；`execute_with` 顶层入口（拦截库/用户/权限语句，其余路由到 current_db） | `Instance::open` / `execute_with` / `with_database_mut` |
 | `config.rs` | 全局配置中心：`Config`（storage/wal/server/execution/auth/transaction），`config.toml` 加载、默认值、校验 | `Config::load` / `from_toml_str` / `validate` |
 | `catalog/mod.rs` | `Catalog`：`Table`/`HeapStore`/`IndexEntry`、`Schema`/`ColumnDesc`（带 `owner`）、`resolve()` 歧义检测 | |
-| `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT8** + 统一文件头（事务簿记 + 视图定义 + 列约束 + 唯一索引标记） | `CatalogSnapshot` |
+| `catalog/meta.rs` | catalog.bin 自描述格式，魔数 **CHIDCAT9** + 统一文件头（事务簿记 + 视图定义 + 列约束 + 唯一索引标记）；`next_trx_id`/`committed_trxs` 为 `u64` | `CatalogSnapshot` |
 | `storage/page.rs` | 页常量：`PAGE_SIZE=8192`、`FileId=u32`、`PageNo=u32`、`zeroed_page` | |
 | `storage/disk.rs` | `DiskManager`：分页文件读写、建文件、可选 Double-Write Buffer 的 stage/sync/reset；**按文件加锁**（`RwLock<BTreeMap<FileId, Arc<FileSlot>>>` 注册表 + 每文件 `Mutex<Option<File>>`，方法全 `&self`），`with_file` 提供"持单文件锁跑闭包"的原语，`alloc_page` 把"取页数 + 写零页"做成原子的；`write_page` 不再调 `File::flush`（对 `File` 是 no-op） | `with_file` / `alloc_page` |
 | `storage/header.rs` | 统一文件头 `[magic8][version u16][kind u8][page_size u32]`；`write_header`/`read_header` 校验版本/类型/页大小 | `FORMAT_VERSION` |
@@ -109,11 +109,11 @@ python3 scripts/smoke.py     # Windows: python scripts\smoke.py；期望输出 S
 | `storage/slotted.rs` | slotted 页纯函数：槽目录、变长条目、`page_insert`（空槽复用+压实）、`page_get/iter/delete/write` | |
 | `storage/engine.rs` | 存储读接缝：`TableEngine`/`RowScanner` trait + `HeapEngine`（流式逐页扫描） | `HeapEngine::scan` |
 | `storage/heap.rs` | `HeapFile`：page 0 文件头（魔数 **CHIDHEAP** + 统一头；行带 MVCC 字段）、first-fit 多页、`insert/get/delete(物理)/delete_mark(MVCC)/for_each` | `Rid{page_no,slot}` |
-| `storage/codec.rs` | 行/记录编码：自描述 tag（Null=00/Int=01/Float=02/Str=03/Bool=04/Date=05/Text）、值计数前缀；`encode_row/decode_row`；**版本化记录** `encode_record(creator,deleter,row)`（前 8 字节两个隐藏 u32） | |
+| `storage/codec.rs` | 行/记录编码：自描述 tag（Null=00/Int=01/Float=02/Str=03/Bool=04/Date=05/Text）、值计数前缀；`encode_row/decode_row`；**版本化记录** `encode_record(creator,deleter,row)`（前 16 字节两个隐藏 `u64`，`RECORD_HEADER`） | |
 | `index/key.rs` | 索引保序键编码：int 符号翻转大端、float 保序变换、str+NUL 结尾、date 符号翻转、null=0x00 | `encode_key` |
 | `index/node.rs` | B+ 树节点页：叶/内部条目、lower/upper bound、bytes 占用阈值 25%、`page_write` 原位重写 | |
 | `index/btree.rs` | B+ 树主体：`init/open/open_or_repair/at`、递归插入双级分裂长高、search（跨叶重复键回退）、scan_range 叶链、delete 借用/合并/根收缩（~880 行） | |
-| `wal.rs` | 预写日志：帧 `[u32 len][u8 type][u32 trx][payload]`，Record::Insert/DeleteMark/Commit，追加 + `sync()`（提交点）+ `truncate()`（checkpoint）；`plan_recovery` 解析日志（容忍截断尾帧），纯函数有单测 | `Wal` / `plan_recovery` |
+| `wal.rs` | 预写日志：帧 `[u32 len][u8 type][u64 trx][payload]`，Record::Insert/DeleteMark/Commit，追加 + `sync()`（提交点）+ `truncate()`（checkpoint）；`plan_recovery` 解析日志（容忍截断尾帧），纯函数有单测 | `Wal` / `plan_recovery` |
 
 ### 3.2 测试（`tests/`，57 个文件 / 477 tests）
 
@@ -239,7 +239,7 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ```
 <data_dir>/
-  catalog.bin            # 魔数 CHIDCAT6 + 统一文件头 + next_table_file/next_index_file/next_trx_id/committed[]
+  catalog.bin            # 魔数 CHIDCAT9 + 统一文件头 + next_table_file/next_index_file/next_trx_id(u64)/committed[](u64)
                           # + 表元数据（列定义+file_no）+ 索引元数据（name/table/column/file_no）
   wal.bin                # 预写日志（见 §6.3）；干净关闭/flush 后为 0 字节
   tables/000000.dbf ...  # 每表一个 HeapFile；page 0 头魔数 CHIDHEAP + 统一头，数据页从 1 起，first-fit
@@ -249,26 +249,27 @@ EXPLAIN SELECT ...;                        -- 输出 FullScan / IndexScan / Nest
 
 ### 6.2 MVCC 现状（M12.1）
 
-- 每条堆记录物理格式：`[u32 creator_trx][u32 deleter_trx][行 codec]`（见 `codec::encode_record/decode_record`）
+- 每条堆记录物理格式：`[u64 creator_trx][u64 deleter_trx][行 codec]`（见 `codec::encode_record/decode_record`）
 - 事务状态在 `db/trx.rs`：
   - `Session { trx: Option<TrxState> }`（server 每连接一个；REPL 一个）
-  - `TrxState { id, snapshot: HashSet<u32> 已提交集合快照, undo, explicit }`
+  - `TrxState { id: u64, snapshot: Snapshot { xmax, xip }, clog: Arc<CommitStatus>, undo, wal, explicit }`
+    （PG 式：可见性查 clog，不再深拷贝 committed 集合）
   - 可见性：creator ∈ {0, self, snapshot} 且 deleter=0 或 deleter=self 的反向规则——
     `deleted_for_me = deleter != 0 && (deleter == self.id || snapshot.contains(deleter))`
     **注意：自己删的行对自己立即可见性为假（行消失）**，这是曾经写反过的坑
 - 自动提交：`execute_sql`（无 session）每条语句一个临时事务；语句失败 → 整条语句 undo
 - DML 语义：
   - INSERT → 新版本（creator=trx）；undo 物理删除该 rid 并删对应索引项
-  - DELETE → `HeapFile::delete_mark`（原位改写 8 字节，记录长度不变；**不做物理回收**）；undo 清标记
+  - DELETE → `HeapFile::delete_mark`（原位改写 16 字节版本头的 deleter，记录长度不变；**不做物理回收**）；undo 清标记
   - UPDATE → 标记旧版本 + 追加新版本（新 Rid）；索引只追加新键项，旧项靠读时可见性过滤；undo 删新版本+索引项+解除旧标记
-- 提交：`committed_trxs.insert(id)` 后，**只有写事务**（undo 非空）才追加 Commit 帧 + `wal.sync()` + `save_catalog()`；只读事务只更新内存 committed 集就返回（无版本行引用其 id，落盘无意义，且避免每条 SELECT 重写 catalog）
+- 提交：**只有写事务**（undo 非空）才追加 Commit 帧 + `wal.sync()`；**每提交不再 `save_catalog`**（Step 1 去掉 O(n²) 重写，WAL 的 Commit 帧即提交事实，恢复时据此修复 catalog）。只读事务只更新内存 clog 就返回
 - 读路径统一走 `decode_visible(records, trx)`；JOIN 流水线、索引扫描（store_get_records）都要过这层
 - 并发模型：全局单 Mutex 串行化，允许多个 BEGIN 并存但执行串行；连接断开时应 `rollback_session`（net/server.rs 当前在连接结束路径，确认已接入）
 - 索引与可见性：索引本身**不含** trx 信息，扫到 rid 后回表 + 可见性过滤；UPDATE/DELETE 会积累 stale 索引项（空间债）
 
 ### 6.3 WAL + 崩溃恢复（M12.3，已实现）
 
-帧格式 `[u32 len][u8 type][u32 trx_id][payload]`（len 覆盖 len 之后的所有字节；type 1=Insert、2=DeleteMark、3=Commit；解析遇截断尾帧/未知 type 即停止）。Update 记为 DeleteMark+Insert 两条。
+帧格式 `[u32 len][u8 type][u64 trx_id][payload]`（len 覆盖 len 之后的所有字节；type 1=Insert、2=DeleteMark、3=Commit；解析遇截断尾帧/未知 type 即停止）。Update 记为 DeleteMark+Insert 两条。
 
 - **写时机**：`store_insert` / `store_delete_mark` / `store_update_versions`（lib.rs）在堆操作成功后追加；`commit_trx(trx_id, wrote)` 在 `committed_trxs.insert` 后追加 Commit 帧 + `sync_all()`（真正的提交点），随后 save_catalog。**只读事务（undo 空）不记 Commit、不 fsync**
 - **恢复**（`Database::open` 末尾，`recover_from_wal`）：

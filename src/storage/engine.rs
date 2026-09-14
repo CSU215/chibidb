@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::config::PageLayout;
 use crate::storage::buffer::BufferPool;
-use crate::storage::codec::{decode_row_with_want, decode_tagged_value, LobResolver};
+use crate::storage::codec::{decode_row_with_want, decode_tagged_value, LobResolver, RECORD_HEADER};
 use crate::storage::heap::{HeapFile, Rid};
 use crate::storage::page::{FileId, PageNo, PAGE_SIZE};
 use crate::storage::slotted::{page_get, page_iter, page_put_at, page_slots};
@@ -85,7 +85,7 @@ pub trait TableEngine: Send + Sync {
 /// `FnMut` so the borrowed `values` slice does not trip higher-ranked-lifetime
 /// inference when a caller wraps another closure.
 pub trait RowSink {
-    fn row(&mut self, creator: u32, deleter: u32, values: &[Value]) -> Result<()>;
+    fn row(&mut self, creator: u64, deleter: u64, values: &[Value]) -> Result<()>;
 }
 
 /// Full table-storage seam: MVCC version writes plus the read cursor. The
@@ -100,7 +100,7 @@ pub trait TableStorage: TableEngine + std::fmt::Debug {
 
     /// Rewrites the record's deleter field; returns the previous deleter,
     /// which first-committer-wins needs.
-    fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u32) -> Result<u32>;
+    fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u64) -> Result<u64>;
 
     /// The file backing this table, for WAL replay and index mapping.
     fn file_id(&self) -> FileId;
@@ -181,14 +181,14 @@ impl TableEngine for HeapEngine {
                 match self.layout {
                     PageLayout::Row => {
                         for (_, rec) in page_iter(page) {
-                            if rec.len() < 8 {
+                            if rec.len() < RECORD_HEADER {
                                 return Err(Error::Runtime("truncated versioned record".into()));
                             }
-                            let creator = u32::from_le_bytes(rec[0..4].try_into().unwrap());
-                            let deleter = u32::from_le_bytes(rec[4..8].try_into().unwrap());
+                            let creator = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+                            let deleter = u64::from_le_bytes(rec[8..16].try_into().unwrap());
                             if !cols.is_empty() {
                                 out.iter_mut().for_each(|v| *v = Value::Null);
-                                decode_row_with_want(&rec[8..], &want, lobs, &mut out)?;
+                                decode_row_with_want(&rec[RECORD_HEADER..], &want, lobs, &mut out)?;
                             }
                             sink.row(creator, deleter, &out)?;
                         }
@@ -231,7 +231,7 @@ impl TableStorage for HeapEngine {
         HeapFile::at(self.file, self.layout).delete(bp, rid)
     }
 
-    fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u32) -> Result<u32> {
+    fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u64) -> Result<u64> {
         HeapFile::at(self.file, self.layout).delete_mark(bp, rid, deleter)
     }
 

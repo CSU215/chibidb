@@ -50,7 +50,7 @@ pub struct ExecContext<'a> {
 }
 
 /// Receives `(creator, deleter, projected values)` for one row.
-pub(crate) type ProjectedSink<'a> = dyn FnMut(u32, u32, &[Value]) -> Result<()> + 'a;
+pub(crate) type ProjectedSink<'a> = dyn FnMut(u64, u64, &[Value]) -> Result<()> + 'a;
 
 /// Whether a plan streams rows or is a side-effecting command (DML).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +216,11 @@ impl PhysicalOperator for TableScan {
             if !ctx.trx.visible(creator, deleter) {
                 continue;
             }
-            chunk.push_encoded_row(&self.record[8..], ctx.db.lobs(), self.keep.as_deref())?;
+            chunk.push_encoded_row(
+                &self.record[crate::storage::codec::RECORD_HEADER..],
+                ctx.db.lobs(),
+                self.keep.as_deref(),
+            )?;
         }
         Ok((!chunk.is_empty()).then_some(chunk))
     }
@@ -243,7 +247,7 @@ impl PhysicalOperator for TableScan {
                 continue;
             }
             crate::storage::codec::decode_row_into(
-                &self.record[8..],
+                &self.record[crate::storage::codec::RECORD_HEADER..],
                 Some(ctx.db.lobs()),
                 self.keep.as_deref(),
                 &mut self.row_buf,
@@ -282,7 +286,7 @@ struct VisibleSink<'a> {
 }
 
 impl crate::storage::engine::RowSink for VisibleSink<'_> {
-    fn row(&mut self, creator: u32, deleter: u32, values: &[Value]) -> Result<()> {
+    fn row(&mut self, creator: u64, deleter: u64, values: &[Value]) -> Result<()> {
         if self.trx.visible(creator, deleter) {
             (self.sink)(creator, deleter, values)?;
         }

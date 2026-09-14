@@ -185,17 +185,17 @@ impl HeapFile {
     /// MVCC delete-mark: rewrites the record in place, setting its deleter id.
     /// Returns the previous deleter (0 when the version was live), which the
     /// first-committer-wins check needs.
-    pub fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u32) -> Result<u32> {
+    pub fn delete_mark(&self, bp: &BufferPool, rid: Rid, deleter: u64) -> Result<u64> {
         bp.with_page(self.file, rid.page_no, |page| match self.layout {
             PageLayout::Row => {
                 let rec = page_get(page, rid.slot)?
                     .ok_or_else(|| Error::Runtime(format!("no record at {rid:?}")))?;
                 let mut updated = rec.to_vec();
-                if updated.len() < 8 {
+                if updated.len() < crate::storage::codec::RECORD_HEADER {
                     return Err(Error::Runtime("record lacks mvcc fields".into()));
                 }
-                let prev = u32::from_le_bytes(updated[4..8].try_into().unwrap());
-                updated[4..8].copy_from_slice(&deleter.to_le_bytes());
+                let prev = u64::from_le_bytes(updated[8..16].try_into().unwrap());
+                updated[8..16].copy_from_slice(&deleter.to_le_bytes());
                 page_write(page, rid.slot, &updated)?;
                 Ok(prev)
             }

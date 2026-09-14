@@ -168,7 +168,7 @@ impl Database {
         let mut next_table_file = 0;
         let mut next_index_file = 0;
         let mut next_trx_id = 1;
-        let mut committed_trxs: HashSet<u32> = HashSet::new();
+        let mut committed_trxs: HashSet<u64> = HashSet::new();
         // tables whose index file headers were rebuilt after a crash; their
         // contents must be re-derived from the heap
         let mut repaired_index_tables: Vec<String> = Vec::new();
@@ -316,7 +316,7 @@ impl Database {
 
     /// Runs a checkpoint. `exclude` is the id of the statement's own
     /// (autocommit) transaction, which must not count as an open one.
-    pub(crate) fn flush_inner(&self, exclude: Option<u32>) -> Result<()> {
+    pub(crate) fn flush_inner(&self, exclude: Option<u64>) -> Result<()> {
         let _serial = self.checkpoint_lock.lock();
         // Writing pages back is safe while transactions are open; only
         // dropping the log needs the no-open guarantee below.
@@ -416,8 +416,8 @@ impl Database {
                             continue;
                         }
                         if let Ok(bytes) = engine.get(&self.pool, *rid)
-                            && bytes.len() >= 8
-                            && u32::from_le_bytes(bytes[4..8].try_into().unwrap()) == 0
+                            && bytes.len() >= crate::storage::codec::RECORD_HEADER
+                            && u64::from_le_bytes(bytes[8..16].try_into().unwrap()) == 0
                         {
                             engine.delete_mark(&self.pool, *rid, *deleter)?;
                         }
@@ -473,7 +473,7 @@ impl Database {
             // snapshot needs its id and its bookkeeping need not hit disk.
             // Skipping the catalog rewrite keeps SELECT cheap.
             self.trx.commit(trx_id);
-            self.locks.unlock_all(trx_id as u64);
+            self.locks.unlock_all(trx_id);
             return Ok(());
         }
         // The synced commit record is the durability point. Flush the
@@ -495,7 +495,7 @@ impl Database {
         {
             eprintln!("commit: opportunistic checkpoint failed: {e}");
         }
-        self.locks.unlock_all(trx_id as u64);
+        self.locks.unlock_all(trx_id);
         Ok(())
     }
 
@@ -529,7 +529,7 @@ impl Database {
     }
 
     /// Whether `id` names a transaction that committed after `trx`'s snapshot.
-    fn conflicting_committer(&self, trx: &TrxState, id: u32) -> bool {
+    fn conflicting_committer(&self, trx: &TrxState, id: u64) -> bool {
         id != 0
             && id != trx.id
             && !trx.committed_before(id)
@@ -762,7 +762,7 @@ impl Database {
     }
 
     /// Whether any session other than `trx_id` has a transaction open.
-    pub(crate) fn has_open_trxs_excluding(&self, trx_id: u32) -> bool {
+    pub(crate) fn has_open_trxs_excluding(&self, trx_id: u64) -> bool {
         self.trx.has_open_excluding(trx_id)
     }
 
@@ -803,7 +803,7 @@ impl Database {
     fn rollback_trx_to(&self, trx: &mut TrxState, undo_mark: usize, wal_mark: usize) -> Result<()> {
         if undo_mark == 0 {
             // full rollback: release the transaction's row locks
-            self.locks.unlock_all(trx.id as u64);
+            self.locks.unlock_all(trx.id);
         }
         trx.wal.truncate(wal_mark);
         while trx.undo.len() > undo_mark {
@@ -1108,7 +1108,7 @@ impl Database {
         let deleter = trx.id;
         for rid in rids {
             // serialize writers of the same row; different rows proceed
-            self.locks.lock(deleter as u64, name, *rid)?;
+            self.locks.lock(deleter, name, *rid)?;
             let prev_deleter = engine.delete_mark(&self.pool, *rid, deleter)?;
             trx.undo.push(Undo::DeleteMark {
                 table: name.to_string(),
@@ -1142,7 +1142,7 @@ impl Database {
         let ops = self.index_ops(name)?;
         for (rid, new_row) in updates {
             // serialize writers of the same row; different rows proceed
-            self.locks.lock(trx_id as u64, name, *rid)?;
+            self.locks.lock(trx_id, name, *rid)?;
             let prev_deleter = engine.delete_mark(&self.pool, *rid, trx_id)?;
             crate::wal::encode_frame_into(
                 &mut trx.wal,

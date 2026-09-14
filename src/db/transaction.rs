@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -16,32 +16,32 @@ use crate::db::clog::CommitStatus;
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     /// xids >= xmax were allocated after the snapshot: always invisible.
-    pub xmax: u32,
+    pub xmax: u64,
     /// xids in flight when the snapshot was taken, sorted ascending.
-    pub xip: Vec<u32>,
+    pub xip: Vec<u64>,
 }
 
 /// Transaction id source plus the committed/open bookkeeping.
 pub struct TransactionManager {
-    next_id: AtomicU32,
+    next_id: AtomicU64,
     /// Monotonic commit counter. A checkpoint compares it across its flush to
     /// notice a transaction that committed while the flush was in flight,
     /// without having to read the clog (which would invert the
     /// `commit` -> `open` lock order).
     commits: AtomicU64,
     committed: Arc<CommitStatus>,
-    open: RwLock<HashSet<u32>>,
+    open: RwLock<HashSet<u64>>,
 }
 
 impl TransactionManager {
     /// Resumes from a recovered state: the next free id and the committed ids.
-    pub fn new(next_id: u32, committed: impl IntoIterator<Item = u32>) -> Self {
+    pub fn new(next_id: u64, committed: impl IntoIterator<Item = u64>) -> Self {
         let status = CommitStatus::new();
         for id in committed {
             status.mark_committed(id);
         }
         Self {
-            next_id: AtomicU32::new(next_id),
+            next_id: AtomicU64::new(next_id),
             commits: AtomicU64::new(0),
             committed: Arc::new(status),
             open: RwLock::new(HashSet::new()),
@@ -49,14 +49,14 @@ impl TransactionManager {
     }
 
     /// Reserves the next transaction id.
-    pub fn allocate(&self) -> u32 {
+    pub fn allocate(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Reserves an id and marks it open in one step. Splitting this into
     /// `allocate` + `insert_open` leaves a window where a transaction owns an
     /// id but is invisible to a checkpoint's no-open check.
-    pub fn begin_open(&self) -> u32 {
+    pub fn begin_open(&self) -> u64 {
         let mut open = self.open.write();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         open.insert(id);
@@ -64,13 +64,13 @@ impl TransactionManager {
     }
 
     /// Never hands a recovered transaction's id to a new transaction.
-    pub fn ensure_next_id_at_least(&self, id: u32) {
+    pub fn ensure_next_id_at_least(&self, id: u64) {
         if id >= self.next_id.load(Ordering::SeqCst) {
             self.next_id.store(id.saturating_add(1), Ordering::SeqCst);
         }
     }
 
-    pub fn next_id(&self) -> u32 {
+    pub fn next_id(&self) -> u64 {
         self.next_id.load(Ordering::SeqCst)
     }
 
@@ -78,7 +78,7 @@ impl TransactionManager {
     pub fn snapshot(&self) -> Snapshot {
         let xmax = self.next_id.load(Ordering::SeqCst);
         let open = self.open.read();
-        let mut xip: Vec<u32> = open.iter().copied().collect();
+        let mut xip: Vec<u64> = open.iter().copied().collect();
         xip.sort_unstable();
         Snapshot { xmax, xip }
     }
@@ -93,24 +93,24 @@ impl TransactionManager {
         Arc::clone(&self.committed)
     }
 
-    pub fn committed_ids(&self) -> Vec<u32> {
+    pub fn committed_ids(&self) -> Vec<u64> {
         self.committed.ids()
     }
 
-    pub fn is_committed(&self, id: u32) -> bool {
+    pub fn is_committed(&self, id: u64) -> bool {
         self.committed.is_committed(id)
     }
 
-    pub fn insert_open(&self, id: u32) {
+    pub fn insert_open(&self, id: u64) {
         self.open.write().insert(id);
     }
 
-    pub fn remove_open(&self, id: u32) {
+    pub fn remove_open(&self, id: u64) {
         self.open.write().remove(&id);
     }
 
     /// Records a commit and clears the open marker.
-    pub fn commit(&self, id: u32) {
+    pub fn commit(&self, id: u64) {
         // Bump the counter first: a checkpoint holding the open set must see
         // this commit even though it cannot yet remove the open marker.
         self.commits.fetch_add(1, Ordering::SeqCst);
@@ -118,7 +118,7 @@ impl TransactionManager {
         self.open.write().remove(&id);
     }
 
-    pub fn extend_committed(&self, ids: impl IntoIterator<Item = u32>) {
+    pub fn extend_committed(&self, ids: impl IntoIterator<Item = u64>) {
         for id in ids {
             self.committed.mark_committed(id);
         }
@@ -135,12 +135,12 @@ impl TransactionManager {
 
     /// Runs `f` while holding the open set, so no transaction can begin and
     /// none can finish committing during a checkpoint's final decision.
-    pub fn with_open_set<R>(&self, f: impl FnOnce(&HashSet<u32>) -> R) -> R {
+    pub fn with_open_set<R>(&self, f: impl FnOnce(&HashSet<u64>) -> R) -> R {
         f(&self.open.write())
     }
 
     /// Whether any transaction other than `id` is open (blocks DDL/checkpoint).
-    pub fn has_open_excluding(&self, id: u32) -> bool {
+    pub fn has_open_excluding(&self, id: u64) -> bool {
         self.open.read().iter().any(|&open| open != id)
     }
 }

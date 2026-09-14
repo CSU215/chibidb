@@ -29,7 +29,7 @@ impl CommitStatus {
     }
 
     /// Records that `xid` committed. Idempotent.
-    pub fn mark_committed(&self, xid: u32) {
+    pub fn mark_committed(&self, xid: u64) {
         let word = xid as usize / BITS;
         let mask = 1u64 << (xid as usize % BITS);
         {
@@ -48,7 +48,7 @@ impl CommitStatus {
     }
 
     /// Whether `xid` committed. xid 0 (the read-only sentinel) never has.
-    pub fn is_committed(&self, xid: u32) -> bool {
+    pub fn is_committed(&self, xid: u64) -> bool {
         let word = xid as usize / BITS;
         let bit = xid as usize % BITS;
         let words = self.words.read();
@@ -59,7 +59,7 @@ impl CommitStatus {
     }
 
     /// Every committed xid, ascending. O(bitmap); for catalogs/checkpoints.
-    pub fn ids(&self) -> Vec<u32> {
+    pub fn ids(&self) -> Vec<u64> {
         let words = self.words.read();
         let mut out = Vec::new();
         for (w, word) in words.iter().enumerate() {
@@ -67,7 +67,7 @@ impl CommitStatus {
             while bits != 0 {
                 let bit = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                out.push((w * BITS + bit) as u32);
+                out.push((w * BITS + bit) as u64);
             }
         }
         out
@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn marks_and_reads_back_across_chunks() {
         let clog = CommitStatus::new();
-        let across = (BITS * WORDS_PER_CHUNK) as u32 + 5; // forces a second chunk
+        let across = (BITS * WORDS_PER_CHUNK) as u64 + 5; // forces a second chunk
         assert!(!clog.is_committed(1));
         clog.mark_committed(1);
         clog.mark_committed(across);

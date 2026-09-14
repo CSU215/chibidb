@@ -11,6 +11,9 @@ const TAG_DATE: u8 = 0x05;
 /// A reference to an out-of-line large object (a `u64` id follows).
 const TAG_LOB: u8 = 0x06;
 
+/// Size of the `(creator, deleter)` version header that precedes every row.
+pub const RECORD_HEADER: usize = 16;
+
 /// Out-of-line storage used to externalize long string values.
 pub trait LobResolver {
     fn put(&self, data: &[u8]) -> Result<u64>;
@@ -27,11 +30,11 @@ impl LobResolver for LobStore {
     }
 }
 
-/// Versioned record: two hidden u32 transaction fields precede the row. String
+/// Versioned record: two hidden u64 transaction fields precede the row. String
 /// values longer than `inline_limit` are stored out-of-line in `lobs`.
 pub fn encode_record(
-    creator: u32,
-    deleter: u32,
+    creator: u64,
+    deleter: u64,
     row: &[Value],
     lobs: &dyn LobResolver,
     inline_limit: usize,
@@ -44,21 +47,21 @@ pub fn encode_record(
 }
 
 /// Reads the `(creator, deleter)` version header of a versioned record.
-pub fn record_version(data: &[u8]) -> Result<(u32, u32)> {
-    if data.len() < 8 {
+pub fn record_version(data: &[u8]) -> Result<(u64, u64)> {
+    if data.len() < RECORD_HEADER {
         return Err(Error::Runtime("truncated versioned record".into()));
     }
-    let creator = u32::from_le_bytes(data[0..4].try_into().unwrap());
-    let deleter = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let creator = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let deleter = u64::from_le_bytes(data[8..16].try_into().unwrap());
     Ok((creator, deleter))
 }
 
 pub fn decode_record(
     data: &[u8],
     lobs: &dyn LobResolver,
-) -> Result<(u32, u32, Vec<Value>)> {
+) -> Result<(u64, u64, Vec<Value>)> {
     let (creator, deleter) = record_version(data)?;
-    let (row, _) = decode_row_with(&data[8..], Some(lobs), None)?;
+    let (row, _) = decode_row_with(&data[RECORD_HEADER..], Some(lobs), None)?;
     Ok((creator, deleter, row))
 }
 
@@ -69,9 +72,9 @@ pub fn decode_record_pruned(
     data: &[u8],
     lobs: &dyn LobResolver,
     keep: &[bool],
-) -> Result<(u32, u32, Vec<Value>)> {
+) -> Result<(u64, u64, Vec<Value>)> {
     let (creator, deleter) = record_version(data)?;
-    let (row, _) = decode_row_with(&data[8..], Some(lobs), Some(keep))?;
+    let (row, _) = decode_row_with(&data[RECORD_HEADER..], Some(lobs), Some(keep))?;
     Ok((creator, deleter, row))
 }
 
@@ -80,8 +83,8 @@ pub fn decode_record_pruned(
 /// object when its last version is physically removed.
 pub fn collect_lob_ids(data: &[u8]) -> Vec<u64> {
     let mut ids = Vec::new();
-    if data.len() >= 8 {
-        collect_row_lob_ids(&data[8..], &mut ids);
+    if data.len() >= RECORD_HEADER {
+        collect_row_lob_ids(&data[RECORD_HEADER..], &mut ids);
     }
     ids
 }
@@ -181,7 +184,7 @@ pub fn encoded_row_size(row: &[Value], inline_limit: usize) -> usize {
 
 /// Encodes a versioned record with every string inline, for tests and callers
 /// that do not use large objects.
-pub fn encode_record_inline(creator: u32, deleter: u32, row: &[Value]) -> Vec<u8> {
+pub fn encode_record_inline(creator: u64, deleter: u64, row: &[Value]) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&creator.to_le_bytes());
     buf.extend_from_slice(&deleter.to_le_bytes());

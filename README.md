@@ -124,7 +124,7 @@ SQL 字符串
   → 子查询物化      按外层行求值 IN/EXISTS/标量子查询并改写为字面量（支持相关子查询）
   → B+ 树索引      保序字节键、分裂/借用/合并、范围扫描
   → MVCC           快照隔离、undo 回滚、BEGIN/COMMIT/ROLLBACK
-  → TransactionManager 事务 id 分配 + committed/open 集合 + 快照
+  → TransactionManager 事务 id(u64) 分配 + clog 提交位图 + PG 式快照 {xmax, xip}
   → WAL            提交时 fsync；崩溃后重放已提交事务
   → slotted page   8KB、槽目录、变长条目
   → TableStorage   表存储接缝（`insert/delete/delete_mark/scan/get`，带 MVCC 语义）
