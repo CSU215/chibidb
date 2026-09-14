@@ -1,16 +1,8 @@
 <script setup lang="ts">
-import type { Cell, ResultSet } from '../api/types'
+import type { ResultSet } from '../api/types'
+import { display } from '../format'
 
 defineProps<{ results: ResultSet[] }>()
-
-/// NULL has to look different from the empty string, and from the literal text
-/// "NULL", or the grid misreports what is in the database.
-function display(cell: Cell): string {
-  if (cell === null) return 'NULL'
-  if (cell === true) return 'true'
-  if (cell === false) return 'false'
-  return String(cell)
-}
 </script>
 
 <template>

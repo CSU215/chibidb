@@ -13,10 +13,11 @@ cargo run -q -- serve <dir>     # TCP server，默认监听 127.0.0.1:5678
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
 # HTTP/JSON 前端：配置 server.http_addr 后，POST /query {"sql":"..."} → {"results":[...]}
 # Web 控制台：同一个 http_addr 上还托管 Web 前端，浏览器直接访问该地址即可
-#   cd web && npm install && npm run build   # 构建产物（需 Node），由 Rust 同源托管
-#   cd web && npm run dev                     # 开发期用 Vite dev server，API 走代理
+#   scripts/build_web.sh                      # 构建前端产物 web/dist（需 Node 与网络）
+#   cd web && npm run dev                     # 或开发期用 Vite dev server，API 走代理
+#   设 server.admin_api = true 后，/api/parse 提供 Token 流与 AST（「解析」页要用）
 # MySQL 前端：配置 server.mysql_addr 后，可用 mysql 客户端连接（mysql_native_password、文本结果集、预处理语句）
-cargo test                      # 全量回归（635 tests，另有 9 个 #[ignore] 性能探针）
+cargo test                      # 全量回归（658 tests，另有 9 个 #[ignore] 性能探针）
 cargo test --release --test bench -- --ignored --nocapture   # 索引 vs 全表扫基准
 ```
 
@@ -29,6 +30,7 @@ REPL / client 中输入 `exit` 或 `quit` 退出。
 `server.http_addr`（可选，HTTP/JSON 监听）、`server.mysql_addr`（可选，MySQL wire 监听）、
 `server.web_root`（默认 `"web/dist"`；托管在 `http_addr` 上的前端产物目录，
 相对路径按当前工作目录解析，`""` 表示关闭托管）、
+`server.admin_api`（默认 `false`；开启后 `/api/*` 才可用，目前提供 `POST /api/parse`）、
 `server.thread_model`/`worker_threads`、
 `execution.mode`（`"volcano"` 默认 / `"chunk"` 列式批处理，见下）、
 `transaction.isolation`（`"read_committed"` 默认 / `"repeatable_read"` / `"serializable"`）、
@@ -153,8 +155,13 @@ src/
   index/     key node btree
   catalog/   mod meta
   db/        instance transaction trx
-  net/       server client protocol wire http admin mysql repl render
+  net/       server client protocol wire http admin json session mysql repl render
 ```
+
+`web/` 是同源托管的 Vue 3 控制台（用法见「快速开始」）：`web/src/` 是源码，
+`web/dist/` 是 `scripts/build_web.sh` 的构建产物（**不入库**），由 `server.web_root` 指定。
+控制台通过 `X-Chibi-Session` 让事务跨越多次 HTTP 请求——浏览器会自由复用连接，
+没有这个头的话 `BEGIN` 之后的 `INSERT` 可能落到另一条连接上。
 
 表存储通过 `TableStorage` 抽象（`Arc<dyn TableStorage>` 存于 catalog），执行层与
 `Database` 的 `store_*`/回滚/vacuum/唯一性检查都走该接缝。两种引擎：

@@ -1,12 +1,14 @@
 # chibidb 交接文档（Handoff）
 
 > 一份给下一个 Agent / 开发者的完整上下文。读完本文档即可在不了解前序对话的情况下继续开发。
-> 最后更新：**F0 Web 前端第一步**——HTTP 前端在同源路径托管 `web/dist`（新增 `src/net/admin.rs`
-> 与 `server.web_root` 配置项），`write_response` 改为按字节写出并支持额外响应头
-> （`Cache-Control`/`nosniff`），`web_root` 缺失时启动打印一条 note、`GET /` 返回可读的构建提示。
+> 最后更新：**Web 前端 F0–F2 前半完成**——HTTP 前端同源托管 `web/dist`
+> （`src/net/admin.rs` + `server.web_root`），`X-Chibi-Session` 会话注册表让事务跨请求
+> （`src/net/session.rs`），`POST /api/parse` 返回 Token 流与 AST（受 `server.admin_api` 门控），
+> 手写 JSON 值解析器替换 `json_string_field`（新增 `src/net/json.rs`），
+> 以及 Vue 3 控制台（`web/`，SQL 控制台 + 解析实验台）。详见 §10 的 F 系列。
 > 此前：src 按层重组为 `sql/`/`db/`/`net/`（`lib.rs` 用 `pub use` 保留旧扁平路径）、
 > catalog 原子写（temp+rename）、P10/P7/P8/P3 + P9（HTTP+MySQL 含预处理）、LSM 分级压实/流式、
-> 堆/LSM 差分等价与性能探针。**635 tests 全绿、clippy 零警告**
+> 堆/LSM 差分等价与性能探针。**658 Rust tests + 17 前端测试全绿、clippy 零警告**
 > （测试数会被后续提交改变，以 `cargo test` 输出为准；本文档其余数字同理）。
 
 ---
@@ -64,6 +66,7 @@ python3 scripts/smoke.py     # Windows: python scripts\smoke.py；期望输出 S
 `storage.inline_lob_limit`、
 `storage.lsm_compaction_trigger`、`wal.checkpoint_threshold`、`server.addr`/`http_addr`/`mysql_addr`、
 `server.web_root`（默认 `"web/dist"`，托管在 `http_addr` 上的前端产物目录；`""` 关闭）、
+`server.admin_api`（默认 `false`，开启后 `/api/*` 才可用）、
 `server.thread_model`/`worker_threads`、`execution.mode`、`auth.enabled`、`transaction.isolation`/`lock_timeout_ms`。
 页大小（`PAGE_SIZE=8192`）是编译期常量，**不是**配置项（动态页大小属 P6 存储抽象）。
 
@@ -440,11 +443,20 @@ P10 收尾（P10.4/P10.5）：补齐课程验收点名的两块缓存机制—�
 | 文档阶段 | 本轮步骤 | 内容 | 状态 |
 |---|---|---|---|
 | F0 | ① 静态托管 | `server.web_root`（默认 `"web/dist"`，`""` 关闭）+ 新增 `src/net/admin.rs` + `write_response` 改按字节写并支持额外响应头 + 缺失时的启动 note 与可读兜底页 | ✅ `78bd185`、`2f7a221` |
-| F0 | ② 会话令牌 | `X-Chibi-Session` 注册表：跨请求保持事务/`USE`，含空闲过期回滚、数量上限、后台清理线程 | ⬜ |
-| F1 + F2 前半 | ③ 解析接口 + 前端 | `POST /api/parse`（Token 流 + AST）+ Vue 控制台（同源托管，含库表树与结果表） | ⬜ |
+| F0 | ② 会话令牌 | `X-Chibi-Session` 注册表：跨请求保持事务/`USE`，含空闲过期回滚、数量上限、后台清理线程 | ✅ `1f8b115` |
+| F1 + F2 前半 | ③ 解析接口 + 前端 | `POST /api/parse`（Token 流 + AST，受 `server.admin_api` 门控）+ Vue 控制台（同源托管，含库表树与结果表）；JSON 值解析器替换 `json_string_field` | ✅ `fb61689`、`c089516`、`f977bdb` |
 | F3 | — | 计划可视化（从**真实算子树**渲染 + 漂移检测测试，见 `docs/web_frontend.md` §4.3d） | ⬜ |
 | F4 | — | 缓冲池面板（置换日志由队友实现，等拉取后接） | ⬜ |
 | F5–F9 | — | 空间图/页检视、索引、LSM、运行时旋钮、管理台 | ⬜ |
+
+本轮前端已落地的两处**设计取舍**（细节见 `docs/web_frontend.md` §3 与各提交说明）：
+**不做 CORS**（同源托管 + dev 代理已足够，且浏览器可向回环地址发简单跨源 POST，
+不需要就不加）；**会话为混合制**——不带 `X-Chibi-Session` 的请求保持每连接会话与
+关闭即回滚，带头的才走注册表，因此既有客户端行为逐位不变。
+
+前端 `web/` 有独立的测试：`cd web && npm test`（vitest，17 个用例，
+覆盖请求构造、错误映射与会话 id 的接管）。`web/dist` 不入库，
+新 clone 需先跑 `scripts/build_web.sh`。
 
 本轮已定的边界：**不做 CORS**（同源托管 + 开发期 Vite 代理已足够；更重要的是
 浏览器可向回环地址发**简单**跨源 POST，不需要就不加）；**不做库级权限分级**

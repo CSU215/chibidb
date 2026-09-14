@@ -2,6 +2,7 @@
 import { onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import { shortId } from './format'
 import { useSession } from './stores/session'
 
 const session = useSession()
@@ -12,12 +13,6 @@ onMounted(session.bootstrap)
 
 function go(path: string): void {
   void router.push(path)
-}
-
-/// Only the first 8 hex digits are shown: the id is long, and the badge only has
-/// to be enough to tell two tabs apart.
-function shortId(id: string): string {
-  return id ? id.slice(0, 8) : '…'
 }
 </script>
 

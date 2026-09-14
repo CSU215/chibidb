@@ -3,6 +3,7 @@ import { onMounted, ref } from 'vue'
 
 import { query } from '../api/client'
 import type { ResultSet } from '../api/types'
+import { ident } from '../format'
 
 const emit = defineEmits<{ selected: [database: string] }>()
 
@@ -12,14 +13,6 @@ const tables = ref<string[]>([])
 const columns = ref<{ name: string; type: string; extra: string }[]>([])
 const error = ref('')
 const loading = ref(false)
-
-/// Names come from the engine's own listings, so they are not user input -- but
-/// they are interpolated into SQL, and a guard is cheaper than reasoning about
-/// whether a table name could ever carry a statement separator.
-function ident(name: string): string {
-  if (!/^[A-Za-z0-9_]+$/.test(name)) throw new Error(`非法标识符: ${name}`)
-  return name
-}
 
 function textRows(results: ResultSet[]): string[][] {
   const first = results.find((r) => r.type === 'rows')
