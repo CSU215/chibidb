@@ -1202,9 +1202,14 @@ pub(crate) fn is_read_only(stmt: &crate::ast::Stmt) -> bool {
     )
 }
 
-/// A first-committer-wins conflict on `table`.
+/// A first-committer-wins conflict on `table`, reported with PostgreSQL's
+/// serialization-failure wording (`SQLSTATE 40001`): the version this
+/// transaction read was updated by another transaction that committed after
+/// its snapshot.
 fn conflict_error(table: &str) -> Error {
-    Error::Runtime(format!("transaction conflict: {table} was modified concurrently"))
+    Error::Runtime(format!(
+        "could not serialize access due to concurrent update on {table}"
+    ))
 }
 
 /// Drives one operator tree to completion, appending rows to `out`.

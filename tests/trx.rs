@@ -246,7 +246,7 @@ fn first_committer_wins_aborts_the_lost_update() {
     let (update_err, commit_err) = b.join().unwrap();
     assert!(update_err.is_none(), "update should not fail: {update_err:?}");
     let commit_err = commit_err.expect("B's commit must fail");
-    assert!(commit_err.contains("conflict"), "{commit_err}");
+    assert!(commit_err.contains("serialize"), "{commit_err}");
 
     // the loser's value never lands
     assert_eq!(rows(&db, &mut a, "select name from t;"), [[Value::Str("a".into())]]);
