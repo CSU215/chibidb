@@ -90,6 +90,7 @@ pub struct Config {
     pub execution: ExecutionConfig,
     pub auth: AuthConfig,
     pub transaction: TransactionConfig,
+    pub observability: ObservabilityConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -136,6 +137,18 @@ pub struct ExecutionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
     pub enabled: bool,
+}
+
+/// Buffer-pool observability switches. Both default to off so an existing
+/// deployment behaves exactly as before (no counters printed, no eviction
+/// lines).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    /// Print a buffer-pool snapshot at each checkpoint and on shutdown.
+    pub cache_stats: bool,
+    /// Print one line per frame eviction ("replacement log").
+    pub eviction_log: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

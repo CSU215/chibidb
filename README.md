@@ -27,7 +27,8 @@ REPL / client 中输入 `exit` 或 `quit` 退出。
 `server.thread_model`/`worker_threads`、
 `execution.mode`（`"volcano"` 默认 / `"chunk"` 列式批处理，见下）、
 `transaction.isolation`（`"read_committed"` 默认 / `"repeatable_read"` / `"serializable"`）、
-`transaction.lock_timeout_ms`；
+`transaction.lock_timeout_ms`、
+`observability.cache_stats`/`observability.eviction_log`（缓冲池命中统计与替换日志，默认关闭）；
 其余为后续阶段预留（详见 `HANDOFF.md` §10 重构路线图）。
 
 ### 冒烟演示
@@ -180,6 +181,10 @@ catalog 记录每表引擎，打开/建表/删除/WAL 重放均按引擎分派�
 - 淘汰策略可配置：`storage.eviction = "lru" | "clock" | "fifo"`，默认 **LRU**。
   策略只决定"换出哪一帧"，不影响任何可观测结果（换出的脏页会先写回）；
   默认值保证行为与引入此键之前逐位一致
+- 缓冲池可观测性（默认关闭）：`observability.cache_stats = true` 在每次 checkpoint
+  与退出时输出一行 `hits/misses/evictions/clean/dirty/resident/命中率`；
+  `observability.eviction_log = true` 每次淘汰输出一行（文件、页、策略、是否脏）。
+  事件经 `CacheReporter` 接缝交给 stderr，测试可注入 reporter 断言
 - 磁盘 I/O 按文件并行：`DiskManager` 用注册表 `RwLock` + **每文件** `Mutex`，
   不同文件的读写互不阻塞（`with_file` 提供"持单文件锁跑闭包"的原语，
   `alloc_page` 的"取页数 + 写零页"因此在同一把锁内完成）

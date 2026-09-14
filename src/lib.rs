@@ -110,10 +110,11 @@ impl Database {
             crate::storage::dwb::recover(&dwb_path, crate::storage::dwb::write_page_at)?;
             disk.enable_double_write(&dwb_path)?;
         }
-        let pool = BufferPool::new_with_eviction(
+        let pool = BufferPool::new_with_observability(
             disk,
             config.storage.buffer_pool_frames,
             config.storage.eviction,
+            config.observability.clone(),
         );
         let mut catalog = Catalog::default();
         let mut next_table_file = 0;
@@ -316,7 +317,10 @@ impl Database {
                 self.wal.truncate()?;
             }
             Ok(())
-        })
+        })?;
+        // checkpoint is the natural reporting point for cache observability
+        self.pool.report_stats();
+        Ok(())
     }
 
     /// Physically removes rows no transaction can ever see again:

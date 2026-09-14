@@ -21,6 +21,22 @@ fn defaults_are_sane() {
     assert_eq!(c.execution.mode, ExecutionMode::Chunk);
     assert!(!c.auth.enabled);
     assert_eq!(c.transaction.isolation, Isolation::ReadCommitted);
+    assert!(!c.observability.cache_stats);
+    assert!(!c.observability.eviction_log);
+}
+
+#[test]
+fn observability_switches_parse() {
+    let c = Config::from_toml_str(
+        "[observability]\ncache_stats = true\neviction_log = true\n",
+    )
+    .unwrap();
+    assert!(c.observability.cache_stats);
+    assert!(c.observability.eviction_log);
+
+    // 严格模式：拼错的键被拒绝。
+    assert!(Config::from_toml_str("[observability]\ncache = true\n").is_err());
+    assert!(Config::from_toml_str("[observability]\nstats_interval_secs = 1\n").is_err());
 }
 
 #[test]
@@ -78,6 +94,10 @@ mode = "chunk"
 
 [auth]
 enabled = true
+
+[observability]
+cache_stats = true
+eviction_log = true
 "#;
     let c = Config::from_toml_str(toml).unwrap();
     assert_eq!(c.storage.default_engine, EngineKind::Lsm);
@@ -91,6 +111,8 @@ enabled = true
     assert_eq!(c.server.protocols, ["text", "mysql"]);
     assert_eq!(c.execution.mode, ExecutionMode::Chunk);
     assert!(c.auth.enabled);
+    assert!(c.observability.cache_stats);
+    assert!(c.observability.eviction_log);
 }
 
 #[test]

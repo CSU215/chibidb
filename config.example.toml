@@ -33,6 +33,15 @@ inline_lob_limit = 4096
 # 活跃 SSTable 数量达到该值时触发一次自动 LSM 压实。
 lsm_compaction_trigger = 4
 
+[observability]
+# 缓冲池命中统计总开关。开启后在每次 checkpoint 和退出时向 stderr 输出一行
+# 快照（hits/misses/evictions/dirty_evictions/resident/容量/命中率）。
+cache_stats = false
+
+# 替换（淘汰）日志总开关。开启后每次缓冲池淘汰一帧都向 stderr 输出一行，
+# 含文件号、页号、淘汰策略与该帧是否脏。高频负载下输出量很大，仅在排查时开启。
+eviction_log = false
+
 [wal]
 # WAL 字节数超过该阈值且无未提交事务时，自动 checkpoint（刷盘 + 截断日志）。
 checkpoint_threshold = 8388608

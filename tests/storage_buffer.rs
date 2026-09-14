@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 
-use chibidb::config::EvictionPolicy;
-use chibidb::storage::{BufferPool, DiskManager, PAGE_SIZE};
+use chibidb::config::{EvictionPolicy, ObservabilityConfig};
+use chibidb::storage::{BufferPool, CacheReporter, DiskManager, PoolStats, PAGE_SIZE};
 
 const ALL_POLICIES: [EvictionPolicy; 3] =
     [EvictionPolicy::Lru, EvictionPolicy::Clock, EvictionPolicy::Fifo];
@@ -395,4 +395,96 @@ fn every_eviction_policy_keeps_writes_correct() {
         assert_eq!(on_disk, counted, "{policy:?} 下丢了写");
         assert!(counted.iter().all(|&c| c > 0), "{policy:?} 下并发负载没跑起来");
     }
+}
+
+/// 注入的 reporter 必须看到每一次淘汰，且区分干净/脏换出；`report_stats`
+/// 在同一开关下交付快照。容量 1 让每一次缺页都恰好淘汰一个帧。
+#[derive(Default)]
+struct RecordingReporter {
+    evictions: std::sync::Mutex<Vec<((u32, u32), bool)>>,
+    stats: std::sync::Mutex<Vec<PoolStats>>,
+}
+
+impl CacheReporter for RecordingReporter {
+    fn evict(&self, key: (u32, u32), dirty: bool, _stats: &PoolStats) {
+        self.evictions.lock().unwrap().push((key, dirty));
+    }
+
+    fn stats(&self, stats: &PoolStats) {
+        self.stats.lock().unwrap().push(*stats);
+    }
+}
+
+#[test]
+fn reporter_sees_eviction_events_with_dirtiness() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = DiskManager::new();
+    let f = disk.create_file(&dir.path().join("report.dbf")).unwrap();
+    let obs = ObservabilityConfig { cache_stats: true, eviction_log: true };
+    let reporter = Arc::new(RecordingReporter::default());
+    let bp =
+        BufferPool::new_with_reporter(disk, 1, EvictionPolicy::Lru, obs, reporter.clone());
+
+    // 干净换出：读入 page 0，再读 page 1 时 page 0（干净）被淘汰。
+    bp.read_page(f, 0, |_| Ok(())).unwrap();
+    bp.read_page(f, 1, |_| Ok(())).unwrap();
+    // 脏换出：写 page 1 置脏，再读 page 2 时它被写回后淘汰。
+    bp.with_page(f, 1, |p| {
+        p[0] = 1;
+        Ok(())
+    })
+    .unwrap();
+    bp.read_page(f, 2, |_| Ok(())).unwrap();
+
+    let stats = bp.stats();
+    assert_eq!(stats.evictions, 2);
+    assert_eq!(stats.dirty_evictions, 1);
+    assert_eq!(stats.clean_evictions(), 1);
+    assert_eq!(stats.resident, 1);
+    assert_eq!(stats.capacity, 1);
+
+    let events = reporter.evictions.lock().unwrap().clone();
+    assert_eq!(events, vec![((f, 0), false), ((f, 1), true)]);
+
+    // cache_stats 开启：report_stats 把快照交给 reporter。
+    bp.report_stats();
+    assert_eq!(reporter.stats.lock().unwrap().len(), 1);
+}
+
+/// 两个开关都关闭时，reporter 一次都不该被调用（默认行为与旧版一致）。
+#[test]
+fn reporter_is_silent_when_switches_are_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = DiskManager::new();
+    let f = disk.create_file(&dir.path().join("quiet.dbf")).unwrap();
+    let reporter = Arc::new(RecordingReporter::default());
+    let bp = BufferPool::new_with_reporter(
+        disk,
+        1,
+        EvictionPolicy::Lru,
+        ObservabilityConfig::default(),
+        reporter.clone(),
+    );
+
+    bp.read_page(f, 0, |_| Ok(())).unwrap();
+    bp.read_page(f, 1, |_| Ok(())).unwrap();
+    bp.report_stats();
+
+    assert!(reporter.evictions.lock().unwrap().is_empty());
+    assert!(reporter.stats.lock().unwrap().is_empty());
+}
+
+#[test]
+fn pool_stats_derives_hit_rate_and_clean_evictions() {
+    let s = PoolStats {
+        hits: 3,
+        misses: 1,
+        evictions: 5,
+        dirty_evictions: 2,
+        resident: 4,
+        capacity: 8,
+    };
+    assert!((s.hit_rate() - 0.75).abs() < 1e-9);
+    assert_eq!(s.clean_evictions(), 3);
+    assert_eq!(PoolStats::default().hit_rate(), 0.0);
 }

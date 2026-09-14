@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, MutexGuard};
 
-use crate::config::EvictionPolicy;
+use crate::config::{EvictionPolicy, ObservabilityConfig};
 use crate::storage::disk::DiskManager;
 use crate::storage::page::{zeroed_page, FileId, PageData, PageNo, PAGE_SIZE};
 use crate::storage::replacer::{from_policy, FrameVitals, Key, Replacer};
@@ -115,8 +115,87 @@ pub struct PoolStats {
     pub hits: u64,
     /// Lookups that had to load a page from disk.
     pub misses: u64,
-    /// Frames written back to make room for a miss.
+    /// Frames chosen for replacement to make room for a miss.
     pub evictions: u64,
+    /// Evictions of a dirty frame, i.e. those that triggered a write-back.
+    pub dirty_evictions: u64,
+    /// Frames currently resident in the pool.
+    pub resident: u64,
+    /// Configured frame capacity.
+    pub capacity: u64,
+}
+
+impl PoolStats {
+    /// Fraction of lookups served from cache, in `0.0..=1.0`; `0.0` with no
+    /// lookups.
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }
+    }
+
+    /// Evictions whose frame was clean, so no write-back was needed.
+    pub fn clean_evictions(&self) -> u64 {
+        self.evictions - self.dirty_evictions
+    }
+}
+
+/// Sink for buffer-pool observability events. The pool only calls it when the
+/// matching `[observability]` switch is on, so a reporter can assume it is
+/// wanted. Kept as a trait so tests can capture events instead of stderr.
+pub trait CacheReporter: Send + Sync {
+    /// One frame was replaced. `dirty` means it was written back.
+    fn evict(&self, key: Key, dirty: bool, stats: &PoolStats);
+    /// A snapshot requested at a checkpoint or on shutdown.
+    fn stats(&self, stats: &PoolStats);
+}
+
+/// Default reporter: one line per event on stderr. `policy` labels eviction
+/// lines, since a pool has exactly one eviction policy.
+pub struct StderrReporter {
+    policy: EvictionPolicy,
+}
+
+impl StderrReporter {
+    pub fn new(policy: EvictionPolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl CacheReporter for StderrReporter {
+    fn evict(&self, key: Key, dirty: bool, stats: &PoolStats) {
+        eprintln!(
+            "chibidb[buffer]: evict (file={},page={}) policy={} dirty={} resident={}/{} hit={:.1}%",
+            key.0,
+            key.1,
+            policy_label(self.policy),
+            dirty,
+            stats.resident,
+            stats.capacity,
+            stats.hit_rate() * 100.0,
+        );
+    }
+
+    fn stats(&self, stats: &PoolStats) {
+        eprintln!(
+            "chibidb[buffer]: stats hits={} misses={} evictions={} clean={} dirty={} resident={}/{} hit_rate={:.1}%",
+            stats.hits,
+            stats.misses,
+            stats.evictions,
+            stats.clean_evictions(),
+            stats.dirty_evictions,
+            stats.resident,
+            stats.capacity,
+            stats.hit_rate() * 100.0,
+        );
+    }
+}
+
+fn policy_label(policy: EvictionPolicy) -> &'static str {
+    match policy {
+        EvictionPolicy::Lru => "lru",
+        EvictionPolicy::Clock => "clock",
+        EvictionPolicy::Fifo => "fifo",
+    }
 }
 
 /// Thread-safe buffer pool: `&self` methods let readers share the pool while
@@ -135,6 +214,11 @@ pub struct BufferPool {
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
+    dirty_evictions: AtomicU64,
+    /// Which observability events to emit; both off by default.
+    observability: ObservabilityConfig,
+    /// Event sink, called only when the matching switch above is on.
+    reporter: Arc<dyn CacheReporter>,
 }
 
 impl BufferPool {
@@ -148,6 +232,35 @@ impl BufferPool {
         capacity: usize,
         eviction: EvictionPolicy,
     ) -> Self {
+        Self::new_with_observability(disk, capacity, eviction, ObservabilityConfig::default())
+    }
+
+    /// Like [`BufferPool::new_with_eviction`] but with the observability
+    /// switches applied; the stderr reporter is the production sink.
+    pub fn new_with_observability(
+        disk: DiskManager,
+        capacity: usize,
+        eviction: EvictionPolicy,
+        observability: ObservabilityConfig,
+    ) -> Self {
+        Self::new_with_reporter(
+            disk,
+            capacity,
+            eviction,
+            observability,
+            Arc::new(StderrReporter::new(eviction)),
+        )
+    }
+
+    /// Full constructor: a custom [`CacheReporter`] can capture events in
+    /// tests. Events are still gated by `observability`.
+    pub fn new_with_reporter(
+        disk: DiskManager,
+        capacity: usize,
+        eviction: EvictionPolicy,
+        observability: ObservabilityConfig,
+        reporter: Arc<dyn CacheReporter>,
+    ) -> Self {
         Self {
             disk,
             state: Mutex::new(PoolState { frames: HashMap::new(), replacer: from_policy(eviction) }),
@@ -156,15 +269,30 @@ impl BufferPool {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            dirty_evictions: AtomicU64::new(0),
+            observability,
+            reporter,
         }
     }
 
-    /// A consistent-enough snapshot of the lookup counters.
+    /// A consistent-enough snapshot of the lookup counters and residency.
     pub fn stats(&self) -> PoolStats {
+        let resident = self.state.lock().frames.len() as u64;
         PoolStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
+            dirty_evictions: self.dirty_evictions.load(Ordering::Relaxed),
+            resident,
+            capacity: self.capacity as u64,
+        }
+    }
+
+    /// Emits a snapshot through the reporter when `observability.cache_stats`
+    /// is on. Called at checkpoints and on shutdown.
+    pub fn report_stats(&self) {
+        if self.observability.cache_stats {
+            self.reporter.stats(&self.stats());
         }
     }
 
@@ -198,51 +326,65 @@ impl BufferPool {
     /// pin, so the frame cannot be evicted while the caller still uses it.
     fn frame_for(&self, file: FileId, no: PageNo) -> Result<PinnedFrame> {
         let key = (file, no);
-        let mut state = self.state.lock();
-        // `frames` 可变借用于淘汰，`replacer` 可变借用于重排；拆开字段让两者并存。
-        let PoolState { frames, replacer } = &mut *state;
-        if let Some(frame) = frames.get(&key).cloned() {
-            replacer.record_access(key);
-            frame.accessed.store(true, Ordering::Relaxed); // CLOCK 的引用位
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(PinnedFrame::new(frame));
-        }
-        while frames.len() >= self.capacity {
-            // 被 pin 的帧留在队列/环里，只是不参与淘汰 —— 否则它们会丢掉
-            // 淘汰顺序（不变式 Ⅳ：登记数恒等于页表长度）。
-            let victim_key = {
-                let vitals = PoolVitals { frames };
-                replacer.choose_victim(&vitals)
+        // 本轮淘汰的帧，锁外再上报（替换日志不能在持 `state` 锁时做 I/O）。
+        let mut evicted: Vec<(Key, bool)> = Vec::new();
+        let frame = {
+            let mut state = self.state.lock();
+            // `frames` 可变借用于淘汰，`replacer` 可变借用于重排；拆开字段让两者并存。
+            let PoolState { frames, replacer } = &mut *state;
+            if let Some(frame) = frames.get(&key).cloned() {
+                replacer.record_access(key);
+                frame.accessed.store(true, Ordering::Relaxed); // CLOCK 的引用位
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(PinnedFrame::new(frame));
             }
-            .ok_or_else(|| {
-                Error::Runtime("buffer pool exhausted: every frame is pinned".into())
-            })?;
-            self.evictions.fetch_add(1, Ordering::Relaxed);
-            let victim = frames
-                .remove(&victim_key)
-                .expect("the replacer stays in sync with the page table");
-            if victim.dirty.load(Ordering::Acquire) {
-                // 锁序：页闩 → 文件锁，与 flush_* 同向。被选中的帧 pins == 0，
-                // 而页闩的持有期是 pin 持有期的子集，所以这句不会阻塞（§6.3）。
-                let data = victim.data.lock();
-                self.disk.write_page(victim.file, victim.no, &data)?;
-                victim.dirty.store(false, Ordering::Release);
+            while frames.len() >= self.capacity {
+                // 被 pin 的帧留在队列/环里，只是不参与淘汰 —— 否则它们会丢掉
+                // 淘汰顺序（不变式 Ⅳ：登记数恒等于页表长度）。
+                let victim_key = {
+                    let vitals = PoolVitals { frames };
+                    replacer.choose_victim(&vitals)
+                }
+                .ok_or_else(|| {
+                    Error::Runtime("buffer pool exhausted: every frame is pinned".into())
+                })?;
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+                let victim = frames
+                    .remove(&victim_key)
+                    .expect("the replacer stays in sync with the page table");
+                let dirty = victim.dirty.load(Ordering::Acquire);
+                if dirty {
+                    // 锁序：页闩 → 文件锁，与 flush_* 同向。被选中的帧 pins == 0，
+                    // 而页闩的持有期是 pin 持有期的子集，所以这句不会阻塞（§6.3）。
+                    self.dirty_evictions.fetch_add(1, Ordering::Relaxed);
+                    let data = victim.data.lock();
+                    self.disk.write_page(victim.file, victim.no, &data)?;
+                    victim.dirty.store(false, Ordering::Release);
+                }
+                evicted.push((victim_key, dirty));
+            }
+            let mut data = zeroed_page();
+            self.disk.read_page(file, no, &mut data)?;
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            let frame = Arc::new(Frame {
+                file,
+                no,
+                data: Mutex::new(data),
+                dirty: AtomicBool::new(false),
+                pins: AtomicU32::new(0),
+                accessed: AtomicBool::new(true), // 刚载入 → 有第二次机会
+            });
+            frames.insert(key, frame.clone());
+            replacer.push(key);
+            debug_assert_eq!(frames.len(), replacer.len(), "invariant Ⅳ: the replacer mirrors the page table");
+            frame
+        };
+        if self.observability.eviction_log && !evicted.is_empty() {
+            let stats = self.stats();
+            for (victim_key, dirty) in evicted {
+                self.reporter.evict(victim_key, dirty, &stats);
             }
         }
-        let mut data = zeroed_page();
-        self.disk.read_page(file, no, &mut data)?;
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        let frame = Arc::new(Frame {
-            file,
-            no,
-            data: Mutex::new(data),
-            dirty: AtomicBool::new(false),
-            pins: AtomicU32::new(0),
-            accessed: AtomicBool::new(true), // 刚载入 → 有第二次机会
-        });
-        frames.insert(key, frame.clone());
-        replacer.push(key);
-        debug_assert_eq!(frames.len(), replacer.len(), "invariant Ⅳ: the replacer mirrors the page table");
         Ok(PinnedFrame::new(frame))
     }
 
@@ -368,5 +510,7 @@ impl BufferPool {
 impl Drop for BufferPool {
     fn drop(&mut self) {
         let _ = self.flush_all();
+        // final snapshot, so a short run that never checkpointed still reports
+        self.report_stats();
     }
 }
