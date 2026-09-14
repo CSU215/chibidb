@@ -274,6 +274,32 @@ fn auto_checkpoint_bounds_wal_and_respects_open_trxs() {
 }
 
 #[test]
+fn dml_commits_do_not_rewrite_the_catalog() {
+    // The catalog is saved by DDL and by checkpoints, not by every commit; a
+    // long run of DML must not grow it (the old code rewrote the whole
+    // committed-id list into it on each commit).
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    db.execute_sql("create table t (id int);").unwrap();
+    let catalog = dir.path().join("catalog.bin");
+    let after_ddl = std::fs::metadata(&catalog).unwrap().len();
+
+    for i in 0..500 {
+        db.execute_sql(&format!("insert into t values ({i});")).unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(&catalog).unwrap().len(),
+        after_ddl,
+        "DML must not rewrite catalog.bin"
+    );
+
+    // the rows are still durable through the WAL
+    drop(db);
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(rows(&db, "select id from t;").len(), 500);
+}
+
+#[test]
 fn flush_during_open_transaction_is_rejected() {
     // flushing (and thus truncating the log) while a transaction is open
     // would drop its redo records, losing the COMMIT on recovery

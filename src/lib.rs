@@ -475,12 +475,11 @@ impl Database {
         self.wal.append(trx_id, &Record::Commit)?;
         self.wal.sync()?;
         self.trx.commit(trx_id);
-        // From here the transaction is durable: recovery can replay it from the
-        // WAL even if the catalog is stale, so post-commit bookkeeping failures
-        // are reported but must not roll the transaction back.
-        if let Err(e) = self.save_catalog() {
-            eprintln!("commit: saving catalog failed: {e}");
-        }
+        // No per-commit catalog rewrite: the synced WAL already carries this
+        // commit, so recovery can rebuild it. The catalog is saved by DDL and
+        // by `flush_inner` before it truncates the log, which is what keeps the
+        // persisted committed set (and next xid) from lagging behind a
+        // truncated log. Rewriting it here made every commit O(committed ids).
         if self.wal.len().unwrap_or(0) > self.wal_checkpoint_threshold.load(Ordering::Relaxed)
             && self.trx.no_open_transactions()
             && let Err(e) = self.flush()
