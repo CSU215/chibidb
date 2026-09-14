@@ -213,8 +213,12 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
   的判定合流，`xmin` 只在"用区间近似 clog"（Step 7 的 horizon）时才需要。
 - **Step 3｜行级锁管理器**（进行中）：原语 `LockManager` ✅（`14ee18a`，`src/db/lockmgr.rs`）
   —— `(table, rid)` 元组锁 + FIFO 交接 + `lock_timeout` + 等待图死锁自检，含单测
-  （重入 / 超时 / 交接 / 双持有者死锁）。**待办**：接到写路径并替换整库 `DatabaseWriteLock`
-  （当前整库写锁仍在，所以真实写路径尚不会争用）。验收：不同行不阻塞 / 同行按序等待 / 超时 / 死锁回退。
+  （重入 / 超时 / 交接 / 双持有者死锁）。
+  **阻塞项**：接线 + 撤整库写锁需要**索引支持并发写**（见 §12）——`BTree::insert/delete`
+  是"下降 + 底向上分裂/合并"、逐页加锁、无 latch coupling，`db.write()` 目前是索引正确性的
+  实际保护。**必须在行锁接线之前先做索引并发。**
+- **Step 3.5｜索引并发（B-link tree）**（见 §12）：让 `BTree` 支持并发读写。
+  验收：`tests/index_model.rs` 随机模型在并发下通过；`index_btree` 全绿。
 - **Step 4｜RC + EPQ**（默认档先做对）：记录头加 `next_rid`；等锁后 EPQ 重读最新版本。
   验收：RC 下「后写者看到前者结果而非 abort」用例。
 - **Step 5｜RR / SI**：事务级快照固定；冲突报 40001（不再 FCW）。撤掉 Instance 的整库写独占。
@@ -259,3 +263,47 @@ deadlock_timeout_ms = 1000      # 等多久触发一次死锁检测（PG 的 dea
 之后被别人**提交地**改过"，针对的是**快照**。所以 RR 下等锁后新版本对我不可见，只能 40001；
 只有 RC 的语句级快照允许 EPQ 重读最新版本、不 abort。这与 PostgreSQL 的
 Repeatable Read 行为一致。
+
+---
+
+## 12. 索引并发（B-link tree）—— Step 3.5
+
+### 12.1 问题
+`BTree::insert/delete`（`src/index/btree.rs`）是自顶向下**查找**、再**底向上分裂/合并**：
+`insert_rec` 逐层 `read_page` 下降，叶子满则分裂并改叶子、右邻居 `prev/next`、父分隔键；
+这些页**逐个** `with_page`（每次只持一页闩），没有 latch coupling/crabbing。两个并发写者
+同时分裂/合并会互相覆盖。所以现状 `Database` 的写独占（`db.write()`）是索引正确性的实际保护。
+
+### 12.2 目标：B-link（Lehman-Yao）树
+- **节点新增 right-link（右兄弟页号）+ high key（该节点覆盖键的上界）**；叶子已有 `next`，
+  可直接作 right-link。
+- **查找 lock-fetch**：读一个节点后，若 `key >= high_key` 说明目标在小右邻，沿 right-link
+  右移重试；这样读无需持多把锁也能跟上并发分裂。
+- **插入 top-down + latch coupling**：下降时持父闩取子闩、随即放父闩（crabbing）；遇到满
+  节点就**预分裂**（top-down split），因此不需要在分裂后回拿父闩。
+- **删除/合并**是 SMO，最难。两个选项：
+  - **D1（建议先做）**：删除/合并用**每索引一把 SMO 闩**（独占）；插入/查找仍用页闩。
+    删除较罕见，SMO 期间结构变更互斥即可，插入/查找安全。
+  - **D2（完整）**：删除也走 right-link 协议（redistribute/merge），复杂度最高。
+
+### 12.3 格式与底层 API 改动
+- `src/index/node.rs`：leaf/internal header 增加 right-link 与 high key（变长，需规划布局）；
+  leaf 的 `next` 复用为 right-link。索引文件 **magic/版本升级**（格式可不兼容）。
+- latch coupling 需要"**同时持有父闩与子闩**"。两种实现：
+  - 复用闭包式 `with_page` 的**嵌套**（父闭包内再 `with_page(child)`）实现 crabbing；
+  - 或给 `BufferPool` 增加**页闩守卫** `latch_page(file, no) -> PageGuard`（pin + 页闩的 RAII），
+    适合顶向下预分裂需要跨多页持锁的场景。倾向按需再加，避免提前改 `BufferPool`。
+
+### 12.4 子步骤与验收
+- **C1**｜节点格式：加 right-link/high-key 并在现有分裂中正确维护；升 magic。单线程行为不变。
+  验收：`index_btree`、`index_node`、`index_model` 全绿。
+- **C2**｜查找改 lock-fetch（right-link 右移）。验收：并发「读 + 插入」压力下结果与模型一致。
+- **C3**｜插入改 top-down + latch coupling + 预分裂。验收：`tests/index_model.rs` 的随机
+  模型在**并发**插入/删除下与 `BTreeMap` 模型一致；无损坏。
+- **C4**｜删除并发化（D1 或 D2）。验收：并发删除/插入/查找混合压力。
+
+### 12.5 测试
+- 现成的 `tests/index_model.rs`（`BTreeMap<Vec<u8>, BTreeSet<Rid>>` 差分模型）是理想 oracle，
+  扩展为多线程随机操作并最终与模型对齐。
+- 保留 `index_btree`/`index_node` 作为单线程护栏。
+- 这一步是**整个方案里并发风险最高**的部分，必须配压力测试，且 C1–C4 分步绿灯推进。
