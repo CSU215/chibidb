@@ -121,35 +121,72 @@
       <aside class="storage-side">
         <div class="card card-flush">
           <div class="card-head"><span class="card-title">数据库</span></div>
-          <div class="pad"><select id="storage-db" class="select"></select></div>
+          <div class="pad storage-toolbar">
+            <select id="storage-db" class="select"></select>
+            <button id="storage-refresh" class="btn btn-small" type="button" title="重新读取 schema / 文件 / 总览 / 当前单元">刷新</button>
+          </div>
         </div>
         <div class="card card-flush">
-          <div class="card-head"><span class="card-title">文件</span></div>
+          <div class="card-head">
+            <span class="card-title">文件</span>
+            <span id="storage-file-count" class="hint"></span>
+          </div>
           <div id="storage-files" class="file-list"><span class="muted">加载中&hellip;</span></div>
         </div>
       </aside>
 
       <div class="storage-main">
         <div id="storage-disabled" class="notice" hidden>
-          storage preview disabled (set [web] page_preview = true)
+          存储预览已关闭（在 config.toml 设 [web] page_preview = true）
         </div>
 
         <div id="storage-viewer">
-          <div class="card page-nav-card">
-            <div class="page-nav">
-              <button id="page-prev" class="btn btn-small" type="button">&#9664; 上一页</button>
-              <span id="page-indicator" class="mono">0 / 0</span>
-              <button id="page-next" class="btn btn-small" type="button">下一页 &#9654;</button>
-              <form id="page-jump-form" class="jump">
-                <input id="page-jump" class="input input-small" type="number" min="0" step="1" placeholder="页码">
-                <button class="btn btn-small" type="submit">跳转</button>
-              </form>
-              <span id="page-file" class="mono muted"></span>
+          <div class="card card-flush">
+            <div class="card-head">
+              <span class="card-title">占用总览 <span id="storage-file-title" class="mono muted"></span></span>
+              <span id="storage-overview-meta" class="hint"></span>
             </div>
+            <div id="storage-overview" class="occupancy"></div>
           </div>
 
-          <div id="page-meta" class="page-meta"></div>
-          <div id="page-hex" class="hex-wrap"></div>
+          <div id="storage-unit">
+            <div class="card card-flush">
+              <div class="card-head">
+                <span class="card-title" id="unit-mode">&mdash;</span>
+                <span id="unit-index" class="hint"></span>
+              </div>
+              <div class="pad">
+                <p id="unit-description" class="mode-desc muted"></p>
+              </div>
+            </div>
+
+            <div class="unit-grid">
+              <div class="card card-flush">
+                <div class="card-head">
+                  <span class="card-title">字段注释 HEX</span>
+                  <span id="unit-bytes" class="hint"></span>
+                </div>
+                <div id="unit-hex" class="hex-wrap"></div>
+              </div>
+              <div class="card card-flush">
+                <div class="card-head"><span class="card-title">字段图例</span></div>
+                <div id="unit-legend" class="field-legend"></div>
+              </div>
+            </div>
+
+            <div class="unit-grid">
+              <div class="card card-flush">
+                <div class="card-head"><span class="card-title">结构 (structure)</span></div>
+                <div id="unit-structure" class="pad"></div>
+              </div>
+              <div class="card card-flush">
+                <div class="card-head"><span class="card-title">头部 (header)</span></div>
+                <div id="unit-header" class="pad"></div>
+              </div>
+            </div>
+
+            <div id="unit-notes" class="footnote muted"></div>
+          </div>
         </div>
       </div>
     </div>

@@ -74,6 +74,22 @@ impl Instance {
         &self.root
     }
 
+    /// A handle to the system (`chibi_meta`) database.
+    pub fn meta(&self) -> Arc<RwLock<Database>> {
+        self.meta.clone()
+    }
+
+    /// Registered databases as `(name, is_system)`, with the system database
+    /// first. Unlike [`databases`](Self::databases), the system database has no
+    /// row in the registry, so it is added explicitly.
+    pub fn database_names(&self) -> Result<Vec<(String, bool)>> {
+        let mut names = vec![(META_DIR.to_string(), true)];
+        for name in self.databases()? {
+            names.push((name, false));
+        }
+        Ok(names)
+    }
+
     fn bootstrap_meta(&self) -> Result<()> {
         let meta = self.meta.read();
         if !meta.table_exists("databases") {

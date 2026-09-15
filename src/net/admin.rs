@@ -92,6 +92,7 @@ fn api(
         ("GET", "/api/config") => config_trace(config),
         ("GET", "/api/schema") => schema_trace(instance),
         ("GET", "/api/files") => files_trace(instance, config, query),
+        ("GET", "/api/overview") => inspect::overview(instance, config, query),
         ("GET", "/api/page") => inspect::page(instance, config, query),
         _ => Response::not_found(),
     }
@@ -259,20 +260,20 @@ fn config_trace(config: &Config) -> Response {
 // --------------------------------------------------------------- /api/schema
 
 fn schema_trace(instance: &Instance) -> Response {
-    let names = instance.databases().unwrap_or_default();
     let mut databases = Vec::new();
-    for name in names {
+    for (name, system) in instance.database_names().unwrap_or_default() {
         if name == crate::instance::INFORMATION_SCHEMA {
             continue;
         }
-        let Ok(db) = instance.database(&name) else {
+        let Some(db) = inspect::db_handle(instance, &name) else {
             continue;
         };
         let guard = db.read();
         let tables: Vec<String> = guard.catalog().table_metas().iter().map(table_json).collect();
         databases.push(format!(
-            "{{\"name\":{},\"tables\":[{}]}}",
+            "{{\"name\":{},\"system\":{},\"tables\":[{}]}}",
             json_string(&name),
+            system,
             tables.join(",")
         ));
     }
@@ -319,7 +320,8 @@ fn table_json(meta: &TableMeta) -> String {
 // ---------------------------------------------------------------- /api/files
 
 /// `GET /api/files?db=<name>` -- the files making up one database directory.
-/// Gated by `web.page_preview`, which is off by default.
+/// Gated by `web.page_preview`, which is off by default. The system database
+/// `chibi_meta` is listed like any other, resolved straight under the root.
 fn files_trace(instance: &Instance, config: &Config, query: &str) -> Response {
     if !config.web.page_preview {
         return Response::not_found();
@@ -335,107 +337,205 @@ fn files_trace(instance: &Instance, config: &Config, query: &str) -> Response {
     if !dir.is_dir() {
         return Response::not_found();
     }
+    let system = db == crate::instance::META_DIR;
 
     // `(name, json)` pairs so the output can be sorted by the forward-slash name.
-    let mut files: Vec<(String, String)> = Vec::new();
-    for (name, kind) in
-        [("catalog.bin", "catalog"), ("wal.bin", "wal"), ("dwb.bin", "dwb")]
-    {
-        if let Some(json) = file_json(&dir.join(name), name, kind) {
-            files.push((name.to_string(), json));
-        }
-    }
+    let mut files: Vec<(String, String)> = catalog_entries(&dir);
+
     for (fname, path) in subdir_entries(&dir, "tables") {
         let name = format!("tables/{fname}");
         if fname.ends_with(".dbf") {
-            if let Some(json) = file_json(&path, &name, "heap") {
-                files.push((name, json));
-            }
+            files.push((name.clone(), heap_entry(instance, db, &fname, &name, &path)));
         } else if fname.ends_with(".lsm") {
-            // `.lsm` is a directory; its size is the sum of the SSTables in it.
-            let size = dir_size(&path);
-            files.push((name.clone(), entry_json(&name, "lsm", size, 0)));
+            // An `.lsm` directory is listed by its contents, one level down.
+            let table = inspect::table_name_for_file(instance, db, &fname);
+            for (inner, ipath) in read_entries(&path) {
+                let rel = format!("tables/{fname}/{inner}");
+                let size = std::fs::metadata(&ipath).map(|m| m.len()).unwrap_or(0);
+                let entry = if inner == "MANIFEST" {
+                    Entry {
+                        name: &rel,
+                        kind: "lsm_manifest",
+                        size,
+                        unit_kind: "none",
+                        units: 1,
+                        engine: Some("lsm"),
+                        layout: Some("row"),
+                        table: table.as_deref(),
+                        index: None,
+                    }
+                } else if inner.starts_with("sst-") && inner.ends_with(".sst") {
+                    Entry {
+                        name: &rel,
+                        kind: "lsm_sstable",
+                        size,
+                        unit_kind: "region",
+                        units: inspect::sstable_region_count(&ipath),
+                        engine: Some("lsm"),
+                        layout: Some("row"),
+                        table: table.as_deref(),
+                        index: None,
+                    }
+                } else {
+                    continue;
+                };
+                let json = entry.json();
+                files.push((rel, json));
+            }
         }
     }
     for (fname, path) in subdir_entries(&dir, "indexes") {
         if fname.ends_with(".idxf") {
             let name = format!("indexes/{fname}");
-            if let Some(json) = file_json(&path, &name, "index") {
-                files.push((name, json));
-            }
+            files.push((name.clone(), index_entry(instance, db, &fname, &name, &path)));
         }
     }
     for (fname, path) in subdir_entries(&dir, "lobs") {
         if fname.ends_with(".lob") {
             let name = format!("lobs/{fname}");
-            if let Some(json) = file_json(&path, &name, "lob") {
-                files.push((name, json));
-            }
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let entry = Entry {
+                name: &name,
+                kind: "lob",
+                size,
+                unit_kind: "none",
+                units: 1,
+                engine: None,
+                layout: None,
+                table: None,
+                index: None,
+            };
+            let json = entry.json();
+            files.push((name, json));
         }
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let body = format!(
-        "{{\"db\":{},\"files\":[{}]}}",
+        "{{\"db\":{},\"system\":{},\"files\":[{}]}}",
         json_string(db),
+        system,
         files.into_iter().map(|(_, json)| json).collect::<Vec<_>>().join(",")
     );
     Response::json("200 OK", body)
 }
 
+/// One file in an `/api/files` listing.
+struct Entry<'a> {
+    name: &'a str,
+    kind: &'a str,
+    size: u64,
+    unit_kind: &'a str,
+    units: u32,
+    engine: Option<&'a str>,
+    layout: Option<&'a str>,
+    table: Option<&'a str>,
+    index: Option<&'a str>,
+}
+
+impl Entry<'_> {
+    fn json(&self) -> String {
+        format!(
+            "{{\"name\":{},\"kind\":{},\"size\":{},\"unit_kind\":{},\"units\":{},\
+             \"engine\":{},\"layout\":{},\"table\":{},\"index\":{}}}",
+            json_string(self.name),
+            json_string(self.kind),
+            self.size,
+            json_string(self.unit_kind),
+            self.units,
+            opt_str(self.engine),
+            opt_str(self.layout),
+            opt_str(self.table),
+            opt_str(self.index),
+        )
+    }
+}
+
+fn opt_str(value: Option<&str>) -> String {
+    value.map_or_else(|| "null".to_string(), json_string)
+}
+
+/// The catalog/wal/dwb files at the root of a database directory.
+fn catalog_entries(dir: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (name, kind) in
+        [("catalog.bin", "catalog"), ("wal.bin", "wal"), ("dwb.bin", "dwb")]
+    {
+        let path = dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let (unit_kind, units) = match kind {
+            "wal" => ("frame", inspect::unit_count_for_path(kind, &path)),
+            "dwb" => ("record", inspect::unit_count_for_path(kind, &path)),
+            _ => ("page", 1),
+        };
+        let entry = Entry {
+            name,
+            kind,
+            size,
+            unit_kind,
+            units,
+            engine: None,
+            layout: None,
+            table: None,
+            index: None,
+        };
+        out.push((name.to_string(), entry.json()));
+    }
+    out
+}
+
+fn heap_entry(instance: &Instance, db: &str, fname: &str, name: &str, path: &Path) -> String {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let units = size.div_ceil(crate::storage::PAGE_SIZE as u64) as u32;
+    let meta = inspect::table_for_dbf(instance, db, fname);
+    let entry = Entry {
+        name,
+        kind: "heap",
+        size,
+        unit_kind: "page",
+        units,
+        engine: Some(meta.as_ref().map_or("heap", |m| inspect::engine_str(m.engine))),
+        layout: meta.as_ref().map(|m| inspect::layout_str(m.layout)),
+        table: meta.as_ref().map(|m| m.name.as_str()),
+        index: None,
+    };
+    entry.json()
+}
+
+fn index_entry(instance: &Instance, db: &str, fname: &str, name: &str, path: &Path) -> String {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let units = size.div_ceil(crate::storage::PAGE_SIZE as u64) as u32;
+    let meta = inspect::index_for_idxf(instance, db, fname);
+    let entry = Entry {
+        name,
+        kind: "index",
+        size,
+        unit_kind: "page",
+        units,
+        engine: None,
+        layout: None,
+        table: meta.as_ref().map(|m| m.table.as_str()),
+        index: meta.as_ref().map(|m| m.name.as_str()),
+    };
+    entry.json()
+}
+
 /// `(name, path)` for every entry directly inside `<dir>/<subdir>`.
 fn subdir_entries(dir: &Path, subdir: &str) -> Vec<(String, std::path::PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(dir.join(subdir)) else {
+    read_entries(&dir.join(subdir))
+}
+
+fn read_entries(dir: &Path) -> Vec<(String, std::path::PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     entries
         .flatten()
         .filter_map(|e| Some((e.file_name().to_str()?.to_owned(), e.path())))
         .collect()
-}
-
-fn file_json(path: &Path, name: &str, kind: &str) -> Option<String> {
-    let size = std::fs::metadata(path).ok()?.len();
-    Some(entry_json(name, kind, size, page_count(name, size)))
-}
-
-fn entry_json(name: &str, kind: &str, size: u64, pages: u32) -> String {
-    format!(
-        "{{\"name\":{},\"kind\":{},\"size\":{},\"pages\":{}}}",
-        json_string(name),
-        json_string(kind),
-        size,
-        pages
-    )
-}
-
-/// Whole pages in a file, for the fixed-page formats.
-fn page_count(name: &str, size: u64) -> u32 {
-    if name.ends_with(".dbf")
-        || name.ends_with(".idxf")
-        || name == "dwb.bin"
-        || name.ends_with(".dwb")
-    {
-        size.div_ceil(crate::storage::page::PAGE_SIZE as u64) as u32
-    } else {
-        0
-    }
-}
-
-fn dir_size(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    let mut total = 0;
-    for entry in entries.flatten() {
-        let meta = entry.metadata();
-        match meta {
-            Ok(m) if m.is_dir() => total += dir_size(&entry.path()),
-            Ok(m) => total += m.len(),
-            Err(_) => {}
-        }
-    }
-    total
 }
 
 // ------------------------------------------------------------------ json bits
