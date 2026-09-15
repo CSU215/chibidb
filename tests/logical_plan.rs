@@ -78,6 +78,24 @@ fn explain_covers_constant_and_union_selects() {
 }
 
 #[test]
+fn where_equality_turns_a_comma_join_into_an_inner_join() {
+    let db = seeded();
+    let plan = message(
+        &db,
+        "explain select emp.name, dept.dname from emp, dept where emp.dept_id = dept.id;",
+    );
+    // The WHERE equi-predicate becomes the join condition on the logical plan,
+    // so the logical tree has an inner join rather than a cross join plus filter.
+    assert!(plan.contains("LogicalPlan:"), "{plan}");
+    assert!(plan.contains("Join Inner"), "{plan}");
+    assert!(!plan.contains("Join Cross"), "{plan}");
+    assert!(!plan.contains("Filter"), "{plan}");
+    // Lowering only picks the access path: a hash join for the equi keys.
+    assert!(plan.contains("HashJoin"), "{plan}");
+    assert!(!plan.contains("NestedLoopJoin"), "{plan}");
+}
+
+#[test]
 fn explain_matches_query_results() {
     let db = seeded();
     let rs = db.execute_sql("select dept_id, count(*) from emp group by dept_id order by dept_id;")

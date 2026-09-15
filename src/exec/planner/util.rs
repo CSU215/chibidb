@@ -4,7 +4,9 @@
 //! operators), so both the logical layer and the lowering layer can use them
 //! without one depending on the other.
 
+use crate::catalog::Schema;
 use crate::sql::ast::{BinOp, Expr, JoinKind, SelectItem, SelectStmt};
+use crate::value::DataType;
 
 use crate::exec::aggregate::expr_has_aggregate;
 
@@ -56,4 +58,54 @@ pub(crate) fn items_have_aggregate(items: &[SelectItem]) -> bool {
         SelectItem::Expr(e) | SelectItem::Aliased(e, _) => expr_has_aggregate(e),
         SelectItem::Star => false,
     })
+}
+
+/// Dtype of a simple column reference, used to reject join keys whose numerics
+/// would need coercion (the index key encoding is type-sensitive).
+fn column_dtype(schema: &Schema, expr: &Expr) -> Option<DataType> {
+    match expr {
+        Expr::Column(name) => schema.columns.iter().find(|c| &c.name == name).map(|c| c.dtype),
+        Expr::QualifiedColumn(owner, name) => schema
+            .columns
+            .iter()
+            .find(|c| c.owner.as_deref() == Some(owner) && &c.name == name)
+            .map(|c| c.dtype),
+        _ => None,
+    }
+}
+
+fn types_compatible(a: DataType, b: DataType) -> bool {
+    matches!(
+        (a, b),
+        (DataType::Int, DataType::Int)
+            | (DataType::Float, DataType::Float)
+            | (DataType::Date, DataType::Date)
+            | (DataType::Text, DataType::Text)
+            | (DataType::Char(_), DataType::Char(_))
+    )
+}
+
+/// If `expr` is an equality between a plain column of `left` and one of
+/// `right` with compatible types, returns the `(left_expr, right_expr)` pair.
+/// Shared by the logical join-forming rewrite and the physical hash-join key
+/// extraction, so both agree on what counts as an equi-join predicate.
+pub(crate) fn equi_join_keys<'a>(
+    expr: &'a Expr,
+    left: &Schema,
+    right: &Schema,
+) -> Option<(&'a Expr, &'a Expr)> {
+    let Expr::Binary(BinOp::Eq, a, b) = expr else {
+        return None;
+    };
+    if let (Some(ld), Some(rd)) = (column_dtype(left, a), column_dtype(right, b))
+        && types_compatible(ld, rd)
+    {
+        return Some((a, b));
+    }
+    if let (Some(ld), Some(rd)) = (column_dtype(left, b), column_dtype(right, a))
+        && types_compatible(ld, rd)
+    {
+        return Some((b, a));
+    }
+    None
 }

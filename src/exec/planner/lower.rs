@@ -5,8 +5,8 @@
 use std::collections::HashSet;
 
 use crate::catalog::{ColumnDesc, Schema};
-use crate::sql::ast::{BinOp, Expr, JoinKind, SelectItem, TableRef};
-use crate::value::{DataType, Value};
+use crate::sql::ast::{Expr, JoinKind, SelectItem, TableRef};
+use crate::value::Value;
 use crate::{Database, Error, Result};
 
 use crate::exec::aggregate::{self, expr_has_aggregate};
@@ -18,7 +18,7 @@ use crate::exec::operator::{
 
 use super::access::resolved_order_column;
 use super::logical::LogicalOperator;
-use super::util::{combine_and, items_have_aggregate, split_conjuncts};
+use super::util::{combine_and, equi_join_keys, items_have_aggregate, split_conjuncts};
 
 /// What lowering needs from the enclosing query, accumulated as it descends the
 /// logical plan: `Project` supplies the items, `Sort` the order keys, `Having`
@@ -30,33 +30,6 @@ struct LowerCtx<'a> {
     order_by: &'a [(Expr, bool)],
     having: Option<&'a Expr>,
     group_by: &'a [Expr],
-}
-
-/// Dtype of a simple column reference, used to reject hash keys whose numerics
-/// would need coercion (the index key encoding is type-sensitive).
-fn column_dtype(schema: &Schema, expr: &Expr) -> Option<DataType> {
-    match expr {
-        Expr::Column(name) => {
-            schema.columns.iter().find(|c| &c.name == name).map(|c| c.dtype)
-        }
-        Expr::QualifiedColumn(owner, name) => schema
-            .columns
-            .iter()
-            .find(|c| c.owner.as_deref() == Some(owner) && &c.name == name)
-            .map(|c| c.dtype),
-        _ => None,
-    }
-}
-
-fn compatible(a: DataType, b: DataType) -> bool {
-    matches!(
-        (a, b),
-        (DataType::Int, DataType::Int)
-            | (DataType::Float, DataType::Float)
-            | (DataType::Date, DataType::Date)
-            | (DataType::Text, DataType::Text)
-            | (DataType::Char(_), DataType::Char(_))
-    )
 }
 
 /// Extracts equi-join key pairs from `ON a.k = b.k [and ...]`. Returns `None`
@@ -92,23 +65,12 @@ fn extract_hash_keys(
     let mut right_keys = Vec::new();
     let mut kept = Vec::new();
     for conjunct in conjuncts {
-        if let Expr::Binary(BinOp::Eq, a, b) = conjunct {
-            if let (Some(ld), Some(rd)) = (column_dtype(left, a), column_dtype(right, b))
-                && compatible(ld, rd)
-            {
-                left_keys.push((**a).clone());
-                right_keys.push((**b).clone());
-                continue;
-            }
-            if let (Some(ld), Some(rd)) = (column_dtype(left, b), column_dtype(right, a))
-                && compatible(ld, rd)
-            {
-                left_keys.push((**b).clone());
-                right_keys.push((**a).clone());
-                continue;
-            }
+        if let Some((l, r)) = equi_join_keys(conjunct, left, right) {
+            left_keys.push(l.clone());
+            right_keys.push(r.clone());
+        } else {
+            kept.push(conjunct.clone());
         }
-        kept.push(conjunct.clone());
     }
     (left_keys, right_keys, kept)
 }
@@ -157,21 +119,19 @@ fn lower_region(
         return Ok(Some((op, ordered)));
     }
 
-    // Multi-table: WHERE conjuncts left after pushdown feed comma-join hash
-    // keys; whatever no join consumes becomes the residual filter above the tree.
-    let (root, mut residual) = match node {
-        LogicalOperator::Filter { input, predicate } => (
-            input.as_ref(),
-            split_conjuncts(predicate).into_iter().cloned().collect::<Vec<Expr>>(),
-        ),
-        other => (other, Vec::new()),
+    // Multi-table: the WHERE conjuncts that were not turned into join conditions
+    // by the logical optimizer remain as one filter above the join tree.
+    let (root, predicate) = match node {
+        LogicalOperator::Filter { input, predicate } => (input.as_ref(), Some(predicate.clone())),
+        other => (other, None),
     };
-    let Some(mut op) = lower_join_tree(db, root, &mut residual)? else {
+    let Some(op) = lower_join_tree(db, root)? else {
         return Ok(None);
     };
-    if let Some(predicate) = combine_and(residual) {
-        op = Box::new(Filter::new(op, predicate));
-    }
+    let op = match predicate {
+        Some(predicate) => Box::new(Filter::new(op, predicate)),
+        None => op,
+    };
     Ok(Some((op, None)))
 }
 
@@ -235,41 +195,30 @@ fn lower_single_table(
     Ok(Some((Box::new(TableScan::with_owner_keep(db, &tref.name, owner, keep)?), None)))
 }
 
-/// Lowers a join/scan tree. `residual` holds the WHERE conjuncts still
-/// available to form comma-join hash keys; consumed ones are removed.
+/// Lowers a join/scan tree. Join conditions were already attached to the join
+/// nodes by the logical optimizer; access-path choice here only decides between
+/// a hash join (when the condition has equi keys) and a nested loop.
 fn lower_join_tree(
     db: &Database,
     node: &LogicalOperator,
-    residual: &mut Vec<Expr>,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
     match node {
         LogicalOperator::Scan(tref) => build_from_source(db, tref),
         LogicalOperator::Filter { input, predicate } => {
-            let Some(inner) = lower_join_tree(db, input, residual)? else {
+            let Some(inner) = lower_join_tree(db, input)? else {
                 return Ok(None);
             };
             Ok(Some(Box::new(Filter::new(inner, predicate.clone()))))
         }
         LogicalOperator::Join { left, right, kind, on } => {
-            let lop = lower_join_tree(db, left, residual)?;
-            let rop = lower_join_tree(db, right, residual)?;
+            let lop = lower_join_tree(db, left)?;
+            let rop = lower_join_tree(db, right)?;
             let (Some(lop), Some(rop)) = (lop, rop) else {
                 return Ok(None);
             };
-            let keys = match on {
-                Some(on) => analyze_hash_join(*kind, Some(on), lop.schema(), rop.schema()),
-                None if *kind == JoinKind::Cross => {
-                    let (left_keys, right_keys, kept) =
-                        extract_hash_keys(residual, lop.schema(), rop.schema());
-                    if left_keys.is_empty() {
-                        None
-                    } else {
-                        *residual = kept;
-                        Some(HashKeys { left_keys, right_keys, residual: None })
-                    }
-                }
-                None => None,
-            };
+            let keys = on
+                .as_ref()
+                .and_then(|on| analyze_hash_join(*kind, Some(on), lop.schema(), rop.schema()));
             Ok(Some(match keys {
                 Some(keys) => Box::new(HashJoin::new(lop, rop, *kind, keys)),
                 None => Box::new(NestedLoopJoin::new(lop, rop, *kind, on.clone())?),
@@ -599,6 +548,8 @@ fn limit_bound(expr: Option<&Expr>) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnDesc, Schema};
+    use crate::sql::ast::BinOp;
+    use crate::value::DataType;
 
     fn schema(owner: &str, name: &str, dtype: DataType) -> Schema {
         Schema {

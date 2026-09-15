@@ -17,7 +17,9 @@ use crate::exec::eval::{expr_has_column, expr_has_subquery};
 
 use crate::value::DataType;
 
-use super::util::{combine_and, items_have_aggregate, join_clauses, split_conjuncts};
+use super::util::{
+    combine_and, equi_join_keys, items_have_aggregate, join_clauses, split_conjuncts,
+};
 
 /// One node of the logical plan for a statement.
 pub(crate) enum LogicalOperator {
@@ -415,10 +417,52 @@ fn pushdown_region(
     }
     let mut index = 0;
     let rebuilt = rebuild(input, &pushed, &mut index);
+    let rebuilt = form_joins(db, rebuilt, &mut kept)?;
     Ok(Some(match combine_and(kept) {
         Some(predicate) => LogicalOperator::Filter { input: Box::new(rebuilt), predicate },
         None => rebuilt,
     }))
+}
+
+/// The logical WHERE -> JOIN rewrite: turns comma (`Cross`) joins into inner
+/// joins by moving their equi-join WHERE conjuncts onto the join nodes (deepest
+/// first). Conjuncts no join can consume stay in `residual` for the filter above
+/// the tree. Access-path choice (hash vs nested loop) stays in lowering.
+fn form_joins(
+    db: &Database,
+    node: LogicalOperator,
+    residual: &mut Vec<Expr>,
+) -> Result<LogicalOperator> {
+    match node {
+        LogicalOperator::Join { left, right, kind, on } => {
+            let left = Box::new(form_joins(db, *left, residual)?);
+            let right = Box::new(form_joins(db, *right, residual)?);
+            if on.is_none()
+                && matches!(kind, JoinKind::Cross | JoinKind::Inner)
+                && let (Some(ls), Some(rs)) = (schema(db, &left)?, schema(db, &right)?)
+            {
+                let mut join_preds = Vec::new();
+                residual.retain(|conjunct| {
+                    if equi_join_keys(conjunct, &ls, &rs).is_some() {
+                        join_preds.push(conjunct.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if let Some(predicate) = combine_and(join_preds) {
+                    return Ok(LogicalOperator::Join {
+                        left,
+                        right,
+                        kind: JoinKind::Inner,
+                        on: Some(predicate),
+                    });
+                }
+            }
+            Ok(LogicalOperator::Join { left, right, kind, on })
+        }
+        other => Ok(other),
+    }
 }
 
 fn inner_only(node: &LogicalOperator) -> bool {

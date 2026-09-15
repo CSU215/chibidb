@@ -7,7 +7,7 @@
 
 纯 Rust + tokio 手写的教学型单机关系数据库。按 **TDD 红绿**节奏演化，提交细粒度。
 存储、索引、事务、执行器、网络前端全部手写。当前 `cargo test --workspace` 为
-**697 passed + 9 ignored**（探针），`ffi` 子 crate 把引擎编译成 `cdylib`。
+**698 passed + 9 ignored**（探针），`ffi` 子 crate 把引擎编译成 `cdylib`。
 
 已完成的主干：SQL → lexer → parser(AST) → LogicalOperator（翻译 + 优化，`exec/planner/`）
 → PhysicalOperator（lower，`exec/operator/`，对 Statement 无知）→ 执行器（chunk/volcano）
@@ -53,7 +53,7 @@ python scripts\smoke.py          # 起 server→SQL→强杀→复开验证 WAL�
 | `exec/mod.rs` | 语句分发：DDL/SHOW/EXPLAIN/CHECKPOINT/VACUUM；DML 的 `apply_*`、EPQ 重试、`coerce`；统一执行缝 `collect_rows` | `execute(db, trx, stmt)` |
 | `exec/command.rs` | 翻译期绑定好列下标的 DML 命令：`InsertCommand`/`UpdateCommand`/`DeleteCommand` | `*Command::resolve` |
 | `exec/dml.rs` | 命令算子 `InsertOp`/`UpdateOp`/`DeleteOp`（持命令、`output_kind = Command`） | |
-| `exec/planner/` | 规划层：`logical`（LogicalOperator + 翻译/优化/树渲染）、`lower`（访达路径选择、`*`/别名展开、聚合重写）、`access`（索引选路）、`fold`（常量折叠）、`explain`、`util`（纯 AST 助手） | `plan_statement` / `plan_select` |
+| `exec/planner/` | 规划层：`logical`（LogicalOperator + 翻译/优化：谓词下推、WHERE→JOIN）、`lower`（访达路径选择、`*`/别名展开、聚合重写）、`access`（索引选路）、`fold`（常量折叠）、`explain`、`util`（纯 AST 助手） | `plan_statement` / `plan_select` |
 | `exec/operator/` | 火山算子（对 Statement 无知）：`PhysicalOperator` + `ExecContext{db,trx,outer}`；`basic`/`scan`/`index_scan`/`join`/`subquery`（`PlannedSubqueries` 承载计划期预降的子查询） | `physical_tree` |
 | `exec/chunk.rs` | 列式批处理 `Chunk`/`Column`（`CHUNK_ROWS=1024`）与行式桥接 | |
 | `exec/eval.rs` | 表达式求值（三值逻辑、LIKE+ESCAPE、标量函数、`EvalCtx` 父链） | `eval_const` / `eval_bound` |
@@ -97,7 +97,7 @@ python scripts\smoke.py          # 起 server→SQL→强杀→复开验证 WAL�
 
 ### 3.2 测试（`tests/`）
 
-约 60 个文件、697 个用例，按层分布（`lexer/parser/eval/agg/join/union/db*/trx/wal/vacuum/
+约 60 个文件、698 个用例，按层分布（`lexer/parser/eval/agg/join/union/db*/trx/wal/vacuum/
 storage_*/index_*/lsm_*/wire/server/http_*/mysql_frontend/instance/users/privileges/
 information_schema/constraints/correlated/miniob_compat/engine_equivalence/concurrency*`）。
 
