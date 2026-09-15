@@ -10,7 +10,8 @@
 //! SELECT items are intentionally left alone: folding them would change the
 //! result column headers (`1+2` -> `3`), which are part of the observable output.
 
-use crate::sql::ast::{DeleteStmt, Expr, InsertStmt, SelectStmt, Stmt, UpdateStmt};
+use crate::sql::ast::{BinOp, DeleteStmt, Expr, InsertStmt, SelectStmt, Stmt, UpdateStmt};
+use crate::value::Value;
 
 use super::eval::{eval_const, expr_has_column, expr_has_subquery};
 
@@ -106,7 +107,40 @@ fn fold_expr(e: &Expr) -> Expr {
     {
         return Expr::Value(value);
     }
-    folded
+    simplify(folded)
+}
+
+/// Applies boolean identities over an already-folded node. Constant folding
+/// turns `1=1` into a `Bool` literal; this drops it again where the surrounding
+/// `AND`/`OR` makes it redundant, so a conjunct list is not silently neutered.
+fn simplify(e: Expr) -> Expr {
+    if let Expr::Binary(op @ (BinOp::And | BinOp::Or), l, r) = &e {
+        let left = bool_lit(l);
+        let right = bool_lit(r);
+        match op {
+            // `x AND false` is false in SQL even when `x` is NULL.
+            BinOp::And if left == Some(false) || right == Some(false) => {
+                return Expr::Value(Value::Bool(false));
+            }
+            BinOp::And if left == Some(true) => return (**r).clone(),
+            BinOp::And if right == Some(true) => return (**l).clone(),
+            // `x OR true` is true even when `x` is NULL.
+            BinOp::Or if left == Some(true) || right == Some(true) => {
+                return Expr::Value(Value::Bool(true));
+            }
+            BinOp::Or if left == Some(false) => return (**r).clone(),
+            BinOp::Or if right == Some(false) => return (**l).clone(),
+            _ => {}
+        }
+    }
+    e
+}
+
+fn bool_lit(e: &Expr) -> Option<bool> {
+    match e {
+        Expr::Value(Value::Bool(b)) => Some(*b),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -159,5 +193,26 @@ mod tests {
             sub.selection,
             Some(Expr::Binary(crate::sql::ast::BinOp::Eq, _, ref r)) if **r == Expr::Value(Value::Int(5))
         ));
+    }
+
+    #[test]
+    fn drops_a_redundant_true_conjunct() {
+        let s = select("select id from t where id > 0 and 1 = 1;");
+        let folded = fold_select(&s);
+        assert_eq!(
+            folded.selection,
+            Some(Expr::Binary(
+                BinOp::Gt,
+                Box::new(Expr::Column("id".into())),
+                Box::new(Expr::Int(0)),
+            ))
+        );
+    }
+
+    #[test]
+    fn folds_a_false_predicate_to_false() {
+        let s = select("select id from t where 1 = 0;");
+        let folded = fold_select(&s);
+        assert_eq!(folded.selection, Some(Expr::Value(Value::Bool(false))));
     }
 }

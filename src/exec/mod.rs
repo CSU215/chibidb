@@ -14,6 +14,7 @@ mod aggregate;
 pub mod chunk;
 mod dml;
 mod eval;
+mod logical;
 pub(crate) mod optimize;
 pub mod operator;
 pub(crate) mod plan;

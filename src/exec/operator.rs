@@ -14,7 +14,8 @@ use crate::{Database, Error, Result};
 
 use super::aggregate::{expr_has_aggregate, sort_rows};
 use super::chunk::{CHUNK_ROWS, Chunk, Column};
-use super::eval::{eval_binary, eval_const, expr_has_column, expr_has_subquery, EvalCtx};
+use super::eval::{eval_binary, eval_const, EvalCtx};
+use super::logical::LogicalOperator;
 use super::subquery::{eval_bound, eval_predicate_bound};
 
 /// Build-row indices matching one key. The common unique-key case stays inline
@@ -1179,7 +1180,7 @@ fn compatible(a: DataType, b: DataType) -> bool {
     )
 }
 
-fn split_conjuncts(expr: &Expr) -> Vec<&Expr> {
+pub(crate) fn split_conjuncts(expr: &Expr) -> Vec<&Expr> {
     match expr {
         Expr::Binary(BinOp::And, l, r) => {
             let mut out = split_conjuncts(l);
@@ -1190,46 +1191,7 @@ fn split_conjuncts(expr: &Expr) -> Vec<&Expr> {
     }
 }
 
-/// The single FROM source that owns every column of `expr`, or `None` when the
-/// expression has no column, carries a subquery, or resolves in more than one
-/// source (ambiguous, so pushing it would hide the ambiguity).
-fn sole_source(expr: &Expr, sources: &[Schema]) -> Option<usize> {
-    if !expr_has_column(expr) || expr_has_subquery(expr) {
-        return None;
-    }
-    let mut found = None;
-    for (i, schema) in sources.iter().enumerate() {
-        if expr_resolves(expr, schema) {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(i);
-        }
-    }
-    found
-}
-
-/// Whether every column reference in `expr` resolves against `schema`.
-fn expr_resolves(expr: &Expr, schema: &Schema) -> bool {
-    match expr {
-        Expr::Column(name) => schema.index_of(name).is_some(),
-        Expr::QualifiedColumn(owner, name) => schema
-            .columns
-            .iter()
-            .any(|c| c.owner.as_deref() == Some(owner) && &c.name == name),
-        Expr::Unary(_, e) => expr_resolves(e, schema),
-        Expr::Binary(_, l, r) => expr_resolves(l, schema) && expr_resolves(r, schema),
-        Expr::IsNull(e, _) => expr_resolves(e, schema),
-        Expr::Like { expr, pattern, .. } => {
-            expr_resolves(expr, schema) && expr_resolves(pattern, schema)
-        }
-        Expr::Function(_, args) => args.iter().all(|a| expr_resolves(a, schema)),
-        // Literals, values and anything else without a column resolve trivially.
-        _ => true,
-    }
-}
-
-fn combine_and(mut parts: Vec<Expr>) -> Option<Expr> {
+pub(crate) fn combine_and(mut parts: Vec<Expr>) -> Option<Expr> {
     let mut acc = parts.pop()?;
     while let Some(e) = parts.pop() {
         acc = Expr::Binary(BinOp::And, Box::new(e), Box::new(acc));
@@ -1301,7 +1263,7 @@ fn extract_hash_keys(
 /// order. A comma join is `Cross` with no ON; an explicit join consumes the
 /// next entry of `select.on`, keeping both vectors aligned even when commas
 /// and explicit joins are mixed.
-fn join_clauses(select: &SelectStmt) -> Vec<(JoinKind, Option<Expr>)> {
+pub(crate) fn join_clauses(select: &SelectStmt) -> Vec<(JoinKind, Option<Expr>)> {
     let mut out = Vec::new();
     let mut on_index = 0usize;
     for i in 1..select.from.len() {
@@ -2063,7 +2025,7 @@ pub fn build_statement(
 }
 
 /// Builds a scan for one FROM entry: a table scan or a view sub-plan.
-fn build_from_source(
+pub(crate) fn build_from_source(
     db: &Database,
     tref: &TableRef,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
@@ -2074,6 +2036,130 @@ fn build_from_source(
             .map(|scan| Box::new(scan) as Box<dyn PhysicalOperator>));
     }
     Ok(Some(Box::new(TableScan::with_owner(db, &tref.name, &owner)?)))
+}
+
+/// A lowered FROM region plus the ORDER BY column an ordered index scan already
+/// provides, so the caller can skip the sort.
+type LoweredFrom = (Box<dyn PhysicalOperator>, Option<String>);
+
+/// Lowers the logical FROM/WHERE/JOIN region into a physical tree, reproducing
+/// the access-path choices the builder made directly before. Returns `None`
+/// when a source cannot be built, so the caller falls back to the materialized
+/// executor.
+fn lower_logical(
+    db: &Database,
+    select: &SelectStmt,
+    node: &LogicalOperator,
+) -> Result<Option<LoweredFrom>> {
+    if select.from.len() == 1 {
+        let (tref, predicate) = match node {
+            LogicalOperator::Scan(tref) => (tref, None),
+            LogicalOperator::Filter { input, predicate } => match input.as_ref() {
+                LogicalOperator::Scan(tref) => (tref, Some(predicate.clone())),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let Some((mut op, ordered)) = lower_single_table(db, select, tref, predicate.as_ref())?
+        else {
+            return Ok(None);
+        };
+        if let Some(predicate) = predicate {
+            op = Box::new(Filter::new(op, predicate));
+        }
+        return Ok(Some((op, ordered)));
+    }
+
+    // Multi-table: WHERE conjuncts left after pushdown feed comma-join hash
+    // keys; whatever no join consumes becomes the residual filter above the tree.
+    let (root, mut residual) = match node {
+        LogicalOperator::Filter { input, predicate } => (
+            input.as_ref(),
+            split_conjuncts(predicate).into_iter().cloned().collect::<Vec<Expr>>(),
+        ),
+        other => (other, Vec::new()),
+    };
+    let Some(mut op) = lower_join_tree(db, root, &mut residual)? else {
+        return Ok(None);
+    };
+    if let Some(predicate) = combine_and(residual) {
+        op = Box::new(Filter::new(op, predicate));
+    }
+    Ok(Some((op, None)))
+}
+
+/// The single-table access path: view, best index, ordered index, full scan.
+fn lower_single_table(
+    db: &Database,
+    select: &SelectStmt,
+    tref: &TableRef,
+    predicate: Option<&Expr>,
+) -> Result<Option<LoweredFrom>> {
+    if db.catalog().view(&tref.name).is_some() {
+        return Ok(build_from_source(db, tref)?.map(|source| (source, None)));
+    }
+    let owner = tref.alias.as_deref().unwrap_or(&tref.name);
+    if let Some(scan) = IndexScan::with_owner(db, &tref.name, owner, predicate)? {
+        let column = scan.ordered_column().to_string();
+        return Ok(Some((Box::new(scan), Some(column))));
+    }
+    // An index on the ORDER BY column can supply the order even without a WHERE
+    // clause, skipping the sort.
+    if select.group_by.is_empty()
+        && !items_have_aggregate(&select.items)
+        && let Some(column) =
+            crate::exec::plan::resolved_order_column(&select.items, &select.order_by)
+        && let Some(scan) = IndexScan::ordered(db, &tref.name, owner, &column)?
+    {
+        let column = scan.ordered_column().to_string();
+        return Ok(Some((Box::new(scan), Some(column))));
+    }
+    // sequential scans may skip large objects the query never reads
+    let keep = lob_keep(select, &db.catalog().table(&tref.name)?.schema.columns, owner, &tref.name);
+    Ok(Some((Box::new(TableScan::with_owner_keep(db, &tref.name, owner, keep)?), None)))
+}
+
+/// Lowers a join/scan tree. `residual` holds the WHERE conjuncts still
+/// available to form comma-join hash keys; consumed ones are removed.
+fn lower_join_tree(
+    db: &Database,
+    node: &LogicalOperator,
+    residual: &mut Vec<Expr>,
+) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    match node {
+        LogicalOperator::Scan(tref) => build_from_source(db, tref),
+        LogicalOperator::Filter { input, predicate } => {
+            let Some(inner) = lower_join_tree(db, input, residual)? else {
+                return Ok(None);
+            };
+            Ok(Some(Box::new(Filter::new(inner, predicate.clone()))))
+        }
+        LogicalOperator::Join { left, right, kind, on } => {
+            let lop = lower_join_tree(db, left, residual)?;
+            let rop = lower_join_tree(db, right, residual)?;
+            let (Some(lop), Some(rop)) = (lop, rop) else {
+                return Ok(None);
+            };
+            let keys = match on {
+                Some(on) => analyze_hash_join(*kind, Some(on), lop.schema(), rop.schema()),
+                None if *kind == JoinKind::Cross => {
+                    let (left_keys, right_keys, kept) =
+                        extract_hash_keys(residual, lop.schema(), rop.schema());
+                    if left_keys.is_empty() {
+                        None
+                    } else {
+                        *residual = kept;
+                        Some(HashKeys { left_keys, right_keys, residual: None })
+                    }
+                }
+                None => None,
+            };
+            Ok(Some(match keys {
+                Some(keys) => Box::new(HashJoin::new(lop, rop, *kind, keys)),
+                None => Box::new(NestedLoopJoin::new(lop, rop, *kind, on.clone())?),
+            }))
+        }
+    }
 }
 
 /// Builds a physical plan for a SELECT. Returns `None` for any shape the
@@ -2100,119 +2186,17 @@ pub fn build_select(
         return Ok(Some(Box::new(plan)));
     }
 
-    // FROM: a single table uses the best access path; multiple tables build a
-    // left-deep nested-loop/hash join over from-sources (tables or views).
-    let mut post_filter = select.selection.clone();
-    let (mut op, ordered_by): (Box<dyn PhysicalOperator>, Option<String>) = if select.from.len() == 1
-    {
-        let tref = &select.from[0];
-        if db.catalog().view(&tref.name).is_some() {
-            let Some(source) = build_from_source(db, tref)? else {
-                return Ok(None);
-            };
-            (source, None)
-        } else {
-            let owner = tref.alias.as_deref().unwrap_or(&tref.name);
-            match IndexScan::with_owner(db, &tref.name, owner, select.selection.as_ref())? {
-                Some(scan) => {
-                    let column = scan.ordered_column().to_string();
-                    (Box::new(scan), Some(column))
-                }
-                None => {
-                    // An index on the ORDER BY column can supply the order even
-                    // without a WHERE clause, skipping the sort.
-                    if select.group_by.is_empty()
-                        && !items_have_aggregate(&select.items)
-                        && let Some(column) =
-                            crate::exec::plan::resolved_order_column(&select.items, &select.order_by)
-                        && let Some(scan) =
-                            IndexScan::ordered(db, &tref.name, owner, &column)?
-                    {
-                        let column = scan.ordered_column().to_string();
-                        (Box::new(scan), Some(column))
-                    } else {
-                        // sequential scans may skip large objects the query never reads
-                        let keep = lob_keep(
-                            select,
-                            &db.catalog().table(&tref.name)?.schema.columns,
-                            owner,
-                            &tref.name,
-                        );
-                        (Box::new(TableScan::with_owner_keep(db, &tref.name, owner, keep)?), None)
-                    }
-                }
-            }
-        }
-    } else {
-        // Build every source first so WHERE conjuncts on a single source can be
-        // pushed onto it before the join.
-        let clauses = join_clauses(select);
-        let mut inputs: Vec<Box<dyn PhysicalOperator>> = Vec::with_capacity(select.from.len());
-        for tref in &select.from {
-            let Some(source) = build_from_source(db, tref)? else {
-                return Ok(None);
-            };
-            inputs.push(source);
-        }
-        let mut where_conjuncts: Vec<Expr> =
-            select.selection.as_ref().map(split_conjuncts).unwrap_or_default()
-                .into_iter().cloned().collect();
-        // Pushing a WHERE predicate below an outer join would change which rows
-        // are null-extended, so only inner/comma joins are eligible.
-        if clauses
-            .iter()
-            .all(|(kind, _)| matches!(kind, JoinKind::Inner | JoinKind::Cross))
-        {
-            let schemas: Vec<Schema> = inputs.iter().map(|s| s.schema().clone()).collect();
-            let mut pushed: Vec<Vec<Expr>> = vec![Vec::new(); inputs.len()];
-            let mut kept = Vec::with_capacity(where_conjuncts.len());
-            for conjunct in where_conjuncts.drain(..) {
-                match sole_source(&conjunct, &schemas) {
-                    Some(i) => pushed[i].push(conjunct),
-                    None => kept.push(conjunct),
-                }
-            }
-            where_conjuncts = kept;
-            inputs = inputs
-                .into_iter()
-                .zip(pushed)
-                .map(|(source, preds)| match combine_and(preds) {
-                    Some(pred) => Box::new(Filter::new(source, pred)) as Box<dyn PhysicalOperator>,
-                    None => source,
-                })
-                .collect();
-        }
-        // Comma joins carry no ON clause; equi-predicates between the two sides
-        // are sourced from WHERE so the join can hash instead of cross-produce.
-        let mut iter = inputs.into_iter();
-        let mut op = iter.next().expect("from is non-empty");
-        for ((kind, on), right) in clauses.into_iter().zip(iter) {
-            let keys = match on.as_ref() {
-                Some(on) => analyze_hash_join(kind, Some(on), op.schema(), right.schema()),
-                None if kind == JoinKind::Cross => {
-                    let (left_keys, right_keys, kept) =
-                        extract_hash_keys(&where_conjuncts, op.schema(), right.schema());
-                    if left_keys.is_empty() {
-                        None
-                    } else {
-                        where_conjuncts = kept;
-                        Some(HashKeys { left_keys, right_keys, residual: None })
-                    }
-                }
-                None => None,
-            };
-            match keys {
-                Some(keys) => op = Box::new(HashJoin::new(op, right, kind, keys)),
-                None => op = Box::new(NestedLoopJoin::new(op, right, kind, on)?),
-            }
-        }
-        // Whatever no hash key or pushed-down filter consumed is the residual.
-        post_filter = combine_and(where_conjuncts);
-        (op, None)
+    // FROM: translate the from/where/join region to a logical plan, push
+    // single-source predicates onto their source, then lower to operators.
+    let Some(logical) = super::logical::logical_from(select) else {
+        return Ok(None);
     };
-    if let Some(selection) = &post_filter {
-        op = Box::new(Filter::new(op, selection.clone()));
-    }
+    let Some(logical) = super::logical::pushdown(db, logical)? else {
+        return Ok(None);
+    };
+    let Some((mut op, ordered_by)) = lower_logical(db, select, &logical)? else {
+        return Ok(None);
+    };
 
     // grouped / aggregate: grouping, having, ordering, projection, distinct
     // and limit are all handled inside GroupBy (matching the materialized path)
