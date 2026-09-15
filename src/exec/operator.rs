@@ -12,9 +12,9 @@ use crate::storage::Rid;
 use crate::value::{DataType, Value};
 use crate::{Database, Error, Result};
 
-use super::aggregate::{expr_has_aggregate, sort_rows};
+use super::aggregate::{self, expr_has_aggregate, sort_rows};
 use super::chunk::{CHUNK_ROWS, Chunk, Column};
-use super::eval::{eval_binary, eval_const, EvalCtx};
+use super::eval::{eval_binary, eval_const, expr_has_column, EvalCtx};
 use super::logical::LogicalOperator;
 use super::subquery::{eval_bound, eval_predicate_bound};
 
@@ -2211,11 +2211,10 @@ fn lower(
         | LogicalOperator::Filter { .. }
         | LogicalOperator::Join { .. } => lower_region(db, select, node)?.map(|(op, _)| op),
         LogicalOperator::Aggregate { input, select: inner } => {
-            let Some(op) = lower(db, inner, input)? else {
+            let Some(input) = lower(db, inner, input)? else {
                 return Ok(None);
             };
-            let (exprs, headers) = build_projection(op.schema(), &inner.items);
-            Some(Box::new(GroupBy::new(op, (**inner).clone(), exprs, headers)))
+            aggregate_tail(inner, input)?
         }
         LogicalOperator::Project { input, items } => {
             let Some(op) = lower(db, select, input)? else {
@@ -2254,6 +2253,105 @@ fn lower(
             Some(Box::new(Limit::new(op, offset, Some(count))))
         }
     })
+}
+
+/// Lowers an aggregate SELECT into standard operators: `Aggregate` computes one
+/// row per group (the group's first input row plus one `#aggN` column per
+/// aggregate), and HAVING / ORDER BY / projection / DISTINCT / LIMIT stack
+/// above it.
+fn aggregate_tail(
+    select: &SelectStmt,
+    input: Box<dyn PhysicalOperator>,
+) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    for g in &select.group_by {
+        if expr_has_aggregate(g) {
+            return Err(Error::Runtime(
+                "aggregate functions are not allowed in group by".into(),
+            ));
+        }
+    }
+    if select.group_by.is_empty() {
+        for item in &select.items {
+            if let SelectItem::Expr(e) | SelectItem::Aliased(e, _) = item
+                && expr_has_column(e)
+            {
+                return Err(Error::Runtime(
+                    "column must appear in group by or aggregate".into(),
+                ));
+            }
+        }
+    }
+
+    let input_schema = input.schema().clone();
+    let (exprs, headers) = build_projection(&input_schema, &select.items);
+
+    let mut refs: Vec<&Expr> = exprs.iter().collect();
+    if let Some(having) = &select.having {
+        refs.push(having);
+    }
+    for (e, _) in &select.order_by {
+        refs.push(e);
+    }
+    let aggregates = aggregate::extract_aggregates(&refs);
+
+    let mut needed_refs: Vec<&Expr> = select.group_by.iter().collect();
+    needed_refs.extend(exprs.iter());
+    if let Some(having) = &select.having {
+        needed_refs.push(having);
+    }
+    for (e, _) in &select.order_by {
+        needed_refs.push(e);
+    }
+    for agg in &aggregates {
+        if let Expr::Aggregate(_, Some(arg), _) = agg {
+            needed_refs.push(arg);
+        }
+    }
+    let needed = aggregate::referenced_columns(&input_schema, &needed_refs);
+
+    let mut op: Box<dyn PhysicalOperator> = Box::new(aggregate::Aggregate::new(
+        input,
+        input_schema,
+        select.group_by.clone(),
+        aggregates.clone(),
+        needed,
+    ));
+
+    if let Some(having) = &select.having {
+        op = Box::new(Filter::new(op, aggregate::rewrite_aggregates(having, &aggregates)));
+    }
+    if !select.order_by.is_empty() {
+        let items: Vec<SelectItem> =
+            select.items.iter().map(|item| rewrite_item(item, &aggregates)).collect();
+        let order: Vec<(Expr, bool)> = select
+            .order_by
+            .iter()
+            .map(|(e, desc)| (aggregate::rewrite_aggregates(e, &aggregates), *desc))
+            .collect();
+        op = Box::new(Sort::new(op, order, items));
+    }
+    let rewritten: Vec<Expr> =
+        exprs.iter().map(|e| aggregate::rewrite_aggregates(e, &aggregates)).collect();
+    op = Box::new(Project::new(op, rewritten, headers));
+    if select.distinct {
+        op = Box::new(Distinct::new(op));
+    }
+    if let Some(limit) = &select.limit {
+        let offset = limit_bound(limit.offset.as_ref())?;
+        let count = limit_bound(Some(&limit.count))?;
+        op = Box::new(Limit::new(op, offset, Some(count)));
+    }
+    Ok(Some(op))
+}
+
+fn rewrite_item(item: &SelectItem, aggregates: &[Expr]) -> SelectItem {
+    match item {
+        SelectItem::Expr(e) => SelectItem::Expr(aggregate::rewrite_aggregates(e, aggregates)),
+        SelectItem::Aliased(e, alias) => {
+            SelectItem::Aliased(aggregate::rewrite_aggregates(e, aggregates), alias.clone())
+        }
+        SelectItem::Star => SelectItem::Star,
+    }
 }
 
 /// Builds the plan for a UNION [ALL] chain: each operand is planned, then the

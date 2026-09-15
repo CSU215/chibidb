@@ -7,9 +7,9 @@
 //! lowers the result. Access-path choice (index vs scan, hash vs nested loop)
 //! is deliberately *not* here: it stays in lowering.
 //!
-//! `Aggregate` is currently a fused node carrying the whole SELECT: the
-//! physical `GroupBy` fuses grouping, HAVING, ordering, projection, DISTINCT
-//! and LIMIT. It is split into standard operators in a later step.
+//! `Aggregate` is still one logical node for a grouped query; lowering splits
+//! it into a physical `Aggregate` plus separate HAVING/ORDER BY/projection/
+//! DISTINCT/LIMIT operators. Splitting the logical node itself is a later step.
 
 use crate::catalog::Schema;
 use crate::sql::ast::{Expr, JoinKind, Limit, SelectItem, SelectStmt, TableRef};

@@ -47,7 +47,8 @@ fn explain_logical_join_and_aggregate() {
 
     let plan = message(&db, "explain select dept_id, count(*) from emp group by dept_id;");
     assert!(plan.contains("Aggregate"), "{plan}");
-    assert!(plan.contains("GroupBy"), "{plan}");
+    assert!(plan.contains("Project"), "{plan}");
+    assert!(plan.contains("Scan emp"), "{plan}");
 }
 
 #[test]
