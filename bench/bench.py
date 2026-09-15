@@ -12,11 +12,17 @@ Usage (from the repo root):
     python bench/bench.py --benches point_select
     python bench/bench.py --list
     python bench/bench.py --json bench/result.json
+    python bench/bench.py --repeat 5 --plot bench/report.html
     python bench/bench.py --no-progress      # silence the progress bar
 
 A progress bar on stderr tracks each (bench, target) step; it degrades to one
 plain line per step when stderr is not a TTY. Each bench times itself and
 returns a metrics dict; this script renders it.
+
+Every (bench, target) pair is run ``--repeat`` times (default 5) so run-to-run
+variance is visible: records carry the per-run ``samples`` alongside a median
+``metrics`` aggregate, and ``--plot`` turns that spread into a box-plot HTML
+report (see ``bench/plot.py``).
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ import importlib.util
 import json
 import os
 import shutil
+import statistics
 import sys
 import tempfile
 import time
@@ -64,6 +71,18 @@ class Progress:
         if not self.enabled:
             return
         self.done += 1
+        self._draw(label)
+
+    def set_label(self, label: str) -> None:
+        """Rewrite the current line's label without advancing the counter.
+
+        Used to show which repeat is running; a no-op outside a TTY so the
+        fallback never spams one line per sample.
+        """
+        if self.interactive:
+            self._draw(label)
+
+    def _draw(self, label: str) -> None:
         elapsed = time.monotonic() - self.start
         ratio = self.done / self.total
         filled = int(self.WIDTH * ratio)
@@ -133,7 +152,42 @@ def describe_target(target: Target) -> tuple[bool, str]:
     return bool(ok), str(reason or "")
 
 
-def run_one(bench: Bench, target: Target, env: Env) -> dict:
+def attempt(bench: Bench, target: Target, env: Env) -> tuple[dict | None, dict | None]:
+    """One open/run/close cycle. Returns ``(metrics, error)``; one is ``None``."""
+    error = None
+    metrics = None
+    try:
+        target.open(env)
+        metrics = bench.run(target, env)
+        if not isinstance(metrics, dict):
+            raise TypeError("run() must return a dict, got %s" % type(metrics).__name__)
+    except Exception as exc:
+        error = {"reason": "%s: %s" % (type(exc).__name__, exc), "trace": traceback.format_exc()}
+        return None, error
+    finally:
+        try:
+            target.close()
+        except Exception as exc:
+            if error is None:
+                error = {"reason": "close() raised %s: %s" % (type(exc).__name__, exc)}
+                metrics = None
+    return metrics, error
+
+
+def aggregate(samples: list) -> dict:
+    """Median of every metric across samples; non-numeric keys keep their last value."""
+    metrics = {}
+    for key in samples[-1]:
+        values = [s.get(key) for s in samples]
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+            metrics[key] = statistics.median(values)
+        else:
+            metrics[key] = values[-1]
+    return metrics
+
+
+def run_pair(bench: Bench, target: Target, repeat: int, progress: Progress, keep: bool) -> dict:
+    """Run one (bench, target) pair ``repeat`` times over fresh scratch dirs."""
     rec = {"bench": bench.id, "target": target.id}
     if not bench.enabled:
         rec.update(status="skip", reason="disabled in bench config")
@@ -141,30 +195,42 @@ def run_one(bench: Bench, target: Target, env: Env) -> dict:
     if target.id in tuple(bench.disabled_targets):
         rec.update(status="skip", reason="disabled for target %s" % target.id)
         return rec
-    try:
-        ok, reason = bench.check(target, env)
-    except Exception as exc:
-        rec.update(status="error", reason="check() raised %s: %s" % (type(exc).__name__, exc))
-        rec["trace"] = traceback.format_exc()
-        return rec
-    if not ok:
-        rec.update(status="skip", reason=str(reason or "unsupported"))
-        return rec
-    try:
-        target.open(env)
-        metrics = bench.run(target, env)
-        if not isinstance(metrics, dict):
-            raise TypeError("run() must return a dict, got %s" % type(metrics).__name__)
-        rec.update(status="ok", metrics=metrics)
-    except Exception as exc:
-        rec.update(status="error", reason="%s: %s" % (type(exc).__name__, exc))
-        rec["trace"] = traceback.format_exc()
-    finally:
+
+    samples = []
+    first_error = None
+    for i in range(repeat):
+        data_dir = tempfile.mkdtemp(prefix="chaoticdb-bench-")
+        env = Env(root=ROOT, bench_dir=HERE, data_dir=data_dir)
         try:
-            target.close()
-        except Exception as exc:
-            if rec.get("status") == "ok":
-                rec.update(status="error", reason="close() raised %s: %s" % (type(exc).__name__, exc))
+            if i == 0:
+                try:
+                    ok, reason = bench.check(target, env)
+                except Exception as exc:
+                    rec.update(status="error", reason="check() raised %s: %s" % (type(exc).__name__, exc))
+                    rec["trace"] = traceback.format_exc()
+                    return rec
+                if not ok:
+                    rec.update(status="skip", reason=str(reason or "unsupported"))
+                    return rec
+            progress.set_label("%s / %s  sample %d/%d" % (bench.id, target.id, i + 1, repeat))
+            metrics, error = attempt(bench, target, env)
+            if error is None:
+                samples.append(metrics)
+            elif first_error is None:
+                first_error = error
+        finally:
+            if not keep:
+                shutil.rmtree(data_dir, ignore_errors=True)
+
+    if not samples:
+        rec.update(status="error", reason=first_error["reason"] if first_error else "no samples")
+        if first_error and first_error.get("trace"):
+            rec["trace"] = first_error["trace"]
+        return rec
+    rec.update(status="ok", metrics=aggregate(samples), samples=samples, repeat=repeat)
+    if first_error is not None:
+        rec["failed_samples"] = repeat - len(samples)
+        rec["reason"] = first_error["reason"]
     return rec
 
 
@@ -179,7 +245,9 @@ def render(records: list) -> None:
     rows = []
     for rec in records:
         if rec["status"] == "ok":
-            detail = " ".join("%s=%s" % (k, fmt(v)) for k, v in rec["metrics"].items())
+            samples = rec.get("samples") or [rec["metrics"]]
+            prefix = "n=%d  " % len(samples) if len(samples) > 1 else ""
+            detail = prefix + " ".join("%s=%s" % (k, fmt(v)) for k, v in rec["metrics"].items())
         else:
             detail = rec.get("reason", "")
         rows.append((rec["target"], rec["bench"], rec["status"], detail))
@@ -200,11 +268,24 @@ def main() -> int:
     parser.add_argument("--targets", help="comma-separated target ids")
     parser.add_argument("--benches", help="comma-separated bench ids")
     parser.add_argument("--json", dest="json_path", help="write structured results here")
+    parser.add_argument(
+        "--plot",
+        dest="plot_path",
+        help="write a box-plot HTML report here (see bench/plot.py)",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=5,
+        help="times to run each (bench, target) pair, for the box-plot spread (default 5)",
+    )
     parser.add_argument("--keep", action="store_true", help="keep scratch data directories")
     parser.add_argument("--no-progress", action="store_true", help="disable the progress bar")
     parser.add_argument("-v", "--verbose", action="store_true", help="print tracebacks on error")
     parser.add_argument("--list", action="store_true", help="list targets and benches")
     args = parser.parse_args()
+    if args.repeat < 1:
+        parser.error("--repeat must be at least 1")
 
     targets = select(load_objects(TARGETS_DIR, "TARGET", Target), args.targets)
     benches = select(load_objects(BENCHES_DIR, "BENCH", Bench), args.benches)
@@ -235,19 +316,12 @@ def main() -> int:
     for bench in benches:
         for target in targets:
             progress.update("%s / %s" % (bench.id, target.id))
-            rec = {"bench": bench.id, "target": target.id}
             ok, reason = status[target.id]
             if not ok:
-                rec.update(status="skip", reason="target unavailable: %s" % reason)
-                records.append(rec)
+                records.append({"bench": bench.id, "target": target.id, "status": "skip",
+                                "reason": "target unavailable: %s" % reason})
                 continue
-            data_dir = tempfile.mkdtemp(prefix="chaoticdb-bench-")
-            env = Env(root=ROOT, bench_dir=HERE, data_dir=data_dir)
-            try:
-                records.append(run_one(bench, target, env))
-            finally:
-                if not args.keep:
-                    shutil.rmtree(data_dir, ignore_errors=True)
+            records.append(run_pair(bench, target, args.repeat, progress, args.keep))
     progress.finish()
 
     print()
@@ -264,17 +338,28 @@ def main() -> int:
             if rec["status"] == "error" and rec.get("trace"):
                 print("\n[%s / %s]\n%s" % (rec["bench"], rec["target"], rec["trace"]))
 
+    payload = {
+        "title": "chaoticdb benchmark",
+        "repeat": args.repeat,
+        "targets": [
+            {"id": t.id, "title": t.title, "available": status[t.id][0], "reason": status[t.id][1]}
+            for t in targets
+        ],
+        "benches": [{"id": b.id, "title": b.title} for b in benches],
+        "records": records,
+    }
+
     if args.json_path:
-        payload = {
-            "targets": [
-                {"id": t.id, "title": t.title, "available": status[t.id][0], "reason": status[t.id][1]}
-                for t in targets
-            ],
-            "records": records,
-        }
         with open(args.json_path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
         print("wrote %s" % args.json_path)
+
+    if args.plot_path:
+        from plot import render_report  # sibling module next to this file
+
+        with open(args.plot_path, "w", encoding="utf-8") as fh:
+            fh.write(render_report(payload))
+        print("wrote %s" % args.plot_path)
 
     return 1 if failed else 0
 
