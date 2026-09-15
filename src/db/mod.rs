@@ -582,23 +582,22 @@ impl Database {
                 return Err(Error::Runtime(format!("no such table: {table}")));
             }
         }
-        // The planner folds expressions, translates/optimizes the logical plan
-        // and lowers it to physical operators.
-        let mut physical = crate::exec::planner::plan_statement(self, stmt)?;
-        if let Some(plan) = physical.as_mut() {
-            let kind = plan.output_kind();
-            let columns: Vec<String> =
-                plan.schema().columns.iter().map(|c| c.name.clone()).collect();
-            let rows = self.collect_plan(session, plan.as_mut())?;
-            match kind {
-                crate::exec::operator::OutputKind::Command => match plan.affected_rows() {
-                    Some(n) => Ok(ResultSet::Affected(n)),
-                    None => Ok(ResultSet::Message("SUCCESS".into())),
-                },
-                crate::exec::operator::OutputKind::Rows => Ok(ResultSet::Rows { columns, rows }),
-            }
-        } else {
-            crate::exec::execute(self, session.trx(), stmt)
+        // The planner composes the stages: constant folding, translation to a
+        // LogicalOperator, logical optimization, then lowering to physical
+        // operators. Take the layered result so the pipeline stays explicit.
+        let layers = crate::exec::planner::plan_statement_layers(self, stmt)?;
+        let Some(mut plan) = layers.physical else {
+            return crate::exec::execute(self, session.trx(), stmt);
+        };
+        let kind = plan.output_kind();
+        let columns: Vec<String> = plan.schema().columns.iter().map(|c| c.name.clone()).collect();
+        let rows = self.collect_plan(session, plan.as_mut())?;
+        match kind {
+            crate::exec::operator::OutputKind::Command => match plan.affected_rows() {
+                Some(n) => Ok(ResultSet::Affected(n)),
+                None => Ok(ResultSet::Message("SUCCESS".into())),
+            },
+            crate::exec::operator::OutputKind::Rows => Ok(ResultSet::Rows { columns, rows }),
         }
     }
 

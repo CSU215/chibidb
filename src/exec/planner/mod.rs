@@ -27,15 +27,17 @@ use crate::{Database, Result};
 use super::operator::{PhysicalOperator, PlannedSubqueries, SubqueryRegistry};
 use logical::LogicalOperator;
 
-/// The result of planning: the optimized logical plan (when the shape has a
-/// single one) plus the physical plan that executes it. `logical` is `None` for
-/// DML, a constant SELECT or a UNION chain.
+/// The result of planning: the optimized logical plan plus the physical plan
+/// that executes it. Both are `None` for statements the operator layer does not
+/// cover (DDL, SHOW, transaction control).
 pub(crate) struct Layers {
     pub(crate) logical: Option<LogicalOperator>,
     pub(crate) physical: Option<Box<dyn PhysicalOperator>>,
 }
 
-/// Plans `stmt`, or `None` for statements the operator layer does not cover.
+/// Convenience over [`plan_statement_layers`] that returns only the executable
+/// plan. It still runs the whole pipeline; use the layered form when the
+/// intermediate [`LogicalOperator`] is needed.
 pub fn plan_statement(
     db: &Database,
     stmt: &Stmt,
