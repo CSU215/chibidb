@@ -13,7 +13,7 @@ cargo run -q                    # 内存实例 REPL（临时目录后端，退�
 cargo run -q -- <dir>           # 文件实例 REPL（多库数据根目录）
 cargo run -q -- serve <dir> [addr]   # TCP server，addr 缺省取 config.toml 的 server.addr
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（700 passed + 9 个 #[ignore] 性能探针）
+cargo test                      # 全量回归（704 passed + 9 个 #[ignore] 性能探针）
 ```
 
 REPL / client 中输入 `exit` 或 `quit` 退出。启动时从**当前工作目录**读取 `config.toml`
@@ -97,8 +97,9 @@ SHOW TABLES;  SHOW DATABASES;  SHOW COLUMNS FROM t;  SHOW COLUMNS IN t;  DESCRIB
 CREATE USER alice IDENTIFIED BY 'secret';  DROP USER alice;
 -- 认证（仅当 auth.enabled = true；登录绑定会话）
 LOGIN alice IDENTIFIED BY 'secret';
--- 权限（read/write；ON * 表示所有库）
+-- 权限（read/write/manage；ON * 表示所有库；ALL = read + write，不含 manage）
 GRANT READ, WRITE ON shop TO alice;  GRANT ALL ON * TO alice;  REVOKE WRITE ON shop FROM alice;
+GRANT MANAGE ON * TO alice;          -- 建/删用户；manage on <db> 只能转授该库的权限
 -- DDL（可选 ENGINE = heap|lsm、PAGE_LAYOUT = row|pax；缺省取 storage 配置）
 CREATE TABLE t (id int primary key, name char(10) not null,
                 score float default 0, email char(20) unique) ENGINE = lsm;
@@ -148,6 +149,8 @@ EXPLAIN SELECT ...;            -- 输出 FullScan / IndexScan / OrderedIndexScan
 - `concat` 把任意标量转文本拼接（任一参数 NULL 则结果 NULL）；`upper`/`lower`/`length`/`substring`
   仅接受字符串，NULL 传播；`substring` 下标从 1 起，越界得空串。
 - 显式事务内执行 DDL 报错；`CHECKPOINT`/`VACUUM` 在任一事务未结束时报错。
+- 开启 `auth.enabled` 后，第一个创建的用户自动获得 `manage on *`（初始管理员）：建/删用户需
+  实例级 manage，`GRANT`/`REVOKE` 需目标库（或 `*`）上的 manage；`ALL` 只含 read + write。
 - `information_schema` 只读；`SHOW COLUMNS`/`DESCRIBE` 只描述表，视图报错；`SHOW TABLES` 列出表与视图并排序。
 - REPL/client 仅在 stdin 为终端时打印提示符，管道输入不污染首行、表格保持对齐。
 
@@ -244,7 +247,7 @@ dwb.bin                # Double-Write Buffer（storage.double_write 开启时）
 
 ## 测试
 
-`cargo test --workspace` 当前 **700 passed + 9 ignored**。集成测试覆盖词法/语法/求值/
+`cargo test --workspace` 当前 **704 passed + 9 ignored**。集成测试覆盖词法/语法/求值/
 LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/表约束（PK/UNIQUE/NOT NULL/DEFAULT）/
 索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等。`tests/miniob_compat.rs` 用经典
 student/course/sc 场景做端到端回归；`tests/engine_equivalence.rs` 用确定性随机脚本对

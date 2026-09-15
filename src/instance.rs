@@ -433,17 +433,38 @@ impl Instance {
         let Some(user) = session.user() else {
             return Err(Error::Runtime("not logged in".into()));
         };
-        // account administration only needs a login (there is no role model)
-        if matches!(
-            stmt,
-            Stmt::CreateUser(_)
-                | Stmt::DropUser(_)
-                | Stmt::Grant(_)
-                | Stmt::Revoke(_)
-                | Stmt::CreateDatabase(_)
-                | Stmt::DropDatabase(_)
-        ) {
-            return Ok(());
+        // User and privilege administration needs MANAGE: instance-wide for
+        // accounts, and on the statement's target scope for grant/revoke.
+        match stmt {
+            Stmt::CreateUser(_) | Stmt::DropUser(_) => {
+                if !self.has_privilege(user, "*", Privilege::Manage)? {
+                    return Err(Error::Runtime(format!(
+                        "permission denied for {user}: manage required to administer users"
+                    )));
+                }
+                return Ok(());
+            }
+            Stmt::Grant(g) => {
+                if !self.has_privilege(user, &g.database, Privilege::Manage)? {
+                    return Err(Error::Runtime(format!(
+                        "permission denied for {user}: manage required on {}",
+                        g.database
+                    )));
+                }
+                return Ok(());
+            }
+            Stmt::Revoke(r) => {
+                if !self.has_privilege(user, &r.database, Privilege::Manage)? {
+                    return Err(Error::Runtime(format!(
+                        "permission denied for {user}: manage required on {}",
+                        r.database
+                    )));
+                }
+                return Ok(());
+            }
+            // database-level statements only need a login
+            Stmt::CreateDatabase(_) | Stmt::DropDatabase(_) => return Ok(()),
+            _ => {}
         }
         // the virtual metadata database is readable by any logged-in user
         if session.current_db() == Some(INFORMATION_SCHEMA) {
@@ -462,14 +483,7 @@ impl Instance {
     }
 
     fn any_users(&self) -> Result<bool> {
-        let meta = self.meta.read();
-        let result = meta.execute_sql("select count(*) from users;")?;
-        Ok(match result.into_iter().next() {
-            Some(ResultSet::Rows { rows, .. }) if !rows.is_empty() => {
-                matches!(rows[0].first(), Some(Value::Int(n)) if *n > 0)
-            }
-            _ => false,
-        })
+        any_users(&self.meta.read())
     }
 
     // ---- users -----------------------------------------------------------
@@ -480,11 +494,20 @@ impl Instance {
         if user_exists(&meta, name)? {
             return Err(Error::Runtime(format!("user already exists: {name}")));
         }
+        let first = !any_users(&meta)?;
         let hash = hash_password(password);
         let native = crate::net::mysql::native_verifier_hex(password);
         meta.execute_sql(&format!(
             "insert into users values ('{name}', '{hash}', '{native}');"
         ))?;
+        if first {
+            // The bootstrap account is the initial administrator: it may create
+            // further users and hand out privileges.
+            meta.execute_sql(&format!(
+                "insert into privileges values ('{name}', '*', '{}');",
+                Privilege::Manage.as_str()
+            ))?;
+        }
         Ok(())
     }
 
@@ -600,6 +623,17 @@ fn statement_privilege(stmt: &Stmt) -> Option<Privilege> {
 fn user_exists(meta: &Database, name: &str) -> Result<bool> {
     let result = meta.execute_sql(&format!("select name from users where name = '{name}';"))?;
     Ok(matches!(result.into_iter().next(), Some(ResultSet::Rows { rows, .. }) if !rows.is_empty()))
+}
+
+/// Whether any account exists yet (used for the bootstrap administrator).
+fn any_users(meta: &Database) -> Result<bool> {
+    let result = meta.execute_sql("select count(*) from users;")?;
+    Ok(match result.into_iter().next() {
+        Some(ResultSet::Rows { rows, .. }) if !rows.is_empty() => {
+            matches!(rows[0].first(), Some(Value::Int(n)) if *n > 0)
+        }
+        _ => false,
+    })
 }
 
 fn revoke(meta: &Database, user: &str, database: &str, kind: &str) -> Result<()> {

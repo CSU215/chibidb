@@ -92,6 +92,36 @@ fn dropping_a_database_removes_its_privileges() {
 }
 
 #[test]
+fn manage_is_not_part_of_all_and_must_be_granted() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = instance(&dir);
+    let mut s = Session::new();
+    setup(&inst, &mut s);
+
+    inst.execute_with(&mut s, "create user bob identified by 'x';").unwrap();
+    inst.execute_with(&mut s, "grant all on * to bob;").unwrap();
+    assert!(inst.has_privilege("bob", "shop", Privilege::Read).unwrap());
+    assert!(inst.has_privilege("bob", "shop", Privilege::Write).unwrap());
+    assert!(!inst.has_privilege("bob", "*", Privilege::Manage).unwrap());
+
+    inst.execute_with(&mut s, "grant manage on * to bob;").unwrap();
+    assert!(inst.has_privilege("bob", "shop", Privilege::Manage).unwrap());
+}
+
+#[test]
+fn the_first_user_becomes_the_administrator() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = instance(&dir);
+    let mut s = Session::new();
+
+    inst.execute_with(&mut s, "create user alice identified by 'x';").unwrap();
+    assert!(inst.has_privilege("alice", "*", Privilege::Manage).unwrap());
+
+    inst.execute_with(&mut s, "create user bob identified by 'x';").unwrap();
+    assert!(!inst.has_privilege("bob", "*", Privilege::Manage).unwrap());
+}
+
+#[test]
 fn parses_grant_and_revoke() {
     use chaoticdb::sql::ast::{GrantStmt, RevokeStmt, Stmt};
     use chaoticdb::sql::parser::parse;
@@ -110,6 +140,14 @@ fn parses_grant_and_revoke() {
         Stmt::Grant(GrantStmt {
             privileges: vec![Privilege::Read, Privilege::Write],
             database: "shop".into(),
+            user: "alice".into(),
+        })
+    );
+    assert_eq!(
+        one("grant manage on * to alice;"),
+        Stmt::Grant(GrantStmt {
+            privileges: vec![Privilege::Manage],
+            database: "*".into(),
             user: "alice".into(),
         })
     );

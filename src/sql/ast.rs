@@ -253,6 +253,9 @@ pub struct DropUserStmt {
 pub enum Privilege {
     Read,
     Write,
+    /// Instance administration: create/drop users and grant/revoke privileges.
+    /// Not part of `ALL`; it must be granted explicitly.
+    Manage,
 }
 
 impl Privilege {
@@ -260,6 +263,7 @@ impl Privilege {
         match self {
             Privilege::Read => "read",
             Privilege::Write => "write",
+            Privilege::Manage => "manage",
         }
     }
 }

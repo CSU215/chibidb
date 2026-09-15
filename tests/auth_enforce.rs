@@ -107,3 +107,49 @@ fn checkpoint_and_vacuum_require_write_privilege() {
     assert!(err(&inst, &mut s, "checkpoint;").contains("permission denied"));
     assert!(err(&inst, &mut s, "vacuum;").contains("permission denied"));
 }
+
+#[test]
+fn manage_is_required_to_administer_users_and_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = Instance::open(dir.path(), &auth_config()).unwrap();
+
+    // the bootstrap account is the administrator
+    let mut admin = Session::new();
+    inst.execute_with(&mut admin, "create user admin identified by 'pw';").unwrap();
+    inst.execute_with(&mut admin, "login admin identified by 'pw';").unwrap();
+    inst.execute_with(&mut admin, "create user bob identified by 'pw';").unwrap();
+    inst.execute_with(&mut admin, "grant read on shop to bob;").unwrap();
+
+    // bob can log in but cannot manage accounts or hand out privileges
+    let mut bob = Session::new();
+    inst.execute_with(&mut bob, "login bob identified by 'pw';").unwrap();
+    assert!(err(&inst, &mut bob, "create user carol identified by 'pw';").contains("manage required"));
+    assert!(err(&inst, &mut bob, "drop user admin;").contains("manage required"));
+    assert!(err(&inst, &mut bob, "grant write on shop to bob;").contains("manage required"));
+}
+
+#[test]
+fn manage_can_be_scoped_to_one_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = Instance::open(dir.path(), &auth_config()).unwrap();
+
+    let mut admin = Session::new();
+    inst.execute_with(&mut admin, "create user admin identified by 'pw';").unwrap();
+    inst.execute_with(&mut admin, "login admin identified by 'pw';").unwrap();
+    inst.execute_with(&mut admin, "create user mallory identified by 'pw';").unwrap();
+    inst.execute_with(&mut admin, "grant manage on shop to mallory;").unwrap();
+
+    let mut mallory = Session::new();
+    inst.execute_with(&mut mallory, "login mallory identified by 'pw';").unwrap();
+
+    // manage on shop lets mallory grant on shop ...
+    inst.execute_with(&mut mallory, "grant read on shop to admin;").unwrap();
+    // ... but not elsewhere, and not administer accounts
+    assert!(
+        err(&inst, &mut mallory, "grant read on other to admin;").contains("manage required")
+    );
+    assert!(
+        err(&inst, &mut mallory, "create user carol identified by 'pw';")
+            .contains("manage required")
+    );
+}

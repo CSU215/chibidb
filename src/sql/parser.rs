@@ -353,8 +353,10 @@ impl Parser<'_> {
                 out.push(Privilege::Read);
             } else if self.eat_keyword("write") {
                 out.push(Privilege::Write);
+            } else if self.eat_keyword("manage") {
+                out.push(Privilege::Manage);
             } else {
-                return Err(self.unexpected("privilege (read/write/all)"));
+                return Err(self.unexpected("privilege (read/write/manage/all)"));
             }
             if !self.eat_punct(Punct::Comma) {
                 break;
