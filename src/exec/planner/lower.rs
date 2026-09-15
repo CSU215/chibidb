@@ -5,18 +5,32 @@
 use std::collections::HashSet;
 
 use crate::catalog::{ColumnDesc, Schema};
-use crate::sql::ast::{BinOp, Expr, JoinKind, SelectItem, SelectStmt, TableRef};
+use crate::sql::ast::{BinOp, Expr, JoinKind, SelectItem, TableRef};
 use crate::value::{DataType, Value};
 use crate::{Database, Error, Result};
 
 use crate::exec::aggregate::{self, expr_has_aggregate};
 use crate::exec::eval::{eval_const, expr_has_column};
 use crate::exec::operator::{
-    Distinct, Filter, HashJoin, IndexScan, Limit, NestedLoopJoin, PhysicalOperator, Project, Sort,
-    TableScan, ViewScan,
+    ConstantScan, Distinct, Filter, HashJoin, HashKeys, IndexScan, Limit, NestedLoopJoin,
+    PhysicalOperator, Project, Sort, TableScan, Union, ViewScan,
 };
 
+use super::access::resolved_order_column;
 use super::logical::LogicalOperator;
+use super::util::{combine_and, items_have_aggregate, split_conjuncts};
+
+/// What lowering needs from the enclosing query, accumulated as it descends the
+/// logical plan: `Project` supplies the items, `Sort` the order keys, `Having`
+/// the predicate and `Aggregate` the grouping. Keeping this context explicit
+/// lets lowering consume a bare `LogicalOperator` instead of the `SelectStmt`.
+#[derive(Clone, Copy, Default)]
+struct LowerCtx<'a> {
+    items: &'a [SelectItem],
+    order_by: &'a [(Expr, bool)],
+    having: Option<&'a Expr>,
+    group_by: &'a [Expr],
+}
 
 /// Dtype of a simple column reference, used to reject hash keys whose numerics
 /// would need coercion (the index key encoding is type-sensitive).
@@ -43,31 +57,6 @@ fn compatible(a: DataType, b: DataType) -> bool {
             | (DataType::Text, DataType::Text)
             | (DataType::Char(_), DataType::Char(_))
     )
-}
-
-pub(crate) fn split_conjuncts(expr: &Expr) -> Vec<&Expr> {
-    match expr {
-        Expr::Binary(BinOp::And, l, r) => {
-            let mut out = split_conjuncts(l);
-            out.extend(split_conjuncts(r));
-            out
-        }
-        other => vec![other],
-    }
-}
-
-pub(crate) fn combine_and(mut parts: Vec<Expr>) -> Option<Expr> {
-    let mut acc = parts.pop()?;
-    while let Some(e) = parts.pop() {
-        acc = Expr::Binary(BinOp::And, Box::new(e), Box::new(acc));
-    }
-    Some(acc)
-}
-
-pub(crate) struct HashKeys {
-    pub(crate) left_keys: Vec<Expr>,
-    pub(crate) right_keys: Vec<Expr>,
-    pub(crate) residual: Option<Expr>,
 }
 
 /// Extracts equi-join key pairs from `ON a.k = b.k [and ...]`. Returns `None`
@@ -124,36 +113,23 @@ fn extract_hash_keys(
     (left_keys, right_keys, kept)
 }
 
-/// The join kind and optional ON clause for every table after the first, in
-/// order. A comma join is `Cross` with no ON; an explicit join consumes the
-/// next entry of `select.on`, keeping both vectors aligned even when commas
-/// and explicit joins are mixed.
-pub(crate) fn join_clauses(select: &SelectStmt) -> Vec<(JoinKind, Option<Expr>)> {
-    let mut out = Vec::new();
-    let mut on_index = 0usize;
-    for i in 1..select.from.len() {
-        let kind = select.joins.get(i).copied().unwrap_or(JoinKind::Cross);
-        let on = if kind == JoinKind::Cross {
-            None
-        } else {
-            let on = select.on.get(on_index).cloned();
-            on_index += 1;
-            on
-        };
-        out.push((kind, on));
-    }
-    out
-}
-/// Builds a scan for one FROM entry: a table scan or a view sub-plan.
+/// Builds a scan for one FROM entry: a table scan or a view sub-plan. The view
+/// definition is parsed and planned here, so the `ViewScan` operator only ever
+/// receives a ready child plan.
 pub(crate) fn build_from_source(
     db: &Database,
     tref: &TableRef,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
     let owner = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
-    let view_sql = db.catalog().view(&tref.name).cloned();
-    if let Some(sql) = view_sql {
-        return Ok(ViewScan::new(db, &sql, &owner)?
-            .map(|scan| Box::new(scan) as Box<dyn PhysicalOperator>));
+    if let Some(sql) = db.catalog().view(&tref.name).cloned() {
+        let stmts = crate::sql::parser::parse(&sql)?;
+        let Some(crate::sql::ast::Stmt::Select(select)) = stmts.into_iter().next() else {
+            return Ok(None);
+        };
+        let Some(child) = super::plan_select(db, &select)? else {
+            return Ok(None);
+        };
+        return Ok(Some(Box::new(ViewScan::new(child, &owner))));
     }
     Ok(Some(Box::new(TableScan::with_owner(db, &tref.name, &owner)?)))
 }
@@ -168,24 +144,15 @@ type LoweredFrom = (Box<dyn PhysicalOperator>, Option<String>);
 /// executor.
 fn lower_region(
     db: &Database,
-    select: &SelectStmt,
     node: &LogicalOperator,
+    ctx: &LowerCtx<'_>,
 ) -> Result<Option<LoweredFrom>> {
-    if select.from.len() == 1 {
-        let (tref, predicate) = match node {
-            LogicalOperator::Scan(tref) => (tref, None),
-            LogicalOperator::Filter { input, predicate } => match input.as_ref() {
-                LogicalOperator::Scan(tref) => (tref, Some(predicate.clone())),
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
-        };
-        let Some((mut op, ordered)) = lower_single_table(db, select, tref, predicate.as_ref())?
-        else {
+    if let Some((tref, predicate)) = single_scan(node) {
+        let Some((mut op, ordered)) = lower_single_table(db, tref, predicate, ctx)? else {
             return Ok(None);
         };
         if let Some(predicate) = predicate {
-            op = Box::new(Filter::new(op, predicate));
+            op = Box::new(Filter::new(op, predicate.clone()));
         }
         return Ok(Some((op, ordered)));
     }
@@ -208,42 +175,63 @@ fn lower_region(
     Ok(Some((op, None)))
 }
 
+/// The single-table part of a region: a `Scan`, or a `Filter` directly over it.
+/// Anything else is a multi-source region.
+fn single_scan(node: &LogicalOperator) -> Option<(&TableRef, Option<&Expr>)> {
+    match node {
+        LogicalOperator::Scan(tref) => Some((tref, None)),
+        LogicalOperator::Filter { input, predicate } => match input.as_ref() {
+            LogicalOperator::Scan(tref) => Some((tref, Some(predicate))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The single-table access path: view, best index, ordered index, full scan.
 fn lower_single_table(
     db: &Database,
-    select: &SelectStmt,
     tref: &TableRef,
     predicate: Option<&Expr>,
+    ctx: &LowerCtx<'_>,
 ) -> Result<Option<LoweredFrom>> {
     if db.catalog().view(&tref.name).is_some() {
         return Ok(build_from_source(db, tref)?.map(|source| (source, None)));
     }
     let owner = tref.alias.as_deref().unwrap_or(&tref.name);
-    if let Some(mut scan) = IndexScan::with_owner(db, &tref.name, owner, predicate)? {
-        let column = scan.ordered_column().to_string();
-        let supplies_order = select.group_by.is_empty()
-            && !items_have_aggregate(&select.items)
-            && crate::exec::planner::resolved_order_column(&select.items, &select.order_by)
-                .as_deref()
-                == Some(column.as_str());
-        if supplies_order {
+    // Access-path selection may only reuse an index's order when the query is
+    // not grouped/aggregated and the ORDER BY resolves to that column.
+    let orderable = ctx.group_by.is_empty() && !items_have_aggregate(ctx.items);
+    let ordered_column = resolved_order_column(ctx.items, ctx.order_by);
+    if let Some(plan) = super::plan_index_scan(db, &tref.name, predicate)? {
+        let column = plan.column.clone();
+        let mut scan = IndexScan::from_plan(db, &tref.name, owner, plan)?;
+        if orderable && ordered_column.as_deref() == Some(column.as_str()) {
             scan.mark_ordered();
         }
         return Ok(Some((Box::new(scan), Some(column))));
     }
     // An index on the ORDER BY column can supply the order even without a WHERE
     // clause, skipping the sort.
-    if select.group_by.is_empty()
-        && !items_have_aggregate(&select.items)
-        && let Some(column) =
-            crate::exec::planner::resolved_order_column(&select.items, &select.order_by)
-        && let Some(scan) = IndexScan::ordered(db, &tref.name, owner, &column)?
+    if orderable
+        && let Some(column) = &ordered_column
+        && let Some(file) = super::ordered_index_file(db, &tref.name, column)?
     {
+        let scan = IndexScan::from_cursor(db, &tref.name, owner, column, file)?;
         let column = scan.ordered_column().to_string();
         return Ok(Some((Box::new(scan), Some(column))));
     }
     // sequential scans may skip large objects the query never reads
-    let keep = lob_keep(select, &db.catalog().table(&tref.name)?.schema.columns, owner, &tref.name);
+    let keep = lob_keep(
+        ctx.items,
+        predicate,
+        ctx.group_by,
+        ctx.having,
+        ctx.order_by,
+        &db.catalog().table(&tref.name)?.schema.columns,
+        owner,
+        &tref.name,
+    );
     Ok(Some((Box::new(TableScan::with_owner_keep(db, &tref.name, owner, keep)?), None)))
 }
 
@@ -292,18 +280,26 @@ fn lower_join_tree(
     }
 }
 
-/// Lowers a logical plan to physical operators, reusing the access-path choices
-/// the builder made directly before. `select` supplies what the logical nodes
-/// leave implicit (item expansion for `*`, ORDER BY aliases).
+/// Lowers a logical plan to physical operators. This is the only place that
+/// picks access paths and expands widening (`*`, ORDER BY aliases), all from the
+/// logical plan plus the query context it carries.
 pub(crate) fn lower(
     db: &Database,
-    select: &SelectStmt,
     node: &LogicalOperator,
+) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    lower_node(db, node, &LowerCtx::default())
+}
+
+fn lower_node(
+    db: &Database,
+    node: &LogicalOperator,
+    ctx: &LowerCtx<'_>,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
     Ok(match node {
         LogicalOperator::Scan(_)
         | LogicalOperator::Filter { .. }
-        | LogicalOperator::Join { .. } => lower_region(db, select, node)?.map(|(op, _)| op),
+        | LogicalOperator::Join { .. } => lower_region(db, node, ctx)?.map(|(op, _)| op),
+        LogicalOperator::Constant => Some(Box::new(ConstantScan::new())),
         LogicalOperator::Aggregate { input, group_by, aggregates } => {
             for g in group_by {
                 if expr_has_aggregate(g) {
@@ -313,7 +309,7 @@ pub(crate) fn lower(
                 }
             }
             if group_by.is_empty() {
-                for item in &select.items {
+                for item in ctx.items {
                     if let SelectItem::Expr(e) | SelectItem::Aliased(e, _) = item
                         && expr_has_column(e)
                     {
@@ -323,19 +319,20 @@ pub(crate) fn lower(
                     }
                 }
             }
-            let Some(op) = lower(db, select, input)? else {
+            let child_ctx = LowerCtx { group_by, ..*ctx };
+            let Some(op) = lower_node(db, input, &child_ctx)? else {
                 return Ok(None);
             };
             let input_schema = op.schema().clone();
             // Columns the representative row must carry: group keys, the
             // projection's base columns, HAVING/ORDER BY, and aggregate args.
-            let (exprs, _) = build_projection(&input_schema, &select.items);
+            let (exprs, _) = build_projection(&input_schema, ctx.items);
             let mut needed_refs: Vec<&Expr> = group_by.iter().collect();
             needed_refs.extend(exprs.iter());
-            if let Some(having) = &select.having {
+            if let Some(having) = ctx.having {
                 needed_refs.push(having);
             }
-            for (e, _) in &select.order_by {
+            for (e, _) in ctx.order_by {
                 needed_refs.push(e);
             }
             for agg in aggregates {
@@ -353,7 +350,8 @@ pub(crate) fn lower(
             )))
         }
         LogicalOperator::Having { input, predicate } => {
-            let Some(op) = lower(db, select, input)? else {
+            let child_ctx = LowerCtx { having: Some(predicate), ..*ctx };
+            let Some(op) = lower_node(db, input, &child_ctx)? else {
                 return Ok(None);
             };
             let predicate = match find_aggregate_parts(op.as_ref()) {
@@ -363,7 +361,8 @@ pub(crate) fn lower(
             Some(Box::new(Filter::new(op, predicate)))
         }
         LogicalOperator::Project { input, items } => {
-            let Some(op) = lower(db, select, input)? else {
+            let child_ctx = LowerCtx { items, ..*ctx };
+            let Some(op) = lower_node(db, input, &child_ctx)? else {
                 return Ok(None);
             };
             let (exprs, headers) = match find_aggregate_parts(op.as_ref()) {
@@ -380,6 +379,7 @@ pub(crate) fn lower(
             Some(Box::new(Project::new(op, exprs, headers)))
         }
         LogicalOperator::Sort { input, order_by } => {
+            let child_ctx = LowerCtx { order_by, ..*ctx };
             // A bare region below may already provide the order via an index.
             if matches!(
                 input.as_ref(),
@@ -387,23 +387,19 @@ pub(crate) fn lower(
                     | LogicalOperator::Filter { .. }
                     | LogicalOperator::Join { .. }
             ) {
-                let Some((op, ordered_by)) = lower_region(db, select, input)? else {
+                let Some((op, ordered_by)) = lower_region(db, input, &child_ctx)? else {
                     return Ok(None);
                 };
                 let skip = ordered_by.as_deref().is_some_and(|column| {
-                    crate::exec::planner::resolved_order_column(&select.items, order_by).as_deref()
-                        == Some(column)
+                    resolved_order_column(ctx.items, order_by).as_deref() == Some(column)
                 });
                 if skip {
                     return Ok(Some(op));
                 }
-                return Ok(Some(Box::new(Sort::new(
-                    op,
-                    order_by.clone(),
-                    select.items.clone(),
-                ))));
+                let order = aggregate::resolve_order_aliases(order_by, ctx.items);
+                return Ok(Some(Box::new(Sort::new(op, order))));
             }
-            let Some(op) = lower(db, select, input)? else {
+            let Some(op) = lower_node(db, input, &child_ctx)? else {
                 return Ok(None);
             };
             let (order, items) = match find_aggregate_parts(op.as_ref()) {
@@ -412,29 +408,48 @@ pub(crate) fn lower(
                         .iter()
                         .map(|(e, desc)| (aggregate::rewrite_aggregates(e, aggregates), *desc))
                         .collect(),
-                    select
-                        .items
+                    ctx.items
                         .iter()
                         .map(|item| rewrite_item(item, aggregates))
                         .collect(),
                 ),
-                None => (order_by.clone(), select.items.clone()),
+                None => (order_by.clone(), ctx.items.to_vec()),
             };
-            Some(Box::new(Sort::new(op, order, items)))
+            let order = aggregate::resolve_order_aliases(&order, &items);
+            Some(Box::new(Sort::new(op, order)))
         }
         LogicalOperator::Distinct { input } => {
-            let Some(op) = lower(db, select, input)? else {
+            let Some(op) = lower_node(db, input, ctx)? else {
                 return Ok(None);
             };
             Some(Box::new(Distinct::new(op)))
         }
         LogicalOperator::Limit { input, limit } => {
-            let Some(op) = lower(db, select, input)? else {
+            let Some(op) = lower_node(db, input, ctx)? else {
                 return Ok(None);
             };
             let offset = limit_bound(limit.offset.as_ref())?;
             let count = limit_bound(Some(&limit.count))?;
             Some(Box::new(Limit::new(op, offset, Some(count))))
+        }
+        LogicalOperator::Union { inputs, order_by, limit } => {
+            let mut physical = Vec::with_capacity(inputs.len());
+            for (all, input) in inputs {
+                let Some(op) = lower_node(db, input, &LowerCtx::default())? else {
+                    return Ok(None);
+                };
+                physical.push((*all, op));
+            }
+            Some(Box::new(Union::new(physical, order_by.clone(), limit.clone())))
+        }
+        LogicalOperator::Insert(i) => {
+            Some(Box::new(crate::exec::dml::InsertOp::new(i.clone())))
+        }
+        LogicalOperator::Update(u) => {
+            Some(Box::new(crate::exec::dml::UpdateOp::new(u.clone())))
+        }
+        LogicalOperator::Delete(d) => {
+            Some(Box::new(crate::exec::dml::DeleteOp::new(d.clone())))
         }
     })
 }
@@ -489,16 +504,18 @@ fn build_projection(schema: &Schema, items: &[SelectItem]) -> (Vec<Expr>, Vec<St
 
 /// Per-column flags marking which base columns a single-table SELECT reads.
 /// Returns `None` (do not prune) whenever the analysis cannot be certain:
-/// multiple sources, a `*` projection, a subquery, or a foreign qualifier.
+/// a `*` projection, a subquery, or a foreign qualifier.
+#[allow(clippy::too_many_arguments)]
 fn lob_keep(
-    select: &SelectStmt,
+    items: &[SelectItem],
+    selection: Option<&Expr>,
+    group_by: &[Expr],
+    having: Option<&Expr>,
+    order_by: &[(Expr, bool)],
     columns: &[ColumnDesc],
     owner: &str,
     table: &str,
 ) -> Option<Vec<bool>> {
-    if select.from.len() != 1 {
-        return None;
-    }
     let mut needed: HashSet<String> = HashSet::new();
     let mut safe = true;
     let visit = |expr: &Expr, needed: &mut HashSet<String>, safe: &mut bool| {
@@ -506,7 +523,7 @@ fn lob_keep(
             *safe = false;
         }
     };
-    for item in &select.items {
+    for item in items {
         match item {
             SelectItem::Star => return None,
             SelectItem::Expr(e) | SelectItem::Aliased(e, _) => {
@@ -514,16 +531,16 @@ fn lob_keep(
             }
         }
     }
-    if let Some(selection) = &select.selection {
+    if let Some(selection) = selection {
         visit(selection, &mut needed, &mut safe);
     }
-    for expr in &select.group_by {
+    for expr in group_by {
         visit(expr, &mut needed, &mut safe);
     }
-    if let Some(having) = &select.having {
+    if let Some(having) = having {
         visit(having, &mut needed, &mut safe);
     }
-    for (expr, _) in &select.order_by {
+    for (expr, _) in order_by {
         visit(expr, &mut needed, &mut safe);
     }
     if !safe {
@@ -566,13 +583,6 @@ fn collect_column_refs(expr: &Expr, owner: &str, table: &str, needed: &mut HashS
         Expr::Aggregate(_, None, _) => true,
         Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => false,
     }
-}
-
-pub(crate) fn items_have_aggregate(items: &[SelectItem]) -> bool {
-    items.iter().any(|item| match item {
-        SelectItem::Expr(e) | SelectItem::Aliased(e, _) => expr_has_aggregate(e),
-        SelectItem::Star => false,
-    })
 }
 
 fn limit_bound(expr: Option<&Expr>) -> Result<u64> {

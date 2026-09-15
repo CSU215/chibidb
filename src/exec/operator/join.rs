@@ -9,8 +9,15 @@ use crate::{Database, Error, Result};
 use super::{ExecContext, PhysicalOperator};
 use crate::exec::chunk::{CHUNK_ROWS, Chunk};
 use crate::exec::eval::EvalCtx;
-use crate::exec::planner::lower::HashKeys;
 use crate::exec::subquery::{eval_bound, eval_predicate_bound};
+
+/// Equi-join key pairs and any residual predicate a lowered hash join carries.
+/// Plain data handed in by lowering, so the operator has no planner dependency.
+pub(crate) struct HashKeys {
+    pub(crate) left_keys: Vec<Expr>,
+    pub(crate) right_keys: Vec<Expr>,
+    pub(crate) residual: Option<Expr>,
+}
 /// Build-row indices matching one key. The common unique-key case stays inline
 /// so building the table does not allocate a `Vec` per key.
 enum MatchList {

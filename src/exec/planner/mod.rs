@@ -13,16 +13,19 @@ mod explain;
 mod fold;
 pub(crate) mod logical;
 pub(crate) mod lower;
+mod util;
 
-pub(crate) use access::{ordered_index_file, plan_index_scan, resolved_order_column};
+pub(crate) use access::{ordered_index_file, plan_index_scan};
 pub(crate) use explain::execute_explain;
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::sql::ast::{Expr, SelectItem, SelectStmt, Stmt};
 use crate::{Database, Result};
 
-use super::operator::{self, ConstantScan, PhysicalOperator, Project, Union};
+use super::operator::{PhysicalOperator, PlannedSubqueries, SubqueryRegistry};
 use logical::LogicalOperator;
-use lower::items_have_aggregate;
 
 /// The result of planning: the optimized logical plan (when the shape has a
 /// single one) plus the physical plan that executes it. `logical` is `None` for
@@ -41,19 +44,195 @@ pub fn plan_statement(
 }
 
 /// Plans `stmt` and returns every stage, sharing the logical plan instead of
-/// rebuilding it.
+/// rebuilding it. Every operator statement goes through the same pipeline:
+/// translate to a logical plan, optimize it, then lower it.
 pub(crate) fn plan_statement_layers(db: &Database, stmt: &Stmt) -> Result<Layers> {
     // Expression rewrites (constant folding, boolean simplification) run first;
     // they are shared by SELECT and DML.
     let folded = fold::fold_stmt(stmt);
-    match &folded {
-        Stmt::Select(select) => plan_select_layers(db, select),
-        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Ok(Layers {
-            logical: None,
-            physical: operator::build_dml(&folded)?,
-        }),
-        _ => Ok(Layers { logical: None, physical: None }),
+    let Some(logical) = logical::translate_stmt(db, &folded)? else {
+        return Ok(Layers { logical: None, physical: None });
+    };
+    let Some(logical) = logical::optimize(db, logical)? else {
+        return Ok(Layers { logical: None, physical: None });
+    };
+    let physical = lower::lower(db, &logical)?;
+    let physical = attach_subqueries(db, &logical, physical)?;
+    Ok(Layers { logical: Some(logical), physical })
+}
+
+/// Lowers every subquery the plan's expressions can reach and wraps the
+/// physical plan so the evaluator runs stored plans instead of planning while a
+/// row is being evaluated.
+fn attach_subqueries(
+    db: &Database,
+    logical: &LogicalOperator,
+    physical: Option<Box<dyn PhysicalOperator>>,
+) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    let Some(physical) = physical else {
+        return Ok(None);
+    };
+    let mut registry = SubqueryRegistry::new();
+    collect_logical_subqueries(db, logical, &mut registry)?;
+    if registry.is_empty() {
+        return Ok(Some(physical));
     }
+    Ok(Some(Box::new(PlannedSubqueries::new(physical, Rc::new(registry)))))
+}
+
+/// Walks a logical plan's expressions, lowering any subquery they contain.
+fn collect_logical_subqueries(
+    db: &Database,
+    node: &LogicalOperator,
+    registry: &mut SubqueryRegistry,
+) -> Result<()> {
+    match node {
+        LogicalOperator::Scan(_) | LogicalOperator::Constant => {}
+        LogicalOperator::Filter { input, predicate } => {
+            collect_expr_subqueries(db, predicate, registry)?;
+            collect_logical_subqueries(db, input, registry)?;
+        }
+        LogicalOperator::Join { left, right, on, .. } => {
+            if let Some(on) = on {
+                collect_expr_subqueries(db, on, registry)?;
+            }
+            collect_logical_subqueries(db, left, registry)?;
+            collect_logical_subqueries(db, right, registry)?;
+        }
+        LogicalOperator::Aggregate { input, group_by, aggregates } => {
+            for e in group_by {
+                collect_expr_subqueries(db, e, registry)?;
+            }
+            for e in aggregates {
+                collect_expr_subqueries(db, e, registry)?;
+            }
+            collect_logical_subqueries(db, input, registry)?;
+        }
+        LogicalOperator::Having { input, predicate } => {
+            collect_expr_subqueries(db, predicate, registry)?;
+            collect_logical_subqueries(db, input, registry)?;
+        }
+        LogicalOperator::Project { input, items } => {
+            for item in items {
+                collect_item_subqueries(db, item, registry)?;
+            }
+            collect_logical_subqueries(db, input, registry)?;
+        }
+        LogicalOperator::Sort { input, order_by } => {
+            for (e, _) in order_by {
+                collect_expr_subqueries(db, e, registry)?;
+            }
+            collect_logical_subqueries(db, input, registry)?;
+        }
+        LogicalOperator::Distinct { input } => {
+            collect_logical_subqueries(db, input, registry)?;
+        }
+        LogicalOperator::Limit { input, limit } => {
+            collect_expr_subqueries(db, &limit.count, registry)?;
+            if let Some(offset) = &limit.offset {
+                collect_expr_subqueries(db, offset, registry)?;
+            }
+            collect_logical_subqueries(db, input, registry)?;
+        }
+        LogicalOperator::Union { inputs, order_by, limit } => {
+            for (e, _) in order_by {
+                collect_expr_subqueries(db, e, registry)?;
+            }
+            if let Some(limit) = limit {
+                collect_expr_subqueries(db, &limit.count, registry)?;
+                if let Some(offset) = &limit.offset {
+                    collect_expr_subqueries(db, offset, registry)?;
+                }
+            }
+            for (_, input) in inputs {
+                collect_logical_subqueries(db, input, registry)?;
+            }
+        }
+        LogicalOperator::Insert(cmd) => {
+            for row in &cmd.rows {
+                for e in row {
+                    collect_expr_subqueries(db, e, registry)?;
+                }
+            }
+        }
+        LogicalOperator::Update(cmd) => {
+            for (_, e) in &cmd.assignments {
+                collect_expr_subqueries(db, e, registry)?;
+            }
+            if let Some(selection) = &cmd.selection {
+                collect_expr_subqueries(db, selection, registry)?;
+            }
+        }
+        LogicalOperator::Delete(cmd) => {
+            if let Some(selection) = &cmd.selection {
+                collect_expr_subqueries(db, selection, registry)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_item_subqueries(
+    db: &Database,
+    item: &SelectItem,
+    registry: &mut SubqueryRegistry,
+) -> Result<()> {
+    match item {
+        SelectItem::Star => Ok(()),
+        SelectItem::Expr(e) | SelectItem::Aliased(e, _) => {
+            collect_expr_subqueries(db, e, registry)
+        }
+    }
+}
+
+fn collect_expr_subqueries(
+    db: &Database,
+    expr: &Expr,
+    registry: &mut SubqueryRegistry,
+) -> Result<()> {
+    match expr {
+        Expr::InSubquery { expr, sub, .. } => {
+            collect_expr_subqueries(db, expr, registry)?;
+            lower_subquery(db, sub, registry)?;
+        }
+        Expr::Exists { sub } | Expr::ScalarSubquery(sub) => {
+            lower_subquery(db, sub, registry)?;
+        }
+        Expr::Unary(_, a) => collect_expr_subqueries(db, a, registry)?,
+        Expr::Binary(_, l, r) => {
+            collect_expr_subqueries(db, l, registry)?;
+            collect_expr_subqueries(db, r, registry)?;
+        }
+        Expr::IsNull(a, _) => collect_expr_subqueries(db, a, registry)?,
+        Expr::Like { expr, pattern, .. } => {
+            collect_expr_subqueries(db, expr, registry)?;
+            collect_expr_subqueries(db, pattern, registry)?;
+        }
+        Expr::Function(_, args) => {
+            for a in args {
+                collect_expr_subqueries(db, a, registry)?;
+            }
+        }
+        Expr::Aggregate(_, Some(a), _) => collect_expr_subqueries(db, a, registry)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn lower_subquery(
+    db: &Database,
+    sub: &SelectStmt,
+    registry: &mut SubqueryRegistry,
+) -> Result<()> {
+    let key = format!("{sub:?}");
+    if registry.contains_key(&key) {
+        return Ok(());
+    }
+    // Recurse through `plan_select` so a subquery's own subqueries are lowered
+    // and hosted by its plan as well.
+    let plan = plan_select(db, sub)?;
+    registry.insert(key, RefCell::new(plan));
+    Ok(())
 }
 
 /// Plans a SELECT: translate to a logical plan, optimize it, then lower.
@@ -61,76 +240,5 @@ pub fn plan_select(
     db: &Database,
     select: &SelectStmt,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
-    Ok(plan_select_layers(db, select)?.physical)
-}
-
-fn plan_select_layers(db: &Database, select: &SelectStmt) -> Result<Layers> {
-    if !select.set_ops.is_empty() {
-        return Ok(Layers { logical: None, physical: plan_union(db, select)? });
-    }
-    if select.from.is_empty() {
-        // A constant SELECT: one projected tuple, no scan.
-        if select.items.iter().any(|it| matches!(it, SelectItem::Star))
-            || items_have_aggregate(&select.items)
-        {
-            return Ok(Layers { logical: None, physical: None });
-        }
-        let (exprs, headers) = projection_exprs(&select.items);
-        let physical = Box::new(Project::new(
-            Box::new(ConstantScan::new()),
-            exprs,
-            headers,
-        ));
-        return Ok(Layers { logical: None, physical: Some(physical) });
-    }
-    let Some(logical) = logical::translate(select) else {
-        return Ok(Layers { logical: None, physical: None });
-    };
-    let Some(logical) = logical::optimize(db, logical)? else {
-        return Ok(Layers { logical: None, physical: None });
-    };
-    let physical = lower::lower(db, select, &logical)?;
-    Ok(Layers { logical: Some(logical), physical })
-}
-
-/// Plans a UNION chain: each operand is planned, then the trailing ORDER BY /
-/// LIMIT apply to the whole result.
-fn plan_union(
-    db: &Database,
-    select: &SelectStmt,
-) -> Result<Option<Box<dyn PhysicalOperator>>> {
-    let mut base = select.clone();
-    base.set_ops = Vec::new();
-    let order_by = std::mem::take(&mut base.order_by);
-    let limit = base.limit.take();
-    let Some(base_plan) = plan_select(db, &base)? else {
-        return Ok(None);
-    };
-    let mut inputs: Vec<(bool, Box<dyn PhysicalOperator>)> = vec![(true, base_plan)];
-    for (all, operand) in &select.set_ops {
-        let Some(plan) = plan_select(db, operand)? else {
-            return Ok(None);
-        };
-        inputs.push((*all, plan));
-    }
-    Ok(Some(Box::new(Union::new(inputs, order_by, limit))))
-}
-
-fn projection_exprs(items: &[SelectItem]) -> (Vec<Expr>, Vec<String>) {
-    let mut exprs = Vec::new();
-    let mut headers = Vec::new();
-    for item in items {
-        match item {
-            SelectItem::Expr(e) => {
-                headers.push(e.to_string());
-                exprs.push(e.clone());
-            }
-            SelectItem::Aliased(e, alias) => {
-                headers.push(alias.clone());
-                exprs.push(e.clone());
-            }
-            SelectItem::Star => unreachable!("star is rejected before projection"),
-        }
-    }
-    (exprs, headers)
+    Ok(plan_statement_layers(db, &Stmt::Select(Box::new(select.clone())))?.physical)
 }

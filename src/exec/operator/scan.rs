@@ -192,9 +192,9 @@ impl crate::storage::engine::RowSink for VisibleSink<'_> {
     }
 }
 
-/// Scans a view by running its stored SELECT as a sub-plan. The view's columns
-/// are exposed with `owner` (the alias or view name) and `Text` placeholders,
-/// matching the materialized view path.
+/// Scans a view by materializing its already-lowered sub-plan. The view's
+/// columns are exposed with `owner` (the alias or view name) and `Text`
+/// placeholders, matching the materialized view path.
 pub struct ViewScan {
     child: Box<dyn PhysicalOperator>,
     schema: Schema,
@@ -203,23 +203,17 @@ pub struct ViewScan {
 }
 
 impl ViewScan {
-    pub fn new(db: &Database, view_sql: &str, owner: &str) -> Result<Option<Self>> {
-        let stmts = crate::sql::parser::parse(view_sql)?;
-        let Some(crate::sql::ast::Stmt::Select(select)) = stmts.into_iter().next() else {
-            return Ok(None);
-        };
-        let Some(plan) = crate::exec::planner::plan_select(db, &select)? else {
-            return Ok(None);
-        };
+    /// `owner` is the alias (or view name) that qualifies the view's columns.
+    pub(crate) fn new(child: Box<dyn PhysicalOperator>, owner: &str) -> Self {
         let schema = Schema {
-            columns: plan
+            columns: child
                 .schema()
                 .columns
                 .iter()
                 .map(|c| ColumnDesc::plain(Some(owner.to_string()), c.name.clone(), DataType::Text))
                 .collect(),
         };
-        Ok(Some(Self { child: plan, schema, rows: Vec::new(), pos: 0 }))
+        Self { child, schema, rows: Vec::new(), pos: 0 }
     }
 }
 

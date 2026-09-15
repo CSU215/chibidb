@@ -260,6 +260,26 @@ fn unions_build_an_operator_plan() {
 }
 
 #[test]
+fn a_planned_subquery_plan_can_run_twice() {
+    let db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (id int, k int);").unwrap();
+    db.execute_sql("create table u (k int);").unwrap();
+    db.execute_sql("create index idx_u_k on u (k);").unwrap();
+    db.execute_sql("insert into t values (1, 10), (2, 20), (3, 30);").unwrap();
+    db.execute_sql("insert into u values (2), (3);").unwrap();
+
+    // The subquery uses an index, so re-running the stored subplan must rebuild
+    // the index cursor on each open.
+    let select = parse_select("select id from t where id in (select k from u where k = 2) order by id;");
+    let mut plan = build_select(&db, &select).unwrap().unwrap();
+    let mut session = Session::new();
+    let first = db.collect_plan(&mut session, plan.as_mut()).unwrap();
+    let second = db.collect_plan(&mut session, plan.as_mut()).unwrap();
+    assert_eq!(first, vec![vec![Value::Int(2)]]);
+    assert_eq!(first, second);
+}
+
+#[test]
 fn float_literal_on_int_index_falls_back_to_scan() {
     let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int primary key, v int);").unwrap();

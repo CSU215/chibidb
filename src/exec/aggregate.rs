@@ -169,18 +169,18 @@ fn resolve_order_expr<'a>(expr: &'a Expr, aliases: &'a [(String, Expr)]) -> &'a 
     }
 }
 
-fn eval_sort_keys(
-    db: &Database,
-    trx: &mut TrxState,
-    ctx: EvalCtx,
+/// Rewrites ORDER BY expressions so an unqualified column that names a SELECT
+/// alias is replaced by the aliased expression. Lowering does this once, so the
+/// physical `Sort` only carries resolved expressions.
+pub(crate) fn resolve_order_aliases(
     order_by: &[(Expr, bool)],
-    aliases: &[(String, Expr)],
-) -> Result<Vec<Value>> {
-    let mut keys = Vec::with_capacity(order_by.len());
-    for (e, _) in order_by {
-        keys.push(eval_bound(db, trx, resolve_order_expr(e, aliases), Some(&ctx))?);
-    }
-    Ok(keys)
+    items: &[SelectItem],
+) -> Vec<(Expr, bool)> {
+    let aliases = select_aliases(items);
+    order_by
+        .iter()
+        .map(|(e, desc)| (resolve_order_expr(e, &aliases).clone(), *desc))
+        .collect()
 }
 
 pub(crate) fn cmp_sort_keys(a: &[Value], b: &[Value], order_by: &[(Expr, bool)]) -> std::cmp::Ordering {
@@ -207,14 +207,15 @@ pub(crate) fn sort_rows(
     schema: &Schema,
     rows: &mut Vec<Vec<Value>>,
     order_by: &[(Expr, bool)],
-    items: &[SelectItem],
 ) -> Result<()> {
-    let aliases = select_aliases(items);
     let mut pairs: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
     for row in rows.drain(..) {
         let mut ctx = EvalCtx::row(schema, &row);
         ctx.parent = outer;
-        let keys = eval_sort_keys(db, trx, ctx, order_by, &aliases)?;
+        let mut keys = Vec::with_capacity(order_by.len());
+        for (e, _) in order_by {
+            keys.push(eval_bound(db, trx, e, Some(&ctx))?);
+        }
         pairs.push((row, keys));
     }
     pairs.sort_by(|(_, ka), (_, kb)| cmp_sort_keys(ka, kb, order_by));

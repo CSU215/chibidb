@@ -13,7 +13,7 @@ cargo run -q                    # 内存实例 REPL（临时目录后端，退�
 cargo run -q -- <dir>           # 文件实例 REPL（多库数据根目录）
 cargo run -q -- serve <dir> [addr]   # TCP server，addr 缺省取 config.toml 的 server.addr
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（656 passed + 9 个 #[ignore] 性能探针）
+cargo test                      # 全量回归（697 passed + 9 个 #[ignore] 性能探针）
 ```
 
 REPL / client 中输入 `exit` 或 `quit` 退出。启动时从**当前工作目录**读取 `config.toml`
@@ -158,10 +158,11 @@ SQL 字符串
   → lexer            分词（int/float/str/标识符/标点/注释）
   → parser           手写递归下降 → AST（sql::ast::Stmt/Expr）
   → Instance         多库路由 / 用户 / 权限 / information_schema（instance.rs）
-  → Database         表存在性校验、访问路径规划、建物理算子树、执行或回退执行器
-                    （db/mod.rs::resolve_optimize_execute）
-  → exec             算子计划（exec/operator.rs，build_statement）或执行器
-                    （过滤/投影/聚合/分组/排序/limit/连接/索引扫描/子查询物化）
+  → Database         表存在性校验、调用规划器、执行物理算子（db/mod.rs::resolve_optimize_execute）
+  → planner          常量折叠 → LogicalOperator → 优化（谓词下推）→ lower 成 PhysicalOperator
+                    （exec/planner/；访问路径选择、`*`/别名展开、聚合重写都在此）
+  → operator         火山算子（exec/operator/，对 Statement 无知）
+                    （过滤/投影/聚合/分组/排序/limit/连接/索引扫描/视图/子查询）
   → chunk/volcano    列式批处理（CHUNK_ROWS=1024）或行式火山，两模式结果一致
   → index            保序字节键 B+ 树（[key,rid] 复合键、分裂/借用/合并、范围扫描）
   → txn              PG 式快照 {xmax,xip} + clog 提交位图 + 行级锁 + SSI
@@ -183,7 +184,9 @@ SQL 字符串
 src/
   lib.rs  main.rs  error.rs  config.rs  wal.rs  instance.rs  value.rs
   sql/       lexer parser ast result datetime
-  exec/      mod dml eval aggregate plan operator subquery chunk
+  exec/         mod command dml eval aggregate subquery chunk
+  exec/planner/ mod logical lower access fold explain util
+  exec/operator/ mod basic scan index_scan join subquery
   storage/   page disk header dwb buffer replacer slotted engine heap codec lob pax lsm/*
   index/     key node btree
   catalog/   mod meta
@@ -241,7 +244,7 @@ dwb.bin                # Double-Write Buffer（storage.double_write 开启时）
 
 ## 测试
 
-`cargo test --workspace` 当前 **656 passed + 9 ignored**。集成测试覆盖词法/语法/求值/
+`cargo test --workspace` 当前 **697 passed + 9 ignored**。集成测试覆盖词法/语法/求值/
 LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/表约束（PK/UNIQUE/NOT NULL/DEFAULT）/
 索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等。`tests/miniob_compat.rs` 用经典
 student/course/sc 场景做端到端回归；`tests/engine_equivalence.rs` 用确定性随机脚本对
@@ -263,7 +266,10 @@ cargo test --test perf_stats -- --ignored --nocapture
 - `Database` 拆分为 **`db/*`**：`mod.rs`（门面与语句执行）、`store.rs`（存储/catalog/回滚）、
   `recovery.rs`（WAL 重放与索引重建）、`checkpoint.rs`（flush/vacuum）、`unique.rs`（唯一约束）。
 - 语句分类由 **`Stmt::is_read_only()` / `needs_exclusive()`** 决定，取代原来的自由函数。
-- 移除了 `Stage` / `Pipeline` 门面：`resolve_optimize_execute` 内联完成解析后的校验、规划与执行。
+- 移除了 `Stage` / `Pipeline` 门面：不恢复门面对象；`resolve_optimize_execute` 调用
+  `exec/planner`（LogicalOperator → 优化 → lower 成 PhysicalOperator）后执行。
+- 规划与算子分层：`exec/operator/` 对 Statement 无知，DML 命令、索引选路、子查询计划都在
+  `exec/planner/` 完成；子查询在计划期预降为子计划，执行期不再现场 `plan_select`。
 - 表文件使用**单一 `FileId`** 同时作为持久编号与缓冲池句柄（索引文件加高位 tag 区分）。
 - HTTP 会话头仍为 `X-Chibi-Session`，系统库仍为 `chibi_meta`（保留兼容命名）。
 
@@ -272,3 +278,4 @@ cargo test --test perf_stats -- --ignored --nocapture
 直接依赖：`tokio`（异步运行时与网络）、`parking_lot`（锁）、`serde`（配置反序列化）、
 `toml`（`config.toml`）、`thiserror`（错误）、`sha2`（口令散列）、`tempfile`（内存实例与测试）。
 `ffi` 子 crate 把引擎编译成 `cdylib`，供非 Rust 前端与基准脚本通过 C ABI 进程内调用。
+

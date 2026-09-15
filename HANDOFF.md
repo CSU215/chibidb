@@ -7,10 +7,11 @@
 
 纯 Rust + tokio 手写的教学型单机关系数据库。按 **TDD 红绿**节奏演化，提交细粒度。
 存储、索引、事务、执行器、网络前端全部手写。当前 `cargo test --workspace` 为
-**656 passed + 9 ignored**（探针），`ffi` 子 crate 把引擎编译成 `cdylib`。
+**697 passed + 9 ignored**（探针），`ffi` 子 crate 把引擎编译成 `cdylib`。
 
-已完成的主干：SQL → lexer → parser(AST) → Instance/Database 路由与规划 → 算子计划
-（chunk/volcano）→ B+ 树索引 → PG 式 MVCC（snapshot + clog + 行锁 + SSI）→ WAL 崩溃恢复
+已完成的主干：SQL → lexer → parser(AST) → LogicalOperator（翻译 + 优化，`exec/planner/`）
+→ PhysicalOperator（lower，`exec/operator/`，对 Statement 无知）→ 执行器（chunk/volcano）
+→ B+ 树索引 → PG 式 MVCC（snapshot + clog + 行锁 + SSI）→ WAL 崩溃恢复
 → 堆/LSM 双引擎 → BufferPool/DiskManager → 多库 Instance → Text/HTTP/MySQL 三个前端。
 
 ## 2. 环境与命令
@@ -49,14 +50,15 @@ python scripts\smoke.py          # 起 server→SQL→强杀→复开验证 WAL�
 | `sql/ast.rs` | AST；`Stmt::is_read_only()` / `needs_exclusive()` 决定路由与锁粒度 | `Stmt` / `Expr` / `SelectStmt` |
 | `sql/result.rs` | `ResultSet::Message/Rows/Affected` | |
 | `sql/datetime.rs` | 日期校验/格式化（Hinnant civil-date） | `parse_date` |
-| `exec/mod.rs` | 语句分发：DDL/SHOW/EXPLAIN/CHECKPOINT/VACUUM；DML 的 `apply_*`、EPQ 重试、`coerce` | `execute(db, trx, stmt)` |
-| `exec/dml.rs` | 命令算子 `InsertOp`/`UpdateOp`/`DeleteOp`（`output_kind = Command`） | |
-| `exec/operator.rs` | 火山算子：`PhysicalOperator` + `ExecContext{db,trx,outer}`；`TableScan`/`IndexScan`/`ViewScan`/`Filter`/`Project`/`Distinct`/`Sort`/`GroupBy`/`HashJoin`/`NestedLoopJoin`/`Union`/`Limit`；`build_statement`/`build_select` | |
+| `exec/mod.rs` | 语句分发：DDL/SHOW/EXPLAIN/CHECKPOINT/VACUUM；DML 的 `apply_*`、EPQ 重试、`coerce`；统一执行缝 `collect_rows` | `execute(db, trx, stmt)` |
+| `exec/command.rs` | 翻译期绑定好列下标的 DML 命令：`InsertCommand`/`UpdateCommand`/`DeleteCommand` | `*Command::resolve` |
+| `exec/dml.rs` | 命令算子 `InsertOp`/`UpdateOp`/`DeleteOp`（持命令、`output_kind = Command`） | |
+| `exec/planner/` | 规划层：`logical`（LogicalOperator + 翻译/优化/树渲染）、`lower`（访达路径选择、`*`/别名展开、聚合重写）、`access`（索引选路）、`fold`（常量折叠）、`explain`、`util`（纯 AST 助手） | `plan_statement` / `plan_select` |
+| `exec/operator/` | 火山算子（对 Statement 无知）：`PhysicalOperator` + `ExecContext{db,trx,outer}`；`basic`/`scan`/`index_scan`/`join`/`subquery`（`PlannedSubqueries` 承载计划期预降的子查询） | `physical_tree` |
 | `exec/chunk.rs` | 列式批处理 `Chunk`/`Column`（`CHUNK_ROWS=1024`）与行式桥接 | |
 | `exec/eval.rs` | 表达式求值（三值逻辑、LIKE+ESCAPE、标量函数、`EvalCtx` 父链） | `eval_const` / `eval_bound` |
-| `exec/aggregate.rs` | 聚合、GROUP BY/HAVING、ORDER BY、DISTINCT 的共享逻辑 | |
-| `exec/plan.rs` | EXPLAIN 文本、单列 sargable 索引选路与同列上下界合并、有序索引扫描判定 | `plan_select` / `find_sargable` |
-| `exec/subquery.rs` | IN/EXISTS/标量子查询按外层行物化改写 | `bind_expr` / `eval_bound` |
+| `exec/aggregate.rs` | 聚合、GROUP BY/HAVING、ORDER BY、DISTINCT 的共享逻辑；`resolve_order_aliases` | |
+| `exec/subquery.rs` | IN/EXISTS/标量子查询改写；优先执行计划期建好的子计划，回退才现场规划 | `bind_expr` / `eval_bound` |
 | `catalog/mod.rs` | `Catalog`/`Table`/`Schema`/`ColumnDesc`/`IndexEntry`；`resolve` 歧义检测 | `Catalog::table` / `create_table` / `create_index` |
 | `catalog/meta.rs` | `catalog.bin` 自描述格式（含事务簿记/约束/视图） | `encode_catalog` / `decode_catalog` / `CatalogSnapshot` |
 | `storage/page.rs` | `PAGE_SIZE=8192`、`FileId=u32`、`PageNo=u32` | |
@@ -95,7 +97,7 @@ python scripts\smoke.py          # 起 server→SQL→强杀→复开验证 WAL�
 
 ### 3.2 测试（`tests/`）
 
-约 60 个文件、656 个用例，按层分布（`lexer/parser/eval/agg/join/union/db*/trx/wal/vacuum/
+约 60 个文件、697 个用例，按层分布（`lexer/parser/eval/agg/join/union/db*/trx/wal/vacuum/
 storage_*/index_*/lsm_*/wire/server/http_*/mysql_frontend/instance/users/privileges/
 information_schema/constraints/correlated/miniob_compat/engine_equivalence/concurrency*`）。
 
@@ -169,3 +171,4 @@ information_schema/constraints/correlated/miniob_compat/engine_equivalence/concu
   `/api/*` 在 `[web] enabled` **或** `server.admin_api` 开启后可用；`/api/files`、`/api/page`
   另需 `[web] page_preview = true`（读原始磁盘页）。内嵌控制台源码改动需重新编译（`include_str!`）。
 - `config.example.toml` 未列出 `server.admin_api`（代码已支持）。
+

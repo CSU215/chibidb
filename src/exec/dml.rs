@@ -1,20 +1,20 @@
-use crate::sql::ast::{DeleteStmt, InsertStmt, UpdateStmt};
 use crate::catalog::Schema;
 use crate::value::Value;
 use crate::Result;
 
+use super::command::{DeleteCommand, InsertCommand, UpdateCommand};
 use super::operator::{ExecContext, OutputKind, PhysicalOperator};
 
 /// INSERT: performs the inserts in `open` and yields no rows.
 pub struct InsertOp {
-    stmt: InsertStmt,
+    cmd: InsertCommand,
     schema: Schema,
     affected: u64,
 }
 
 impl InsertOp {
-    pub fn new(stmt: InsertStmt) -> Self {
-        Self { stmt, schema: Schema::default(), affected: 0 }
+    pub fn new(cmd: InsertCommand) -> Self {
+        Self { cmd, schema: Schema::default(), affected: 0 }
     }
 }
 
@@ -24,11 +24,11 @@ impl PhysicalOperator for InsertOp {
     }
 
     fn label(&self) -> String {
-        format!("Insert {}", self.stmt.table)
+        format!("Insert {}", self.cmd.table)
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
-        self.affected = super::execute_insert(ctx.db, ctx.trx, &self.stmt)?;
+        self.affected = super::execute_insert(ctx.db, ctx.trx, &self.cmd)?;
         Ok(())
     }
 
@@ -51,14 +51,14 @@ impl PhysicalOperator for InsertOp {
 
 /// UPDATE: applies matching updates in `open` and yields no rows.
 pub struct UpdateOp {
-    stmt: UpdateStmt,
+    cmd: UpdateCommand,
     schema: Schema,
     affected: u64,
 }
 
 impl UpdateOp {
-    pub fn new(stmt: UpdateStmt) -> Self {
-        Self { stmt, schema: Schema::default(), affected: 0 }
+    pub fn new(cmd: UpdateCommand) -> Self {
+        Self { cmd, schema: Schema::default(), affected: 0 }
     }
 }
 
@@ -68,11 +68,11 @@ impl PhysicalOperator for UpdateOp {
     }
 
     fn label(&self) -> String {
-        format!("Update {}", self.stmt.table)
+        format!("Update {}", self.cmd.table)
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
-        self.affected = super::execute_update(ctx.db, ctx.trx, &self.stmt)?;
+        self.affected = super::execute_update(ctx.db, ctx.trx, &self.cmd)?;
         Ok(())
     }
 
@@ -95,14 +95,14 @@ impl PhysicalOperator for UpdateOp {
 
 /// DELETE: marks matching rows in `open` and yields no rows.
 pub struct DeleteOp {
-    stmt: DeleteStmt,
+    cmd: DeleteCommand,
     schema: Schema,
     affected: u64,
 }
 
 impl DeleteOp {
-    pub fn new(stmt: DeleteStmt) -> Self {
-        Self { stmt, schema: Schema::default(), affected: 0 }
+    pub fn new(cmd: DeleteCommand) -> Self {
+        Self { cmd, schema: Schema::default(), affected: 0 }
     }
 }
 
@@ -112,11 +112,11 @@ impl PhysicalOperator for DeleteOp {
     }
 
     fn label(&self) -> String {
-        format!("Delete {}", self.stmt.table)
+        format!("Delete {}", self.cmd.table)
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
-        self.affected = super::execute_delete(ctx.db, ctx.trx, &self.stmt)?;
+        self.affected = super::execute_delete(ctx.db, ctx.trx, &self.cmd)?;
         Ok(())
     }
 

@@ -1,5 +1,5 @@
 use crate::catalog::{ColumnDesc, Schema};
-use crate::sql::ast::{BinOp, Expr, Limit as LimitClause, SelectItem};
+use crate::sql::ast::{BinOp, Expr, Limit as LimitClause};
 use crate::value::{DataType, Value};
 use crate::{Error, Result};
 
@@ -370,23 +370,18 @@ impl PhysicalOperator for Distinct {
     }
 }
 
-/// Blocking sort operator: materializes its child, orders by `order_by`
-/// (resolving SELECT aliases against `items`), then streams the result.
+/// Blocking sort operator: materializes its child, orders by the already
+/// alias-resolved `order_by`, then streams the result.
 pub struct Sort {
     child: Box<dyn PhysicalOperator>,
     order_by: Vec<(Expr, bool)>,
-    items: Vec<SelectItem>,
     rows: Vec<Vec<Value>>,
     pos: usize,
 }
 
 impl Sort {
-    pub fn new(
-        child: Box<dyn PhysicalOperator>,
-        order_by: Vec<(Expr, bool)>,
-        items: Vec<SelectItem>,
-    ) -> Self {
-        Self { child, order_by, items, rows: Vec::new(), pos: 0 }
+    pub fn new(child: Box<dyn PhysicalOperator>, order_by: Vec<(Expr, bool)>) -> Self {
+        Self { child, order_by, rows: Vec::new(), pos: 0 }
     }
 }
 
@@ -411,15 +406,7 @@ impl PhysicalOperator for Sort {
         }
         self.child.close()?;
         let schema = self.child.schema().clone();
-        sort_rows(
-            ctx.db,
-            ctx.trx,
-            ctx.outer,
-            &schema,
-            &mut rows,
-            &self.order_by,
-            &self.items,
-        )?;
+        sort_rows(ctx.db, ctx.trx, ctx.outer, &schema, &mut rows, &self.order_by)?;
         self.rows = rows;
         self.pos = 0;
         Ok(())

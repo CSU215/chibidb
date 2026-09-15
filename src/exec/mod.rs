@@ -1,6 +1,6 @@
 use crate::sql::ast::{
-    CreateIndexStmt, CreateTableStmt, CreateViewStmt, DeleteStmt, DropIndexStmt,
-    DropTableStmt, DropViewStmt, Expr, InsertStmt, ShowColumnsStmt, Stmt, UpdateStmt,
+    CreateIndexStmt, CreateTableStmt, CreateViewStmt, DropIndexStmt, DropTableStmt,
+    DropViewStmt, Expr, ShowColumnsStmt, Stmt,
 };
 use crate::catalog::Schema;
 use crate::config::{EngineKind, Isolation, PageLayout};
@@ -12,6 +12,7 @@ use crate::{Database, Error, Result};
 
 mod aggregate;
 pub mod chunk;
+mod command;
 mod dml;
 mod eval;
 pub mod operator;
@@ -189,12 +190,7 @@ fn execute_create_view(
     let Some(mut plan) = planner::plan_select(db, &sel)? else {
         return Err(Error::Runtime("view must be defined by a supported select".into()));
     };
-    {
-        let mut ctx = operator::ExecContext { db, trx, outer: None };
-        plan.open(&mut ctx)?;
-        while plan.next(&mut ctx)?.is_some() {}
-        plan.close()?;
-    }
+    collect_rows(db, trx, plan.as_mut(), None)?;
     db.catalog_mut().create_view(&c.name, c.sql.clone())?;
     db.save_catalog()?;
     Ok(ResultSet::Message("SUCCESS".into()))
@@ -229,6 +225,25 @@ fn execute_vacuum(db: &Database, trx: &TrxState) -> Result<ResultSet> {
     }
     let purged = db.vacuum()?;
     Ok(ResultSet::Message(format!("VACUUM COMPLETE: {purged} rows purged")))
+}
+
+/// Drives a physical plan to completion under `trx`, returning its rows. This
+/// is the single executor seam: callers that must run a plan (DDL validation,
+/// subquery materialization) go through here rather than open/next/close.
+pub(crate) fn collect_rows(
+    db: &Database,
+    trx: &mut TrxState,
+    plan: &mut dyn operator::PhysicalOperator,
+    outer: Option<&EvalCtx>,
+) -> Result<Vec<Vec<Value>>> {
+    let mut ctx = operator::ExecContext { db, trx, outer };
+    plan.open(&mut ctx)?;
+    let mut rows = Vec::new();
+    while let Some(row) = plan.next(&mut ctx)? {
+        rows.push(row);
+    }
+    plan.close()?;
+    Ok(rows)
 }
 
 /// How many times a read-committed statement is restarted after a concurrent
@@ -266,20 +281,18 @@ fn epq_retry<T>(
 pub(crate) fn execute_update(
     db: &Database,
     trx: &mut TrxState,
-    u: &UpdateStmt,
+    u: &command::UpdateCommand,
 ) -> Result<u64> {
     epq_retry(db, trx, &u.table, |db, trx| apply_update(db, trx, u))
 }
 
-fn apply_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<u64> {
+fn apply_update(db: &Database, trx: &mut TrxState, u: &command::UpdateCommand) -> Result<u64> {
     db.note_read(trx.id, &u.table);
     let schema = db.catalog().table(&u.table)?.schema.clone();
     let mut assigns = Vec::new();
-    for (col, expr) in &u.assignments {
-        let idx = schema
-            .index_of(col)
-            .ok_or_else(|| Error::Runtime(format!("no such column: {col}")))?;
-        assigns.push((idx, col.clone(), schema.columns[idx].dtype, expr));
+    for (idx, expr) in &u.assignments {
+        let col = &schema.columns[*idx];
+        assigns.push((*idx, col.name.clone(), col.dtype, expr));
     }
     let records = db.store_scan_raw(&u.table)?;
     let mut updates = Vec::new();
@@ -313,12 +326,12 @@ fn apply_update(db: &Database, trx: &mut TrxState, u: &UpdateStmt) -> Result<u64
 pub(crate) fn execute_delete(
     db: &Database,
     trx: &mut TrxState,
-    d: &DeleteStmt,
+    d: &command::DeleteCommand,
 ) -> Result<u64> {
     epq_retry(db, trx, &d.table, |db, trx| apply_delete(db, trx, d))
 }
 
-fn apply_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<u64> {
+fn apply_delete(db: &Database, trx: &mut TrxState, d: &command::DeleteCommand) -> Result<u64> {
     db.note_read(trx.id, &d.table);
     let schema = db.catalog().table(&d.table)?.schema.clone();
     let records = db.store_scan_raw(&d.table)?;
@@ -340,27 +353,6 @@ fn apply_delete(db: &Database, trx: &mut TrxState, d: &DeleteStmt) -> Result<u64
     Ok(victims.len() as u64)
 }
 
-/// Resolves the schema positions targeted by an INSERT: either every column
-/// or the explicit column list (which may be reordered or partial).
-fn insert_targets(schema: &Schema, columns: &Option<Vec<String>>) -> Result<Vec<usize>> {
-    let Some(cols) = columns else {
-        return Ok((0..schema.columns.len()).collect());
-    };
-    let mut seen = vec![false; schema.columns.len()];
-    let mut targets = Vec::with_capacity(cols.len());
-    for c in cols {
-        let idx = schema
-            .index_of(c)
-            .ok_or_else(|| Error::Runtime(format!("no such column: {c}")))?;
-        if seen[idx] {
-            return Err(Error::Runtime(format!("column specified twice: {c}")));
-        }
-        seen[idx] = true;
-        targets.push(idx);
-    }
-    Ok(targets)
-}
-
 fn check_not_null(schema: &Schema, row: &[Value]) -> Result<()> {
     for (col, v) in schema.columns.iter().zip(row) {
         if col.not_null && matches!(v, Value::Null) {
@@ -373,19 +365,9 @@ fn check_not_null(schema: &Schema, row: &[Value]) -> Result<()> {
 pub(crate) fn execute_insert(
     db: &Database,
     trx: &mut TrxState,
-    i: &InsertStmt,
+    i: &command::InsertCommand,
 ) -> Result<u64> {
     let schema = db.catalog().table(&i.table)?.schema.clone();
-    let targets = insert_targets(&schema, &i.columns)?;
-    for values in &i.rows {
-        if values.len() != targets.len() {
-            return Err(Error::Runtime(format!(
-                "expected {} values, got {}",
-                targets.len(),
-                values.len()
-            )));
-        }
-    }
     let mut claimed: Vec<(usize, Vec<u8>)> = Vec::new();
     for values in &i.rows {
         // start from defaults, then overlay the supplied values
@@ -394,7 +376,7 @@ pub(crate) fn execute_insert(
             .iter()
             .map(|c| c.default.clone().unwrap_or(Value::Null))
             .collect();
-        for (expr, &idx) in values.iter().zip(&targets) {
+        for (expr, &idx) in values.iter().zip(&i.targets) {
             let col = &schema.columns[idx];
             let v = eval_const(expr)?;
             row[idx] = coerce(v, col.dtype, &col.name)?;

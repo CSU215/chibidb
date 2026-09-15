@@ -1,12 +1,22 @@
 use crate::catalog::{ColumnDesc, Schema};
-use crate::sql::ast::Expr;
 use crate::storage::codec::decode_record;
+use crate::storage::page::FileId;
 use crate::storage::Rid;
 use crate::value::Value;
 use crate::{Database, Result};
 
 use super::{ExecContext, PhysicalOperator};
 use crate::exec::chunk::{CHUNK_ROWS, Chunk};
+
+/// The index-derived row ids a lowered access path selected, handed to the scan
+/// as plain data so the operator never reaches back into the planner.
+pub(crate) struct IndexScanPlan {
+    pub(crate) column: String,
+    /// Index name and a human-readable predicate, for EXPLAIN / visualisation.
+    pub(crate) index: String,
+    pub(crate) predicate: String,
+    pub(crate) rids: Vec<Rid>,
+}
 /// Index scan: fetches exactly the row ids the access path selected.
 pub struct IndexScan {
     table: String,
@@ -19,42 +29,40 @@ pub struct IndexScan {
     /// True for the ORDER BY-driven in-order cursor (no WHERE selection).
     ordered: bool,
     rids: Vec<Rid>,
+    /// The index file an in-order scan walks; the live cursor is built in
+    /// `open`, so the same plan can be opened repeatedly (subquery re-runs).
+    cursor_file: Option<FileId>,
     /// A lazy in-order cursor over the index; when set, `rids` is unused.
     cursor: Option<crate::index::LeafCursor>,
     pos: usize,
 }
 
 impl IndexScan {
-    /// Returns `None` when the selection is not sargable (use a `TableScan`).
-    pub fn new(db: &Database, table: &str, selection: Option<&Expr>) -> Result<Option<Self>> {
-        Self::with_owner(db, table, table, selection)
-    }
-
+    /// A range/equality scan over the row ids a lowered access path selected.
     /// `owner` is the alias (or table name) that qualifies this scan's columns.
-    pub fn with_owner(
+    pub(crate) fn from_plan(
         db: &Database,
         table: &str,
         owner: &str,
-        selection: Option<&Expr>,
-    ) -> Result<Option<Self>> {
-        let Some(plan) = crate::exec::planner::plan_index_scan(db, table, selection)? else {
-            return Ok(None);
-        };
+        plan: IndexScanPlan,
+    ) -> Result<Self> {
         let mut scan = Self::skeleton(db, table, owner, plan.column)?;
         scan.index = plan.index;
         scan.predicate = plan.predicate;
         scan.rids = plan.rids;
-        Ok(Some(scan))
+        Ok(scan)
     }
 
     /// Scans `column`'s index in ascending key order, so an `ORDER BY column`
     /// can reuse the index instead of sorting. The scan is lazy, so a LIMIT
-    /// stops it once it has the rows it needs. Returns `None` without that
-    /// index.
-    pub fn ordered(db: &Database, table: &str, owner: &str, column: &str) -> Result<Option<Self>> {
-        let Some(file) = crate::exec::planner::ordered_index_file(db, table, column)? else {
-            return Ok(None);
-        };
+    /// stops it once it has the rows it needs.
+    pub(crate) fn from_cursor(
+        db: &Database,
+        table: &str,
+        owner: &str,
+        column: &str,
+        file: FileId,
+    ) -> Result<Self> {
         let mut scan = Self::skeleton(db, table, owner, column.to_string())?;
         scan.index = db
             .catalog()
@@ -64,8 +72,8 @@ impl IndexScan {
             .map(|ix| ix.name.clone())
             .unwrap_or_default();
         scan.ordered = true;
-        scan.cursor = Some(crate::index::BTree::at(file).leaf_cursor(&db.pool)?);
-        Ok(Some(scan))
+        scan.cursor_file = Some(file);
+        Ok(scan)
     }
 
     fn skeleton(db: &Database, table: &str, owner: &str, column: String) -> Result<Self> {
@@ -90,6 +98,7 @@ impl IndexScan {
             predicate: String::new(),
             ordered: false,
             rids: Vec::new(),
+            cursor_file: None,
             cursor: None,
             pos: 0,
         })
@@ -141,6 +150,10 @@ impl PhysicalOperator for IndexScan {
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
         ctx.db.note_read(ctx.trx.id, &self.table);
         self.pos = 0;
+        self.cursor = match self.cursor_file {
+            Some(file) => Some(crate::index::BTree::at(file).leaf_cursor(&ctx.db.pool)?),
+            None => None,
+        };
         Ok(())
     }
 
@@ -181,6 +194,7 @@ impl PhysicalOperator for IndexScan {
 
     fn close(&mut self) -> Result<()> {
         self.pos = self.rids.len();
+        self.cursor = None;
         Ok(())
     }
 }

@@ -8,18 +8,23 @@
 //! (index vs scan, hash vs nested loop) is deliberately *not* here.
 
 use crate::catalog::Schema;
-use crate::sql::ast::{Expr, JoinKind, Limit, SelectItem, SelectStmt, TableRef};
+use crate::exec::command::{DeleteCommand, InsertCommand, UpdateCommand};
+use crate::sql::ast::{Expr, JoinKind, Limit, SelectItem, SelectStmt, Stmt, TableRef};
 use crate::{Database, Result};
 
 use crate::exec::aggregate::extract_aggregates;
 use crate::exec::eval::{expr_has_column, expr_has_subquery};
 
-use super::lower::{build_from_source, combine_and, items_have_aggregate, join_clauses, split_conjuncts};
+use crate::value::DataType;
 
-/// One node of the logical plan for a SELECT.
+use super::util::{combine_and, items_have_aggregate, join_clauses, split_conjuncts};
+
+/// One node of the logical plan for a statement.
 pub(crate) enum LogicalOperator {
     /// A base table or view, with its alias resolved by the caller.
     Scan(TableRef),
+    /// One empty tuple, for a SELECT without a FROM clause.
+    Constant,
     Filter { input: Box<LogicalOperator>, predicate: Expr },
     Join {
         left: Box<LogicalOperator>,
@@ -40,13 +45,52 @@ pub(crate) enum LogicalOperator {
     Sort { input: Box<LogicalOperator>, order_by: Vec<(Expr, bool)> },
     Distinct { input: Box<LogicalOperator> },
     Limit { input: Box<LogicalOperator>, limit: Limit },
+    /// `UNION [ALL]`: each input is a complete logical plan; the trailing
+    /// ORDER BY / LIMIT apply to the whole set. The bool marks `UNION ALL`.
+    Union {
+        inputs: Vec<(bool, Box<LogicalOperator>)>,
+        order_by: Vec<(Expr, bool)>,
+        limit: Option<Limit>,
+    },
+    /// DML commands, carrying schema-bound operands lowering turns into the
+    /// command operator.
+    Insert(InsertCommand),
+    Update(UpdateCommand),
+    Delete(DeleteCommand),
 }
 
-/// Translates a SELECT into a logical plan. Returns `None` for shapes handled
-/// directly by the planner (no FROM, or a UNION chain).
+/// Translates a top-level statement into a logical plan. Returns `None` for
+/// statements the operator layer does not cover (DDL, SHOW, transaction
+/// control, ...). DML is bound to schema positions here, so the plan and the
+/// operators carry resolved operands rather than the AST statement.
+pub(crate) fn translate_stmt(db: &Database, stmt: &Stmt) -> Result<Option<LogicalOperator>> {
+    Ok(match stmt {
+        Stmt::Select(s) => translate(s),
+        Stmt::Insert(i) => Some(LogicalOperator::Insert(InsertCommand::resolve(db, i)?)),
+        Stmt::Update(u) => Some(LogicalOperator::Update(UpdateCommand::resolve(db, u)?)),
+        Stmt::Delete(d) => Some(LogicalOperator::Delete(DeleteCommand::resolve(db, d)?)),
+        _ => None,
+    })
+}
+
+/// Translates a SELECT into a logical plan. Returns `None` for the shapes the
+/// operator layer cannot run (a `*`/aggregate projection with no FROM).
 pub(crate) fn translate(select: &SelectStmt) -> Option<LogicalOperator> {
-    if select.from.is_empty() || !select.set_ops.is_empty() {
-        return None;
+    if !select.set_ops.is_empty() {
+        return translate_union(select);
+    }
+    if select.from.is_empty() {
+        // A constant SELECT projects one empty tuple; `*` and aggregates have
+        // no input to work on and stay unsupported.
+        if select.items.iter().any(|it| matches!(it, SelectItem::Star))
+            || items_have_aggregate(&select.items)
+        {
+            return None;
+        }
+        return Some(LogicalOperator::Project {
+            input: Box::new(LogicalOperator::Constant),
+            items: select.items.clone(),
+        });
     }
     let mut node = logical_from(select)?;
     // Grouped/aggregate queries: Aggregate, then HAVING / ORDER BY / project /
@@ -103,6 +147,20 @@ pub(crate) fn translate(select: &SelectStmt) -> Option<LogicalOperator> {
     Some(node)
 }
 
+/// Translates a UNION chain: the head select (minus its trailing ORDER BY /
+/// LIMIT, which the union node owns) and every operand become inputs.
+fn translate_union(select: &SelectStmt) -> Option<LogicalOperator> {
+    let mut base = select.clone();
+    base.set_ops = Vec::new();
+    let order_by = std::mem::take(&mut base.order_by);
+    let limit = base.limit.take();
+    let mut inputs = vec![(true, Box::new(translate(&base)?))];
+    for (all, operand) in &select.set_ops {
+        inputs.push((*all, Box::new(translate(operand)?)));
+    }
+    Some(LogicalOperator::Union { inputs, order_by, limit })
+}
+
 /// Translates a SELECT's FROM / WHERE / JOIN region into a logical plan. The
 /// WHERE clause becomes one `Filter` above the join tree; it is not yet pushed.
 fn logical_from(select: &SelectStmt) -> Option<LogicalOperator> {
@@ -146,13 +204,14 @@ fn aggregate_list(select: &SelectStmt) -> Vec<Expr> {
     extract_aggregates(&refs)
 }
 
-/// The output schema of a logical node, `None` when a source cannot be built
-/// (the caller then falls back to the materialized executor).
+/// The schema of a logical node's source. Only single-source scans are resolved
+/// here (predicate pushdown asks for exactly those); projection shapes keep
+/// their input schema, because pushing a predicate only needs to know which
+/// source owns a column. Resolving from the catalog keeps the logical layer
+/// independent of physical operator construction.
 fn schema(db: &Database, node: &LogicalOperator) -> Result<Option<Schema>> {
     match node {
-        LogicalOperator::Scan(tref) => {
-            Ok(build_from_source(db, tref)?.map(|op| op.schema().clone()))
-        }
+        LogicalOperator::Scan(tref) => source_schema(db, tref),
         LogicalOperator::Filter { input, .. }
         | LogicalOperator::Having { input, .. }
         | LogicalOperator::Aggregate { input, .. }
@@ -167,7 +226,99 @@ fn schema(db: &Database, node: &LogicalOperator) -> Result<Option<Schema>> {
             left.columns.extend(right.columns);
             Ok(Some(left))
         }
+        LogicalOperator::Constant => Ok(Some(Schema::default())),
+        LogicalOperator::Union { inputs, .. } => match inputs.first() {
+            Some((_, first)) => schema(db, first),
+            None => Ok(Some(Schema::default())),
+        },
+        LogicalOperator::Insert(_) | LogicalOperator::Update(_) | LogicalOperator::Delete(_) => {
+            Ok(Some(Schema::default()))
+        }
     }
+}
+
+/// Resolves a FROM source (table or view) to the schema a scan exposes. A view
+/// is expanded into its projected output columns, mirroring `ViewScan`.
+fn source_schema(db: &Database, tref: &TableRef) -> Result<Option<Schema>> {
+    let owner = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+    if let Some(sql) = db.catalog().view(&tref.name).cloned() {
+        let stmts = crate::sql::parser::parse(&sql)?;
+        let Some(Stmt::Select(select)) = stmts.into_iter().next() else {
+            return Ok(None);
+        };
+        let Some(node) = translate(&select) else {
+            return Ok(None);
+        };
+        let Some(names) = output_names(db, &node)? else {
+            return Ok(None);
+        };
+        return Ok(Some(Schema {
+            columns: names
+                .into_iter()
+                .map(|name| {
+                    crate::catalog::ColumnDesc::plain(Some(owner.clone()), name, DataType::Text)
+                })
+                .collect(),
+        }));
+    }
+    let columns = db.catalog().table(&tref.name)?.schema.columns.clone();
+    Ok(Some(Schema {
+        columns: columns
+            .into_iter()
+            .map(|c| crate::catalog::ColumnDesc::plain(Some(owner.clone()), c.name, c.dtype))
+            .collect(),
+    }))
+}
+
+/// The projected output column names of a logical plan, used to describe a
+/// view's columns without building physical operators.
+fn output_names(db: &Database, node: &LogicalOperator) -> Result<Option<Vec<String>>> {
+    Ok(match node {
+        LogicalOperator::Scan(tref) => {
+            source_schema(db, tref)?.map(|s| s.columns.into_iter().map(|c| c.name).collect())
+        }
+        LogicalOperator::Constant => Some(Vec::new()),
+        LogicalOperator::Filter { input, .. }
+        | LogicalOperator::Having { input, .. }
+        | LogicalOperator::Sort { input, .. }
+        | LogicalOperator::Distinct { input }
+        | LogicalOperator::Limit { input, .. } => output_names(db, input)?,
+        LogicalOperator::Aggregate { input, aggregates, .. } => {
+            let Some(mut names) = output_names(db, input)? else {
+                return Ok(None);
+            };
+            names.extend((0..aggregates.len()).map(crate::exec::aggregate::agg_column));
+            Some(names)
+        }
+        LogicalOperator::Project { input, items } => {
+            let Some(base) = output_names(db, input)? else {
+                return Ok(None);
+            };
+            let mut out = Vec::new();
+            for item in items {
+                match item {
+                    SelectItem::Star => out.extend(base.iter().cloned()),
+                    SelectItem::Expr(e) => out.push(e.to_string()),
+                    SelectItem::Aliased(_, alias) => out.push(alias.clone()),
+                }
+            }
+            Some(out)
+        }
+        LogicalOperator::Join { left, right, .. } => {
+            let (Some(mut l), Some(r)) = (output_names(db, left)?, output_names(db, right)?) else {
+                return Ok(None);
+            };
+            l.extend(r);
+            Some(l)
+        }
+        LogicalOperator::Union { inputs, .. } => match inputs.first() {
+            Some((_, first)) => output_names(db, first)?,
+            None => Some(Vec::new()),
+        },
+        LogicalOperator::Insert(_) | LogicalOperator::Update(_) | LogicalOperator::Delete(_) => {
+            Some(Vec::new())
+        }
+    })
 }
 
 /// Applies the logical rewrites to the plan (currently predicate pushdown).
@@ -210,6 +361,20 @@ pub(crate) fn optimize(
         LogicalOperator::Limit { input, limit } => optimize(db, *input)?.map(|n| {
             LogicalOperator::Limit { input: Box::new(n), limit }
         }),
+        LogicalOperator::Constant => Some(LogicalOperator::Constant),
+        LogicalOperator::Union { inputs, order_by, limit } => {
+            let mut out = Vec::with_capacity(inputs.len());
+            for (all, input) in inputs {
+                let Some(n) = optimize(db, *input)? else {
+                    return Ok(None);
+                };
+                out.push((all, Box::new(n)));
+            }
+            Some(LogicalOperator::Union { inputs: out, order_by, limit })
+        }
+        LogicalOperator::Insert(i) => Some(LogicalOperator::Insert(i)),
+        LogicalOperator::Update(u) => Some(LogicalOperator::Update(u)),
+        LogicalOperator::Delete(d) => Some(LogicalOperator::Delete(d)),
     })
 }
 
@@ -326,6 +491,7 @@ pub(crate) fn logical_tree(node: &LogicalOperator) -> String {
                 Some(alias) => format!("Scan {} as {alias}", tref.name),
                 None => format!("Scan {}", tref.name),
             },
+            LogicalOperator::Constant => "Constant".to_string(),
             LogicalOperator::Filter { predicate, .. } => format!("Filter {predicate}"),
             LogicalOperator::Having { predicate, .. } => format!("Having {predicate}"),
             LogicalOperator::Join { kind, .. } => format!("Join {kind:?}"),
@@ -336,11 +502,19 @@ pub(crate) fn logical_tree(node: &LogicalOperator) -> String {
             LogicalOperator::Limit { limit, .. } => {
                 format!("Limit count={}", limit.count)
             }
+            LogicalOperator::Union { inputs, .. } => format!("Union arms={}", inputs.len()),
+            LogicalOperator::Insert(i) => format!("Insert {}", i.table),
+            LogicalOperator::Update(u) => format!("Update {}", u.table),
+            LogicalOperator::Delete(d) => format!("Delete {}", d.table),
         }
     }
     fn children(node: &LogicalOperator, f: &mut impl FnMut(&LogicalOperator)) {
         match node {
-            LogicalOperator::Scan(_) => {}
+            LogicalOperator::Scan(_)
+            | LogicalOperator::Constant
+            | LogicalOperator::Insert(_)
+            | LogicalOperator::Update(_)
+            | LogicalOperator::Delete(_) => {}
             LogicalOperator::Filter { input, .. }
             | LogicalOperator::Having { input, .. }
             | LogicalOperator::Aggregate { input, .. }
@@ -351,6 +525,11 @@ pub(crate) fn logical_tree(node: &LogicalOperator) -> String {
             LogicalOperator::Join { left, right, .. } => {
                 f(left);
                 f(right);
+            }
+            LogicalOperator::Union { inputs, .. } => {
+                for (_, input) in inputs {
+                    f(input);
+                }
             }
         }
     }

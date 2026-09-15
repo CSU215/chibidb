@@ -1,5 +1,5 @@
 use crate::catalog::Schema;
-use crate::sql::ast::{Expr, Stmt};
+use crate::sql::ast::Expr;
 use crate::value::Value;
 use crate::{Database, Result};
 
@@ -10,11 +10,16 @@ mod basic;
 mod index_scan;
 mod join;
 mod scan;
+mod subquery;
 
 pub use basic::{Distinct, Filter, Limit, Project, Sort, Union};
 pub use index_scan::IndexScan;
+pub(crate) use index_scan::IndexScanPlan;
+pub(crate) use join::HashKeys;
 pub use join::{HashJoin, NestedLoopJoin};
 pub use scan::{ConstantScan, TableScan, ViewScan};
+pub(crate) use subquery::{SubqueryRegistry, current_registry};
+pub(crate) use subquery::PlannedSubqueries;
 /// Context threaded through operators: the database, the session's active
 /// transaction, and the outer row/group context when this plan runs as a
 /// correlated subquery.
@@ -130,21 +135,4 @@ pub fn physical_tree(plan: &dyn PhysicalOperator) -> String {
     let mut out = String::new();
     walk(plan, 0, &mut out);
     out
-}
-
-/// Builds the physical command for a DML statement; `None` for anything else.
-/// SELECT planning lives in [`super::planner`].
-pub(crate) fn build_dml(stmt: &Stmt) -> Result<Option<Box<dyn PhysicalOperator>>> {
-    Ok(match stmt {
-        Stmt::Insert(insert) => {
-            Some(Box::new(crate::exec::dml::InsertOp::new(insert.clone())))
-        }
-        Stmt::Update(update) => {
-            Some(Box::new(crate::exec::dml::UpdateOp::new(update.clone())))
-        }
-        Stmt::Delete(delete) => {
-            Some(Box::new(crate::exec::dml::DeleteOp::new(delete.clone())))
-        }
-        _ => None,
-    })
 }

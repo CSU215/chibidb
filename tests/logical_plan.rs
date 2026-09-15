@@ -62,6 +62,22 @@ fn explain_logical_join_and_aggregate() {
 }
 
 #[test]
+fn explain_covers_constant_and_union_selects() {
+    let db = seeded();
+
+    // A SELECT without FROM is a Project over a Constant, not a physical-only plan.
+    let plan = message(&db, "explain select 1 + 2;");
+    assert!(plan.contains("LogicalPlan:"), "{plan}");
+    assert!(!plan.contains("(no logical plan)"), "{plan}");
+    assert!(plan.contains("Constant"), "{plan}");
+
+    // A UNION chain is a logical Union node over its operands.
+    let plan = message(&db, "explain select id from dept union select id from dept;");
+    assert!(plan.contains("Union arms=2"), "{plan}");
+    assert!(!plan.contains("(no logical plan)"), "{plan}");
+}
+
+#[test]
 fn explain_matches_query_results() {
     let db = seeded();
     let rs = db.execute_sql("select dept_id, count(*) from emp group by dept_id order by dept_id;")

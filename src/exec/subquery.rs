@@ -144,20 +144,37 @@ fn run_subquery(
     sub: &crate::sql::ast::SelectStmt,
     outer: Option<&EvalCtx>,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    // Prefer the plan lowering already built for this subquery, so no planning
+    // happens while a row is being evaluated. Re-running is safe: a stored
+    // subplan is re-openable.
+    let key = format!("{sub:?}");
+    if let Some(registry) = crate::exec::operator::current_registry()
+        && let Some(cell) = registry.get(&key)
+    {
+        let mut slot = cell.borrow_mut();
+        let Some(plan) = slot.as_mut() else {
+            return Err(Error::Runtime(
+                "subquery shape is not supported by the operators".into(),
+            ));
+        };
+        return run_subquery_plan(db, trx, plan.as_mut(), outer);
+    }
+    // Fallback for a shape not collected at plan time: lower it on first use.
     let Some(mut plan) = crate::exec::planner::plan_select(db, sub)? else {
         return Err(Error::Runtime(
             "subquery shape is not supported by the operators".into(),
         ));
     };
+    run_subquery_plan(db, trx, plan.as_mut(), outer)
+}
+
+fn run_subquery_plan(
+    db: &Database,
+    trx: &mut TrxState,
+    plan: &mut dyn crate::exec::operator::PhysicalOperator,
+    outer: Option<&EvalCtx>,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
     let columns: Vec<String> = plan.schema().columns.iter().map(|c| c.name.clone()).collect();
-    let mut rows = Vec::new();
-    {
-        let mut ctx = crate::exec::operator::ExecContext { db, trx, outer };
-        plan.open(&mut ctx)?;
-        while let Some(row) = plan.next(&mut ctx)? {
-            rows.push(row);
-        }
-        plan.close()?;
-    }
+    let rows = super::collect_rows(db, trx, plan, outer)?;
     Ok((columns, rows))
 }

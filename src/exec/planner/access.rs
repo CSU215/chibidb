@@ -9,6 +9,7 @@ use crate::{Database, Result};
 
 use crate::exec::coerce;
 use crate::exec::eval::{eval_const, expr_has_column, expr_has_subquery};
+use crate::exec::operator::IndexScanPlan;
 
 /// The plain column of a single ascending ORDER BY key, after resolving SELECT
 /// aliases. `SELECT b AS id ... ORDER BY id` therefore resolves to `b`, so an
@@ -207,20 +208,12 @@ fn bound<'a>(key: Option<&'a Vec<u8>>, inclusive: bool) -> Bound<'a> {
 }
 
 /// Index-derived row ids for a sargable selection, if one applies. The
-/// `IndexScan` operator consumes this.
-pub(crate) struct IndexScanRids {
-    pub column: String,
-    /// Index name and a human-readable predicate, for EXPLAIN / visualisation.
-    pub index: String,
-    pub predicate: String,
-    pub rids: Vec<Rid>,
-}
-
+/// `IndexScan` operator consumes this as plain data.
 pub(crate) fn plan_index_scan(
     db: &Database,
     table: &str,
     selection: Option<&Expr>,
-) -> Result<Option<IndexScanRids>> {
+) -> Result<Option<IndexScanPlan>> {
     let Some(sarg) = find_sargable(db, table, selection)? else {
         return Ok(None);
     };
@@ -252,7 +245,7 @@ pub(crate) fn plan_index_scan(
         }
     };
     let predicate = describe_sarg(&sarg);
-    Ok(Some(IndexScanRids {
+    Ok(Some(IndexScanPlan {
         column: sarg.column,
         index: sarg.index,
         predicate,
