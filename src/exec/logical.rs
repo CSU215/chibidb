@@ -29,8 +29,15 @@ pub(crate) enum LogicalOperator {
         kind: JoinKind,
         on: Option<Expr>,
     },
-    /// Fused grouping/aggregation (see the module note).
-    Aggregate { input: Box<LogicalOperator>, select: Box<SelectStmt> },
+    /// Grouping/aggregation: one output row per group, with the aggregate
+    /// results appended (see the physical `Aggregate`).
+    Aggregate {
+        input: Box<LogicalOperator>,
+        group_by: Vec<Expr>,
+        aggregates: Vec<Expr>,
+    },
+    /// A `HAVING` filter above an [`LogicalOperator::Aggregate`].
+    Having { input: Box<LogicalOperator>, predicate: Expr },
     Project { input: Box<LogicalOperator>, items: Vec<SelectItem> },
     Sort { input: Box<LogicalOperator>, order_by: Vec<(Expr, bool)> },
     Distinct { input: Box<LogicalOperator> },
@@ -44,15 +51,40 @@ pub(crate) fn logical_select(select: &SelectStmt) -> Option<LogicalOperator> {
         return None;
     }
     let mut node = logical_from(select)?;
-    // Grouped/aggregate queries stay fused: GroupBy handles the whole tail.
+    // Grouped/aggregate queries: Aggregate, then HAVING / ORDER BY / project /
+    // DISTINCT / LIMIT as standard nodes.
     if !select.group_by.is_empty()
         || select.having.is_some()
         || items_have_aggregate(&select.items)
     {
-        return Some(LogicalOperator::Aggregate {
+        let mut tail = LogicalOperator::Aggregate {
             input: Box::new(node),
-            select: Box::new(select.clone()),
-        });
+            group_by: select.group_by.clone(),
+            aggregates: aggregate_list(select),
+        };
+        if let Some(having) = &select.having {
+            tail = LogicalOperator::Having {
+                input: Box::new(tail),
+                predicate: having.clone(),
+            };
+        }
+        if !select.order_by.is_empty() {
+            tail = LogicalOperator::Sort {
+                input: Box::new(tail),
+                order_by: select.order_by.clone(),
+            };
+        }
+        tail = LogicalOperator::Project {
+            input: Box::new(tail),
+            items: select.items.clone(),
+        };
+        if select.distinct {
+            tail = LogicalOperator::Distinct { input: Box::new(tail) };
+        }
+        if let Some(limit) = &select.limit {
+            tail = LogicalOperator::Limit { input: Box::new(tail), limit: limit.clone() };
+        }
+        return Some(tail);
     }
     if !select.order_by.is_empty() {
         node = LogicalOperator::Sort {
@@ -96,6 +128,26 @@ fn logical_from(select: &SelectStmt) -> Option<LogicalOperator> {
     Some(node)
 }
 
+/// The distinct aggregate expressions in a SELECT's items, HAVING and ORDER BY,
+/// in first-seen order. Matches what lowering extracts, so `#aggN` indices line
+/// up.
+fn aggregate_list(select: &SelectStmt) -> Vec<Expr> {
+    let mut refs: Vec<&Expr> = Vec::new();
+    for item in &select.items {
+        match item {
+            SelectItem::Expr(e) | SelectItem::Aliased(e, _) => refs.push(e),
+            SelectItem::Star => {}
+        }
+    }
+    if let Some(having) = &select.having {
+        refs.push(having);
+    }
+    for (e, _) in &select.order_by {
+        refs.push(e);
+    }
+    super::aggregate::extract_aggregates(&refs)
+}
+
 /// The output schema of a logical node, `None` when a source cannot be built
 /// (the caller then falls back to the materialized executor).
 fn schema(db: &Database, node: &LogicalOperator) -> Result<Option<Schema>> {
@@ -104,11 +156,12 @@ fn schema(db: &Database, node: &LogicalOperator) -> Result<Option<Schema>> {
             Ok(build_from_source(db, tref)?.map(|op| op.schema().clone()))
         }
         LogicalOperator::Filter { input, .. }
+        | LogicalOperator::Having { input, .. }
+        | LogicalOperator::Aggregate { input, .. }
         | LogicalOperator::Project { input, .. }
         | LogicalOperator::Sort { input, .. }
         | LogicalOperator::Distinct { input }
-        | LogicalOperator::Limit { input, .. }
-        | LogicalOperator::Aggregate { input, .. } => schema(db, input),
+        | LogicalOperator::Limit { input, .. } => schema(db, input),
         LogicalOperator::Join { left, right, .. } => {
             let (Some(mut left), Some(right)) = (schema(db, left)?, schema(db, right)?) else {
                 return Ok(None);
@@ -128,10 +181,17 @@ pub(crate) fn pushdown(
         node @ (LogicalOperator::Scan(_)
         | LogicalOperator::Filter { .. }
         | LogicalOperator::Join { .. }) => pushdown_region(db, node)?,
-        LogicalOperator::Aggregate { input, select } => {
+        LogicalOperator::Aggregate { input, group_by, aggregates } => {
             pushdown(db, *input)?.map(|n| LogicalOperator::Aggregate {
                 input: Box::new(n),
-                select,
+                group_by,
+                aggregates,
+            })
+        }
+        LogicalOperator::Having { input, predicate } => {
+            pushdown(db, *input)?.map(|n| LogicalOperator::Having {
+                input: Box::new(n),
+                predicate,
             })
         }
         LogicalOperator::Project { input, items } => {
@@ -269,6 +329,7 @@ pub(crate) fn logical_tree(node: &LogicalOperator) -> String {
                 None => format!("Scan {}", tref.name),
             },
             LogicalOperator::Filter { predicate, .. } => format!("Filter {predicate}"),
+            LogicalOperator::Having { predicate, .. } => format!("Having {predicate}"),
             LogicalOperator::Join { kind, .. } => format!("Join {kind:?}"),
             LogicalOperator::Aggregate { .. } => "Aggregate".to_string(),
             LogicalOperator::Project { items, .. } => format!("Project cols={}", items.len()),
@@ -283,6 +344,7 @@ pub(crate) fn logical_tree(node: &LogicalOperator) -> String {
         match node {
             LogicalOperator::Scan(_) => {}
             LogicalOperator::Filter { input, .. }
+            | LogicalOperator::Having { input, .. }
             | LogicalOperator::Aggregate { input, .. }
             | LogicalOperator::Project { input, .. }
             | LogicalOperator::Sort { input, .. }

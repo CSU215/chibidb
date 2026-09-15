@@ -3,11 +3,8 @@ use crate::catalog::Schema;
 use crate::value::Value;
 use crate::{Error, Result};
 
-use super::aggregate::eval_aggregate;
-
 pub(crate) enum Scope<'a> {
     Row(&'a Schema, &'a [Value]),
-    Group(&'a Schema, &'a [Vec<Value>]),
 }
 
 /// An evaluation context. `parent` links to the enclosing query's context
@@ -20,10 +17,6 @@ pub(crate) struct EvalCtx<'a> {
 impl<'a> EvalCtx<'a> {
     pub(crate) fn row(schema: &'a Schema, row: &'a [Value]) -> Self {
         EvalCtx { scope: Scope::Row(schema, row), parent: None }
-    }
-
-    pub(crate) fn group(schema: &'a Schema, rows: &'a [Vec<Value>]) -> Self {
-        EvalCtx { scope: Scope::Group(schema, rows), parent: None }
     }
 }
 
@@ -41,9 +34,6 @@ fn resolve_column(ctx: Option<&EvalCtx>, qual: Option<&str>, name: &str) -> Resu
     while let Some(c) = cur {
         let resolved = match &c.scope {
             Scope::Row(schema, row) => schema.resolve(qual, name).map(|i| row[i].clone()),
-            Scope::Group(schema, rows) => schema.resolve(qual, name).map(|i| {
-                rows.first().map(|r| r[i].clone()).unwrap_or(Value::Null)
-            }),
         };
         match resolved {
             Ok(v) => return Ok(v),
@@ -96,12 +86,7 @@ pub(crate) fn eval(expr: &Expr, ctx: Option<&EvalCtx>) -> Result<Value> {
         Expr::Null => Ok(Value::Null),
         Expr::Column(c) => resolve_column(ctx, None, c),
         Expr::QualifiedColumn(t, c) => resolve_column(ctx, Some(t), c),
-        Expr::Aggregate(func, arg, distinct) => match ctx.map(|c| &c.scope) {
-            Some(Scope::Group(schema, rows)) => {
-                eval_aggregate(*func, arg.as_deref(), *distinct, schema, rows)
-            }
-            _ => Err(Error::Runtime("aggregate not allowed here".into())),
-        },
+        Expr::Aggregate(..) => Err(Error::Runtime("aggregate not allowed here".into())),
         Expr::Unary(op, e) => {
             let v = eval(e, ctx)?;
             match op {

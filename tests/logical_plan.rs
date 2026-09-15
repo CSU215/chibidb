@@ -49,6 +49,16 @@ fn explain_logical_join_and_aggregate() {
     assert!(plan.contains("Aggregate"), "{plan}");
     assert!(plan.contains("Project"), "{plan}");
     assert!(plan.contains("Scan emp"), "{plan}");
+
+    // the aggregate tail is split into standard logical nodes
+    let plan = message(
+        &db,
+        "explain select dept_id, count(*) from emp group by dept_id \
+         having count(*) > 0 order by dept_id;",
+    );
+    assert!(plan.contains("Having"), "{plan}");
+    assert!(plan.contains("Sort"), "{plan}");
+    assert!(plan.contains("Aggregate"), "{plan}");
 }
 
 #[test]
