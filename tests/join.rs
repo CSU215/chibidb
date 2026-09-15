@@ -100,6 +100,31 @@ fn inner_join_on() {
     });
 }
 
+/// A single-source WHERE conjunct is pushed onto that source before the join;
+/// an outer join must not be (its null-extension would change).
+#[test]
+fn where_is_pushed_only_through_inner_joins() {
+    with_dbs(|db| {
+        seeded(db);
+        // both predicates belong to one side (e.id to emp, d.dname to dept)
+        let inner = rows_of(
+            db,
+            "select e.name from emp e join dept d on e.dept_id = d.id \
+             where d.dname = 'dev' and e.id > 10 order by e.name;",
+        );
+        assert_eq!(inner, [[Value::Str("carol".into())]]);
+
+        // the same predicate over a LEFT join must stay above the join: pushing
+        // it onto dept would still null-extend every emp, so bob/dan would leak
+        let left = rows_of(
+            db,
+            "select e.name from emp e left join dept d on e.dept_id = d.id \
+             where d.dname = 'dev' order by e.name;",
+        );
+        assert_eq!(left, [[Value::Str("alice".into())], [Value::Str("carol".into())]]);
+    });
+}
+
 #[test]
 fn join_with_aliases() {
     with_dbs(|db| {

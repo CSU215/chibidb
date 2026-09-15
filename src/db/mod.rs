@@ -576,6 +576,10 @@ impl Database {
         session: &mut Session,
         stmt: &Stmt,
     ) -> Result<ResultSet> {
+        // Rewrite before planning so both the operator path and the fallback
+        // executor see the folded expressions.
+        let folded = crate::exec::optimize::fold_stmt(stmt);
+        let stmt = &folded;
         for table in referenced_tables(stmt) {
             let known = self.table_exists(&table) || self.catalog().view(&table).is_some();
             if !known {

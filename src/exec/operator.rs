@@ -14,7 +14,7 @@ use crate::{Database, Error, Result};
 
 use super::aggregate::{expr_has_aggregate, sort_rows};
 use super::chunk::{CHUNK_ROWS, Chunk, Column};
-use super::eval::{eval_binary, eval_const, EvalCtx};
+use super::eval::{eval_binary, eval_const, expr_has_column, expr_has_subquery, EvalCtx};
 use super::subquery::{eval_bound, eval_predicate_bound};
 
 /// Build-row indices matching one key. The common unique-key case stays inline
@@ -1190,6 +1190,45 @@ fn split_conjuncts(expr: &Expr) -> Vec<&Expr> {
     }
 }
 
+/// The single FROM source that owns every column of `expr`, or `None` when the
+/// expression has no column, carries a subquery, or resolves in more than one
+/// source (ambiguous, so pushing it would hide the ambiguity).
+fn sole_source(expr: &Expr, sources: &[Schema]) -> Option<usize> {
+    if !expr_has_column(expr) || expr_has_subquery(expr) {
+        return None;
+    }
+    let mut found = None;
+    for (i, schema) in sources.iter().enumerate() {
+        if expr_resolves(expr, schema) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(i);
+        }
+    }
+    found
+}
+
+/// Whether every column reference in `expr` resolves against `schema`.
+fn expr_resolves(expr: &Expr, schema: &Schema) -> bool {
+    match expr {
+        Expr::Column(name) => schema.index_of(name).is_some(),
+        Expr::QualifiedColumn(owner, name) => schema
+            .columns
+            .iter()
+            .any(|c| c.owner.as_deref() == Some(owner) && &c.name == name),
+        Expr::Unary(_, e) => expr_resolves(e, schema),
+        Expr::Binary(_, l, r) => expr_resolves(l, schema) && expr_resolves(r, schema),
+        Expr::IsNull(e, _) => expr_resolves(e, schema),
+        Expr::Like { expr, pattern, .. } => {
+            expr_resolves(expr, schema) && expr_resolves(pattern, schema)
+        }
+        Expr::Function(_, args) => args.iter().all(|a| expr_resolves(a, schema)),
+        // Literals, values and anything else without a column resolve trivially.
+        _ => true,
+    }
+}
+
 fn combine_and(mut parts: Vec<Expr>) -> Option<Expr> {
     let mut acc = parts.pop()?;
     while let Some(e) = parts.pop() {
@@ -2105,19 +2144,49 @@ pub fn build_select(
             }
         }
     } else {
-        let Some(mut op) = build_from_source(db, &select.from[0])? else {
-            return Ok(None);
-        };
-        // Comma joins carry no ON clause; equi-predicates between the two sides
-        // are sourced from WHERE so the join can hash instead of cross-produce.
+        // Build every source first so WHERE conjuncts on a single source can be
+        // pushed onto it before the join.
+        let clauses = join_clauses(select);
+        let mut inputs: Vec<Box<dyn PhysicalOperator>> = Vec::with_capacity(select.from.len());
+        for tref in &select.from {
+            let Some(source) = build_from_source(db, tref)? else {
+                return Ok(None);
+            };
+            inputs.push(source);
+        }
         let mut where_conjuncts: Vec<Expr> =
             select.selection.as_ref().map(split_conjuncts).unwrap_or_default()
                 .into_iter().cloned().collect();
-        let mut where_reduced = false;
-        for (i, (kind, on)) in join_clauses(select).into_iter().enumerate() {
-            let Some(right) = build_from_source(db, &select.from[i + 1])? else {
-                return Ok(None);
-            };
+        // Pushing a WHERE predicate below an outer join would change which rows
+        // are null-extended, so only inner/comma joins are eligible.
+        if clauses
+            .iter()
+            .all(|(kind, _)| matches!(kind, JoinKind::Inner | JoinKind::Cross))
+        {
+            let schemas: Vec<Schema> = inputs.iter().map(|s| s.schema().clone()).collect();
+            let mut pushed: Vec<Vec<Expr>> = vec![Vec::new(); inputs.len()];
+            let mut kept = Vec::with_capacity(where_conjuncts.len());
+            for conjunct in where_conjuncts.drain(..) {
+                match sole_source(&conjunct, &schemas) {
+                    Some(i) => pushed[i].push(conjunct),
+                    None => kept.push(conjunct),
+                }
+            }
+            where_conjuncts = kept;
+            inputs = inputs
+                .into_iter()
+                .zip(pushed)
+                .map(|(source, preds)| match combine_and(preds) {
+                    Some(pred) => Box::new(Filter::new(source, pred)) as Box<dyn PhysicalOperator>,
+                    None => source,
+                })
+                .collect();
+        }
+        // Comma joins carry no ON clause; equi-predicates between the two sides
+        // are sourced from WHERE so the join can hash instead of cross-produce.
+        let mut iter = inputs.into_iter();
+        let mut op = iter.next().expect("from is non-empty");
+        for ((kind, on), right) in clauses.into_iter().zip(iter) {
             let keys = match on.as_ref() {
                 Some(on) => analyze_hash_join(kind, Some(on), op.schema(), right.schema()),
                 None if kind == JoinKind::Cross => {
@@ -2127,7 +2196,6 @@ pub fn build_select(
                         None
                     } else {
                         where_conjuncts = kept;
-                        where_reduced = true;
                         Some(HashKeys { left_keys, right_keys, residual: None })
                     }
                 }
@@ -2138,9 +2206,8 @@ pub fn build_select(
                 None => op = Box::new(NestedLoopJoin::new(op, right, kind, on)?),
             }
         }
-        if where_reduced {
-            post_filter = combine_and(where_conjuncts);
-        }
+        // Whatever no hash key or pushed-down filter consumed is the residual.
+        post_filter = combine_and(where_conjuncts);
         (op, None)
     };
     if let Some(selection) = &post_filter {
