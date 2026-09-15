@@ -1,22 +1,21 @@
-//! A relational IR for a SELECT.
+//! The logical plan: a relational IR plus its translation and rewrites.
 //!
-//! Translation ([`logical_select`]) is a pure structural step: it exposes the
-//! query as explicit `Scan`/`Filter`/`Join`/`Project`/`Aggregate`/`Sort`/
-//! `Distinct`/`Limit` nodes instead of the quirks of [`SelectStmt`]. Rewrites
-//! such as [`pushdown`] then operate on this algebra, and the physical layer
-//! lowers the result. Access-path choice (index vs scan, hash vs nested loop)
-//! is deliberately *not* here: it stays in lowering.
-//!
-//! `Aggregate` is still one logical node for a grouped query; lowering splits
-//! it into a physical `Aggregate` plus separate HAVING/ORDER BY/projection/
-//! DISTINCT/LIMIT operators. Splitting the logical node itself is a later step.
+//! [`translate`] is a pure structural step that exposes a SELECT as explicit
+//! `Scan`/`Filter`/`Join`/`Project`/`Aggregate`/`Having`/`Sort`/`Distinct`/
+//! `Limit` nodes instead of the quirks of [`SelectStmt`]. [`optimize`] runs the
+//! logical rewrites (currently predicate pushdown) on that algebra, and the
+//! lowering step turns the result into physical operators. Access-path choice
+//! (index vs scan, hash vs nested loop) is deliberately *not* here.
 
 use crate::catalog::Schema;
 use crate::sql::ast::{Expr, JoinKind, Limit, SelectItem, SelectStmt, TableRef};
 use crate::{Database, Result};
 
-use super::eval::{expr_has_column, expr_has_subquery};
-use super::operator::{build_from_source, combine_and, items_have_aggregate, join_clauses, split_conjuncts};
+use crate::exec::aggregate::extract_aggregates;
+use crate::exec::eval::{expr_has_column, expr_has_subquery};
+use crate::exec::operator::{
+    build_from_source, combine_and, items_have_aggregate, join_clauses, split_conjuncts,
+};
 
 /// One node of the logical plan for a SELECT.
 pub(crate) enum LogicalOperator {
@@ -145,7 +144,7 @@ fn aggregate_list(select: &SelectStmt) -> Vec<Expr> {
     for (e, _) in &select.order_by {
         refs.push(e);
     }
-    super::aggregate::extract_aggregates(&refs)
+    extract_aggregates(&refs)
 }
 
 /// The output schema of a logical node, `None` when a source cannot be built

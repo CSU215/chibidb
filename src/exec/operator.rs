@@ -14,7 +14,7 @@ use crate::{Database, Error, Result};
 use super::aggregate::{self, expr_has_aggregate, sort_rows};
 use super::chunk::{CHUNK_ROWS, Chunk, Column};
 use super::eval::{eval_binary, eval_const, expr_has_column, EvalCtx};
-use super::logical::LogicalOperator;
+use crate::exec::planner::logical::LogicalOperator;
 use super::subquery::{eval_bound, eval_predicate_bound};
 
 /// Build-row indices matching one key. The common unique-key case stays inline
@@ -1736,7 +1736,7 @@ impl IndexScan {
         owner: &str,
         selection: Option<&Expr>,
     ) -> Result<Option<Self>> {
-        let Some(plan) = crate::exec::plan::plan_index_scan(db, table, selection)? else {
+        let Some(plan) = crate::exec::planner::plan_index_scan(db, table, selection)? else {
             return Ok(None);
         };
         let mut scan = Self::skeleton(db, table, owner, plan.column)?;
@@ -1751,7 +1751,7 @@ impl IndexScan {
     /// stops it once it has the rows it needs. Returns `None` without that
     /// index.
     pub fn ordered(db: &Database, table: &str, owner: &str, column: &str) -> Result<Option<Self>> {
-        let Some(file) = crate::exec::plan::ordered_index_file(db, table, column)? else {
+        let Some(file) = crate::exec::planner::ordered_index_file(db, table, column)? else {
             return Ok(None);
         };
         let mut scan = Self::skeleton(db, table, owner, column.to_string())?;
@@ -1980,7 +1980,7 @@ fn lower_single_table(
         let column = scan.ordered_column().to_string();
         let supplies_order = select.group_by.is_empty()
             && !items_have_aggregate(&select.items)
-            && crate::exec::plan::resolved_order_column(&select.items, &select.order_by)
+            && crate::exec::planner::resolved_order_column(&select.items, &select.order_by)
                 .as_deref()
                 == Some(column.as_str());
         if supplies_order {
@@ -1993,7 +1993,7 @@ fn lower_single_table(
     if select.group_by.is_empty()
         && !items_have_aggregate(&select.items)
         && let Some(column) =
-            crate::exec::plan::resolved_order_column(&select.items, &select.order_by)
+            crate::exec::planner::resolved_order_column(&select.items, &select.order_by)
         && let Some(scan) = IndexScan::ordered(db, &tref.name, owner, &column)?
     {
         let column = scan.ordered_column().to_string();
@@ -2148,7 +2148,7 @@ pub(crate) fn lower(
                     return Ok(None);
                 };
                 let skip = ordered_by.as_deref().is_some_and(|column| {
-                    crate::exec::plan::resolved_order_column(&select.items, order_by).as_deref()
+                    crate::exec::planner::resolved_order_column(&select.items, order_by).as_deref()
                         == Some(column)
                 });
                 if skip {

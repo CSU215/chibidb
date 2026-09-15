@@ -1,14 +1,21 @@
 //! The planner is the single place that composes the stages for one statement:
-//! fold expressions on the AST, translate a SELECT into a [`LogicalOperator`],
+//! fold expressions on the AST, translate a SELECT into a [`logical::LogicalOperator`],
 //! optimize the logical plan, then lower it to physical operators.
 //!
 //! Keeping the composition here means `operator` only ever turns a logical plan
 //! into physical operators; it never orchestrates the logical layer itself.
 
+mod access;
+mod explain;
+mod fold;
+pub(crate) mod logical;
+
+pub(crate) use explain::execute_explain;
+pub(crate) use access::{ordered_index_file, plan_index_scan, resolved_order_column};
+
 use crate::sql::ast::{Expr, SelectItem, SelectStmt, Stmt};
 use crate::{Database, Result};
 
-use super::logical;
 use super::operator::{self, ConstantScan, PhysicalOperator, Project, Union};
 
 /// Plans `stmt`, or `None` for statements the operator layer does not cover.
@@ -18,7 +25,7 @@ pub fn plan_statement(
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
     // Expression rewrites (constant folding, boolean simplification) run first;
     // they are shared by SELECT and DML.
-    let folded = super::optimize::fold_stmt(stmt);
+    let folded = fold::fold_stmt(stmt);
     match &folded {
         Stmt::Select(select) => plan_select(db, select),
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => operator::build_dml(&folded),

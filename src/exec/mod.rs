@@ -14,10 +14,7 @@ mod aggregate;
 pub mod chunk;
 mod dml;
 mod eval;
-pub(crate) mod logical;
-pub(crate) mod optimize;
 pub mod operator;
-pub(crate) mod plan;
 pub mod planner;
 mod subquery;
 
@@ -25,7 +22,7 @@ pub use eval::eval_const;
 
 use aggregate::cmp_sort_keys;
 use eval::EvalCtx;
-use plan::execute_explain;
+use planner::execute_explain;
 use subquery::{eval_bound, eval_predicate_bound};
 
 pub(crate) fn execute(db: &Database, trx: &mut TrxState, stmt: &Stmt) -> Result<ResultSet> {

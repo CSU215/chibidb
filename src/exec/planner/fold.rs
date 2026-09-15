@@ -13,7 +13,7 @@
 use crate::sql::ast::{BinOp, DeleteStmt, Expr, InsertStmt, SelectStmt, Stmt, UpdateStmt};
 use crate::value::Value;
 
-use super::eval::{eval_const, expr_has_column, expr_has_subquery};
+use crate::exec::eval::{eval_const, expr_has_column, expr_has_subquery};
 
 /// Returns a copy of `stmt` with its constant subexpressions folded.
 pub(crate) fn fold_stmt(stmt: &Stmt) -> Stmt {

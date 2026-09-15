@@ -1,34 +1,14 @@
-use crate::sql::ast::{BinOp, Expr, ExplainStmt, SelectItem, Stmt};
+//! Access-path selection: which index (if any) satisfies a sargable predicate,
+//! and the ORDER BY column an in-order index scan can supply instead of a sort.
+
+use crate::sql::ast::{BinOp, Expr, SelectItem};
 use crate::index::{encode_key, BTree, Bound};
-use crate::sql::result::ResultSet;
 use crate::storage::Rid;
 use crate::value::DataType;
-use crate::{Database, Error, Result};
+use crate::{Database, Result};
 
-use super::coerce;
-use super::eval::{eval_const, expr_has_column, expr_has_subquery};
-
-pub(crate) fn execute_explain(db: &Database, e: &ExplainStmt) -> Result<ResultSet> {
-    match &*e.stmt {
-        Stmt::Select(s) => {
-            let mut out = String::from("LogicalPlan:\n");
-            match super::logical::translate(s) {
-                Some(node) => match super::logical::optimize(db, node)? {
-                    Some(node) => out.push_str(&super::logical::logical_tree(&node)),
-                    None => out.push_str("  (no logical plan)\n"),
-                },
-                None => out.push_str("  (handled by the materialized executor)\n"),
-            }
-            out.push_str("PhysicalPlan:\n");
-            match super::planner::plan_statement(db, &Stmt::Select(s.clone()))? {
-                Some(op) => out.push_str(&super::operator::physical_tree(op.as_ref())),
-                None => out.push_str("  (no physical plan)\n"),
-            }
-            Ok(ResultSet::Message(out))
-        }
-        _ => Err(Error::Runtime("explain supports select only".into())),
-    }
-}
+use crate::exec::coerce;
+use crate::exec::eval::{eval_const, expr_has_column, expr_has_subquery};
 
 /// The plain column of a single ascending ORDER BY key, after resolving SELECT
 /// aliases. `SELECT b AS id ... ORDER BY id` therefore resolves to `b`, so an

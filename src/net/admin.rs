@@ -188,9 +188,9 @@ fn resolve_statement(
     let Stmt::Select(select) = stmt else {
         return Ok((None, None));
     };
-    let plan = match crate::exec::logical::translate(select) {
-        Some(node) => crate::exec::logical::optimize(&guard, node)?
-            .map(|node| crate::exec::logical::logical_tree(&node)),
+    let plan = match crate::exec::planner::logical::translate(select) {
+        Some(node) => crate::exec::planner::logical::optimize(&guard, node)?
+            .map(|node| crate::exec::planner::logical::logical_tree(&node)),
         None => None,
     };
     let physical = crate::exec::planner::plan_statement(&guard, stmt)?
