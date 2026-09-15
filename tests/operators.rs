@@ -1,5 +1,6 @@
 use chaoticdb::sql::ast::{BinOp, Expr, Stmt};
-use chaoticdb::exec::operator::{build_select, build_statement, Filter, Limit, Project, TableScan};
+use chaoticdb::exec::operator::{Filter, Limit, Project, TableScan};
+use chaoticdb::exec::planner::{plan_select as build_select, plan_statement as build_statement};
 use chaoticdb::value::Value;
 use chaoticdb::{Database, Session};
 

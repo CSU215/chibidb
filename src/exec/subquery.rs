@@ -144,7 +144,7 @@ fn run_subquery(
     sub: &crate::sql::ast::SelectStmt,
     outer: Option<&EvalCtx>,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-    let Some(mut plan) = crate::exec::operator::build_select(db, sub)? else {
+    let Some(mut plan) = crate::exec::planner::plan_select(db, sub)? else {
         return Err(Error::Runtime(
             "subquery shape is not supported by the operators".into(),
         ));

@@ -12,15 +12,15 @@ pub(crate) fn execute_explain(db: &Database, e: &ExplainStmt) -> Result<ResultSe
     match &*e.stmt {
         Stmt::Select(s) => {
             let mut out = String::from("LogicalPlan:\n");
-            match super::logical::logical_select(s) {
-                Some(node) => match super::logical::pushdown(db, node)? {
+            match super::logical::translate(s) {
+                Some(node) => match super::logical::optimize(db, node)? {
                     Some(node) => out.push_str(&super::logical::logical_tree(&node)),
                     None => out.push_str("  (no logical plan)\n"),
                 },
                 None => out.push_str("  (handled by the materialized executor)\n"),
             }
             out.push_str("PhysicalPlan:\n");
-            match super::operator::build_statement(db, &Stmt::Select(s.clone()))? {
+            match super::planner::plan_statement(db, &Stmt::Select(s.clone()))? {
                 Some(op) => out.push_str(&super::operator::physical_tree(op.as_ref())),
                 None => out.push_str("  (no physical plan)\n"),
             }

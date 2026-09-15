@@ -576,19 +576,15 @@ impl Database {
         session: &mut Session,
         stmt: &Stmt,
     ) -> Result<ResultSet> {
-        // Rewrite before planning so both the operator path and the fallback
-        // executor see the folded expressions.
-        let folded = crate::exec::optimize::fold_stmt(stmt);
-        let stmt = &folded;
         for table in referenced_tables(stmt) {
             let known = self.table_exists(&table) || self.catalog().view(&table).is_some();
             if !known {
                 return Err(Error::Runtime(format!("no such table: {table}")));
             }
         }
-        // Access-path validation happens inside `build_statement`, which plans
-        // the SELECT on the logical plan.
-        let mut physical = crate::exec::operator::build_statement(self, stmt)?;
+        // The planner folds expressions, translates/optimizes the logical plan
+        // and lowers it to physical operators.
+        let mut physical = crate::exec::planner::plan_statement(self, stmt)?;
         if let Some(plan) = physical.as_mut() {
             let kind = plan.output_kind();
             let columns: Vec<String> =

@@ -45,8 +45,8 @@ pub(crate) enum LogicalOperator {
 }
 
 /// Translates a SELECT into a logical plan. Returns `None` for shapes handled
-/// directly by the builder (no FROM, or a UNION chain).
-pub(crate) fn logical_select(select: &SelectStmt) -> Option<LogicalOperator> {
+/// directly by the planner (no FROM, or a UNION chain).
+pub(crate) fn translate(select: &SelectStmt) -> Option<LogicalOperator> {
     if select.from.is_empty() || !select.set_ops.is_empty() {
         return None;
     }
@@ -172,8 +172,8 @@ fn schema(db: &Database, node: &LogicalOperator) -> Result<Option<Schema>> {
     }
 }
 
-/// Applies the logical rewrites to the FROM region beneath the upper nodes.
-pub(crate) fn pushdown(
+/// Applies the logical rewrites to the plan (currently predicate pushdown).
+pub(crate) fn optimize(
     db: &Database,
     node: LogicalOperator,
 ) -> Result<Option<LogicalOperator>> {
@@ -182,34 +182,34 @@ pub(crate) fn pushdown(
         | LogicalOperator::Filter { .. }
         | LogicalOperator::Join { .. }) => pushdown_region(db, node)?,
         LogicalOperator::Aggregate { input, group_by, aggregates } => {
-            pushdown(db, *input)?.map(|n| LogicalOperator::Aggregate {
+            optimize(db, *input)?.map(|n| LogicalOperator::Aggregate {
                 input: Box::new(n),
                 group_by,
                 aggregates,
             })
         }
         LogicalOperator::Having { input, predicate } => {
-            pushdown(db, *input)?.map(|n| LogicalOperator::Having {
+            optimize(db, *input)?.map(|n| LogicalOperator::Having {
                 input: Box::new(n),
                 predicate,
             })
         }
         LogicalOperator::Project { input, items } => {
-            pushdown(db, *input)?.map(|n| LogicalOperator::Project {
+            optimize(db, *input)?.map(|n| LogicalOperator::Project {
                 input: Box::new(n),
                 items,
             })
         }
         LogicalOperator::Sort { input, order_by } => {
-            pushdown(db, *input)?.map(|n| LogicalOperator::Sort {
+            optimize(db, *input)?.map(|n| LogicalOperator::Sort {
                 input: Box::new(n),
                 order_by,
             })
         }
         LogicalOperator::Distinct { input } => {
-            pushdown(db, *input)?.map(|n| LogicalOperator::Distinct { input: Box::new(n) })
+            optimize(db, *input)?.map(|n| LogicalOperator::Distinct { input: Box::new(n) })
         }
-        LogicalOperator::Limit { input, limit } => pushdown(db, *input)?.map(|n| {
+        LogicalOperator::Limit { input, limit } => optimize(db, *input)?.map(|n| {
             LogicalOperator::Limit { input: Box::new(n), limit }
         }),
     })

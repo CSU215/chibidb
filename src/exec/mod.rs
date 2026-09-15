@@ -18,6 +18,7 @@ pub(crate) mod logical;
 pub(crate) mod optimize;
 pub mod operator;
 pub(crate) mod plan;
+pub mod planner;
 mod subquery;
 
 pub use eval::eval_const;
@@ -188,7 +189,7 @@ fn execute_create_view(
     let Some(Stmt::Select(sel)) = stmts.into_iter().next() else {
         return Err(Error::Runtime("view must be defined by a select".into()));
     };
-    let Some(mut plan) = operator::build_select(db, &sel)? else {
+    let Some(mut plan) = planner::plan_select(db, &sel)? else {
         return Err(Error::Runtime("view must be defined by a supported select".into()));
     };
     {

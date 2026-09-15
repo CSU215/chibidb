@@ -359,7 +359,7 @@ impl ViewScan {
         let Some(crate::sql::ast::Stmt::Select(select)) = stmts.into_iter().next() else {
             return Ok(None);
         };
-        let Some(plan) = build_select(db, &select)? else {
+        let Some(plan) = super::planner::plan_select(db, &select)? else {
             return Ok(None);
         };
         let schema = Schema {
@@ -1884,25 +1884,21 @@ impl PhysicalOperator for IndexScan {
     }
 }
 
-/// Builds a plan for statements the operator layer covers: SELECT and DML.
-/// Other statements (DDL, EXPLAIN, transaction control) return `None`.
-pub fn build_statement(
-    db: &Database,
-    stmt: &Stmt,
-) -> Result<Option<Box<dyn PhysicalOperator>>> {
-    match stmt {
-        Stmt::Select(select) => build_select(db, select),
+/// Builds the physical command for a DML statement; `None` for anything else.
+/// SELECT planning lives in [`super::planner`].
+pub(crate) fn build_dml(stmt: &Stmt) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    Ok(match stmt {
         Stmt::Insert(insert) => {
-            Ok(Some(Box::new(crate::exec::dml::InsertOp::new(insert.clone()))))
+            Some(Box::new(crate::exec::dml::InsertOp::new(insert.clone())))
         }
         Stmt::Update(update) => {
-            Ok(Some(Box::new(crate::exec::dml::UpdateOp::new(update.clone()))))
+            Some(Box::new(crate::exec::dml::UpdateOp::new(update.clone())))
         }
         Stmt::Delete(delete) => {
-            Ok(Some(Box::new(crate::exec::dml::DeleteOp::new(delete.clone()))))
+            Some(Box::new(crate::exec::dml::DeleteOp::new(delete.clone())))
         }
-        _ => Ok(None),
-    }
+        _ => None,
+    })
 }
 
 /// Builds a scan for one FROM entry: a table scan or a view sub-plan.
@@ -2053,44 +2049,10 @@ fn lower_join_tree(
     }
 }
 
-/// Builds a physical plan for a SELECT. Returns `None` for any shape the
-/// operators do not cover yet, leaving the materialized executor as fallback.
-pub fn build_select(
-    db: &Database,
-    select: &SelectStmt,
-) -> Result<Option<Box<dyn PhysicalOperator>>> {
-    // set operations: build each operand, then apply the trailing order/limit
-    if !select.set_ops.is_empty() {
-        return build_set_op(db, select);
-    }
-
-    // no FROM: a single projected tuple (distinct/order/limit are ignored by
-    // the materialized path here, so we match that)
-    if select.from.is_empty() {
-        if select.items.iter().any(|it| matches!(it, SelectItem::Star))
-            || items_have_aggregate(&select.items)
-        {
-            return Ok(None);
-        }
-        let (exprs, headers) = projection_exprs(&select.items);
-        let plan = Project::new(Box::new(ConstantScan::new()), exprs, headers);
-        return Ok(Some(Box::new(plan)));
-    }
-
-    // FROM: build the logical plan, push single-source predicates, then lower.
-    let Some(logical) = super::logical::logical_select(select) else {
-        return Ok(None);
-    };
-    let Some(logical) = super::logical::pushdown(db, logical)? else {
-        return Ok(None);
-    };
-    lower(db, select, &logical)
-}
-
 /// Lowers a logical plan to physical operators, reusing the access-path choices
 /// the builder made directly before. `select` supplies what the logical nodes
 /// leave implicit (item expansion for `*`, ORDER BY aliases).
-fn lower(
+pub(crate) fn lower(
     db: &Database,
     select: &SelectStmt,
     node: &LogicalOperator,
@@ -2251,48 +2213,6 @@ fn rewrite_item(item: &SelectItem, aggregates: &[Expr]) -> SelectItem {
         }
         SelectItem::Star => SelectItem::Star,
     }
-}
-
-/// Builds the plan for a UNION [ALL] chain: each operand is planned, then the
-/// trailing ORDER BY / LIMIT apply to the whole result.
-fn build_set_op(
-    db: &Database,
-    select: &SelectStmt,
-) -> Result<Option<Box<dyn PhysicalOperator>>> {
-    let mut base = select.clone();
-    base.set_ops = Vec::new();
-    let order_by = std::mem::take(&mut base.order_by);
-    let limit = base.limit.take();
-    let Some(base_plan) = build_select(db, &base)? else {
-        return Ok(None);
-    };
-    let mut inputs: Vec<(bool, Box<dyn PhysicalOperator>)> = vec![(true, base_plan)];
-    for (all, operand) in &select.set_ops {
-        let Some(plan) = build_select(db, operand)? else {
-            return Ok(None);
-        };
-        inputs.push((*all, plan));
-    }
-    Ok(Some(Box::new(Union::new(inputs, order_by, limit))))
-}
-
-fn projection_exprs(items: &[SelectItem]) -> (Vec<Expr>, Vec<String>) {
-    let mut exprs = Vec::new();
-    let mut headers = Vec::new();
-    for item in items {
-        match item {
-            SelectItem::Expr(e) => {
-                headers.push(e.to_string());
-                exprs.push(e.clone());
-            }
-            SelectItem::Aliased(e, alias) => {
-                headers.push(alias.clone());
-                exprs.push(e.clone());
-            }
-            SelectItem::Star => unreachable!("star is rejected before projection"),
-        }
-    }
-    (exprs, headers)
 }
 
 /// Expands SELECT items against `schema`: `*` becomes owner-qualified column

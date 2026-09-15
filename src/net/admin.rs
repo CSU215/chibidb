@@ -188,12 +188,12 @@ fn resolve_statement(
     let Stmt::Select(select) = stmt else {
         return Ok((None, None));
     };
-    let plan = match crate::exec::logical::logical_select(select) {
-        Some(node) => crate::exec::logical::pushdown(&guard, node)?
+    let plan = match crate::exec::logical::translate(select) {
+        Some(node) => crate::exec::logical::optimize(&guard, node)?
             .map(|node| crate::exec::logical::logical_tree(&node)),
         None => None,
     };
-    let physical = operator::build_statement(&guard, stmt)?
+    let physical = crate::exec::planner::plan_statement(&guard, stmt)?
         .map(|op| operator::physical_tree(op.as_ref()));
     Ok((plan, physical))
 }

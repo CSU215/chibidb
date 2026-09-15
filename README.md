@@ -57,7 +57,7 @@ REPL / client 中输入 `exit` 或 `quit` 退出。启动时从**当前工作目
 （源码在 `web/demo/`，编译期由 `include_str!` 内嵌；`web.enabled` 为真时优先于 `server.web_root`）：
 
 - **SQL 控制台**：执行 SQL 并展示结果表 / affected / 错误；会话可跨请求（事务）。
-- **编译流水线**：输入 → Token 流 → Statement(AST) → Plan(访问路径) → PhysicalOperator(缩进算子树)。
+- **编译流水线**：输入 → Token 流 → Statement(AST) → LogicalOperator（逻辑计划）→ 优化 → PhysicalOperator（缩进算子树）。
 - **存储与页**：浏览数据目录文件、页导航、文件头 / 槽目录 / B+ 节点结构 + Hex / ASCII。
 - **BufferPool**：各库缓冲池的命中率、命中 / 未命中、淘汰（clean / dirty）与驻留帧 / 容量。
 - **Schema 树**：库 / 表 / 列与约束。
