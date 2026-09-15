@@ -188,6 +188,23 @@ fn schema_lists_the_created_table_and_columns() {
 }
 
 #[test]
+fn schema_lists_views_with_their_definition() {
+    let (addr, _dir) = start_server(demo_config(true));
+    for sql in ["create table t (id int);", "create view v as select id from t;"] {
+        let response = query(addr, sql);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{sql}: {response}");
+    }
+
+    let response = get(addr, "/api/schema");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let payload = body(&response);
+    assert!(
+        payload.contains(r#""views":[{"name":"v","sql":"select id from t"}]"#),
+        "{payload}"
+    );
+}
+
+#[test]
 fn files_lists_the_catalog_and_the_table_file() {
     let (addr, _dir) = start_server(demo_config(true));
     setup(addr);

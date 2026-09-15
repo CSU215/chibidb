@@ -1,7 +1,7 @@
 use chaoticdb::config::Config;
 use chaoticdb::instance::Instance;
 use chaoticdb::value::Value;
-use chaoticdb::ResultSet;
+use chaoticdb::{ResultSet, Session};
 
 fn open(dir: &tempfile::TempDir) -> Instance {
     Instance::open(dir.path(), &Config::default()).unwrap()
@@ -47,6 +47,27 @@ fn rejects_duplicate_invalid_and_reserved_names() {
     assert!(inst.create_database("").is_err());
     assert!(inst.create_database("bad name").is_err());
     assert!(inst.create_database("chibi_meta").is_err());
+    assert!(inst.create_database("information_schema").is_err());
+    assert!(inst.drop_database("chibi_meta").is_err());
+    assert!(inst.drop_database("information_schema").is_err());
+}
+
+#[test]
+fn show_databases_includes_the_system_and_virtual_databases() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = open(&dir);
+    inst.create_database("shop").unwrap();
+    let mut s = Session::new();
+    let rs = inst.execute_with(&mut s, "show databases;").unwrap().remove(0);
+    let ResultSet::Rows { rows, .. } = rs else { panic!("expected rows") };
+    let names: Vec<String> = rows
+        .into_iter()
+        .map(|r| match &r[0] {
+            Value::Str(name) => name.clone(),
+            other => panic!("expected a name, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["information_schema", "shop"]);
 }
 
 #[test]

@@ -277,6 +277,8 @@ body {
 
 .schema-mini .tbl-btn:hover { background: var(--accent-soft); color: #cfe4ff; }
 
+.schema-mini .view-btn { color: #7ee787; font-style: italic; }
+
 .schema-mini .col-list {
   margin: 0 0 4px 0;
   padding: 0 0 4px 14px;
@@ -662,6 +664,17 @@ pre.code {
 .badge-unique { color: #79c0ff; border-color: rgba(121, 192, 255, 0.4); }
 .badge-notnull { color: #ff7b72; border-color: rgba(255, 123, 114, 0.4); }
 .badge-default { color: #d2a8ff; border-color: rgba(210, 168, 255, 0.4); }
+.badge-view { color: #7ee787; border-color: rgba(126, 231, 135, 0.4); }
+
+.view-block { border-left-color: #7ee787; }
+.view-sql {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 /* ---------- buffer pool ---------- */
 .stat-grid {

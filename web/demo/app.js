@@ -372,6 +372,21 @@
         });
         group.append(ul);
       });
+      (db.views || []).forEach(function (v) {
+        group.append(el('button', {
+          className: 'tbl-btn view-btn',
+          text: v.name + ' · view',
+          title: v.sql || '',
+          attrs: { type: 'button' },
+          on: {
+            click: function () {
+              var input = $('#sql-input');
+              input.value = 'SELECT * FROM ' + v.name + ';';
+              input.focus();
+            }
+          }
+        }));
+      });
       box.append(group);
     });
   }
@@ -393,15 +408,18 @@
     clear(box);
     var dbs = (schema && schema.databases) || [];
     var tableCount = 0;
+    var viewCount = 0;
     if (!dbs.length) {
       box.append(el('span', { className: 'muted', text: '（无数据库）' }));
       return;
     }
     dbs.forEach(function (db) {
       var dbBlock = el('div', { className: 'db-block' });
+      var counts = (db.tables || []).length + ' tables';
+      if ((db.views || []).length) counts += ' · ' + (db.views || []).length + ' views';
       dbBlock.append(el('div', { className: 'db-title' }, [
         el('span', { text: db.name }),
-        badge((db.tables || []).length + ' tables')
+        badge(counts)
       ]));
       (db.tables || []).forEach(function (t) {
         tableCount++;
@@ -434,10 +452,20 @@
         tbl.append(table);
         dbBlock.append(tbl);
       });
+      (db.views || []).forEach(function (v) {
+        viewCount++;
+        var vb = el('div', { className: 'tbl-block view-block' });
+        vb.append(el('div', { className: 'tbl-title' }, [
+          el('span', { className: 't-name', text: v.name }),
+          badge('view', 'badge-view')
+        ]));
+        vb.append(el('pre', { className: 'view-sql', text: v.sql == null ? '' : v.sql }));
+        dbBlock.append(vb);
+      });
       box.append(dbBlock);
     });
     var summary = $('#schema-summary');
-    if (summary) summary.textContent = dbs.length + ' databases · ' + tableCount + ' tables';
+    if (summary) summary.textContent = dbs.length + ' databases · ' + tableCount + ' tables · ' + viewCount + ' views';
   }
 
   function populateDbSelect(schema) {

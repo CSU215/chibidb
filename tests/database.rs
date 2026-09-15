@@ -154,7 +154,7 @@ fn show_databases_lists_registered_databases() {
     inst.execute_with(&mut s, "create database blog;").unwrap();
     let rs = inst.execute_with(&mut s, "show databases;").unwrap();
     assert_eq!(columns_and_rows(&rs).0, ["database"].map(String::from).as_slice());
-    assert_eq!(column_strings(&rs), ["blog", "shop"]);
+    assert_eq!(column_strings(&rs), ["blog", "information_schema", "shop"]);
 }
 
 #[test]

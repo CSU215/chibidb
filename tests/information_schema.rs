@@ -76,6 +76,29 @@ fn information_schema_reports_the_page_layout() {
 }
 
 #[test]
+fn information_schema_exposes_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let inst = Instance::open(dir.path(), &Config::default()).unwrap();
+    let mut s = Session::new();
+    inst.execute_with(&mut s, "create database shop;").unwrap();
+    inst.execute_with(&mut s, "use shop;").unwrap();
+    inst.execute_with(&mut s, "create table t (id int, name char(8));").unwrap();
+    inst.execute_with(&mut s, "create view v as select id from t where name = 'x';").unwrap();
+
+    inst.execute_with(&mut s, "use information_schema;").unwrap();
+    let views =
+        rows(&inst, &mut s, "select table_schema, table_name, view_definition from views;");
+    assert_eq!(
+        views,
+        [[
+            Value::Str("shop".into()),
+            Value::Str("v".into()),
+            Value::Str("select id from t where name = 'x'".into()),
+        ]]
+    );
+}
+
+#[test]
 fn information_schema_is_read_only() {
     let dir = tempfile::tempdir().unwrap();
     let inst = Instance::open(dir.path(), &Config::default()).unwrap();

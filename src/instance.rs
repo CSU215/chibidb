@@ -221,11 +221,11 @@ impl Instance {
                     out.push(ResultSet::Message("SUCCESS".into()));
                 }
                 Stmt::ShowDatabases => {
-                    let rows = self
-                        .databases()?
-                        .into_iter()
-                        .map(|name| vec![Value::Str(name)])
-                        .collect();
+                    let mut names = self.databases()?;
+                    names.push(INFORMATION_SCHEMA.to_string());
+                    names.sort();
+                    let rows =
+                        names.into_iter().map(|name| vec![Value::Str(name)]).collect();
                     out.push(ResultSet::Rows { columns: vec!["database".into()], rows });
                 }
                 Stmt::Use(u) => {
@@ -356,6 +356,9 @@ impl Instance {
             "create table columns (table_schema char(64), table_name char(64), \
              column_name char(64), data_type char(32), not_null int, primary_key int, is_unique int);",
         )?;
+        db.execute_sql(
+            "create table views (table_schema char(64), table_name char(64), view_definition text);",
+        )?;
         for name in self.databases()? {
             db.execute_sql(&format!("insert into schemata values ('{name}');"))?;
             let handle = self.database(&name)?;
@@ -384,6 +387,13 @@ impl Instance {
                         c.unique as i32,
                     ))?;
                 }
+            }
+            for v in guard.catalog().view_metas() {
+                db.execute_sql(&format!(
+                    "insert into views values ('{name}', '{}', '{}');",
+                    sql_lit(&v.name),
+                    sql_lit(&v.sql)
+                ))?;
             }
         }
         Ok(())
@@ -606,10 +616,15 @@ fn delete_privileges(meta: &Database, predicate: &str) -> Result<()> {
 }
 
 fn validate_name(name: &str) -> Result<()> {
-    if name == META_DIR {
+    if name == META_DIR || name == INFORMATION_SCHEMA {
         return Err(Error::Runtime(format!("database name is reserved: {name}")));
     }
     validate_ident(name, "database name")
+}
+
+/// Escapes `s` for embedding in a single-quoted SQL string literal.
+fn sql_lit(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "''")
 }
 
 fn validate_ident(name: &str, what: &str) -> Result<()> {

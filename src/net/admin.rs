@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use crate::catalog::meta::TableMeta;
+use crate::catalog::meta::{TableMeta, ViewMeta};
 use crate::config::{Config, EngineKind, PageLayout, WebRootState};
 use crate::exec::operator;
 use crate::instance::Instance;
@@ -271,11 +271,13 @@ fn schema_trace(instance: &Instance) -> Response {
         };
         let guard = db.read();
         let tables: Vec<String> = guard.catalog().table_metas().iter().map(table_json).collect();
+        let views: Vec<String> = guard.catalog().view_metas().iter().map(view_json).collect();
         databases.push(format!(
-            "{{\"name\":{},\"system\":{},\"tables\":[{}]}}",
+            "{{\"name\":{},\"system\":{},\"tables\":[{}],\"views\":[{}]}}",
             json_string(&name),
             system,
-            tables.join(",")
+            tables.join(","),
+            views.join(",")
         ));
     }
     Response::json("200 OK", format!("{{\"databases\":[{}]}}", databases.join(",")))
@@ -315,6 +317,14 @@ fn table_json(meta: &TableMeta) -> String {
         json_string(engine),
         json_string(layout),
         columns.join(",")
+    )
+}
+
+fn view_json(meta: &ViewMeta) -> String {
+    format!(
+        "{{\"name\":{},\"sql\":{}}}",
+        json_string(&meta.name),
+        json_string(&meta.sql)
     )
 }
 
