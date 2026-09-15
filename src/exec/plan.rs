@@ -1,4 +1,4 @@
-use crate::sql::ast::{BinOp, Expr, ExplainStmt, SelectItem, SelectStmt, Stmt};
+use crate::sql::ast::{BinOp, Expr, ExplainStmt, SelectItem, Stmt};
 use crate::index::{encode_key, BTree, Bound};
 use crate::sql::result::ResultSet;
 use crate::storage::Rid;
@@ -10,59 +10,23 @@ use super::eval::{eval_const, expr_has_column, expr_has_subquery};
 
 pub(crate) fn execute_explain(db: &Database, e: &ExplainStmt) -> Result<ResultSet> {
     match &*e.stmt {
-        Stmt::Select(s) => Ok(ResultSet::Message(plan_select(db, s)?)),
-        _ => Err(Error::Runtime("explain supports select only".into())),
-    }
-}
-
-pub(crate) fn plan_select(db: &Database, s: &SelectStmt) -> Result<String> {
-    if s.from.is_empty() {
-        return Ok("ConstantSelect -> Project".into());
-    }
-    if s.from.len() > 1 {
-        let strategy = if super::operator::select_uses_hash_join(db, s)? {
-            "HashJoin"
-        } else {
-            "NestedLoopJoin"
-        };
-        return Ok(format!(
-            "{strategy}(tables={}) -> Filter -> Project",
-            s.from.len()
-        ));
-    }
-    match find_sargable(db, &s.from[0].name, s.selection.as_ref())? {
-        Some(sarg) => {
-            let ordered = resolved_order_column(&s.items, &s.order_by).as_deref()
-                == Some(sarg.column.as_str())
-                && s.group_by.is_empty()
-                && !super::operator::items_have_aggregate(&s.items);
-            let kind = if ordered { "OrderedIndexScan" } else { "IndexScan" };
-            Ok(format!(
-                "{kind}(index={}, table={}, {}) -> Filter -> Project",
-                sarg.index,
-                s.from[0].name,
-                describe_sarg(&sarg)
-            ))
-        }
-        None => {
-            if let Some(col) = resolved_order_column(&s.items, &s.order_by)
-                && s.group_by.is_empty()
-                && !super::operator::items_have_aggregate(&s.items)
-                && db.catalog().view(&s.from[0].name).is_none()
-                && let Some(ix) = db
-                    .catalog()
-                    .indexes_for(&s.from[0].name)
-                    .into_iter()
-                    .find(|ix| ix.column == col)
-            {
-                Ok(format!(
-                    "OrderedIndexScan(index={}, table={}) -> Filter -> Project",
-                    ix.name, s.from[0].name
-                ))
-            } else {
-                Ok(format!("FullScan(table={}) -> Filter -> Project", s.from[0].name))
+        Stmt::Select(s) => {
+            let mut out = String::from("LogicalPlan:\n");
+            match super::logical::logical_select(s) {
+                Some(node) => match super::logical::pushdown(db, node)? {
+                    Some(node) => out.push_str(&super::logical::logical_tree(&node)),
+                    None => out.push_str("  (no logical plan)\n"),
+                },
+                None => out.push_str("  (handled by the materialized executor)\n"),
             }
+            out.push_str("PhysicalPlan:\n");
+            match super::operator::build_statement(db, &Stmt::Select(s.clone()))? {
+                Some(op) => out.push_str(&super::operator::physical_tree(op.as_ref())),
+                None => out.push_str("  (no physical plan)\n"),
+            }
+            Ok(ResultSet::Message(out))
         }
+        _ => Err(Error::Runtime("explain supports select only".into())),
     }
 }
 
@@ -266,6 +230,9 @@ fn bound<'a>(key: Option<&'a Vec<u8>>, inclusive: bool) -> Bound<'a> {
 /// `IndexScan` operator consumes this.
 pub(crate) struct IndexScanRids {
     pub column: String,
+    /// Index name and a human-readable predicate, for EXPLAIN / visualisation.
+    pub index: String,
+    pub predicate: String,
     pub rids: Vec<Rid>,
 }
 
@@ -304,7 +271,13 @@ pub(crate) fn plan_index_scan(
             scan_rids(&btree, &db.pool, start, end)?
         }
     };
-    Ok(Some(IndexScanRids { column: sarg.column, rids }))
+    let predicate = describe_sarg(&sarg);
+    Ok(Some(IndexScanRids {
+        column: sarg.column,
+        index: sarg.index,
+        predicate,
+        rids,
+    }))
 }
 
 fn scan_rids(

@@ -316,7 +316,7 @@ impl PhysicalOperator for TableScan {
     }
 
     fn label(&self) -> String {
-        format!("TableScan table={}", self.table)
+        format!("FullScan table={}", self.table)
     }
 }
 
@@ -1280,46 +1280,6 @@ pub(crate) fn join_clauses(select: &SelectStmt) -> Vec<(JoinKind, Option<Expr>)>
     out
 }
 
-/// Whether the left-deep join chain hashes at least one pair. Lets `EXPLAIN`
-/// report a comma join rewritten onto WHERE equi-keys as a `HashJoin`.
-pub(crate) fn select_uses_hash_join(db: &Database, s: &SelectStmt) -> Result<bool> {
-    if s.from.len() < 2 {
-        return Ok(false);
-    }
-    let Some(first) = build_from_source(db, &s.from[0])? else {
-        return Ok(false);
-    };
-    let mut left_schema = first.schema().clone();
-    let mut where_conjuncts: Vec<Expr> =
-        s.selection.as_ref().map(split_conjuncts).unwrap_or_default()
-            .into_iter().cloned().collect();
-    for (i, (kind, on)) in join_clauses(s).into_iter().enumerate() {
-        let Some(right) = build_from_source(db, &s.from[i + 1])? else {
-            return Ok(false);
-        };
-        let right_schema = right.schema().clone();
-        let hashed = match on.as_ref() {
-            Some(on) => analyze_hash_join(kind, Some(on), &left_schema, &right_schema).is_some(),
-            None if kind == JoinKind::Cross => {
-                let (left_keys, _, kept) =
-                    extract_hash_keys(&where_conjuncts, &left_schema, &right_schema);
-                if left_keys.is_empty() {
-                    false
-                } else {
-                    where_conjuncts = kept;
-                    true
-                }
-            }
-            None => false,
-        };
-        if hashed {
-            return Ok(true);
-        }
-        left_schema.columns.extend(right_schema.columns.iter().cloned());
-    }
-    Ok(false)
-}
-
 /// Appends one key component to `out`, length-prefixed so components cannot
 /// run together. Returns `false` for a NULL value (the key never matches).
 fn push_key_component(out: &mut Vec<u8>, value: &Value) -> Result<bool> {
@@ -1863,6 +1823,11 @@ pub struct IndexScan {
     schema: Schema,
     engine: std::sync::Arc<dyn crate::storage::engine::TableStorage>,
     column: String,
+    /// Index name and predicate, kept for EXPLAIN / visualisation.
+    index: String,
+    predicate: String,
+    /// True for the ORDER BY-driven in-order cursor (no WHERE selection).
+    ordered: bool,
     rids: Vec<Rid>,
     /// A lazy in-order cursor over the index; when set, `rids` is unused.
     cursor: Option<crate::index::LeafCursor>,
@@ -1886,6 +1851,8 @@ impl IndexScan {
             return Ok(None);
         };
         let mut scan = Self::skeleton(db, table, owner, plan.column)?;
+        scan.index = plan.index;
+        scan.predicate = plan.predicate;
         scan.rids = plan.rids;
         Ok(Some(scan))
     }
@@ -1899,6 +1866,14 @@ impl IndexScan {
             return Ok(None);
         };
         let mut scan = Self::skeleton(db, table, owner, column.to_string())?;
+        scan.index = db
+            .catalog()
+            .indexes_for(table)
+            .into_iter()
+            .find(|ix| ix.column == column)
+            .map(|ix| ix.name.clone())
+            .unwrap_or_default();
+        scan.ordered = true;
         scan.cursor = Some(crate::index::BTree::at(file).leaf_cursor(&db.pool)?);
         Ok(Some(scan))
     }
@@ -1921,6 +1896,9 @@ impl IndexScan {
             schema,
             engine,
             column,
+            index: String::new(),
+            predicate: String::new(),
+            ordered: false,
             rids: Vec::new(),
             cursor: None,
             pos: 0,
@@ -1930,6 +1908,12 @@ impl IndexScan {
     /// The indexed column, which the scan yields in ascending order.
     pub fn ordered_column(&self) -> &str {
         &self.column
+    }
+
+    /// Marks this scan as the ORDER BY access path, so EXPLAIN reports it as an
+    /// `OrderedIndexScan` (the range/equality scan already yields key order).
+    pub(crate) fn mark_ordered(&mut self) {
+        self.ordered = true;
     }
 
     /// The next candidate rid, from the precomputed list or the lazy cursor.
@@ -1953,7 +1937,15 @@ impl PhysicalOperator for IndexScan {
     }
 
     fn label(&self) -> String {
-        format!("IndexScan table={} column={}", self.table, self.column)
+        let kind = if self.ordered { "OrderedIndexScan" } else { "IndexScan" };
+        if self.predicate.is_empty() {
+            format!("{kind}(index={}, table={})", self.index, self.table)
+        } else {
+            format!(
+                "{kind}(index={}, table={}, {})",
+                self.index, self.table, self.predicate
+            )
+        }
     }
 
     fn open(&mut self, ctx: &mut ExecContext<'_>) -> Result<()> {
@@ -2042,11 +2034,11 @@ pub(crate) fn build_from_source(
 /// provides, so the caller can skip the sort.
 type LoweredFrom = (Box<dyn PhysicalOperator>, Option<String>);
 
-/// Lowers the logical FROM/WHERE/JOIN region into a physical tree, reproducing
+/// Lowers a logical Scan/Filter/Join region into a physical tree, reproducing
 /// the access-path choices the builder made directly before. Returns `None`
 /// when a source cannot be built, so the caller falls back to the materialized
 /// executor.
-fn lower_logical(
+fn lower_region(
     db: &Database,
     select: &SelectStmt,
     node: &LogicalOperator,
@@ -2099,8 +2091,16 @@ fn lower_single_table(
         return Ok(build_from_source(db, tref)?.map(|source| (source, None)));
     }
     let owner = tref.alias.as_deref().unwrap_or(&tref.name);
-    if let Some(scan) = IndexScan::with_owner(db, &tref.name, owner, predicate)? {
+    if let Some(mut scan) = IndexScan::with_owner(db, &tref.name, owner, predicate)? {
         let column = scan.ordered_column().to_string();
+        let supplies_order = select.group_by.is_empty()
+            && !items_have_aggregate(&select.items)
+            && crate::exec::plan::resolved_order_column(&select.items, &select.order_by)
+                .as_deref()
+                == Some(column.as_str());
+        if supplies_order {
+            scan.mark_ordered();
+        }
         return Ok(Some((Box::new(scan), Some(column))));
     }
     // An index on the ORDER BY column can supply the order even without a WHERE
@@ -2159,6 +2159,8 @@ fn lower_join_tree(
                 None => Box::new(NestedLoopJoin::new(lop, rop, *kind, on.clone())?),
             }))
         }
+        // Only Scan/Filter/Join appear inside a region.
+        _ => Ok(None),
     }
 }
 
@@ -2186,49 +2188,72 @@ pub fn build_select(
         return Ok(Some(Box::new(plan)));
     }
 
-    // FROM: translate the from/where/join region to a logical plan, push
-    // single-source predicates onto their source, then lower to operators.
-    let Some(logical) = super::logical::logical_from(select) else {
+    // FROM: build the logical plan, push single-source predicates, then lower.
+    let Some(logical) = super::logical::logical_select(select) else {
         return Ok(None);
     };
     let Some(logical) = super::logical::pushdown(db, logical)? else {
         return Ok(None);
     };
-    let Some((mut op, ordered_by)) = lower_logical(db, select, &logical)? else {
-        return Ok(None);
-    };
+    lower(db, select, &logical)
+}
 
-    // grouped / aggregate: grouping, having, ordering, projection, distinct
-    // and limit are all handled inside GroupBy (matching the materialized path)
-    if !select.group_by.is_empty()
-        || select.having.is_some()
-        || items_have_aggregate(&select.items)
-    {
-        let (exprs, headers) = build_projection(op.schema(), &select.items);
-        return Ok(Some(Box::new(GroupBy::new(op, select.clone(), exprs, headers))));
-    }
-
-    if !select.order_by.is_empty() {
-        // an ascending scan on the ordering column already yields the order
-        let skip = ordered_by.as_deref().is_some_and(|column| {
-            crate::exec::plan::resolved_order_column(&select.items, &select.order_by).as_deref()
-                == Some(column)
-        });
-        if !skip {
-            op = Box::new(Sort::new(op, select.order_by.clone(), select.items.clone()));
+/// Lowers a logical plan to physical operators, reusing the access-path choices
+/// the builder made directly before. `select` supplies what the logical nodes
+/// leave implicit (item expansion for `*`, ORDER BY aliases).
+fn lower(
+    db: &Database,
+    select: &SelectStmt,
+    node: &LogicalOperator,
+) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    Ok(match node {
+        LogicalOperator::Scan(_)
+        | LogicalOperator::Filter { .. }
+        | LogicalOperator::Join { .. } => lower_region(db, select, node)?.map(|(op, _)| op),
+        LogicalOperator::Aggregate { input, select: inner } => {
+            let Some(op) = lower(db, inner, input)? else {
+                return Ok(None);
+            };
+            let (exprs, headers) = build_projection(op.schema(), &inner.items);
+            Some(Box::new(GroupBy::new(op, (**inner).clone(), exprs, headers)))
         }
-    }
-    let (exprs, headers) = build_projection(op.schema(), &select.items);
-    op = Box::new(Project::new(op, exprs, headers));
-    if select.distinct {
-        op = Box::new(Distinct::new(op));
-    }
-    if let Some(limit) = &select.limit {
-        let offset = limit_bound(limit.offset.as_ref())?;
-        let count = limit_bound(Some(&limit.count))?;
-        op = Box::new(Limit::new(op, offset, Some(count)));
-    }
-    Ok(Some(op))
+        LogicalOperator::Project { input, items } => {
+            let Some(op) = lower(db, select, input)? else {
+                return Ok(None);
+            };
+            let (exprs, headers) = build_projection(op.schema(), items);
+            Some(Box::new(Project::new(op, exprs, headers)))
+        }
+        LogicalOperator::Sort { input, order_by } => {
+            let Some((op, ordered_by)) = lower_region(db, select, input)? else {
+                return Ok(None);
+            };
+            // an ascending scan on the ordering column already yields the order
+            let skip = ordered_by.as_deref().is_some_and(|column| {
+                crate::exec::plan::resolved_order_column(&select.items, order_by).as_deref()
+                    == Some(column)
+            });
+            if skip {
+                Some(op)
+            } else {
+                Some(Box::new(Sort::new(op, order_by.clone(), select.items.clone())))
+            }
+        }
+        LogicalOperator::Distinct { input } => {
+            let Some(op) = lower(db, select, input)? else {
+                return Ok(None);
+            };
+            Some(Box::new(Distinct::new(op)))
+        }
+        LogicalOperator::Limit { input, limit } => {
+            let Some(op) = lower(db, select, input)? else {
+                return Ok(None);
+            };
+            let offset = limit_bound(limit.offset.as_ref())?;
+            let count = limit_bound(Some(&limit.count))?;
+            Some(Box::new(Limit::new(op, offset, Some(count))))
+        }
+    })
 }
 
 /// Builds the plan for a UNION [ALL] chain: each operand is planned, then the

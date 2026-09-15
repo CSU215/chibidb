@@ -1,20 +1,24 @@
-//! A relational IR for the FROM / WHERE / JOIN region of a SELECT.
+//! A relational IR for a SELECT.
 //!
-//! Translation ([`logical_from`]) is a pure structural step: it exposes the
-//! access path as explicit `Filter`/`Join`/`Scan` nodes instead of the quirks of
-//! [`SelectStmt`] (selection on the select, comma joins mixed with `ON`,
-//! `set_ops`). Rewrites such as [`pushdown`] then operate on this algebra, and
-//! the physical layer lowers the result. Access-path choice (index vs scan,
-//! hash vs nested loop) is deliberately *not* here: it stays in lowering.
+//! Translation ([`logical_select`]) is a pure structural step: it exposes the
+//! query as explicit `Scan`/`Filter`/`Join`/`Project`/`Aggregate`/`Sort`/
+//! `Distinct`/`Limit` nodes instead of the quirks of [`SelectStmt`]. Rewrites
+//! such as [`pushdown`] then operate on this algebra, and the physical layer
+//! lowers the result. Access-path choice (index vs scan, hash vs nested loop)
+//! is deliberately *not* here: it stays in lowering.
+//!
+//! `Aggregate` is currently a fused node carrying the whole SELECT: the
+//! physical `GroupBy` fuses grouping, HAVING, ordering, projection, DISTINCT
+//! and LIMIT. It is split into standard operators in a later step.
 
 use crate::catalog::Schema;
-use crate::sql::ast::{Expr, JoinKind, SelectStmt, TableRef};
+use crate::sql::ast::{Expr, JoinKind, Limit, SelectItem, SelectStmt, TableRef};
 use crate::{Database, Result};
 
 use super::eval::{expr_has_column, expr_has_subquery};
-use super::operator::{build_from_source, combine_and, join_clauses, split_conjuncts};
+use super::operator::{build_from_source, combine_and, items_have_aggregate, join_clauses, split_conjuncts};
 
-/// One node of the logical plan for a single SELECT's FROM region.
+/// One node of the logical plan for a SELECT.
 pub(crate) enum LogicalOperator {
     /// A base table or view, with its alias resolved by the caller.
     Scan(TableRef),
@@ -25,12 +29,53 @@ pub(crate) enum LogicalOperator {
         kind: JoinKind,
         on: Option<Expr>,
     },
+    /// Fused grouping/aggregation (see the module note).
+    Aggregate { input: Box<LogicalOperator>, select: Box<SelectStmt> },
+    Project { input: Box<LogicalOperator>, items: Vec<SelectItem> },
+    Sort { input: Box<LogicalOperator>, order_by: Vec<(Expr, bool)> },
+    Distinct { input: Box<LogicalOperator> },
+    Limit { input: Box<LogicalOperator>, limit: Limit },
+}
+
+/// Translates a SELECT into a logical plan. Returns `None` for shapes handled
+/// directly by the builder (no FROM, or a UNION chain).
+pub(crate) fn logical_select(select: &SelectStmt) -> Option<LogicalOperator> {
+    if select.from.is_empty() || !select.set_ops.is_empty() {
+        return None;
+    }
+    let mut node = logical_from(select)?;
+    // Grouped/aggregate queries stay fused: GroupBy handles the whole tail.
+    if !select.group_by.is_empty()
+        || select.having.is_some()
+        || items_have_aggregate(&select.items)
+    {
+        return Some(LogicalOperator::Aggregate {
+            input: Box::new(node),
+            select: Box::new(select.clone()),
+        });
+    }
+    if !select.order_by.is_empty() {
+        node = LogicalOperator::Sort {
+            input: Box::new(node),
+            order_by: select.order_by.clone(),
+        };
+    }
+    node = LogicalOperator::Project {
+        input: Box::new(node),
+        items: select.items.clone(),
+    };
+    if select.distinct {
+        node = LogicalOperator::Distinct { input: Box::new(node) };
+    }
+    if let Some(limit) = &select.limit {
+        node = LogicalOperator::Limit { input: Box::new(node), limit: limit.clone() };
+    }
+    Some(node)
 }
 
 /// Translates a SELECT's FROM / WHERE / JOIN region into a logical plan. The
 /// WHERE clause becomes one `Filter` above the join tree; it is not yet pushed.
-/// Returns `None` for a SELECT without FROM.
-pub(crate) fn logical_from(select: &SelectStmt) -> Option<LogicalOperator> {
+fn logical_from(select: &SelectStmt) -> Option<LogicalOperator> {
     let first = select.from.first()?;
     let mut node = LogicalOperator::Scan(first.clone());
     for (i, (kind, on)) in join_clauses(select).into_iter().enumerate() {
@@ -58,7 +103,12 @@ fn schema(db: &Database, node: &LogicalOperator) -> Result<Option<Schema>> {
         LogicalOperator::Scan(tref) => {
             Ok(build_from_source(db, tref)?.map(|op| op.schema().clone()))
         }
-        LogicalOperator::Filter { input, .. } => schema(db, input),
+        LogicalOperator::Filter { input, .. }
+        | LogicalOperator::Project { input, .. }
+        | LogicalOperator::Sort { input, .. }
+        | LogicalOperator::Distinct { input }
+        | LogicalOperator::Limit { input, .. }
+        | LogicalOperator::Aggregate { input, .. } => schema(db, input),
         LogicalOperator::Join { left, right, .. } => {
             let (Some(mut left), Some(right)) = (schema(db, left)?, schema(db, right)?) else {
                 return Ok(None);
@@ -69,10 +119,46 @@ fn schema(db: &Database, node: &LogicalOperator) -> Result<Option<Schema>> {
     }
 }
 
+/// Applies the logical rewrites to the FROM region beneath the upper nodes.
+pub(crate) fn pushdown(
+    db: &Database,
+    node: LogicalOperator,
+) -> Result<Option<LogicalOperator>> {
+    Ok(match node {
+        node @ (LogicalOperator::Scan(_)
+        | LogicalOperator::Filter { .. }
+        | LogicalOperator::Join { .. }) => pushdown_region(db, node)?,
+        LogicalOperator::Aggregate { input, select } => {
+            pushdown(db, *input)?.map(|n| LogicalOperator::Aggregate {
+                input: Box::new(n),
+                select,
+            })
+        }
+        LogicalOperator::Project { input, items } => {
+            pushdown(db, *input)?.map(|n| LogicalOperator::Project {
+                input: Box::new(n),
+                items,
+            })
+        }
+        LogicalOperator::Sort { input, order_by } => {
+            pushdown(db, *input)?.map(|n| LogicalOperator::Sort {
+                input: Box::new(n),
+                order_by,
+            })
+        }
+        LogicalOperator::Distinct { input } => {
+            pushdown(db, *input)?.map(|n| LogicalOperator::Distinct { input: Box::new(n) })
+        }
+        LogicalOperator::Limit { input, limit } => pushdown(db, *input)?.map(|n| {
+            LogicalOperator::Limit { input: Box::new(n), limit }
+        }),
+    })
+}
+
 /// Pushes WHERE conjuncts that reference a single source onto that source.
 /// Only inner/comma join chains are eligible: below an outer join the
 /// null-extension would change which rows are produced.
-pub(crate) fn pushdown(
+fn pushdown_region(
     db: &Database,
     node: LogicalOperator,
 ) -> Result<Option<LogicalOperator>> {
@@ -121,6 +207,7 @@ fn inner_only(node: &LogicalOperator) -> bool {
                 && inner_only(left)
                 && inner_only(right)
         }
+        _ => false,
     }
 }
 
@@ -132,6 +219,7 @@ fn collect_scans<'a>(node: &'a LogicalOperator, out: &mut Vec<&'a LogicalOperato
             collect_scans(left, out);
             collect_scans(right, out);
         }
+        _ => {}
     }
 }
 
@@ -160,7 +248,55 @@ fn rebuild(node: LogicalOperator, pushed: &[Vec<Expr>], index: &mut usize) -> Lo
             kind,
             on,
         },
+        other => other,
     }
+}
+
+/// Renders an indented tree of `node`, two spaces per depth, newline-terminated.
+pub(crate) fn logical_tree(node: &LogicalOperator) -> String {
+    fn walk(node: &LogicalOperator, depth: usize, out: &mut String) {
+        for _ in 0..depth {
+            out.push_str("  ");
+        }
+        out.push_str(&label(node));
+        out.push('\n');
+        children(node, &mut |child| walk(child, depth + 1, out));
+    }
+    fn label(node: &LogicalOperator) -> String {
+        match node {
+            LogicalOperator::Scan(tref) => match &tref.alias {
+                Some(alias) => format!("Scan {} as {alias}", tref.name),
+                None => format!("Scan {}", tref.name),
+            },
+            LogicalOperator::Filter { predicate, .. } => format!("Filter {predicate}"),
+            LogicalOperator::Join { kind, .. } => format!("Join {kind:?}"),
+            LogicalOperator::Aggregate { .. } => "Aggregate".to_string(),
+            LogicalOperator::Project { items, .. } => format!("Project cols={}", items.len()),
+            LogicalOperator::Sort { order_by, .. } => format!("Sort keys={}", order_by.len()),
+            LogicalOperator::Distinct { .. } => "Distinct".to_string(),
+            LogicalOperator::Limit { limit, .. } => {
+                format!("Limit count={}", limit.count)
+            }
+        }
+    }
+    fn children(node: &LogicalOperator, f: &mut impl FnMut(&LogicalOperator)) {
+        match node {
+            LogicalOperator::Scan(_) => {}
+            LogicalOperator::Filter { input, .. }
+            | LogicalOperator::Aggregate { input, .. }
+            | LogicalOperator::Project { input, .. }
+            | LogicalOperator::Sort { input, .. }
+            | LogicalOperator::Distinct { input }
+            | LogicalOperator::Limit { input, .. } => f(input),
+            LogicalOperator::Join { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(node, 0, &mut out);
+    out
 }
 
 /// The single source that owns every column of `expr`, or `None` when the

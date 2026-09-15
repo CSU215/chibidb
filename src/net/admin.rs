@@ -188,10 +188,14 @@ fn resolve_statement(
     let Stmt::Select(select) = stmt else {
         return Ok((None, None));
     };
-    let plan = crate::exec::plan::plan_select(&guard, select)?;
+    let plan = match crate::exec::logical::logical_select(select) {
+        Some(node) => crate::exec::logical::pushdown(&guard, node)?
+            .map(|node| crate::exec::logical::logical_tree(&node)),
+        None => None,
+    };
     let physical = operator::build_statement(&guard, stmt)?
         .map(|op| operator::physical_tree(op.as_ref()));
-    Ok((Some(plan), physical))
+    Ok((plan, physical))
 }
 
 /// The `error` object shared by `/api/parse` and `/api/plan`.

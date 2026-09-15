@@ -586,11 +586,8 @@ impl Database {
                 return Err(Error::Runtime(format!("no such table: {table}")));
             }
         }
-        if let Stmt::Select(select) = stmt {
-            // The plan is not consumed directly; computing it validates the
-            // access path exactly as the optimizer stage did.
-            let _ = crate::exec::plan::plan_select(self, select)?;
-        }
+        // Access-path validation happens inside `build_statement`, which plans
+        // the SELECT on the logical plan.
         let mut physical = crate::exec::operator::build_statement(self, stmt)?;
         if let Some(plan) = physical.as_mut() {
             let kind = plan.output_kind();
