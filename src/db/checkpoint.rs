@@ -19,6 +19,18 @@ impl Database {
         self.flush_inner(None)
     }
 
+    /// Writes dirty buffer-pool pages and LSM memtables to their files without
+    /// touching the WAL or the catalog. Used by the demo's disk inspector so a
+    /// Refresh reflects writes still sitting in the pool. Safe while
+    /// transactions are open (it only makes pages durable).
+    pub(crate) fn flush_pages(&self) -> Result<()> {
+        self.pool.flush_all()?;
+        for meta in self.catalog().table_metas() {
+            self.catalog().table(&meta.name)?.engine().flush()?;
+        }
+        Ok(())
+    }
+
     /// Runs a checkpoint. `exclude` is the id of the statement's own
     /// (autocommit) transaction, which must not count as an open one.
     pub(crate) fn flush_inner(&self, exclude: Option<u64>) -> Result<()> {

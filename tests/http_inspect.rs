@@ -242,6 +242,27 @@ fn heap_data_page_spans_slots_and_records() {
     );
 }
 
+/// A write still sitting in the buffer pool must appear after Refresh: the
+/// inspector flushes dirty pages before reading raw disk, so no explicit
+/// `checkpoint;` is needed.
+#[test]
+fn recent_writes_are_visible_without_a_checkpoint() {
+    let (addr, _dir) = start_server(demo_config(true));
+    run(
+        addr,
+        &[
+            "create table w (id int, v int);",
+            "insert into w values (1, 10), (2, 20);",
+        ],
+    );
+
+    let response = get(addr, "/api/page?db=main&file=tables%2F000000.dbf&no=1");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let payload = body(&response);
+    assert!(payload.contains(r#""type":"slotted""#), "{payload}");
+    assert!(payload.contains(r#""num_slots":2"#), "{payload}");
+}
+
 #[test]
 fn pax_table_uses_the_pax_mode_and_magic() {
     let (addr, _dir) = start_server(demo_config(true));

@@ -300,6 +300,7 @@ pub(crate) fn page(instance: &Instance, config: &Config, query: &str) -> Respons
         return Response::not_found();
     }
 
+    flush_db(instance, db);
     let class = classify(file);
     let (chunk, region) = read_unit(class, &resolved, no);
     let total = unit_count(class, &resolved);
@@ -393,6 +394,7 @@ pub(crate) fn overview(instance: &Instance, config: &Config, query: &str) -> Res
         return Response::not_found();
     }
 
+    flush_db(instance, db);
     let class = classify(file);
     let mode = base_mode(instance, db, file, class);
     let (total, units) = overview_units(class, &resolved, mode);
@@ -541,6 +543,22 @@ pub(crate) fn unit_count_for_path(kind: &str, path: &Path) -> u32 {
 }
 
 // ----------------------------------------------------------------------- units
+
+/// Makes recent writes visible to the raw-disk inspector: the endpoints read
+/// files directly, so pages still sitting in the buffer pool (or an LSM
+/// memtable) are flushed first. Failures are ignored -- a read-only or
+/// freshly-created database simply has nothing to flush.
+fn flush_db(instance: &Instance, db: &str) {
+    let handle = if db == crate::instance::META_DIR {
+        instance.meta()
+    } else {
+        match instance.database(db) {
+            Ok(handle) => handle,
+            Err(_) => return,
+        }
+    };
+    let _ = handle.read().flush_pages();
+}
 
 /// Reads unit `no`. The second element is the region kind for an SSTable unit
 /// (`data`/`bloom`/`index`/`footer`), so the caller decodes that region alone
