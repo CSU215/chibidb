@@ -4,6 +4,9 @@
 //!
 //! Keeping the composition here means `operator` only ever turns a logical plan
 //! into physical operators; it never orchestrates the logical layer itself.
+//!
+//! [`plan_statement_layers`] hands back the intermediate logical plan alongside
+//! the physical one, so EXPLAIN and the admin API do not have to rebuild it.
 
 mod access;
 mod explain;
@@ -18,20 +21,38 @@ use crate::sql::ast::{Expr, SelectItem, SelectStmt, Stmt};
 use crate::{Database, Result};
 
 use super::operator::{self, ConstantScan, PhysicalOperator, Project, Union};
+use logical::LogicalOperator;
 use lower::items_have_aggregate;
+
+/// The result of planning: the optimized logical plan (when the shape has a
+/// single one) plus the physical plan that executes it. `logical` is `None` for
+/// DML, a constant SELECT or a UNION chain.
+pub(crate) struct Layers {
+    pub(crate) logical: Option<LogicalOperator>,
+    pub(crate) physical: Option<Box<dyn PhysicalOperator>>,
+}
 
 /// Plans `stmt`, or `None` for statements the operator layer does not cover.
 pub fn plan_statement(
     db: &Database,
     stmt: &Stmt,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    Ok(plan_statement_layers(db, stmt)?.physical)
+}
+
+/// Plans `stmt` and returns every stage, sharing the logical plan instead of
+/// rebuilding it.
+pub(crate) fn plan_statement_layers(db: &Database, stmt: &Stmt) -> Result<Layers> {
     // Expression rewrites (constant folding, boolean simplification) run first;
     // they are shared by SELECT and DML.
     let folded = fold::fold_stmt(stmt);
     match &folded {
-        Stmt::Select(select) => plan_select(db, select),
-        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => operator::build_dml(&folded),
-        _ => Ok(None),
+        Stmt::Select(select) => plan_select_layers(db, select),
+        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Ok(Layers {
+            logical: None,
+            physical: operator::build_dml(&folded)?,
+        }),
+        _ => Ok(Layers { logical: None, physical: None }),
     }
 }
 
@@ -40,30 +61,36 @@ pub fn plan_select(
     db: &Database,
     select: &SelectStmt,
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    Ok(plan_select_layers(db, select)?.physical)
+}
+
+fn plan_select_layers(db: &Database, select: &SelectStmt) -> Result<Layers> {
     if !select.set_ops.is_empty() {
-        return plan_union(db, select);
+        return Ok(Layers { logical: None, physical: plan_union(db, select)? });
     }
     if select.from.is_empty() {
         // A constant SELECT: one projected tuple, no scan.
         if select.items.iter().any(|it| matches!(it, SelectItem::Star))
             || items_have_aggregate(&select.items)
         {
-            return Ok(None);
+            return Ok(Layers { logical: None, physical: None });
         }
         let (exprs, headers) = projection_exprs(&select.items);
-        return Ok(Some(Box::new(Project::new(
+        let physical = Box::new(Project::new(
             Box::new(ConstantScan::new()),
             exprs,
             headers,
-        ))));
+        ));
+        return Ok(Layers { logical: None, physical: Some(physical) });
     }
     let Some(logical) = logical::translate(select) else {
-        return Ok(None);
+        return Ok(Layers { logical: None, physical: None });
     };
     let Some(logical) = logical::optimize(db, logical)? else {
-        return Ok(None);
+        return Ok(Layers { logical: None, physical: None });
     };
-    lower::lower(db, select, &logical)
+    let physical = lower::lower(db, select, &logical)?;
+    Ok(Layers { logical: Some(logical), physical })
 }
 
 /// Plans a UNION chain: each operand is planned, then the trailing ORDER BY /

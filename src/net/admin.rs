@@ -185,15 +185,18 @@ fn resolve_statement(
         return Ok((None, None));
     };
     let guard = db.read();
-    let Stmt::Select(select) = stmt else {
+    if !matches!(stmt, Stmt::Select(_)) {
         return Ok((None, None));
-    };
-    let plan = match crate::exec::planner::logical::translate(select) {
-        Some(node) => crate::exec::planner::logical::optimize(&guard, node)?
-            .map(|node| crate::exec::planner::logical::logical_tree(&node)),
-        None => None,
-    };
-    let physical = crate::exec::planner::plan_statement(&guard, stmt)?
+    }
+    // One planning pass: reuse the logical plan for display.
+    let layers = crate::exec::planner::plan_statement_layers(&guard, stmt)?;
+    let plan = layers
+        .logical
+        .as_ref()
+        .map(crate::exec::planner::logical::logical_tree);
+    let physical = layers
+        .physical
+        .as_ref()
         .map(|op| operator::physical_tree(op.as_ref()));
     Ok((plan, physical))
 }

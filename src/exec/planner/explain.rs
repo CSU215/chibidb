@@ -10,16 +10,15 @@ use super::logical;
 pub(crate) fn execute_explain(db: &Database, e: &ExplainStmt) -> Result<ResultSet> {
     match &*e.stmt {
         Stmt::Select(s) => {
+            // Plan once: the layers share the logical plan instead of rebuilding it.
+            let layers = super::plan_statement_layers(db, &Stmt::Select(s.clone()))?;
             let mut out = String::from("LogicalPlan:\n");
-            match logical::translate(s) {
-                Some(node) => match logical::optimize(db, node)? {
-                    Some(node) => out.push_str(&logical::logical_tree(&node)),
-                    None => out.push_str("  (no logical plan)\n"),
-                },
-                None => out.push_str("  (handled by the materialized executor)\n"),
+            match &layers.logical {
+                Some(node) => out.push_str(&logical::logical_tree(node)),
+                None => out.push_str("  (no logical plan)\n"),
             }
             out.push_str("PhysicalPlan:\n");
-            match super::plan_statement(db, &Stmt::Select(s.clone()))? {
+            match &layers.physical {
                 Some(op) => out.push_str(&crate::exec::operator::physical_tree(op.as_ref())),
                 None => out.push_str("  (no physical plan)\n"),
             }
