@@ -9,14 +9,16 @@ mod access;
 mod explain;
 mod fold;
 pub(crate) mod logical;
+pub(crate) mod lower;
 
-pub(crate) use explain::execute_explain;
 pub(crate) use access::{ordered_index_file, plan_index_scan, resolved_order_column};
+pub(crate) use explain::execute_explain;
 
 use crate::sql::ast::{Expr, SelectItem, SelectStmt, Stmt};
 use crate::{Database, Result};
 
 use super::operator::{self, ConstantScan, PhysicalOperator, Project, Union};
+use lower::items_have_aggregate;
 
 /// Plans `stmt`, or `None` for statements the operator layer does not cover.
 pub fn plan_statement(
@@ -44,7 +46,7 @@ pub fn plan_select(
     if select.from.is_empty() {
         // A constant SELECT: one projected tuple, no scan.
         if select.items.iter().any(|it| matches!(it, SelectItem::Star))
-            || operator::items_have_aggregate(&select.items)
+            || items_have_aggregate(&select.items)
         {
             return Ok(None);
         }
@@ -61,7 +63,7 @@ pub fn plan_select(
     let Some(logical) = logical::optimize(db, logical)? else {
         return Ok(None);
     };
-    operator::lower(db, select, &logical)
+    lower::lower(db, select, &logical)
 }
 
 /// Plans a UNION chain: each operand is planned, then the trailing ORDER BY /

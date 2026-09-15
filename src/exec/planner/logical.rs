@@ -13,9 +13,8 @@ use crate::{Database, Result};
 
 use crate::exec::aggregate::extract_aggregates;
 use crate::exec::eval::{expr_has_column, expr_has_subquery};
-use crate::exec::operator::{
-    build_from_source, combine_and, items_have_aggregate, join_clauses, split_conjuncts,
-};
+
+use super::lower::{build_from_source, combine_and, items_have_aggregate, join_clauses, split_conjuncts};
 
 /// One node of the logical plan for a SELECT.
 pub(crate) enum LogicalOperator {
