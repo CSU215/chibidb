@@ -7,7 +7,7 @@
 
 纯 Rust + tokio 手写的教学型单机关系数据库。按 **TDD 红绿**节奏演化，提交细粒度。
 存储、索引、事务、执行器、网络前端全部手写。当前 `cargo test --workspace` 为
-**698 passed + 9 ignored**（探针），`ffi` 子 crate 把引擎编译成 `cdylib`。
+**700 passed + 9 ignored**（探针），`ffi` 子 crate 把引擎编译成 `cdylib`。
 
 已完成的主干：SQL → lexer → parser(AST) → LogicalOperator（翻译 + 优化，`exec/planner/`）
 → PhysicalOperator（lower，`exec/operator/`，对 Statement 无知）→ 执行器（chunk/volcano）
@@ -97,7 +97,7 @@ python scripts\smoke.py          # 起 server→SQL→强杀→复开验证 WAL�
 
 ### 3.2 测试（`tests/`）
 
-约 60 个文件、698 个用例，按层分布（`lexer/parser/eval/agg/join/union/db*/trx/wal/vacuum/
+约 60 个文件、700 个用例，按层分布（`lexer/parser/eval/agg/join/union/db*/trx/wal/vacuum/
 storage_*/index_*/lsm_*/wire/server/http_*/mysql_frontend/instance/users/privileges/
 information_schema/constraints/correlated/miniob_compat/engine_equivalence/concurrency*`）。
 

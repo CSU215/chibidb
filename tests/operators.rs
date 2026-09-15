@@ -260,6 +260,14 @@ fn unions_build_an_operator_plan() {
 }
 
 #[test]
+fn mismatched_union_is_rejected_at_plan_time() {
+    let db = Database::open_in_memory().unwrap();
+    db.execute_sql("create table t (a int, b int);").unwrap();
+    let select = parse_select("select a from t union select a, b from t;");
+    assert!(build_select(&db, &select).is_err());
+}
+
+#[test]
 fn a_planned_subquery_plan_can_run_twice() {
     let db = Database::open_in_memory().unwrap();
     db.execute_sql("create table t (id int, k int);").unwrap();

@@ -1,7 +1,7 @@
 use crate::catalog::{ColumnDesc, Schema};
 use crate::sql::ast::{BinOp, Expr, Limit as LimitClause};
 use crate::value::{DataType, Value};
-use crate::{Error, Result};
+use crate::Result;
 
 use super::join::drain;
 use super::{ExecContext, PhysicalOperator};
@@ -480,13 +480,7 @@ impl PhysicalOperator for Union {
                 rows = part;
                 continue;
             }
-            if plan.schema().columns.len() != columns.len() {
-                return Err(Error::Runtime(format!(
-                    "union column count mismatch: {} vs {}",
-                    columns.len(),
-                    plan.schema().columns.len()
-                )));
-            }
+            // Arity was validated by the logical layer when the union was built.
             rows.append(&mut part);
             if !*all {
                 aggregate::dedup_rows(&mut rows);

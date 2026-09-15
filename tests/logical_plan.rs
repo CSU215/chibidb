@@ -96,6 +96,22 @@ fn where_equality_turns_a_comma_join_into_an_inner_join() {
 }
 
 #[test]
+fn where_equality_merges_into_an_existing_on_clause() {
+    let db = seeded();
+    let plan = message(
+        &db,
+        "explain select emp.name, dept.dname \
+         from emp join dept on emp.dept_id = dept.id \
+         where emp.id = dept.id;",
+    );
+    // The extra multi-source WHERE equality joins the ON condition instead of
+    // staying as a filter above the join.
+    assert!(plan.contains("Join Inner"), "{plan}");
+    assert!(!plan.contains("Filter"), "{plan}");
+    assert!(plan.contains("HashJoin"), "{plan}");
+}
+
+#[test]
 fn explain_matches_query_results() {
     let db = seeded();
     let rs = db.execute_sql("select dept_id, count(*) from emp group by dept_id order by dept_id;")

@@ -9,10 +9,10 @@
 
 use crate::catalog::Schema;
 use crate::exec::command::{DeleteCommand, InsertCommand, UpdateCommand};
-use crate::sql::ast::{Expr, JoinKind, Limit, SelectItem, SelectStmt, Stmt, TableRef};
-use crate::{Database, Result};
+use crate::sql::ast::{BinOp, Expr, JoinKind, Limit, SelectItem, SelectStmt, Stmt, TableRef};
+use crate::{Database, Error, Result};
 
-use crate::exec::aggregate::extract_aggregates;
+use crate::exec::aggregate::{expr_has_aggregate, extract_aggregates};
 use crate::exec::eval::{expr_has_column, expr_has_subquery};
 
 use crate::value::DataType;
@@ -67,12 +67,89 @@ pub(crate) enum LogicalOperator {
 /// operators carry resolved operands rather than the AST statement.
 pub(crate) fn translate_stmt(db: &Database, stmt: &Stmt) -> Result<Option<LogicalOperator>> {
     Ok(match stmt {
-        Stmt::Select(s) => translate(s),
+        Stmt::Select(s) => {
+            validate_select(s)?;
+            let node = translate(s);
+            if let Some(node) = &node {
+                validate_union_arities(db, node)?;
+            }
+            node
+        }
         Stmt::Insert(i) => Some(LogicalOperator::Insert(InsertCommand::resolve(db, i)?)),
         Stmt::Update(u) => Some(LogicalOperator::Update(UpdateCommand::resolve(db, u)?)),
         Stmt::Delete(d) => Some(LogicalOperator::Delete(DeleteCommand::resolve(db, d)?)),
         _ => None,
     })
+}
+
+/// Semantic checks that belong to analysis, not to lowering: GROUP BY rules.
+/// Subqueries in the FROM/WHERE expressions are validated when their own plans
+/// are built.
+fn validate_select(select: &SelectStmt) -> Result<()> {
+    for group in &select.group_by {
+        if expr_has_aggregate(group) {
+            return Err(Error::Runtime(
+                "aggregate functions are not allowed in group by".into(),
+            ));
+        }
+    }
+    // Without GROUP BY, an aggregate query may only project aggregates: any bare
+    // column reference in the SELECT list is a grouping error.
+    if select.group_by.is_empty()
+        && (select.having.is_some() || items_have_aggregate(&select.items))
+    {
+        for item in &select.items {
+            if let SelectItem::Expr(e) | SelectItem::Aliased(e, _) = item
+                && expr_has_column(e)
+            {
+                return Err(Error::Runtime(
+                    "column must appear in group by or aggregate".into(),
+                ));
+            }
+        }
+    }
+    for (_, operand) in &select.set_ops {
+        validate_select(operand)?;
+    }
+    Ok(())
+}
+
+/// Every UNION arm must produce the same number of columns. Checked here from
+/// the catalog-resolved output arity, so lowering never has to.
+fn validate_union_arities(db: &Database, node: &LogicalOperator) -> Result<()> {
+    match node {
+        LogicalOperator::Union { inputs, .. } => {
+            let mut arity: Option<usize> = None;
+            for (_, input) in inputs {
+                validate_union_arities(db, input)?;
+                let Some(n) = output_names(db, input)?.map(|names| names.len()) else {
+                    continue;
+                };
+                match arity {
+                    None => arity = Some(n),
+                    Some(a) if a != n => {
+                        return Err(Error::Runtime(format!(
+                            "union column count mismatch: {a} vs {n}"
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        LogicalOperator::Filter { input, .. }
+        | LogicalOperator::Having { input, .. }
+        | LogicalOperator::Aggregate { input, .. }
+        | LogicalOperator::Project { input, .. }
+        | LogicalOperator::Sort { input, .. }
+        | LogicalOperator::Distinct { input }
+        | LogicalOperator::Limit { input, .. } => validate_union_arities(db, input),
+        LogicalOperator::Join { left, right, .. } => {
+            validate_union_arities(db, left)?;
+            validate_union_arities(db, right)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Translates a SELECT into a logical plan. Returns `None` for the shapes the
@@ -437,8 +514,7 @@ fn form_joins(
         LogicalOperator::Join { left, right, kind, on } => {
             let left = Box::new(form_joins(db, *left, residual)?);
             let right = Box::new(form_joins(db, *right, residual)?);
-            if on.is_none()
-                && matches!(kind, JoinKind::Cross | JoinKind::Inner)
+            if matches!(kind, JoinKind::Cross | JoinKind::Inner)
                 && let (Some(ls), Some(rs)) = (schema(db, &left)?, schema(db, &right)?)
             {
                 let mut join_preds = Vec::new();
@@ -450,12 +526,20 @@ fn form_joins(
                         true
                     }
                 });
-                if let Some(predicate) = combine_and(join_preds) {
+                if let Some(extra) = combine_and(join_preds) {
+                    // Fold the pushed-down equi-join conjuncts into the existing
+                    // ON, so they become hash keys instead of a runtime filter.
+                    let on = match on {
+                        Some(existing) => {
+                            Some(Expr::Binary(BinOp::And, Box::new(existing), Box::new(extra)))
+                        }
+                        None => Some(extra),
+                    };
                     return Ok(LogicalOperator::Join {
                         left,
                         right,
                         kind: JoinKind::Inner,
-                        on: Some(predicate),
+                        on,
                     });
                 }
             }

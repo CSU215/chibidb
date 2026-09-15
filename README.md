@@ -13,7 +13,7 @@ cargo run -q                    # 内存实例 REPL（临时目录后端，退�
 cargo run -q -- <dir>           # 文件实例 REPL（多库数据根目录）
 cargo run -q -- serve <dir> [addr]   # TCP server，addr 缺省取 config.toml 的 server.addr
 cargo run -q -- client [addr]   # 连接 server 的交互式客户端
-cargo test                      # 全量回归（698 passed + 9 个 #[ignore] 性能探针）
+cargo test                      # 全量回归（700 passed + 9 个 #[ignore] 性能探针）
 ```
 
 REPL / client 中输入 `exit` 或 `quit` 退出。启动时从**当前工作目录**读取 `config.toml`
@@ -159,7 +159,7 @@ SQL 字符串
   → parser           手写递归下降 → AST（sql::ast::Stmt/Expr）
   → Instance         多库路由 / 用户 / 权限 / information_schema（instance.rs）
   → Database         表存在性校验、调用规划器、执行物理算子（db/mod.rs::resolve_optimize_execute）
-  → planner          常量折叠 → LogicalOperator → 优化（谓词下推、WHERE→JOIN）→ lower 成 PhysicalOperator
+  → planner          常量折叠 → LogicalOperator → 优化（谓词下推、WHERE→JOIN、JOIN 条件合并、GROUP BY/UNION 语义校验）→ lower 成 PhysicalOperator
                     （exec/planner/；访问路径选择、`*`/别名展开、聚合重写都在此）
   → operator         火山算子（exec/operator/，对 Statement 无知）
                     （过滤/投影/聚合/分组/排序/limit/连接/索引扫描/视图/子查询）
@@ -244,7 +244,7 @@ dwb.bin                # Double-Write Buffer（storage.double_write 开启时）
 
 ## 测试
 
-`cargo test --workspace` 当前 **698 passed + 9 ignored**。集成测试覆盖词法/语法/求值/
+`cargo test --workspace` 当前 **700 passed + 9 ignored**。集成测试覆盖词法/语法/求值/
 LIKE/字符串函数/聚合/连接/子查询（含相关）/UNION/表约束（PK/UNIQUE/NOT NULL/DEFAULT）/
 索引/持久化/事务/WAL 恢复/vacuum/存储层/网络协议等。`tests/miniob_compat.rs` 用经典
 student/course/sc 场景做端到端回归；`tests/engine_equivalence.rs` 用确定性随机脚本对

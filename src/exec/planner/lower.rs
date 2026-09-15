@@ -9,8 +9,8 @@ use crate::sql::ast::{Expr, JoinKind, SelectItem, TableRef};
 use crate::value::Value;
 use crate::{Database, Error, Result};
 
-use crate::exec::aggregate::{self, expr_has_aggregate};
-use crate::exec::eval::{eval_const, expr_has_column};
+use crate::exec::aggregate;
+use crate::exec::eval::eval_const;
 use crate::exec::operator::{
     ConstantScan, Distinct, Filter, HashJoin, HashKeys, IndexScan, Limit, NestedLoopJoin,
     PhysicalOperator, Project, Sort, TableScan, Union, ViewScan,
@@ -250,24 +250,6 @@ fn lower_node(
         | LogicalOperator::Join { .. } => lower_region(db, node, ctx)?.map(|(op, _)| op),
         LogicalOperator::Constant => Some(Box::new(ConstantScan::new())),
         LogicalOperator::Aggregate { input, group_by, aggregates } => {
-            for g in group_by {
-                if expr_has_aggregate(g) {
-                    return Err(Error::Runtime(
-                        "aggregate functions are not allowed in group by".into(),
-                    ));
-                }
-            }
-            if group_by.is_empty() {
-                for item in ctx.items {
-                    if let SelectItem::Expr(e) | SelectItem::Aliased(e, _) = item
-                        && expr_has_column(e)
-                    {
-                        return Err(Error::Runtime(
-                            "column must appear in group by or aggregate".into(),
-                        ));
-                    }
-                }
-            }
             let child_ctx = LowerCtx { group_by, ..*ctx };
             let Some(op) = lower_node(db, input, &child_ctx)? else {
                 return Ok(None);
