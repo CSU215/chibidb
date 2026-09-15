@@ -23,6 +23,7 @@
   <button class="tab is-active" data-tab="sql" role="tab" aria-selected="true">SQL 控制台</button>
   <button class="tab" data-tab="pipeline" role="tab" aria-selected="false">编译流水线</button>
   <button class="tab" data-tab="storage" role="tab" aria-selected="false">存储与页</button>
+  <button class="tab" data-tab="buffer" role="tab" aria-selected="false">BufferPool</button>
   <button class="tab" data-tab="schema" role="tab" aria-selected="false">Schema</button>
 </nav>
 
@@ -189,6 +190,25 @@
           </div>
         </div>
       </div>
+    </div>
+  </section>
+
+  <!-- ============ BufferPool ============ -->
+  <section id="panel-buffer" class="panel" role="tabpanel" hidden>
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">BufferPool 合计</span>
+        <span id="buffer-meta" class="hint"></span>
+      </div>
+      <div id="buffer-summary" class="stat-grid"></div>
+    </div>
+
+    <div class="card card-flush">
+      <div class="card-head">
+        <span class="card-title">每个数据库的缓冲池</span>
+        <button id="buffer-refresh" class="btn btn-small" type="button">刷新</button>
+      </div>
+      <div id="buffer-pools" class="pad"><span class="muted">加载中&hellip;</span></div>
     </div>
   </section>
 

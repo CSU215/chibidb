@@ -1160,11 +1160,129 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * buffer pool panel                                                   *
+   * ------------------------------------------------------------------ */
+  function asNum(v) { return typeof v === 'number' && isFinite(v) ? v : 0; }
+
+  function fmtInt(v) { return asNum(v).toLocaleString('en-US'); }
+
+  function fmtPct(v) { return (asNum(v) * 100).toFixed(1) + '%'; }
+
+  function statTile(label, value, sub) {
+    return el('div', { className: 'stat-tile' }, [
+      el('div', { className: 'stat-label', text: label }),
+      el('div', { className: 'stat-value', text: value }),
+      sub ? el('div', { className: 'stat-sub', text: sub }) : null
+    ]);
+  }
+
+  function poolBar(used, capacity) {
+    var pct = capacity > 0 ? Math.min(100, Math.round((used / capacity) * 100)) : 0;
+    return el('div', { className: 'pool-bar', title: fmtInt(used) + ' / ' + fmtInt(capacity) },
+      el('div', { className: 'pool-bar-fill', attrs: { style: 'width:' + pct + '%' } }));
+  }
+
+  function renderBufferPools(pools) {
+    var box = $('#buffer-pools');
+    clear(box);
+    if (!pools.length) {
+      box.append(el('span', { className: 'muted', text: '（无数据库）' }));
+      return;
+    }
+    var table = el('table', { className: 'grid' });
+    var head = el('thead');
+    head.append(el('tr', {}, [
+      el('th', { text: 'database' }),
+      el('th', { text: 'hit rate' }),
+      el('th', { text: 'hits' }),
+      el('th', { text: 'misses' }),
+      el('th', { text: 'evictions' }),
+      el('th', { text: 'dirty' }),
+      el('th', { text: 'resident / capacity' })
+    ]));
+    table.append(head);
+    var tbody = el('tbody');
+    pools.forEach(function (p) {
+      var tr = el('tr');
+      var nameTd = el('td');
+      nameTd.append(el('span', { text: p.name == null ? '?' : String(p.name) }));
+      if (p.system) nameTd.append(badge('system', 'badge-k'));
+      tr.append(nameTd);
+      tr.append(el('td', { className: 'is-num', text: fmtPct(p.hit_rate) }));
+      tr.append(el('td', { className: 'is-num', text: fmtInt(p.hits) }));
+      tr.append(el('td', { className: 'is-num', text: fmtInt(p.misses) }));
+      tr.append(el('td', { className: 'is-num', text: fmtInt(p.evictions) }));
+      tr.append(el('td', { className: 'is-num', text: fmtInt(p.dirty_evictions) }));
+      var resident = el('td', { className: 'is-num' });
+      resident.append(el('div', { text: fmtInt(p.resident) + ' / ' + fmtInt(p.capacity) }));
+      resident.append(poolBar(asNum(p.resident), asNum(p.capacity)));
+      tr.append(resident);
+      tbody.append(tr);
+    });
+    table.append(tbody);
+    var wrap = el('div', { className: 'table-wrap' });
+    wrap.append(table);
+    box.append(wrap);
+  }
+
+  function renderBuffer(d) {
+    d = d || {};
+    var pools = Array.isArray(d.databases) ? d.databases : [];
+    var total = d.total || {};
+    var meta = $('#buffer-meta');
+    if (meta) {
+      meta.textContent = [
+        d.frame_size ? d.frame_size + ' B/帧' : '',
+        d.eviction ? '淘汰: ' + d.eviction : '',
+        pools.length + ' pools'
+      ].filter(Boolean).join(' · ');
+    }
+    var summary = $('#buffer-summary');
+    clear(summary);
+    summary.append(
+      statTile('命中率', fmtPct(total.hit_rate),
+        fmtInt(total.hits) + ' hits / ' + fmtInt(total.misses) + ' misses'),
+      statTile('驻留帧', fmtInt(total.resident) + ' / ' + fmtInt(total.capacity),
+        'resident / capacity'),
+      statTile('淘汰', fmtInt(total.evictions),
+        fmtInt(total.clean_evictions) + ' clean · ' + fmtInt(total.dirty_evictions) + ' dirty')
+    );
+    renderBufferPools(pools);
+  }
+
+  function loadBuffer() {
+    var box = $('#buffer-pools');
+    if (box) {
+      clear(box);
+      box.append(el('span', { className: 'muted', text: '加载中…' }));
+    }
+    return request('GET', '/api/buffer').then(function (d) {
+      renderBuffer(d || {});
+    }).catch(function (e) {
+      if (!box) return;
+      clear(box);
+      if (e.status === 404) {
+        box.append(el('span', { className: 'muted', text: 'BufferPool 状态未开启（需要 server.admin_api 或 [web] enabled = true）' }));
+      } else {
+        box.append(el('div', { className: 'banner banner-error', text: e.message }));
+      }
+    });
+  }
+
+  function initBufferPanel() {
+    var btn = $('#buffer-refresh');
+    if (btn) btn.addEventListener('click', loadBuffer);
+  }
+
+  /* ------------------------------------------------------------------ *
    * boot                                                                *
    * ------------------------------------------------------------------ */
   function initTabs() {
     Array.prototype.forEach.call(document.querySelectorAll('.tab'), function (tab) {
-      tab.addEventListener('click', function () { activateTab(tab.dataset.tab); });
+      tab.addEventListener('click', function () {
+        activateTab(tab.dataset.tab);
+        if (tab.dataset.tab === 'buffer') loadBuffer();
+      });
     });
   }
 
@@ -1173,6 +1291,7 @@
     initSqlPanel();
     initPipelinePanel();
     initStoragePanel();
+    initBufferPanel();
 
     fetchSession().then(function (id) {
       sessionId = id;

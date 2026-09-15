@@ -45,7 +45,8 @@ REPL / client 中输入 `exit` 或 `quit` 退出。启动时从**当前工作目
   之后携带 `X-Chibi-Session` 头即可让事务跨请求。同一监听器在 `[web] enabled = true` 时托管
   内置演示控制台，否则托管 `server.web_root` 指定的静态站点（默认 `web/dist`）。`/api/*`
   在 `[web] enabled` 或 `server.admin_api` 开启后可用（提供 `/api/parse`、`/api/plan`、
-  `/api/config`、`/api/schema`，以及 `web.page_preview` 门控的 `/api/files`、`/api/page`）。
+  `/api/config`、`/api/schema`、`/api/buffer`，以及 `web.page_preview` 门控的
+  `/api/files`、`/api/page`）。
 - **MySQL wire**：设置 `server.mysql_addr` 后，可用 `mysql` 客户端连接：握手使用
   `mysql_native_password`，`COM_QUERY` 走文本结果集，并支持
   `COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`（预处理语句）。
@@ -58,10 +59,11 @@ REPL / client 中输入 `exit` 或 `quit` 退出。启动时从**当前工作目
 - **SQL 控制台**：执行 SQL 并展示结果表 / affected / 错误；会话可跨请求（事务）。
 - **编译流水线**：输入 → Token 流 → Statement(AST) → Plan(访问路径) → PhysicalOperator(缩进算子树)。
 - **存储与页**：浏览数据目录文件、页导航、文件头 / 槽目录 / B+ 节点结构 + Hex / ASCII。
+- **BufferPool**：各库缓冲池的命中率、命中 / 未命中、淘汰（clean / dirty）与驻留帧 / 容量。
 - **Schema 树**：库 / 表 / 列与约束。
 
 相关接口（开启 `[web] enabled` **或** `server.admin_api` 后可用）：`POST /api/plan`、`GET /api/config`、
-`GET /api/schema`、`GET /api/files`、`GET /api/page`；后两个另需 `[web] page_preview = true`
+`GET /api/schema`、`GET /api/buffer`、`GET /api/files`、`GET /api/page`；后两个另需 `[web] page_preview = true`
 （会读取原始数据页）。
 
 ```toml

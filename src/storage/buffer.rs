@@ -190,7 +190,7 @@ impl CacheReporter for StderrReporter {
     }
 }
 
-fn policy_label(policy: EvictionPolicy) -> &'static str {
+pub(crate) fn policy_label(policy: EvictionPolicy) -> &'static str {
     match policy {
         EvictionPolicy::Lru => "lru",
         EvictionPolicy::Clock => "clock",

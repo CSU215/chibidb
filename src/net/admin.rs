@@ -91,6 +91,7 @@ fn api(
         ("POST", "/api/plan") => plan_trace(instance, session, body),
         ("GET", "/api/config") => config_trace(config),
         ("GET", "/api/schema") => schema_trace(instance),
+        ("GET", "/api/buffer") => buffer_trace(instance, config),
         ("GET", "/api/files") => files_trace(instance, config, query),
         ("GET", "/api/overview") => inspect::overview(instance, config, query),
         ("GET", "/api/page") => inspect::page(instance, config, query),
@@ -314,6 +315,66 @@ fn table_json(meta: &TableMeta) -> String {
         json_string(engine),
         json_string(layout),
         columns.join(",")
+    )
+}
+
+// --------------------------------------------------------------- /api/buffer
+
+/// `GET /api/buffer` -- a buffer-pool snapshot per database.
+///
+/// Every database owns its own pool, so the response lists one entry per open
+/// database plus an aggregate. Counters are cumulative since the pool opened.
+/// Safe to expose (no page contents), so it shares the `/api/*` gate with
+/// `/api/schema` rather than the `web.page_preview` switch.
+fn buffer_trace(instance: &Instance, config: &Config) -> Response {
+    let mut pools = Vec::new();
+    let mut total = crate::storage::PoolStats::default();
+    for (name, system) in instance.database_names().unwrap_or_default() {
+        if name == crate::instance::INFORMATION_SCHEMA {
+            continue;
+        }
+        let Some(db) = inspect::db_handle(instance, &name) else {
+            continue;
+        };
+        let stats = db.read().buffer_pool_stats();
+        total.hits += stats.hits;
+        total.misses += stats.misses;
+        total.evictions += stats.evictions;
+        total.dirty_evictions += stats.dirty_evictions;
+        total.resident += stats.resident;
+        total.capacity += stats.capacity;
+        pools.push(format!(
+            "{{\"name\":{},\"system\":{},{}}}",
+            json_string(&name),
+            system,
+            pool_json(&stats)
+        ));
+    }
+    Response::json(
+        "200 OK",
+        format!(
+            "{{\"frame_size\":{},\"eviction\":{},\"databases\":[{}],\"total\":{{{}}}}}",
+            crate::storage::PAGE_SIZE,
+            json_string(crate::storage::buffer::policy_label(config.storage.eviction)),
+            pools.join(","),
+            pool_json(&total),
+        ),
+    )
+}
+
+/// The counters shared by one pool and the aggregate.
+fn pool_json(stats: &crate::storage::PoolStats) -> String {
+    format!(
+        "\"hits\":{},\"misses\":{},\"evictions\":{},\"dirty_evictions\":{},\
+         \"clean_evictions\":{},\"resident\":{},\"capacity\":{},\"hit_rate\":{:.4}",
+        stats.hits,
+        stats.misses,
+        stats.evictions,
+        stats.dirty_evictions,
+        stats.clean_evictions(),
+        stats.resident,
+        stats.capacity,
+        stats.hit_rate(),
     )
 }
 

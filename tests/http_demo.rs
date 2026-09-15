@@ -154,6 +154,24 @@ fn config_reports_title_and_page_preview() {
 }
 
 #[test]
+fn buffer_reports_a_pool_per_database() {
+    // Not gated by `web.page_preview`: the counters expose no raw page contents.
+    let (addr, _dir) = start_server(demo_config(false));
+    setup(addr);
+
+    let response = get(addr, "/api/buffer");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let payload = body(&response);
+    assert!(payload.contains(r#""frame_size":8192"#), "{payload}");
+    assert!(payload.contains(r#""eviction":"lru""#), "{payload}");
+    assert!(payload.contains(r#""name":"chibi_meta""#), "{payload}");
+    assert!(payload.contains(r#""name":"main""#), "{payload}");
+    assert!(payload.contains(r#""capacity":64"#), "{payload}");
+    assert!(payload.contains(r#""hit_rate":"#), "{payload}");
+    assert!(payload.contains(r#""total":{"#), "{payload}");
+}
+
+#[test]
 fn schema_lists_the_created_table_and_columns() {
     let (addr, _dir) = start_server(demo_config(true));
     setup(addr);
@@ -244,7 +262,7 @@ fn the_demo_console_enables_its_own_api() {
     let (addr, _dir) = start_server(config);
     setup(addr);
 
-    for path in ["/api/config", "/api/schema"] {
+    for path in ["/api/config", "/api/schema", "/api/buffer"] {
         let response = get(addr, path);
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{path}: {response}");
     }
@@ -262,7 +280,7 @@ fn the_api_is_404_without_admin_api_or_the_console() {
     let config = Config::from_toml_str("[server]\nadmin_api = false\n[web]\nenabled = false\n").unwrap();
     let (addr, _dir) = start_server(config);
 
-    for path in ["/api/config", "/api/schema"] {
+    for path in ["/api/config", "/api/schema", "/api/buffer"] {
         let response = get(addr, path);
         assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
     }
