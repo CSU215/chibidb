@@ -93,8 +93,14 @@ def direction(metric: str) -> str:
     return "lower is better" if metric == "seconds" else "higher is better"
 
 
-def svg_boxplot(groups: list, metric: str, width: int = 760, height: int = 340) -> str:
-    """One box per ``(label, values)`` group, sharing a linear y axis."""
+def svg_boxplot(groups: list, metric: str, palette: dict | None = None,
+                width: int = 760, height: int = 340) -> str:
+    """One box per ``(label, values)`` group, sharing a linear y axis.
+
+    ``palette`` maps a group label to its colour; it must come from the target
+    order so a skipped target cannot shift the remaining colours.
+    """
+    palette = palette or {}
     left, right, top, bottom = 68, 20, 26, 62
     plot_w = width - left - right
     plot_h = height - top - bottom
@@ -135,7 +141,7 @@ def svg_boxplot(groups: list, metric: str, width: int = 760, height: int = 340) 
     cap = box_w * 0.35
     for i, (label, values) in enumerate(groups):
         cx = left + slot * (i + 0.5)
-        color = PALETTE[i % len(PALETTE)]
+        color = palette.get(label) or PALETTE[i % len(PALETTE)]
         stats = box_stats(values)
         out.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-width="1.5"/>'
                    % (cx, y(stats["high"]), cx, y(stats["low"]), color))
@@ -246,7 +252,7 @@ def render_report(payload: dict, title: str | None = None) -> str:
                 subtitle,
                 html.escape(metric),
                 direction(metric),
-                svg_boxplot(groups, metric),
+                svg_boxplot(groups, metric, palette),
                 _summary_table(groups, palette),
             )
         )
