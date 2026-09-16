@@ -103,6 +103,34 @@ fn vacuum_is_crash_safe() {
 }
 
 #[test]
+fn vacuum_then_slot_reuse_survives_a_crash() {
+    // VACUUM physically frees a rid without logging it; a later insert can
+    // reuse that rid immediately. Before VACUUM checkpointed, a crash after
+    // the reuse would replay the new row into a slot that the un-flushed purge
+    // still showed as occupied, silently dropping the new row.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Database::open(dir.path()).unwrap();
+        seed(&db);
+        db.execute_sql("delete from t where id = 2;").unwrap();
+        db.execute_sql("vacuum;").unwrap();
+        // reuse the freed slot on the same page, then crash with the new row
+        // still only in the (replayed) log
+        db.execute_sql("insert into t values (4, 'd');").unwrap();
+        db.simulate_crash();
+    }
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(
+        rows(&db, "select * from t order by id;"),
+        vec![
+            vec![Value::Int(1), Value::Str("a".into())],
+            vec![Value::Int(3), Value::Str("c".into())],
+            vec![Value::Int(4), Value::Str("d".into())],
+        ]
+    );
+}
+
+#[test]
 fn vacuum_rejects_open_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();

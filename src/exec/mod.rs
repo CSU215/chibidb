@@ -224,6 +224,13 @@ fn execute_vacuum(db: &Database, trx: &TrxState) -> Result<ResultSet> {
         ));
     }
     let purged = db.vacuum()?;
+    // A purge physically frees rids, which a later insert can immediately
+    // reuse. That free is not WAL-logged, so if its page were still dirty when
+    // the reused slot was inserted and then the process crashed, replay would
+    // find the slot occupied by the un-flushed purged row and silently drop the
+    // new one. Checkpointing here makes the frees durable and drops the redo
+    // that still references the freed rids, before reuse can happen.
+    db.flush_inner(Some(trx.id))?;
     Ok(ResultSet::Message(format!("VACUUM COMPLETE: {purged} rows purged")))
 }
 
