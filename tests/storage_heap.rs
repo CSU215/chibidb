@@ -95,6 +95,29 @@ fn data_survives_pool_restart() {
 }
 
 #[test]
+fn replay_overwrites_a_stale_record_at_a_reused_rid() {
+    // A rid can be freed without that free reaching the log (a VACUUM purge, or
+    // a rollback). A later insert may reuse it, and on recovery the page is
+    // read back from disk, which can still hold the stale record. `insert_at`
+    // must overwrite rather than skip on mere occupancy.
+    use chaoticdb::config::PageLayout;
+    use chaoticdb::storage::engine::{HeapEngine, TableEngine, TableStorage};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (bp, f) = setup(&dir, "h.dbf");
+    HeapFile::init(&bp, f).unwrap();
+    let engine = HeapEngine::with_layout(f, PageLayout::Row);
+
+    let rid = engine.insert(&bp, b"stale").unwrap();
+    bp.flush_all().unwrap(); // the stale row reaches the disk
+    engine.delete(&bp, rid).unwrap(); // rollback/vacuum frees the rid in memory
+    bp.discard_file(f); // ...but that free never reaches the disk
+
+    engine.insert_at(&bp, rid, b"fresh").unwrap();
+    assert_eq!(engine.get(&bp, rid).unwrap(), b"fresh");
+}
+
+#[test]
 fn open_rejects_foreign_files() {
     let dir = tempfile::tempdir().unwrap();
 

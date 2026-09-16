@@ -5,7 +5,7 @@ use crate::storage::buffer::BufferPool;
 use crate::storage::codec::{decode_row_with_want, decode_tagged_value, LobResolver, RECORD_HEADER};
 use crate::storage::heap::{HeapFile, Rid};
 use crate::storage::page::{FileId, PageNo, PAGE_SIZE};
-use crate::storage::slotted::{page_get, page_iter, page_put_at, page_slots};
+use crate::storage::slotted::{page_delete, page_get, page_iter, page_put_at, page_slots};
 use crate::value::Value;
 use crate::{Error, Result};
 /// A forward-only cursor over a table's rows, decoupled from the concrete
@@ -252,22 +252,48 @@ impl TableStorage for HeapEngine {
     }
 
     /// Replays a WAL insert at its original rid. Heap pages are page-addressed,
-    /// so the page is allocated and the record placed, unless it is already
-    /// present (replay is idempotent).
+    /// so the page is allocated if needed and the record placed.
+    ///
+    /// Replay is idempotent, but a rid can be *physically* freed without that
+    /// free ever reaching the log: VACUUM purges a dead row, or a rollback
+    /// removes the aborted transaction's own row. A later insert then reuses
+    /// the rid, so the slot is not simply "empty or already applied" — it may
+    /// hold a stale record that this insert must overwrite. Skip only when the
+    /// bytes already match; otherwise replace whatever is there.
     fn insert_at(&self, bp: &BufferPool, rid: Rid, record: &[u8]) -> Result<()> {
         while bp.page_count(self.file)? <= rid.page_no {
             bp.alloc_page(self.file)?;
         }
-        let occupied = bp.read_page(self.file, rid.page_no, |page| match self.layout {
-            PageLayout::Row => Ok(page_get(page, rid.slot)?.is_some()),
-            PageLayout::Pax => Ok(!crate::storage::pax::is_empty(page, rid.slot)),
+        let state = bp.read_page(self.file, rid.page_no, |page| match self.layout {
+            PageLayout::Row => match page_get(page, rid.slot)? {
+                None => Ok(0u8),
+                Some(existing) if existing == record => Ok(1u8),
+                Some(_) => Ok(2u8),
+            },
+            PageLayout::Pax => {
+                if crate::storage::pax::is_empty(page, rid.slot) {
+                    return Ok(0u8);
+                }
+                let mut existing = Vec::new();
+                crate::storage::pax::read_record(page, rid.slot, None, &mut existing);
+                Ok(if existing == record { 1u8 } else { 2u8 })
+            }
         })?;
-        if occupied {
-            return Ok(());
+        if state == 1 {
+            return Ok(()); // already applied: idempotent no-op
         }
-        bp.with_page(self.file, rid.page_no, |page| match self.layout {
-            PageLayout::Row => page_put_at(page, rid.slot, record),
-            PageLayout::Pax => crate::storage::pax::put_at(page, rid.slot, record),
+        bp.with_page(self.file, rid.page_no, |page| {
+            if state == 2 {
+                // the slot holds a stale record (freed rid, reused in the log)
+                match self.layout {
+                    PageLayout::Row => page_delete(page, rid.slot)?,
+                    PageLayout::Pax => crate::storage::pax::delete(page, rid.slot)?,
+                }
+            }
+            match self.layout {
+                PageLayout::Row => page_put_at(page, rid.slot, record),
+                PageLayout::Pax => crate::storage::pax::put_at(page, rid.slot, record),
+            }
         })
     }
 }
