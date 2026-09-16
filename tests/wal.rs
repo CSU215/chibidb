@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use chaoticdb::config::Config;
 use chaoticdb::value::Value;
 use chaoticdb::{Database, ResultSet, Session};
 
@@ -419,6 +420,55 @@ fn explicit_flush_does_not_drop_a_concurrent_commits_redo() {
 
     let db = Database::open(dir.path()).unwrap();
     assert_eq!(rows(&db, "select id from t;").len(), ROWS);
+}
+
+#[test]
+fn aborted_trx_id_is_not_reused_after_dirty_pages_were_evicted() {
+    // An aborted transaction that never reached the log used to lose its id:
+    // `next_trx_id` is only persisted by checkpoints, and a transaction that
+    // never commits writes no WAL frame, so recovery's `max_trx_id` could not
+    // see it. Its orphan pages may have been evicted to disk, so after a crash
+    // a later transaction could be handed the same id, commit, and make those
+    // never-committed rows visible. The `Begin` frame closes that hole.
+    let mut cfg = Config::default();
+    // A tiny pool so the aborted transaction's dirty pages are evicted while
+    // its redo is still buffered in memory (and lost with the crash).
+    cfg.storage.buffer_pool_frames = 4;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Database::open_with_config(dir.path(), &cfg).unwrap();
+        db.execute_sql("create table t (id int);").unwrap();
+        db.execute_sql("insert into t values (1);").unwrap();
+
+        let mut s = Session::new();
+        db.execute_sql_with(&mut s, "begin;").unwrap();
+        for i in 0..2000i64 {
+            db.execute_sql_with(&mut s, &format!("insert into t values ({});", 1000 + i))
+                .unwrap();
+        }
+        // never commit: crash with the transaction open
+        db.simulate_crash();
+    }
+
+    let db = Database::open_with_config(dir.path(), &cfg).unwrap();
+    let count = |sql: &str| match db.execute_sql(sql).unwrap().remove(0) {
+        ResultSet::Rows { rows, .. } => match rows[0][0] {
+            Value::Int(n) => n,
+            ref other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(count("select count(*) from t where id >= 1000 and id < 2000;"), 0);
+
+    // Enough new transactions that the aborted id would be reached again.
+    for i in 0..50i64 {
+        db.execute_sql(&format!("insert into t values ({});", 9000 + i)).unwrap();
+    }
+    assert_eq!(
+        count("select count(*) from t where id >= 1000 and id < 2000;"),
+        0,
+        "orphan rows became visible through xid reuse"
+    );
 }
 
 #[test]

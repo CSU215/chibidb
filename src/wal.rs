@@ -18,6 +18,7 @@ use crate::{Error, Result};
 const REC_INSERT: u8 = 1;
 const REC_DELETE_MARK: u8 = 2;
 const REC_COMMIT: u8 = 3;
+const REC_BEGIN: u8 = 4;
 
 /// Header overhead: type byte + trx id.
 const HEADER_LEN: usize = 9;
@@ -29,6 +30,12 @@ pub enum Record {
     Insert { file: FileId, rid: Rid, record: Vec<u8> },
     /// MVCC delete mark (deleter trx id + forward pointer) at an exact rid.
     DeleteMark { file: FileId, rid: Rid, deleter: u64, next_rid: u64 },
+    /// A write transaction started. Carries only the trx id, so recovery's
+    /// `max_trx_id` covers it even if the transaction never commits and never
+    /// writes a data frame. Without this, an aborted transaction whose dirty
+    /// pages reached the disk could have its id handed to a later transaction,
+    /// which would resurrect its orphan versions.
+    Begin,
     /// Commit boundary; redo replays only transactions with one of these.
     Commit,
 }
@@ -130,6 +137,10 @@ pub fn encode_frame_into(out: &mut Vec<u8>, trx_id: u64, rec: &Record) {
             out.extend_from_slice(&deleter.to_le_bytes());
             out.extend_from_slice(&next_rid.to_le_bytes());
         }
+        Record::Begin => {
+            out.push(REC_BEGIN);
+            out.extend_from_slice(&trx_id.to_le_bytes());
+        }
         Record::Commit => {
             out.push(REC_COMMIT);
             out.extend_from_slice(&trx_id.to_le_bytes());
@@ -214,6 +225,7 @@ fn decode_frame(bytes: &[u8]) -> Option<(u64, Record, usize)> {
             let next_rid = u64::from_le_bytes(payload[18..26].try_into().unwrap());
             Record::DeleteMark { file, rid: Rid::new(page_no, slot), deleter, next_rid }
         }
+        REC_BEGIN => Record::Begin,
         REC_COMMIT => Record::Commit,
         _ => return None, // unknown frame type: stop scanning
     };

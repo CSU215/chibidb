@@ -67,7 +67,9 @@ impl Database {
                             engine.delete_mark(&self.pool, *rid, *deleter, *next_rid)?;
                         }
                     }
-                    Record::Commit => {}
+                    // Begin only carries the trx id (already folded into the
+                    // committed set / max_trx_id by the plan); nothing to redo.
+                    Record::Begin | Record::Commit => {}
                 }
             }
         }

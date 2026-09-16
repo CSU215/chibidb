@@ -440,6 +440,7 @@ fn overview_units(class: Class, resolved: &Path, mode: &str) -> (u32, Vec<String
                     1 => ("insert", "插入"),
                     2 => ("delete", "删除标记"),
                     3 => ("commit", "提交"),
+                    4 => ("begin", "事务开始"),
                     _ => ("unknown", "未知"),
                 };
                 units.push(unit_json(i as u32, kind, true, &format!("{what} trx={trx}")));
@@ -652,7 +653,7 @@ fn wal_frames(bytes: &[u8]) -> Vec<(usize, usize, u8, u64)> {
             break;
         }
         let ty = match bytes.get(pos + 4) {
-            Some(&b) if (1..=3).contains(&b) => b,
+            Some(&b) if (1..=4).contains(&b) => b,
             _ => break,
         };
         out.push((pos, len, ty, u64_at(bytes, pos + 5)));
@@ -1203,6 +1204,7 @@ fn wal_fields(chunk: &[u8]) -> Vec<Field> {
                 1 => "类型: 插入",
                 2 => "类型: 删除标记",
                 3 => "类型: 提交",
+                4 => "类型: 事务开始",
                 _ => "类型: 未知",
             },
         ));

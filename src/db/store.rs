@@ -198,6 +198,19 @@ impl Database {
         Ok(out)
     }
 
+    /// Appends a `Begin` frame to the WAL the first time this transaction
+    /// writes, so recovery's `max_trx_id` covers its id even if it never
+    /// commits. Without it, an aborted transaction whose dirty pages were
+    /// evicted could have its id reused after a crash, resurrecting its orphan
+    /// versions (they would look committed).
+    fn log_trx_begin(&self, trx: &mut TrxState) -> Result<()> {
+        if !trx.wal_began {
+            self.wal.append(trx.id, &Record::Begin)?;
+            trx.wal_began = true;
+        }
+        Ok(())
+    }
+
     pub(crate) fn store_insert(
         &self,
         name: &str,
@@ -210,6 +223,7 @@ impl Database {
             (t.heap.file, t.engine())
         };
         let creator = trx.id;
+        self.log_trx_begin(trx)?;
         self.note_write(creator, name);
         let data = encode_record(creator, 0, 0, &row, &self.lobs, self.inline_lob_limit())?;
         let rid = engine.insert(&self.pool, &data)?;
@@ -242,6 +256,7 @@ impl Database {
             (t.heap.file, t.engine())
         };
         let deleter = trx.id;
+        self.log_trx_begin(trx)?;
         self.note_write(deleter, name);
         for rid in rids {
             // serialize writers of the same row; different rows proceed
@@ -284,6 +299,7 @@ impl Database {
             (t.heap.file, t.engine())
         };
         let trx_id = trx.id;
+        self.log_trx_begin(trx)?;
         self.note_write(trx_id, name);
         let ops = self.index_ops(name)?;
         for (rid, new_row) in updates {

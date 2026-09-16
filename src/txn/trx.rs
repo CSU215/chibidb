@@ -71,6 +71,7 @@ impl Session {
             clog,
             undo: Vec::new(),
             wal: Vec::new(),
+            wal_began: false,
             explicit,
         });
     }
@@ -87,6 +88,7 @@ impl Session {
             clog,
             undo: Vec::new(),
             wal: Vec::new(),
+            wal_began: false,
             explicit: false,
         });
     }
@@ -114,6 +116,10 @@ pub(crate) struct TrxState {
     /// Redo frames for this transaction's writes, buffered until commit so the
     /// whole statement reaches the log in one write. Rolled back by truncating.
     pub wal: Vec<u8>,
+    /// Whether a `Begin` frame was already appended for this transaction. It is
+    /// written to the log on the first write, not buffered, so recovery learns
+    /// the id even if the transaction never commits (see `Record::Begin`).
+    pub wal_began: bool,
     /// True for BEGIN-initiated transactions (DDL is rejected inside those).
     pub explicit: bool,
 }
