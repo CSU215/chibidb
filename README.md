@@ -254,7 +254,7 @@ student/course/sc 场景做端到端回归；`tests/engine_equivalence.rs` 用�
 heap/LSM 两引擎做差分等价（含中途重开）；`tests/concurrency_fuzz.rs` 用固定种子的随机并发
 调度断言余额守恒与主键唯一。
 
-`tests/bench.rs`（6 个）与 `tests/perf_stats.rs`（3 个）是 `#[ignore]` 性能探针，例如：
+`tests/bench.rs`（7 个）与 `tests/perf_stats.rs`（3 个）是 `#[ignore]` 性能探针，例如：
 
 ```text
 cargo test --release --test bench -- --ignored --nocapture

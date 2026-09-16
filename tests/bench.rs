@@ -1,11 +1,13 @@
-//! A tiny dependency-free micro-benchmark contrasting B+ tree point/range
-//! scans with a full table scan. Ignored by default so it does not slow the
-//! normal suite; run explicitly with:
+//! Tiny dependency-free micro-benchmarks: B+ tree point/range scans vs a full
+//! table scan, vectorized vs row execution, and the Heap vs LSM engines.
+//! Ignored by default so they do not slow the normal suite; run explicitly:
 //!
 //!     cargo test --release --test bench -- --ignored --nocapture
 
-use chaoticdb::Database;
 use chaoticdb::config::{Config, ExecutionMode};
+use chaoticdb::value::Value;
+use chaoticdb::{Database, ResultSet};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 const N: i64 = 50_000;
@@ -258,4 +260,255 @@ fn hash_join_throughput() {
             .unwrap();
     });
     println!("hash join count(*)  50k x 50k   {elapsed:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Heap vs LSM engine, deliberately without any index so the comparison is the
+// storage engine itself (page writes vs memtable/SSTable), not the B+ tree.
+// ---------------------------------------------------------------------------
+
+const ENGINE_ROWS: i64 = 100_000;
+const ENGINE_BATCH: i64 = 500;
+
+fn open_engine(engine: &str) -> (tempfile::TempDir, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    db.execute_sql(&format!(
+        "create table t (id int, grp int, name char(16), score int) engine = {engine};"
+    ))
+    .unwrap();
+    (dir, db)
+}
+
+/// Bulk-loads `ENGINE_ROWS` rows in multi-value INSERT batches. No index, so
+/// every row goes straight at the table storage.
+fn insert_all(db: &Database) -> Duration {
+    let start = Instant::now();
+    let mut i = 0i64;
+    while i < ENGINE_ROWS {
+        let mut sql = String::from("insert into t values ");
+        for j in i..(i + ENGINE_BATCH).min(ENGINE_ROWS) {
+            if j > i {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({j},{},'n{}',{})", j % 10, j % 20, (j * 7) % 1000));
+        }
+        sql.push(';');
+        db.execute_sql(&sql).unwrap();
+        i += ENGINE_BATCH;
+    }
+    start.elapsed()
+}
+
+/// Runs a query expected to return a single integer in its first cell.
+fn scalar_int(db: &Database, sql: &str) -> i64 {
+    match db.execute_sql(sql).unwrap().remove(0) {
+        ResultSet::Rows { rows, .. } => match rows[0][0] {
+            Value::Int(n) => n,
+            ref other => panic!("expected int, got {other:?}"),
+        },
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// Recursive on-disk size of the data root, i.e. bytes the engine actually
+/// persisted (tables + WAL + catalog), after a flush.
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        // `std::fs::metadata` (a fresh stat) rather than `DirEntry::metadata`:
+        // on Windows the directory-scan cache can report a still-open heap
+        // file as 0 bytes.
+        let Ok(meta) = std::fs::metadata(&p) else {
+            continue;
+        };
+        if meta.is_dir() {
+            total += dir_size(&p);
+        } else {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+struct EngineStats {
+    insert: Duration,
+    flush: Duration,
+    footprint: u64,
+    count: Duration,
+    aggregate: Duration,
+    point: Duration,
+    filter: Duration,
+    update_all: Duration,
+    delete_pred: Duration,
+    reopen: Duration,
+    final_count: i64,
+}
+
+fn run_engine_bench(engine: &str) -> EngineStats {
+    let (dir, db) = open_engine(engine);
+
+    let insert = insert_all(&db);
+    assert_eq!(
+        scalar_int(&db, "select count(*) from t;"),
+        ENGINE_ROWS,
+        "{engine}: insert count"
+    );
+
+    let t = Instant::now();
+    db.flush().unwrap();
+    let flush = t.elapsed();
+    let footprint = dir_size(dir.path());
+
+    let count = per_op(5, || {
+        db.execute_sql("select count(*) from t;").unwrap();
+    });
+    let aggregate = per_op(5, || {
+        db.execute_sql("select sum(score), avg(score), min(score), max(score) from t;")
+            .unwrap();
+    });
+    let point = per_op(10, || {
+        db.execute_sql(&format!("select id, score from t where id = {};", ENGINE_ROWS / 2))
+            .unwrap();
+    });
+    let filter = per_op(5, || {
+        db.execute_sql("select id from t where grp = 3;").unwrap();
+    });
+
+    let t = Instant::now();
+    db.execute_sql("update t set score = score + 1;").unwrap();
+    let update_all = t.elapsed();
+    assert_eq!(
+        scalar_int(&db, "select count(*) from t;"),
+        ENGINE_ROWS,
+        "{engine}: count after update"
+    );
+
+    let t = Instant::now();
+    db.execute_sql("delete from t where grp = 0;").unwrap();
+    let delete_pred = t.elapsed();
+    let final_count = scalar_int(&db, "select count(*) from t;");
+
+    db.flush().unwrap();
+    let t = Instant::now();
+    drop(db);
+    let reopened = Database::open(dir.path()).unwrap();
+    let reopen = t.elapsed();
+    assert_eq!(
+        scalar_int(&reopened, "select count(*) from t;"),
+        final_count,
+        "{engine}: count survives reopen"
+    );
+
+    EngineStats {
+        insert,
+        flush,
+        footprint,
+        count,
+        aggregate,
+        point,
+        filter,
+        update_all,
+        delete_pred,
+        reopen,
+        final_count,
+    }
+}
+
+fn ms(d: Duration) -> String {
+    format!("{:>9.1}ms", d.as_secs_f64() * 1e3)
+}
+
+#[test]
+#[ignore = "micro-benchmark; run with --ignored --nocapture"]
+fn lsm_vs_heap_no_index() {
+    println!("rows: {ENGINE_ROWS}, no index");
+    let heap = run_engine_bench("heap");
+    let lsm = run_engine_bench("lsm");
+    assert_eq!(
+        heap.final_count, lsm.final_count,
+        "engines disagree on row count"
+    );
+
+    let rows_per_s = |d: Duration| ENGINE_ROWS as f64 / d.as_secs_f64();
+    let bytes_per_row = |b: u64| b as f64 / ENGINE_ROWS as f64;
+
+    println!();
+    println!("{:<28}{:>22}{:>22}", "phase", "heap", "lsm");
+    println!(
+        "{:<28}{:>22}{:>22}",
+        "bulk insert (rows/s)",
+        format!("{:.0}", rows_per_s(heap.insert)),
+        format!("{:.0}", rows_per_s(lsm.insert)),
+    );
+    println!(
+        "{:<28}{:>22}{:>22}",
+        "insert wall time",
+        ms(heap.insert),
+        ms(lsm.insert)
+    );
+    println!(
+        "{:<28}{:>22}{:>22}",
+        "flush()",
+        ms(heap.flush),
+        ms(lsm.flush)
+    );
+    println!(
+        "{:<28}{:>22}{:>22}",
+        "on-disk total (bytes)",
+        format!("{}", heap.footprint),
+        format!("{}", lsm.footprint),
+    );
+    println!(
+        "{:<28}{:>22}{:>22}",
+        "on-disk bytes/row",
+        format!("{:.1}", bytes_per_row(heap.footprint)),
+        format!("{:.1}", bytes_per_row(lsm.footprint)),
+    );
+    println!(
+        "{:<28}{:>22}{:>22}",
+        "count(*)",
+        ms(heap.count),
+        ms(lsm.count)
+    );
+    println!(
+        "{:<28}{:>22}{:>22}",
+        "sum/avg/min/max",
+        ms(heap.aggregate),
+        ms(lsm.aggregate)
+    );
+    println!(
+        "{:<28}{:>22}{:>22}",
+        "point lookup (full scan)",
+        ms(heap.point),
+        ms(lsm.point)
+    );
+    println!(
+        "{:<28}{:>22}{:>22}",
+        "filter grp = 3",
+        ms(heap.filter),
+        ms(lsm.filter)
+    );
+    println!(
+        "{:<28}{:>22}{:>22}",
+        "update all rows",
+        ms(heap.update_all),
+        ms(lsm.update_all)
+    );
+    println!(
+        "{:<28}{:>22}{:>22}",
+        "delete grp = 0",
+        ms(heap.delete_pred),
+        ms(lsm.delete_pred)
+    );
+    println!(
+        "{:<28}{:>22}{:>22}",
+        "reopen + first count",
+        ms(heap.reopen),
+        ms(lsm.reopen)
+    );
 }
